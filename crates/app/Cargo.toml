@@ -1,0 +1,19 @@
+[package]
+name = "gannet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Stamps and state dumps for bench/ and the end-to-end checks. Never on in a normal build.
+bench = []
+
+[dependencies]
+gannet-core = { path = "../core" }
+rustix.workspace = true
+libc.workspace = true
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+xkbcommon = { version = "0.9", default-features = false }
+swash = "0.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }

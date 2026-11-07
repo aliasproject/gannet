@@ -1,0 +1,11 @@
+# Leave out MimeType=inode/directory: where nothing sets a default for folders,
+# declaring it makes xdg-mime pick Gannet, and installing it shouldn't change that.
+[Desktop Entry]
+Type=Application
+Name=Gannet
+Comment=A very fast file manager
+Exec=gannet %U
+Icon=com.aliasproject.Gannet
+Terminal=false
+Categories=System;FileTools;FileManager;
+StartupNotify=false

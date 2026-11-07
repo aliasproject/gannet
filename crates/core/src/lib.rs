@@ -1,0 +1,21 @@
+//! Everything in Gannet that isn't drawing: folder listings, file operations, the
+//! Trash, the system theme. No code here reads the environment; every path comes in
+//! as an argument, so tests can't reach real user data by accident.
+
+pub mod clipboard;
+pub mod history;
+pub mod listing;
+pub mod mounts;
+pub mod open;
+pub mod ops;
+pub mod places;
+pub mod sort;
+pub mod theme;
+pub mod thumbcache;
+pub mod time;
+pub mod trash;
+pub mod uri;
+pub mod watch;
+
+#[cfg(test)]
+pub(crate) mod testutil;

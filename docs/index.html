@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en" class="scroll-smooth motion-reduce:scroll-auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gannet, a very fast file manager for Wayland</title>
+<meta name="description" content="Gannet is a file manager for Wayland, written in Rust and drawn on the CPU. It sorts and shows a folder of 100,000 files in 28 ms.">
+<meta property="og:title" content="Gannet, a very fast file manager for Wayland">
+<meta property="og:description" content="A hundred thousand files. Twenty-eight milliseconds.">
+<meta property="og:type" content="website">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#111619">
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#FAFAFA">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+<!-- The colours sit outside Tailwind so the right background paints before its script runs. -->
+<style>
+  :root, [data-theme="dark"] {
+    color-scheme: dark;
+    --ground: #111619; --surface: #1A2226; --line: #2A343A;
+    --ink: #F6F3EA; --body: #EDF0F1; --muted: #A9B4B9;
+    --accent: #EDBE55; --on-accent: #0A1418; --accent-text: #EDBE55;
+    --bar-ours: #EDBE55; --bar-theirs: #66747B;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      color-scheme: light;
+      --ground: #FAFAFA; --surface: #F0F1F1; --line: #D9DEE0;
+      --ink: #0A1418; --body: #0A1418; --muted: #52606A;
+      --accent: #EDBE55; --on-accent: #0A1418; --accent-text: #7A5808;
+      --bar-ours: #9A6F0E; --bar-theirs: #A3AEB4;
+    }
+  }
+  [data-theme="light"] {
+    color-scheme: light;
+    --ground: #FAFAFA; --surface: #F0F1F1; --line: #D9DEE0;
+    --ink: #0A1418; --body: #0A1418; --muted: #52606A;
+    --accent: #EDBE55; --on-accent: #0A1418; --accent-text: #7A5808;
+    --bar-ours: #9A6F0E; --bar-theirs: #A3AEB4;
+  }
+  html { background: var(--ground); }
+  [x-cloak] { display: none; }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4.1.13/dist/index.global.js"></script>
+<style type="text/tailwindcss">
+  @custom-variant dark {
+    &:where([data-theme="dark"], [data-theme="dark"] *) { @slot; }
+    @media (prefers-color-scheme: dark) {
+      &:where(html:not([data-theme="light"]), html:not([data-theme="light"]) *) { @slot; }
+    }
+  }
+  @theme {
+    --font-sans: Inter, system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, monospace;
+    --color-ground: var(--ground);
+    --color-surface: var(--surface);
+    --color-line: var(--line);
+    --color-ink: var(--ink);
+    --color-body: var(--body);
+    --color-muted: var(--muted);
+    --color-accent: var(--accent);
+    --color-on-accent: var(--on-accent);
+    --color-accent-text: var(--accent-text);
+    --color-bar-ours: var(--bar-ours);
+    --color-bar-theirs: var(--bar-theirs);
+  }
+</style>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
+</head>
+
+<body id="top" class="bg-ground text-body font-sans text-[1.0625rem] leading-relaxed" x-data="{
+  dark: matchMedia('(prefers-color-scheme: dark)').matches,
+  toggle() {
+    this.dark = !this.dark;
+    document.documentElement.dataset.theme = this.dark ? 'dark' : 'light';
+  },
+}">
+<div class="mx-auto max-w-[1240px] px-4 sm:px-8">
+
+  <nav aria-label="Main" class="flex flex-wrap items-center justify-between gap-x-8 gap-y-3 py-6">
+    <a href="#top" aria-label="Gannet, back to top" class="flex items-center gap-[9px] text-ink hover:opacity-80">
+      <svg width="39" height="39" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+        <path fill-rule="evenodd" d="M6.5 5 L8 2.6 Q8.4 2 9 2 H10.6 Q11.4 2 12 2.6 L15.5 6 L11 5 Z M9 3 V4 H10 V3 Z"/>
+        <path d="M1 7 a1 1 0 0 1 1 -1 H11 a1 1 0 0 1 1 1 V13 a1 1 0 0 1 -1 1 H6 L1 10 Z"/>
+      </svg>
+      <span class="text-2xl font-bold tracking-[-0.03em]">Gannet</span>
+    </a>
+    <div class="flex flex-wrap items-center gap-x-6 gap-y-1 text-[0.9375rem]">
+      <a href="#speed" class="py-2.5 text-muted hover:text-body">Speed</a>
+      <a href="#drag" class="py-2.5 text-muted hover:text-body">Drag</a>
+      <a href="#preview" class="py-2.5 text-muted hover:text-body">Preview</a>
+      <a href="#keys" class="py-2.5 text-muted hover:text-body">Keys</a>
+      <button type="button" x-cloak @click="toggle()" :aria-label="dark ? 'Switch to light mode' : 'Switch to dark mode'" class="flex size-11 cursor-pointer items-center justify-center rounded-[10px] border border-line text-body hover:bg-surface">
+        <svg class="hidden dark:block" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg class="block dark:hidden" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+      <a href="#get" class="flex min-h-11 items-center rounded-[10px] bg-accent px-[18px] font-semibold text-on-accent hover:opacity-85">Get Gannet</a>
+    </div>
+  </nav>
+
+  <main>
+    <header class="flex flex-col gap-6 pt-10 pb-12 sm:pt-16">
+      <p class="font-mono text-sm text-accent-text">A file manager for Wayland</p>
+      <h1 class="text-[clamp(2.75rem,7vw,5.25rem)] leading-none font-bold tracking-[-0.035em] text-balance text-ink">A hundred thousand files. Twenty-eight milliseconds.</h1>
+      <p class="max-w-[640px] text-xl leading-normal text-pretty text-muted">Gannet is written in Rust and draws on the CPU, with no toolkit and no GPU. Your biggest folder is sorted and on screen before your finger has left the key.</p>
+      <div class="mt-2 flex flex-wrap items-center gap-x-5 gap-y-3">
+        <a href="#get" class="flex min-h-[52px] items-center rounded-[10px] bg-accent px-6 font-semibold text-on-accent hover:opacity-85">Get Gannet 0.1.8</a>
+        <span class="text-[0.9375rem] text-muted">MIT licensed. Wayland only.</span>
+      </div>
+    </header>
+
+    <img src="assets/browse-dark.webp" width="2560" height="1600" fetchpriority="high" alt="Gannet showing a Pictures folder of 100,008 items, with three photos selected" class="hidden h-auto w-full rounded-xl border border-line dark:block">
+    <img src="assets/browse-light.webp" width="2560" height="1600" fetchpriority="high" alt="Gannet showing a Pictures folder of 100,008 items, with three photos selected" class="block h-auto w-full rounded-xl border border-line dark:hidden">
+
+    <section id="speed" class="flex scroll-mt-6 flex-col gap-12 pt-20 sm:pt-30">
+      <div class="flex max-w-[720px] flex-col gap-4">
+        <h2 class="text-[clamp(2rem,4vw,3.25rem)] leading-[1.05] font-bold tracking-[-0.03em] text-balance text-ink">The gap is big enough to feel.</h2>
+        <p class="text-pretty text-muted">The same folder of 100,000 files, in the same harness, against GNOME's file manager.</p>
+      </div>
+
+      <div class="flex flex-col gap-8">
+        <div class="flex flex-col gap-2.5">
+          <h3 class="font-semibold">First window on screen</h3>
+          <div class="grid grid-cols-[72px_minmax(0,1fr)_88px] items-center gap-3 text-[0.9375rem] sm:grid-cols-[84px_minmax(0,1fr)_96px]">
+            <span>Gannet</span>
+            <div class="h-[22px]"><div class="h-full w-[2.8%] rounded-[3px] bg-bar-ours"></div></div>
+            <span class="text-right font-mono font-medium">4.1 ms</span>
+          </div>
+          <div class="grid grid-cols-[72px_minmax(0,1fr)_88px] items-center gap-3 text-[0.9375rem] text-muted sm:grid-cols-[84px_minmax(0,1fr)_96px]">
+            <span>Nautilus</span>
+            <div class="h-[22px]"><div class="h-full w-full rounded-[3px] bg-bar-theirs"></div></div>
+            <span class="text-right font-mono">148.3 ms</span>
+          </div>
+        </div>
+        <div class="flex flex-col gap-2.5">
+          <h3 class="font-semibold">Finished loading the folder</h3>
+          <div class="grid grid-cols-[72px_minmax(0,1fr)_88px] items-center gap-3 text-[0.9375rem] sm:grid-cols-[84px_minmax(0,1fr)_96px]">
+            <span>Gannet</span>
+            <div class="h-[22px]"><div class="h-full w-[1.9%] rounded-[3px] bg-bar-ours"></div></div>
+            <span class="text-right font-mono font-medium">0.02 s</span>
+          </div>
+          <div class="grid grid-cols-[72px_minmax(0,1fr)_88px] items-center gap-3 text-[0.9375rem] text-muted sm:grid-cols-[84px_minmax(0,1fr)_96px]">
+            <span>Nautilus</span>
+            <div class="h-[22px]"><div class="h-full w-full rounded-[3px] bg-bar-theirs"></div></div>
+            <span class="text-right font-mono">1.08 s</span>
+          </div>
+        </div>
+        <div class="flex flex-col gap-2.5">
+          <h3 class="font-semibold">Memory while holding it</h3>
+          <div class="grid grid-cols-[72px_minmax(0,1fr)_88px] items-center gap-3 text-[0.9375rem] sm:grid-cols-[84px_minmax(0,1fr)_96px]">
+            <span>Gannet</span>
+            <div class="h-[22px]"><div class="h-full w-[7.9%] rounded-[3px] bg-bar-ours"></div></div>
+            <span class="text-right font-mono font-medium">16.4 MiB</span>
+          </div>
+          <div class="grid grid-cols-[72px_minmax(0,1fr)_88px] items-center gap-3 text-[0.9375rem] text-muted sm:grid-cols-[84px_minmax(0,1fr)_96px]">
+            <span>Nautilus</span>
+            <div class="h-[22px]"><div class="h-full w-full rounded-[3px] bg-bar-theirs"></div></div>
+            <span class="text-right font-mono">207.9 MiB</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid gap-8 border-t border-line pt-8 md:grid-cols-3">
+        <div class="flex flex-col gap-1">
+          <span class="font-mono text-[1.75rem] font-medium text-accent-text">0.8 ms</span>
+          <span class="text-[0.9375rem] text-muted">to paint a frame while scrolling 100,000 rows, 99th percentile. 3.9 ms at 4K.</span>
+        </div>
+        <div class="flex flex-col gap-1">
+          <span class="font-mono text-[1.75rem] font-medium text-accent-text">216 ms</span>
+          <span class="text-[0.9375rem] text-muted">to move 5,000 files to the Trash.</span>
+        </div>
+        <div class="flex flex-col gap-1">
+          <span class="font-mono text-[1.75rem] font-medium text-accent-text">0 wakeups</span>
+          <span class="text-[0.9375rem] text-muted">per second when idle. If nothing is happening, Gannet isn't running.</span>
+        </div>
+      </div>
+
+      <p class="text-sm text-pretty text-muted">Gannet 0.1.8 and Nautilus 51.1 on one desktop, in a headless sway with software rendering, on 100,000 empty files. Nautilus normally draws with the GPU, so its times here may be pessimistic. The benchmark is in the repo: <code class="font-mono">bench/run.py</code>.</p>
+    </section>
+
+    <section id="drag" class="grid scroll-mt-6 items-center gap-12 pt-20 sm:pt-30 lg:grid-cols-2">
+      <div class="flex flex-col gap-4">
+        <h2 class="text-[clamp(2rem,4vw,3.25rem)] leading-[1.05] font-bold tracking-[-0.03em] text-balance text-ink">Know what a drop will do before you let go.</h2>
+        <p class="text-pretty text-muted">The label under the pointer says it in words. A plain drag moves on the same disk and copies to another. Ctrl copies, Shift moves, and Ctrl+Shift makes a link. Changed your mind? Escape cancels and Ctrl+Z undoes.</p>
+        <p class="text-pretty text-muted">It works between Gannet windows and with other apps. Gannet never deletes anything because of what another app reports back.</p>
+      </div>
+      <div>
+        <img src="assets/drag-dark.webp" width="1720" height="1000" loading="lazy" alt="Three selected photos being dragged onto a folder, with a label reading Move 3 items to Selects" class="hidden h-auto w-full rounded-xl border border-line dark:block">
+        <img src="assets/drag-light.webp" width="1720" height="1000" loading="lazy" alt="Three selected photos being dragged onto a folder, with a label reading Move 3 items to Selects" class="block h-auto w-full rounded-xl border border-line dark:hidden">
+      </div>
+    </section>
+
+    <section id="preview" class="grid scroll-mt-6 items-center gap-12 pt-20 sm:pt-30 lg:grid-cols-2">
+      <div class="order-last lg:order-first">
+        <img src="assets/preview-dark.webp" width="1600" height="1000" loading="lazy" alt="A popup previewing a 2400 by 2400 image over the file list" class="hidden h-auto w-full rounded-xl border border-line dark:block">
+        <img src="assets/preview-light.webp" width="1600" height="1000" loading="lazy" alt="A popup previewing a 2400 by 2400 image over the file list" class="block h-auto w-full rounded-xl border border-line dark:hidden">
+      </div>
+      <div class="flex flex-col gap-4">
+        <h2 class="text-[clamp(2rem,4vw,3.25rem)] leading-[1.05] font-bold tracking-[-0.03em] text-balance text-ink">Press Space. Previews run in a sandbox.</h2>
+        <p class="text-pretty text-muted">Space previews images and plays video, and the arrow keys go to the next file. Plus and minus zoom.</p>
+        <p class="text-pretty text-muted">Decoding a file you downloaded shouldn't put your home folder at risk. Each image decodes in its own process under a seccomp sandbox, with no network and no other files. Video runs in a bubblewrap jail with no home folder and no network.</p>
+      </div>
+    </section>
+
+    <section id="keys" class="grid scroll-mt-6 items-start gap-12 pt-20 sm:pt-30 lg:grid-cols-2">
+      <div class="flex flex-col gap-4">
+        <h2 class="text-[clamp(2rem,4vw,3.25rem)] leading-[1.05] font-bold tracking-[-0.03em] text-balance text-ink">Your hands can stay on the keyboard.</h2>
+        <p class="text-pretty text-muted">Start typing a name and you're there. Everything else is a key or two away, including the things most file managers bury in a menu.</p>
+      </div>
+      <dl class="flex flex-col">
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Filter the folder</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+F or /</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Type a path</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+L</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Preview</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Space</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Jump to a place in the sidebar</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Alt+1 to Alt+9</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Sort by name, size, modified</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+1, 2, 3</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Copy the path as text</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+Shift+C</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Undo a rename, move or Trash</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+Z</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Stop the newest operation</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+.</kbd></dd></div>
+      </dl>
+    </section>
+
+    <section class="flex flex-col gap-12 pt-20 sm:pt-30">
+      <div class="flex max-w-[720px] flex-col gap-4">
+        <h2 class="text-[clamp(2rem,4vw,3.25rem)] leading-[1.05] font-bold tracking-[-0.03em] text-balance text-ink">It matches your desktop.</h2>
+        <p class="text-pretty text-muted">Gannet uses the light or dark preference from your GTK settings or gsettings, with a built-in palette, and checks again whenever its window regains focus.</p>
+      </div>
+      <div class="grid gap-6 md:grid-cols-2">
+        <img src="assets/browse-dark.webp" width="2560" height="1600" loading="lazy" alt="Gannet in a dark theme" class="h-auto w-full rounded-xl border border-line">
+        <img src="assets/browse-light.webp" width="2560" height="1600" loading="lazy" alt="Gannet in a light theme" class="h-auto w-full rounded-xl border border-line">
+      </div>
+    </section>
+
+    <section class="grid items-start gap-12 pt-20 sm:pt-30 lg:grid-cols-2">
+      <div class="flex flex-col gap-4">
+        <h2 class="text-[clamp(2rem,4vw,3.25rem)] leading-[1.05] font-bold tracking-[-0.03em] text-balance text-ink">What it doesn't do yet.</h2>
+        <p class="text-pretty text-muted">Gannet is young. If one of these is a dealbreaker, it's better to know now.</p>
+      </div>
+      <ul class="grid gap-x-8 sm:grid-cols-2">
+        <li class="border-b border-line py-3">Tabs</li>
+        <li class="border-b border-line py-3">Screen readers and other accessibility tools</li>
+        <li class="border-b border-line py-3">Input methods and compose</li>
+        <li class="border-b border-line py-3">Right-to-left text</li>
+        <li class="border-b border-line py-3">Keeping ownership and hard links on copies</li>
+        <li class="border-b border-line py-3">X11</li>
+      </ul>
+    </section>
+
+    <section id="get" class="mt-20 grid scroll-mt-6 items-start gap-12 border-t border-line pt-[72px] sm:mt-30 lg:grid-cols-2">
+      <div class="flex flex-col items-start gap-6">
+        <div class="flex items-center gap-4 text-ink">
+          <svg width="72" height="72" viewBox="0 0 16 16" fill="currentColor" role="img" aria-label="Gannet mark">
+            <path fill-rule="evenodd" d="M6.5 5 L8 2.6 Q8.4 2 9 2 H10.6 Q11.4 2 12 2.6 L15.5 6 L11 5 Z M9 3 V4 H10 V3 Z"/>
+            <path d="M1 7 a1 1 0 0 1 1 -1 H11 a1 1 0 0 1 1 1 V13 a1 1 0 0 1 -1 1 H6 L1 10 Z"/>
+          </svg>
+          <span class="text-[44px] font-bold tracking-[-0.03em]">Gannet</span>
+        </div>
+        <p class="max-w-[460px] text-pretty text-muted">Build it from source with Rust. It needs libxkbcommon to link, and at run time fontconfig for fonts, xdg-open for opening files, and libmpv and bubblewrap for video previews.</p>
+        <a href="https://github.com/aliasproject/gannet" class="flex min-h-[52px] items-center rounded-[10px] bg-accent px-6 font-semibold text-on-accent hover:opacity-85">Get Gannet 0.1.8</a>
+      </div>
+      <pre class="min-w-0 overflow-x-auto rounded-xl border border-line bg-surface p-6 font-mono text-[0.9375rem] leading-[1.8]">git clone https://github.com/aliasproject/gannet
+cd gannet
+cargo build --release -p gannet
+./target/release/gannet</pre>
+    </section>
+  </main>
+
+  <footer class="mt-[72px] flex flex-wrap justify-between gap-x-8 gap-y-2 pt-6 pb-10 text-sm text-muted">
+    <span>© 2026 Alias Project, Inc. MIT licensed.</span>
+    <a href="https://github.com/aliasproject/gannet" class="underline hover:text-body">Source on GitHub</a>
+  </footer>
+
+</div>
+</body>
+</html>

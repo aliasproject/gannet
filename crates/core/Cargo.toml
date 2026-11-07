@@ -1,0 +1,10 @@
+[package]
+name = "gannet-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustix.workspace = true
+libc.workspace = true
+md5 = "0.8.1"

@@ -1,0 +1,18 @@
+[workspace]
+members = ["crates/core", "crates/app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.8"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+rustix = { version = "1", features = ["fs", "event", "mm", "stdio", "process", "pipe", "time"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

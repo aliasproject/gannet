@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Gannet">
+  <rect x="32" y="32" width="448" height="448" rx="104" fill="#111619"/>
+  <g transform="translate(91 96) scale(20)" fill="#F6F3EA">
+    <path fill-rule="evenodd" d="M6.5 5 L8 2.6 Q8.4 2 9 2 H10.6 Q11.4 2 12 2.6 L15.5 6 L11 5 Z M9 3 V4 H10 V3 Z"/>
+    <path d="M1 7 a1 1 0 0 1 1 -1 H11 a1 1 0 0 1 1 1 V13 a1 1 0 0 1 -1 1 H6 L1 10 Z"/>
+  </g>
+</svg>

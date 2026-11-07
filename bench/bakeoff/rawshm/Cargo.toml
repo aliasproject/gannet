@@ -1,0 +1,16 @@
+[package]
+name = "rawshm"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+swash = "0.2"
+rustix = { version = "1", features = ["shm","fs","mm"] }
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
