@@ -629,7 +629,7 @@ impl App {
 
     fn current_stop(&self) -> Stop {
         // With no cursor showing there's nothing to come back to.
-        let cursor_name = if self.cursor_shown { self.listing.as_ref().and_then(|l| self.rows.get(self.cursor).map(|&i| l.name(i).to_vec())) } else { None };
+        let cursor_name = if self.cursor_shown { self.listing.as_ref().and_then(|l| self.rows.get(self.cursor).map(|&i| l.key(i).into_owned())) } else { None };
         Stop { dir: self.dir.clone(), cursor_name }
     }
 
@@ -778,9 +778,9 @@ impl App {
             }
         }
         self.load_error = l.listing.read_error.clone();
-        let name_at = |row: usize, rows: &[u32]| old.as_ref().filter(|_| same_dir).and_then(|o| rows.get(row).map(|&i| o.name(i).to_vec()));
+        let name_at = |row: usize, rows: &[u32]| old.as_ref().filter(|_| same_dir).and_then(|o| rows.get(row).map(|&i| o.key(i).into_owned()));
         let picks: Vec<Vec<u8>> = match &old {
-            Some(o) if same_dir && self.sel_count > 0 => self.rows.iter().filter(|&&i| self.is_selected(i)).map(|&i| o.name(i).to_vec()).collect(),
+            Some(o) if same_dir && self.sel_count > 0 => self.rows.iter().filter(|&&i| self.is_selected(i)).map(|&i| o.key(i).into_owned()).collect(),
             _ => Vec::new(),
         };
         self.rows_changing();
@@ -791,7 +791,7 @@ impl App {
         self.selected = vec![0; l.listing.len().div_ceil(64)];
         self.sel_count = 0;
         if !picks.is_empty() {
-            let lookup: std::collections::HashMap<&[u8], u32> = (0..l.listing.len() as u32).map(|i| (l.listing.name(i), i)).collect();
+            let lookup: std::collections::HashMap<std::borrow::Cow<[u8]>, u32> = (0..l.listing.len() as u32).map(|i| (l.listing.key(i), i)).collect();
             for p in &picks {
                 if let Some(&i) = lookup.get(p.as_slice()) {
                     self.set_selected(i, true);
@@ -801,7 +801,7 @@ impl App {
         self.new_stater(l.listing.clone());
         // Same folder: everything stays where it was, by name. A cursor that wasn't
         // showing stays hidden, and the view doesn't jump.
-        let row_of = |name: &Option<Vec<u8>>, rows: &[u32]| name.as_ref().and_then(|n| rows.iter().position(|&i| l.listing.name(i) == n.as_slice()));
+        let row_of = |name: &Option<Vec<u8>>, rows: &[u32]| name.as_ref().and_then(|n| rows.iter().position(|&i| *l.listing.key(i) == *n.as_slice()));
         if same_dir {
             let last = self.rows.len().saturating_sub(1);
             self.cursor = row_of(&keep_cursor, &self.rows).unwrap_or(self.cursor.min(last));
@@ -811,13 +811,13 @@ impl App {
         if !select.is_empty() {
             self.clear_selection();
             let first = select.first().cloned();
-            let lookup: std::collections::HashMap<&[u8], u32> = (0..l.listing.len() as u32).map(|i| (l.listing.name(i), i)).collect();
+            let lookup: std::collections::HashMap<std::borrow::Cow<[u8]>, u32> = (0..l.listing.len() as u32).map(|i| (l.listing.key(i), i)).collect();
             for name in &select {
                 if let Some(&i) = lookup.get(name.as_slice()) {
                     self.set_selected(i, true);
                 }
             }
-            if let Some(row) = first.and_then(|n| self.rows.iter().position(|&i| l.listing.name(i) == n.as_slice())) {
+            if let Some(row) = first.and_then(|n| self.rows.iter().position(|&i| *l.listing.key(i) == *n.as_slice())) {
                 self.cursor = row;
                 self.anchor = row;
                 self.cursor_shown = true;
@@ -872,7 +872,7 @@ impl App {
     fn place_pending_cursor(&mut self, select: bool, settled: bool) {
         let Some(name) = self.pending_cursor.take() else { return };
         let Some(l) = self.listing.clone() else { return };
-        if let Some(row) = self.rows.iter().position(|&i| l.name(i) == name.as_slice()) {
+        if let Some(row) = self.rows.iter().position(|&i| *l.key(i) == *name.as_slice()) {
             self.cursor = row;
             self.anchor = row;
             self.cursor_shown = true;
@@ -2198,7 +2198,9 @@ impl App {
                 return Hit::FilterBox;
             }
             if self.empty_trash_rect().is_some_and(|r| r.contains(x, y)) {
-                return Hit::EmptyTrash;
+                // An empty Trash leaves the button greyed out, with nothing to press.
+                let any = self.listing.as_ref().is_some_and(|l| !l.is_empty());
+                return if any { Hit::EmptyTrash } else { Hit::None };
             }
             if let Edit::Path(_) = self.edit {
                 return Hit::PathBar;
@@ -2570,7 +2572,7 @@ impl App {
             Hit::DialogButton(_) | Hit::DialogCheck | Hit::PreviewBody => {}
             Hit::Row(row) => {
                 // Read first: a press that opens the row changes what's listed.
-                let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.name(self.rows[row]).to_vec());
+                let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
                 let band = (!self.on_row_name(row, x)).then(|| (self.save_selection(), self.list_y(y)));
                 if let Some(narrow) = self.click_row(row) {
                     self.file_drag = Some(FileDrag::Pressed { at: (x, y), row, dir: self.dir.clone(), name, narrow, band });
@@ -2592,10 +2594,11 @@ impl App {
     }
 
     /// The box the path or filter field draws in, for placing the caret from a click.
-    pub fn path_box(&self) -> Rect {
+    pub fn path_box(&mut self) -> Rect {
         let l = self.layout();
         let start = self.px(6.0) + self.px(36.0) * 3 + self.px(8.0);
         let end = self.filter_rect().map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
+        let end = self.empty_trash_rect().map_or(end, |r| r.x - self.px(8.0));
         Rect::new(start, self.px(7.0), end - start, l.toolbar.h - self.px(14.0))
     }
 
@@ -2617,8 +2620,8 @@ impl App {
     /// press opened it and there's nothing to drag.
     fn click_row(&mut self, row: usize) -> Option<bool> {
         let now = Instant::now();
-        // Compared by name: a reload between the clicks can move rows.
-        let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.name(self.rows[row]).to_vec());
+        // Compared by key: a reload between the clicks can move rows.
+        let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
         let double = self.last_click.as_ref().is_some_and(|(t, n)| *n == name && now.duration_since(*t) < DOUBLE_CLICK);
         let (ctrl, shift) = (self.mods_now.ctrl, self.mods_now.shift);
         if double && !ctrl && !shift {
@@ -2808,7 +2811,7 @@ impl App {
 
     /// Whether a pressed row is still what's at that position in the same folder.
     fn pressed_row_is_current(&self, row: usize, dir: &Path, name: &[u8]) -> bool {
-        self.dir == dir && self.rows.get(row).zip(self.listing.as_ref()).is_some_and(|(&id, l)| l.name(id) == name)
+        self.dir == dir && self.rows.get(row).zip(self.listing.as_ref()).is_some_and(|(&id, l)| *l.key(id) == *name)
     }
 
     fn start_file_drag(&mut self) {
@@ -5331,5 +5334,42 @@ mod tests {
         r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
         r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
         assert!(matches!(r.app.dialog, Some(Dialog::ConfirmDelete { empty: true, .. })));
+    }
+
+    #[test]
+    fn a_reload_keeps_the_selection_on_the_same_item_when_two_share_a_name() {
+        let mut r = Rig::new("trash-same-name");
+        trash_names(&mut r, &["a.txt"]);
+        trash_names(&mut r, &["a.txt"]);
+        open_trash(&mut r);
+        let l = r.app.listing.clone().unwrap();
+        // The lowest id is the one a lookup by name alone would lose.
+        let id = (0..l.len() as u32).find(|&i| l.name(i) == b"a.txt").unwrap();
+        let want = l.path(id);
+        let row = r.app.rows.iter().position(|&i| i == id).unwrap();
+        r.app.move_cursor(row, Mods::default());
+        r.app.reload();
+        r.pump_until("reloaded", |a| !a.loading && !a.listing.as_ref().is_some_and(|n| Arc::ptr_eq(n, &l)));
+        let l = r.app.listing.clone().unwrap();
+        let picked: Vec<PathBuf> = r.app.selected_ids().into_iter().map(|i| l.path(i)).collect();
+        assert_eq!(picked, std::slice::from_ref(&want));
+        assert_eq!(l.path(r.app.rows[r.app.cursor]), want);
+    }
+
+    #[test]
+    fn the_path_field_stops_before_the_empty_trash_button() {
+        let mut r = Rig::new("trash-path-box");
+        trash_names(&mut r, &["a.txt"]);
+        open_trash(&mut r);
+        let b = r.app.empty_trash_rect().unwrap();
+        assert!(r.app.path_box().right() <= b.x);
+    }
+
+    #[test]
+    fn an_empty_trash_has_no_button_to_press() {
+        let mut r = Rig::new("trash-empty-button");
+        open_trash(&mut r);
+        let b = r.app.empty_trash_rect().unwrap();
+        assert_eq!(r.app.hit(b.x + b.w / 2, b.y + b.h / 2), Hit::None);
     }
 }

@@ -321,7 +321,9 @@ const SKIPPED_FS: [&str; 6] = ["nfs", "nfs4", "cifs", "smb3", "sshfs", "fuse.ssh
 /// Only folders that already exist count, and nothing is created.
 pub fn roots(home_trash: &Path, uid: u32, mounts: &[Mount]) -> Vec<Root> {
     let mut out = vec![Root { root: home_trash.to_path_buf(), relative_to: None }];
-    let home_canon = fs::canonicalize(home_trash).ok();
+    // A disk mounted twice, or bind-mounted, would list the same Trash twice.
+    let id = |p: &Path| fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    let mut seen: Vec<(u64, u64)> = id(home_trash).into_iter().collect();
     for m in mounts {
         if SKIPPED_FS.contains(&m.fs_type.as_str()) || m.point.starts_with("/proc") || m.point.starts_with("/sys") || m.point.starts_with("/dev") || m.point.starts_with("/run/user") {
             continue;
@@ -333,11 +335,12 @@ pub fn roots(home_trash: &Path, uid: u32, mounts: &[Mount]) -> Vec<Root> {
         }
         candidates.push(m.point.join(format!(".Trash-{uid}")));
         for root in candidates {
-            let is_home = root == home_trash || home_canon.as_ref().is_some_and(|h| fs::canonicalize(&root).is_ok_and(|r| &r == h));
-            if is_home || out.iter().any(|r| r.root == root) {
+            if verify_ours(&root).is_err() || !root.join("files").is_dir() {
                 continue;
             }
-            if verify_ours(&root).is_ok() && root.join("files").is_dir() {
+            let Some(key) = id(&root) else { continue };
+            if !seen.contains(&key) {
+                seen.push(key);
                 out.push(Root { root, relative_to: Some(m.point.clone()) });
             }
         }
@@ -737,5 +740,16 @@ mod tests {
         assert!(!is_inside_trash(home, 1000, Path::new("/mnt/u/1000/files")));
         assert!(!is_inside_trash(home, 1000, Path::new("/h/.local/share/Trash/info")));
         assert!(!is_inside_trash(home, 1000, Path::new("/h/work/files")));
+    }
+
+    #[test]
+    fn a_disk_mounted_twice_lists_its_trash_once() {
+        let s = Scratch::new();
+        let disk = s.dir("disk");
+        fs::create_dir_all(disk.join(format!(".Trash-{}/files", me()))).unwrap();
+        let again = s.path().join("again");
+        symlink(&disk, &again).unwrap();
+        let got = roots(&s.path().join("data/Trash"), me(), &[mount(&disk, "ext4"), mount(&again, "ext4")]);
+        assert_eq!(got.len(), 2, "{got:?}");
     }
 }

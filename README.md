@@ -128,7 +128,7 @@ Trash in the sidebar lists everything you've trashed on every disk, with where e
 came from and when it was deleted. Right-click to restore items or delete them for good, or
 use Empty Trash in the toolbar. Restoring never overwrites anything: if something new has
 taken an item's place, the item stays in the Trash and Gannet says why. Network shares'
-Trash folders aren't shown, because a hung share would hold up the whole list.
+Trash folders aren't shown, and a disk that stops answering only holds up its own items.
 
 ## Preview
 
