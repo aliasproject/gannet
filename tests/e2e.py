@@ -19,7 +19,7 @@ SHOTS = ROOT / ".bench/shots"
 
 
 class App:
-    def __init__(self, h, start, extra_env=None, path_prefix=None, args=None, bwrap_extra=(), state_name="state.json"):
+    def __init__(self, h, start, extra_env=None, path_prefix=None, args=None, bwrap_extra=(), state_name="state.json", window=True):
         self.h = h
         self.fs = SCRATCH / "fs"
         self.state_file = SCRATCH / state_name
@@ -32,7 +32,8 @@ class App:
         cmd = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", home, *hide_real_trash(),
                "--ro-bind", str(BIN), str(BIN), "--bind", str(SCRATCH), str(SCRATCH), *bwrap_extra, str(BIN), *(args if args is not None else [str(start)])]
         self.proc = subprocess.Popen(cmd, env=self.env, stderr=open(SCRATCH / "stderr.log", "a"), stdout=subprocess.DEVNULL)
-        h.wait_window(10)
+        if window:
+            h.wait_window(10)
 
     def state(self):
         try:
@@ -798,6 +799,56 @@ def the_trash_view_restores_and_empties_across_disks(h):
     go(disk)
     a.wait(lambda s: s["names"] == ["c.txt"], "c.txt is back on its disk")
     a.close()
+
+
+class PrivateBus:
+    """A D-Bus session bus of our own, so nothing reaches the real one."""
+
+    def __init__(self):
+        conf = SCRATCH / "bus.conf"
+        sock = SCRATCH / "bus.sock"
+        if sock.exists():
+            sock.unlink()
+        conf.write_text(f"""<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig><type>session</type><listen>unix:path={sock}</listen><auth>EXTERNAL</auth>
+<policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy>
+</busconfig>
+""")
+        self.proc = subprocess.Popen(["dbus-daemon", "--nofork", "--print-address=1", f"--config-file={conf}"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.address = self.proc.stdout.readline().decode().strip()
+        assert self.address, "dbus-daemon printed no address"
+
+    def call(self, *args):
+        return subprocess.run(["busctl", f"--address={self.address}", *args], capture_output=True, text=True, timeout=10)
+
+    def stop(self):
+        self.proc.kill()
+        self.proc.wait()
+
+
+@check
+def show_in_folder_opens_a_window_with_the_items_selected(h):
+    fs = fresh_fs()
+    tree(fs, {"dl/a.txt": "a", "dl/b.txt": "b", "dl/.hidden": "h", "other/c": "c"})
+    bus = PrivateBus()
+    try:
+        # The service has no window: it opens one for each request.
+        a = App(h, None, args=["--file-manager-service"], extra_env={"DBUS_SESSION_BUS_ADDRESS": bus.address}, window=False)
+        end = time.monotonic() + 5
+        while "org.freedesktop.FileManager1" not in bus.call("list", "--no-legend").stdout:
+            assert time.monotonic() < end, "the service never took the name"
+            time.sleep(0.05)
+        uris = [f"file://{quote(str(fs / 'dl/b.txt'))}", f"file://{quote(str(fs / 'dl/.hidden'))}"]
+        r = bus.call("call", "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1", "ShowItems", "ass", "2", *uris, "")
+        assert r.returncode == 0, r.stderr
+        h.wait_window(10)
+        s = a.wait(lambda s: s["dir"] == str(fs / "dl") and sorted(s["selected"]) == [".hidden", "b.txt"], "the folder, with both selected")
+        assert s["hidden"], "a hidden item asked for by name shows"
+        a.shot("show-in-folder")
+        assert a.alive(), "the service stays for the next request"
+    finally:
+        bus.stop()
 
 
 @check

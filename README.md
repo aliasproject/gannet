@@ -122,6 +122,22 @@ a move, and the other app does the work. Gannet never deletes anything because o
 reports back. Dropped in, Gannet does the work and copies, unless the other app only offers a
 move.
 
+## Show in folder
+
+Other programs can show a file in Gannet, such as a browser's "Show in folder" for a
+download. Gannet opens the file's folder with it selected. This goes through the
+`org.freedesktop.FileManager1` D-Bus service, which Nautilus also provides, so it's opt-in:
+
+    mkdir -p ~/.local/share/dbus-1/services
+    sed "s|/usr/bin/gannet|$(command -v gannet)|" packaging/org.freedesktop.FileManager1.service \
+      > ~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service
+
+D-Bus reads the services folder when the session starts, so log out and back in, or have it
+reread it with `busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig`. If
+Nautilus is already running, it keeps answering until it exits. `gannet
+--file-manager-service` has no window: it opens one for each request, and exits after ten
+minutes with none.
+
 ## Trash
 
 Trash in the sidebar lists everything you've trashed on every disk, with where each item

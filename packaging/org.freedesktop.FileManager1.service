@@ -1,0 +1,6 @@
+# Lets other programs' "Show in folder" open Gannet. D-Bus starts the service on the
+# first request, and it exits again when idle. Nautilus ships a file of this name too,
+# so install this one per user, in ~/.local/share/dbus-1/services, which comes first.
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+Exec=/usr/bin/gannet --file-manager-service

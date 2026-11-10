@@ -9,6 +9,7 @@ mod icons;
 mod media;
 mod paint;
 mod preview;
+mod service;
 mod text;
 mod wl;
 
@@ -77,8 +78,11 @@ fn main() {
         if a == decode::TRY_ARG {
             decode::try_main(std::env::args().nth(2).as_deref().unwrap_or("nothing"));
         }
+        if a == service::ARG {
+            service::main();
+        }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]");
+            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       gannet {}", service::ARG);
             return;
         }
         if a == "--version" {
@@ -87,7 +91,14 @@ fn main() {
         }
     }
     let d = dirs();
-    let start_dir = start_location(arg, &d.home);
+    // `--select PATH...`: the first path's folder, with the paths in it selected.
+    let selecting = arg.as_deref().is_some_and(|a| a == service::SELECT_ARG);
+    let picks: Vec<PathBuf> = if selecting { std::env::args_os().skip(2).map(|a| start_location(Some(a), &d.home)).collect() } else { Vec::new() };
+    let start_dir = match picks.first() {
+        Some(first) => first.parent().map_or_else(|| first.clone(), Path::to_path_buf),
+        None if selecting => d.home.clone(),
+        None => start_location(arg, &d.home),
+    };
     let theme_paths = ThemePaths::for_home(&d.home, &d.config);
     let (colors, source) = theme::load(&theme_paths);
 
@@ -131,7 +142,8 @@ fn main() {
         app.slow_read = std::env::var("GANNET_SLOW_READ_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
         app.slow_preview = std::env::var("GANNET_SLOW_PREVIEW_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
     }
-    app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None });
+    app.go(gannet_core::history::Stop { dir: start_dir.clone(), cursor_name: None });
+    app.select_on_arrival(picks.iter().filter(|p| p.parent() == Some(start_dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_encoded_bytes().to_vec()).collect());
     let mut first_frame = true;
     #[cfg(feature = "bench")]
     let mut bench = bench::Bench::new();

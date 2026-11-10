@@ -1273,6 +1273,15 @@ impl App {
         }
     }
 
+    /// Selects these entries of the folder showing, once it's read, with the cursor on the
+    /// first. Hidden ones show, as they were asked for by name.
+    pub fn select_on_arrival(&mut self, names: Vec<Vec<u8>>) {
+        if names.iter().any(|n| n.first() == Some(&b'.')) {
+            self.show_hidden = true;
+        }
+        self.pending_select = names;
+    }
+
     /// The Trash itself, listing every Trash folder, rather than a folder inside one.
     pub fn is_trash_view(&self) -> bool {
         self.dir == self.trash_dir
@@ -5436,5 +5445,22 @@ mod tests {
         let l = r.app.listing.clone().unwrap();
         assert!(r.app.cursor_shown);
         assert_eq!(l.path(r.app.rows[r.app.cursor]), d);
+    }
+
+    #[test]
+    fn items_asked_for_by_name_arrive_selected_hidden_ones_too() {
+        let mut r = Rig::new("select-on-arrival");
+        for n in ["a", "b", ".h"] {
+            fs::write(r.work().join(n), b"").unwrap();
+        }
+        r.app.go(Stop { dir: r.work(), cursor_name: None });
+        r.app.select_on_arrival(vec![b"b".to_vec(), b".h".to_vec()]);
+        r.pump_until("loaded", |a| !a.loading);
+        let mut got = r.selected_names();
+        got.sort();
+        assert_eq!(got, [".h", "b"]);
+        assert!(r.app.show_hidden);
+        let l = r.app.listing.clone().unwrap();
+        assert_eq!(l.name(r.app.rows[r.app.cursor]), b"b", "the cursor is on the first");
     }
 }
