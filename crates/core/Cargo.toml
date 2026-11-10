@@ -8,3 +8,6 @@ license.workspace = true
 rustix.workspace = true
 libc.workspace = true
 md5 = "0.8.1"
+zbus = { version = "6.2.1", default-features = false, features = ["default-rt", "proxy", "service"] }
+futures-core = "0.3"
+serde = "1"
