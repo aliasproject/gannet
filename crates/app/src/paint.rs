@@ -497,7 +497,9 @@ impl App {
                     1 => "Delete the one item in the Trash for good?".to_string(),
                     n => format!("Delete all {n} items in the Trash for good?"),
                 };
-                (t, "This can't be undone.".to_string(), *at)
+                // A disk that didn't answer keeps its items, and the question shouldn't hide that.
+                let more = if self.load_error.is_some() { " A disk that couldn't be read keeps its items." } else { "" };
+                (t, format!("This can't be undone.{more}"), *at)
             }
             Dialog::ConfirmDelete { paths, at, .. } => {
                 let t = match paths.as_slice() {

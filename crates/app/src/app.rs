@@ -2,6 +2,7 @@
 //! arrives as plain values and requests for the platform go out through `cmds`.
 
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -1370,7 +1371,8 @@ impl App {
         }
         let parent = self.dir.parent()?;
         if self.trash_files_root(parent).is_some_and(|f| f == parent) {
-            return Some(Stop { dir: self.trash_dir.clone(), cursor_name: None });
+            // The Trash view finds rows by their real path, which is where we are.
+            return Some(Stop { dir: self.trash_dir.clone(), cursor_name: Some(self.dir.clone().into_os_string().into_vec()) });
         }
         parent_stop(&self.dir)
     }
@@ -2537,7 +2539,12 @@ impl App {
                 if let Some((_, _, path)) = self.crumbs().into_iter().nth(i)
                     && path != self.dir
                 {
-                    let name = self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec());
+                    let name = if path == self.trash_dir && let Some(files) = self.trash_files_root(&self.dir) {
+                        // The Trash view finds rows by their real path, not their name.
+                        self.dir.strip_prefix(&files).ok().and_then(|r| r.components().next()).map(|c| files.join(c).into_os_string().into_vec())
+                    } else {
+                        self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec())
+                    };
                     self.navigate(path, name);
                 }
             }
@@ -5411,5 +5418,23 @@ mod tests {
         r.open(inner.clone());
         let crumbs: Vec<PathBuf> = r.app.crumbs().into_iter().map(|(_, _, p)| p).collect();
         assert_eq!(crumbs, [r.app.trash_dir.clone(), r.root.join("disk/.Trash-1000/files/d"), inner]);
+    }
+
+    #[test]
+    fn leaving_a_folder_in_the_trash_puts_the_cursor_back_on_it() {
+        let mut r = Rig::new("trash-back-to-row");
+        fs::create_dir_all(r.root.join("work/d/inner")).unwrap();
+        trash_names(&mut r, &["z.txt"]);
+        r.open(r.work());
+        r.select("d");
+        r.key(k::KEY_Delete, "");
+        r.idle();
+        let d = r.app.trash_dir.join("d");
+        r.open(d.clone());
+        r.app.go_up();
+        r.pump_until("back in the Trash", |a| !a.loading && a.is_trash_view());
+        let l = r.app.listing.clone().unwrap();
+        assert!(r.app.cursor_shown);
+        assert_eq!(l.path(r.app.rows[r.app.cursor]), d);
     }
 }
