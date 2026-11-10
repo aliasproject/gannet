@@ -5,6 +5,7 @@ use gannet_core::places::PlaceKind;
 use gannet_core::theme::blend;
 use gannet_core::time;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use crate::app::{ActiveDrag, App, Dialog, DragGhost, Edit, FileDrag, Hit, icon_for};
@@ -137,7 +138,7 @@ impl App {
         c.fill(l.toolbar, co.surface);
         c.fill(Rect::new(0, l.toolbar.bottom() - 1, l.toolbar.w, 1), co.border);
         let (b, pad, icon) = (self.px(36.0), self.px(6.0), self.px(18.0));
-        let buttons = [(Hit::Back, Icon::Back, self.history.can_go_back()), (Hit::Forward, Icon::Forward, self.history.can_go_forward()), (Hit::Up, Icon::Up, self.dir.parent().is_some())];
+        let buttons = [(Hit::Back, Icon::Back, self.history.can_go_back()), (Hit::Forward, Icon::Forward, self.history.can_go_forward()), (Hit::Up, Icon::Up, self.up_target().is_some())];
         for (i, (hit, ic, on)) in buttons.into_iter().enumerate() {
             let x = pad + i as i32 * b;
             if on && self.hover == hit {
@@ -158,12 +159,22 @@ impl App {
                 if self.hover == Hit::Crumb(i) {
                     c.rrect(Rect::new(x, self.px(8.0), w, l.toolbar.h - self.px(16.0)), self.px(5.0), co.hover);
                 }
-                let label = path.file_name().map_or_else(|| "/".to_string(), |n| n.to_string_lossy().into_owned());
+                let label = self.crumb_label(&path);
                 self.text.draw_str(c, &label, (x + self.px(6.0)) as f32, y, if i == last { co.foreground } else { co.muted });
                 if i != last {
                     self.icons.draw(c, Icon::Forward, x + w + (gap - self.px(10.0)) / 2, (l.toolbar.h - self.px(10.0)) / 2, self.px(10.0), co.muted);
                 }
             }
+        }
+        if let Some(r) = self.empty_trash_rect() {
+            let on = self.can_empty_trash();
+            if on && self.hover == Hit::EmptyTrash {
+                c.rrect(r, self.px(5.0), co.hover);
+            }
+            c.frame(r, 1, co.border);
+            let w = self.text.measure("Empty Trash");
+            let by = self.baseline(r.y, r.h);
+            self.text.draw_str(c, "Empty Trash", r.x as f32 + (r.w as f32 - w) / 2.0, by, if on { co.danger } else { co.muted });
         }
         if let Some(r) = self.filter_rect() {
             let focused = matches!(self.edit, Edit::Filter(_));
@@ -252,7 +263,11 @@ impl App {
         let name_x = l.header.x + self.px(14.0);
         let y = self.baseline(l.header.y, l.header.h);
         let arrow = self.px(14.0);
-        let cols = [(SortKey::Name, "Name", name_x), (SortKey::Size, "Size", size_x), (SortKey::Modified, "Modified", date_x)];
+        let trash = self.listing.as_ref().is_some_and(|l| l.is_trash());
+        if let Some((ox, _)) = self.origin_column(l.header, size_x).filter(|_| trash) {
+            self.text.draw_str(c, "Original location", ox as f32, y, co.muted);
+        }
+        let cols = [(SortKey::Name, "Name", name_x), (SortKey::Size, "Size", size_x), (SortKey::Modified, if trash { "Deleted" } else { "Modified" }, date_x)];
         for (key, label, x) in cols {
             let on = self.sort.key == key;
             let color = if on || self.hover == Hit::Header(key) { co.foreground } else { co.muted };
@@ -287,7 +302,13 @@ impl App {
         };
         if self.rows.is_empty() {
             if !self.loading {
-                let msg = if !self.filter.is_empty() { "Nothing matches the filter" } else { "This folder is empty" };
+                let msg = if !self.filter.is_empty() {
+                    "Nothing matches the filter"
+                } else if listing.is_trash() {
+                    "The Trash is empty"
+                } else {
+                    "This folder is empty"
+                };
                 self.paint_center(c, area, msg, co.muted);
             }
             return;
@@ -299,7 +320,9 @@ impl App {
         let date_x = area.right() - self.px(14.0) - l.col_date;
         let size_x = date_x - l.col_size;
         let name_x = area.x + self.px(38.0);
-        let name_max = (size_x - self.px(10.0) - name_x) as f32;
+        let origin = self.origin_column(area, size_x).filter(|_| listing.is_trash());
+        let name_max = (origin.map_or(size_x, |(ox, _)| ox) - self.px(10.0) - name_x) as f32;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
         let icon = self.px(16.0);
         let now = time::now();
         let hover_row = if let Hit::Row(r) = self.hover { Some(r) } else { None };
@@ -343,6 +366,16 @@ impl App {
                 } else {
                     self.text.draw_fitted(c, &shown, name_x as f32, by, name_max, if is_cut { dim } else { fg });
                 }
+                if let Some((ox, ow)) = origin
+                    && let Some(folder) = listing.original(id).and_then(Path::parent)
+                {
+                    let shown = match home.as_deref().and_then(|h| folder.strip_prefix(h).ok()) {
+                        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+                        Some(rest) => format!("~/{}", rest.display()),
+                        None => folder.display().to_string(),
+                    };
+                    self.text.draw_fitted(c, &shown, ox as f32, by, ow as f32, dim);
+                }
                 match listing.stat(id) {
                     Stat::Known { size, mtime } => {
                         if !matches!(kind, Kind::Dir | Kind::LinkDir) {
@@ -371,6 +404,14 @@ impl App {
                 c.rrect(Rect::new(area.right() - w - self.px(3.0), area.y + ty, w, th), w / 2, color);
             }
         });
+    }
+
+    /// Where the Trash view's "Original location" column goes, between the names and sizes.
+    pub(crate) fn origin_column(&self, area: Rect, size_x: i32) -> Option<(i32, i32)> {
+        let name_x = area.x + self.px(38.0);
+        let room = size_x - self.px(10.0) - name_x;
+        let w = (room * 2 / 5).min(self.px(320.0));
+        (w >= self.px(60.0)).then(|| (size_x - self.px(10.0) - w, w))
     }
 
     pub(crate) fn paint_center(&mut self, c: &mut Canvas, area: Rect, msg: &str, color: u32) {
@@ -451,7 +492,16 @@ impl App {
                 };
                 (t, body.to_string(), *at)
             }
-            Dialog::ConfirmDelete { paths, at } => {
+            Dialog::ConfirmDelete { paths, at, empty: true } => {
+                let t = match paths.len() {
+                    1 => "Delete the one item in the Trash for good?".to_string(),
+                    n => format!("Delete all {n} items in the Trash for good?"),
+                };
+                // A disk that didn't answer keeps its items, and the question shouldn't hide that.
+                let more = if self.load_error.is_some() { " A disk that couldn't be read keeps its items." } else { "" };
+                (t, format!("This can't be undone.{more}"), *at)
+            }
+            Dialog::ConfirmDelete { paths, at, .. } => {
                 let t = match paths.as_slice() {
                     [one] => format!("Delete “{}” for good?", name(one)),
                     many => format!("Delete {} for good?", format::count(many.len(), "item", "items")),

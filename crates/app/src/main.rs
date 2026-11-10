@@ -518,6 +518,7 @@ mod bench {
             esc(match &a.dialog {
                 None => "",
                 Some(crate::app::Dialog::Conflict { .. }) => "conflict",
+                Some(crate::app::Dialog::ConfirmDelete { empty: true, .. }) => "empty",
                 Some(crate::app::Dialog::ConfirmDelete { .. }) => "delete",
                 Some(crate::app::Dialog::ConfirmQuit { .. }) => "quit",
             }),

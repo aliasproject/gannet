@@ -2,6 +2,7 @@
 //! arrives as plain values and requests for the platform go out through `cmds`.
 
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -10,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use gannet_core::clipboard;
 use gannet_core::history::{History, Stop, parent_stop};
-use gannet_core::listing::{Kind, LoadEvent, LoadHandle, LoadRequest, Listing, Loaded, SortKey, SortSpec, Stat, Stater, sort_entries, spawn_load_watching, visible_rows};
+use gannet_core::listing::{Kind, LoadEvent, LoadHandle, LoadRequest, Listing, Loaded, SortKey, SortSpec, Stat, Stater, DISKS_GIVE_UP, TrashSpec, sort_entries, spawn_load_watching, visible_rows};
+use gannet_core::mounts::Mount;
+use gannet_core::trash;
 use gannet_core::ops::{self, Answer, Choice, Conflict, Engine, Job, Request, Undo};
 use gannet_core::watch::Watch;
 use gannet_core::places::{Place, PlaceKind};
@@ -125,7 +128,8 @@ pub struct JobView {
 /// A question that has to be answered before anything else happens.
 pub enum Dialog {
     Conflict { conflict: Conflict, apply_to_all: bool, at: usize },
-    ConfirmDelete { paths: Vec<PathBuf>, at: usize },
+    /// `empty` is for emptying the Trash, which words the question differently.
+    ConfirmDelete { paths: Vec<PathBuf>, at: usize, empty: bool },
     ConfirmQuit { at: usize },
 }
 
@@ -142,6 +146,7 @@ pub enum Hit {
     Back,
     Forward,
     Up,
+    EmptyTrash,
     PathBar,
     Crumb(usize),
     FilterBox,
@@ -307,6 +312,8 @@ pub enum Action {
     DeleteForGood,
     NewFolder,
     Undo,
+    Restore,
+    EmptyTrash,
 }
 
 pub struct MenuItem {
@@ -438,6 +445,8 @@ pub struct App {
     /// The folder named on the command line might be a file. We only learn that by trying.
     first_load: bool,
     pub slow_read: Option<Duration>,
+    /// Test seam: the mount table the Trash view looks for other disks' Trash folders in.
+    pub trash_mounts: Option<Vec<Mount>>,
 
     pub preview: Option<Preview>,
     pub(crate) preview_gen: u64,
@@ -535,6 +544,7 @@ impl App {
             stater_gen: 0,
             first_load: true,
             slow_read: None,
+            trash_mounts: None,
             preview: None,
             preview_gen: 0,
             cache_home: None,
@@ -620,7 +630,7 @@ impl App {
 
     fn current_stop(&self) -> Stop {
         // With no cursor showing there's nothing to come back to.
-        let cursor_name = if self.cursor_shown { self.listing.as_ref().and_then(|l| self.rows.get(self.cursor).map(|&i| l.name(i).to_vec())) } else { None };
+        let cursor_name = if self.cursor_shown { self.listing.as_ref().and_then(|l| self.rows.get(self.cursor).map(|&i| l.key(i).into_owned())) } else { None };
         Stop { dir: self.dir.clone(), cursor_name }
     }
 
@@ -645,7 +655,7 @@ impl App {
         self.resort_pending = false;
         self.derive_cancel.store(true, Ordering::Relaxed);
         self.derive_gen += 1;
-        self.cmds.push(Cmd::Title(title_for(&self.dir)));
+        self.cmds.push(Cmd::Title(self.crumb_label(&self.dir)));
         if let Some(i) = self.cache.iter().position(|c| c.listing.dir == self.dir) {
             let c = self.cache.remove(i);
             self.show_cached(c);
@@ -704,6 +714,7 @@ impl App {
             row_count: self.row_capacity(),
             slow_read: self.slow_read,
             slow_stat: None,
+            trash: self.is_trash_view().then(|| TrashSpec { home_trash: self.home_trash(), uid: rustix::process::geteuid().as_raw(), mounts: self.trash_mounts.clone(), disks_give_up: DISKS_GIVE_UP }),
         };
         let hub = self.hub.clone();
         self.load = Some(spawn_load_watching(req, self.watch.clone(), move |e| hub.send(Msg::Load(e))));
@@ -768,9 +779,9 @@ impl App {
             }
         }
         self.load_error = l.listing.read_error.clone();
-        let name_at = |row: usize, rows: &[u32]| old.as_ref().filter(|_| same_dir).and_then(|o| rows.get(row).map(|&i| o.name(i).to_vec()));
+        let name_at = |row: usize, rows: &[u32]| old.as_ref().filter(|_| same_dir).and_then(|o| rows.get(row).map(|&i| o.key(i).into_owned()));
         let picks: Vec<Vec<u8>> = match &old {
-            Some(o) if same_dir && self.sel_count > 0 => self.rows.iter().filter(|&&i| self.is_selected(i)).map(|&i| o.name(i).to_vec()).collect(),
+            Some(o) if same_dir && self.sel_count > 0 => self.rows.iter().filter(|&&i| self.is_selected(i)).map(|&i| o.key(i).into_owned()).collect(),
             _ => Vec::new(),
         };
         self.rows_changing();
@@ -781,7 +792,7 @@ impl App {
         self.selected = vec![0; l.listing.len().div_ceil(64)];
         self.sel_count = 0;
         if !picks.is_empty() {
-            let lookup: std::collections::HashMap<&[u8], u32> = (0..l.listing.len() as u32).map(|i| (l.listing.name(i), i)).collect();
+            let lookup: std::collections::HashMap<std::borrow::Cow<[u8]>, u32> = (0..l.listing.len() as u32).map(|i| (l.listing.key(i), i)).collect();
             for p in &picks {
                 if let Some(&i) = lookup.get(p.as_slice()) {
                     self.set_selected(i, true);
@@ -791,7 +802,7 @@ impl App {
         self.new_stater(l.listing.clone());
         // Same folder: everything stays where it was, by name. A cursor that wasn't
         // showing stays hidden, and the view doesn't jump.
-        let row_of = |name: &Option<Vec<u8>>, rows: &[u32]| name.as_ref().and_then(|n| rows.iter().position(|&i| l.listing.name(i) == n.as_slice()));
+        let row_of = |name: &Option<Vec<u8>>, rows: &[u32]| name.as_ref().and_then(|n| rows.iter().position(|&i| *l.listing.key(i) == *n.as_slice()));
         if same_dir {
             let last = self.rows.len().saturating_sub(1);
             self.cursor = row_of(&keep_cursor, &self.rows).unwrap_or(self.cursor.min(last));
@@ -801,13 +812,13 @@ impl App {
         if !select.is_empty() {
             self.clear_selection();
             let first = select.first().cloned();
-            let lookup: std::collections::HashMap<&[u8], u32> = (0..l.listing.len() as u32).map(|i| (l.listing.name(i), i)).collect();
+            let lookup: std::collections::HashMap<std::borrow::Cow<[u8]>, u32> = (0..l.listing.len() as u32).map(|i| (l.listing.key(i), i)).collect();
             for name in &select {
                 if let Some(&i) = lookup.get(name.as_slice()) {
                     self.set_selected(i, true);
                 }
             }
-            if let Some(row) = first.and_then(|n| self.rows.iter().position(|&i| l.listing.name(i) == n.as_slice())) {
+            if let Some(row) = first.and_then(|n| self.rows.iter().position(|&i| *l.listing.key(i) == *n.as_slice())) {
                 self.cursor = row;
                 self.anchor = row;
                 self.cursor_shown = true;
@@ -862,7 +873,7 @@ impl App {
     fn place_pending_cursor(&mut self, select: bool, settled: bool) {
         let Some(name) = self.pending_cursor.take() else { return };
         let Some(l) = self.listing.clone() else { return };
-        if let Some(row) = self.rows.iter().position(|&i| l.name(i) == name.as_slice()) {
+        if let Some(row) = self.rows.iter().position(|&i| *l.key(i) == *name.as_slice()) {
             self.cursor = row;
             self.anchor = row;
             self.cursor_shown = true;
@@ -1257,6 +1268,50 @@ impl App {
                     self.start_job(Request::Undo(u));
                 }
             }
+            Action::Restore => self.restore_selection(),
+            Action::EmptyTrash => self.ask_empty_trash(),
+        }
+    }
+
+    /// The Trash itself, listing every Trash folder, rather than a folder inside one.
+    pub fn is_trash_view(&self) -> bool {
+        self.dir == self.trash_dir
+    }
+
+    fn home_trash(&self) -> PathBuf {
+        self.trash_dir.parent().map_or_else(|| self.trash_dir.clone(), Path::to_path_buf)
+    }
+
+    fn restore_selection(&mut self) {
+        let Some(l) = self.listing.clone().filter(|l| l.is_trash()) else { return };
+        let mut items = Vec::new();
+        for id in self.selected_ids() {
+            match l.trashed(id) {
+                Some(t) => items.push(t),
+                None => self.notices.push(format!("“{}” can't be restored: the Trash has no record of where it came from", String::from_utf8_lossy(l.name(id)))),
+            }
+        }
+        if !items.is_empty() {
+            self.start_job(Request::Restore { items });
+        }
+        self.invalidate_all();
+    }
+
+    /// Emptying needs the whole list: while other disks are still being read, it waits.
+    pub fn can_empty_trash(&self) -> bool {
+        !self.loading && self.listing.as_ref().is_some_and(|l| l.is_trash() && !l.is_empty())
+    }
+
+    fn ask_empty_trash(&mut self) {
+        if !self.can_empty_trash() {
+            return;
+        }
+        let Some(l) = self.listing.clone() else { return };
+        // Hidden items go too, as they would in any other file manager.
+        let paths: Vec<PathBuf> = (0..l.len() as u32).map(|i| l.path(i)).collect();
+        if !paths.is_empty() {
+            self.dialog = Some(Dialog::ConfirmDelete { paths, at: 1, empty: true });
+            self.invalidate_all();
         }
     }
 
@@ -1303,9 +1358,40 @@ impl App {
     }
 
     pub fn go_up(&mut self) {
-        if let Some(s) = parent_stop(&self.dir) {
+        if let Some(s) = self.up_target() {
             self.navigate(s.dir, s.cursor_name);
         }
+    }
+
+    /// Where Up goes. The Trash's own folders are kept out of the way: the Trash view has
+    /// nothing above it, and a folder at the top of any Trash goes up to the Trash view.
+    pub fn up_target(&self) -> Option<Stop> {
+        if self.is_trash_view() {
+            return None;
+        }
+        let parent = self.dir.parent()?;
+        if self.trash_files_root(parent).is_some_and(|f| f == parent) {
+            // The Trash view finds rows by their real path, which is where we are.
+            return Some(Stop { dir: self.trash_dir.clone(), cursor_name: Some(self.dir.clone().into_os_string().into_vec()) });
+        }
+        parent_stop(&self.dir)
+    }
+
+    /// The `files` folder of whichever of this user's Trash folders holds `path`, if any.
+    pub fn trash_files_root(&self, path: &Path) -> Option<PathBuf> {
+        let (home, uid) = (self.home_trash(), rustix::process::geteuid().as_raw());
+        path.ancestors().filter(|a| a.file_name().is_some_and(|n| n == "files")).find(|a| trash::is_inside_trash(&home, uid, a) && !a.parent().is_some_and(|g| trash::is_inside_trash(&home, uid, g))).map(Path::to_path_buf)
+    }
+
+    /// The toolbar's Empty Trash button, shown in the Trash view.
+    pub fn empty_trash_rect(&mut self) -> Option<Rect> {
+        if !self.listing.as_ref().is_some_and(|l| l.is_trash()) {
+            return None;
+        }
+        let l = self.layout();
+        let end = self.filter_rect().map_or(l.toolbar.right() - self.px(8.0), |r| r.x - self.px(8.0));
+        let w = self.text.measure("Empty Trash") as i32 + self.px(24.0);
+        Some(Rect::new(end - w, self.px(7.0), w, l.toolbar.h - self.px(14.0)))
     }
 
     fn set_edit(&mut self, e: Edit) {
@@ -1394,7 +1480,7 @@ impl App {
     }
 
     fn in_trash(&self) -> bool {
-        self.dir.starts_with(&self.trash_dir)
+        trash::is_inside_trash(&self.home_trash(), rustix::process::geteuid().as_raw(), &self.dir)
     }
 
     fn put_on_clipboard(&mut self, cut: bool) {
@@ -1465,7 +1551,7 @@ impl App {
         }
         // Items already in the Trash have nowhere further to go.
         if self.in_trash() {
-            self.dialog = Some(Dialog::ConfirmDelete { paths, at: 1 });
+            self.dialog = Some(Dialog::ConfirmDelete { paths, at: 1, empty: false });
             self.invalidate_all();
             return;
         }
@@ -1476,7 +1562,7 @@ impl App {
         let paths = self.selected_paths();
         if !paths.is_empty() {
             // Cancel has the focus: Enter shouldn't destroy anything by reflex.
-            self.dialog = Some(Dialog::ConfirmDelete { paths, at: 1 });
+            self.dialog = Some(Dialog::ConfirmDelete { paths, at: 1, empty: false });
             self.invalidate_all();
         }
     }
@@ -1517,7 +1603,9 @@ impl App {
                     None if view.is_some_and(|v| v.ends_undo) => self.undo.clear(),
                     None => {}
                 }
-                if o.touched.contains(&self.dir) {
+                // Another disk's Trash may not be watched, and the Trash view shows it too.
+                let trash_touched = self.is_trash_view() && o.touched.iter().any(|t| self.trash_files_root(t).is_some());
+                if o.touched.contains(&self.dir) || trash_touched {
                     use std::os::unix::ffi::OsStrExt;
                     // A selection made since the job began is the user's, and stays.
                     self.pending_select = o.created.iter().filter(|_| selection_untouched).filter(|p| p.parent() == Some(self.dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_bytes().to_vec()).collect();
@@ -1547,6 +1635,7 @@ impl App {
                 v.push(b("Cancel", "Esc", false));
                 v
             }
+            Dialog::ConfirmDelete { empty: true, .. } => vec![b("Empty Trash", "E", true), b("Cancel", "Esc", false)],
             Dialog::ConfirmDelete { .. } => vec![b("Delete", "D", true), b("Cancel", "Esc", false)],
             Dialog::ConfirmQuit { .. } => vec![b("Stop them and close", "S", true), b("Keep working", "Esc", false)],
         }
@@ -1582,7 +1671,7 @@ impl App {
                 let _ = conflict.reply.send(Answer { choice, apply_to_all });
             }
             Dialog::ConfirmDelete { paths, .. } => {
-                if label == "Delete" {
+                if label == "Delete" || label == "Empty Trash" {
                     self.start_job(Request::Delete { paths });
                 }
             }
@@ -1675,6 +1764,22 @@ impl App {
     fn context_items(&self) -> Vec<MenuItem> {
         let any = self.sel_count > 0;
         let one = self.sel_count == 1;
+        if self.listing.as_ref().is_some_and(|l| l.is_trash()) {
+            return vec![
+                MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
+                MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
+                MenuItem { label: "Copy", keys: "Ctrl+C", action: Action::Copy, enabled: any },
+                MenuItem { label: "Restore", keys: "", action: Action::Restore, enabled: any },
+                MenuItem { label: "Delete for good", keys: "Delete", action: Action::DeleteForGood, enabled: any },
+                MenuItem { label: "Empty Trash", keys: "", action: Action::EmptyTrash, enabled: self.can_empty_trash() },
+                MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
+                MenuItem { label: "Sort by name", keys: "Ctrl+1", action: Action::SortBy(SortKey::Name), enabled: true },
+                MenuItem { label: "Sort by size", keys: "Ctrl+2", action: Action::SortBy(SortKey::Size), enabled: true },
+                MenuItem { label: "Sort by date deleted", keys: "Ctrl+3", action: Action::SortBy(SortKey::Modified), enabled: true },
+                MenuItem { label: "Reload", keys: "F5", action: Action::Reload, enabled: true },
+                MenuItem { label: "New window", keys: "Ctrl+N", action: Action::NewWindow, enabled: true },
+            ];
+        }
         vec![
             MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
             MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
@@ -2109,6 +2214,10 @@ impl App {
             if self.filter_rect().is_some_and(|r| r.contains(x, y)) {
                 return Hit::FilterBox;
             }
+            if self.empty_trash_rect().is_some_and(|r| r.contains(x, y)) {
+                // An empty Trash leaves the button greyed out, with nothing to press.
+                return if self.can_empty_trash() { Hit::EmptyTrash } else { Hit::None };
+            }
             if let Edit::Path(_) = self.edit {
                 return Hit::PathBar;
             }
@@ -2185,9 +2294,19 @@ impl App {
     pub fn crumbs(&mut self) -> Vec<(i32, i32, PathBuf)> {
         let start = self.px(6.0) + self.px(36.0) * 3 + self.px(8.0);
         let end = self.filter_rect().map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
+        let end = self.empty_trash_rect().map_or(end, |r| r.x - self.px(8.0));
         let mut parts: Vec<(String, PathBuf)> = Vec::new();
         let mut acc = PathBuf::new();
-        for c in self.dir.components() {
+        // Inside any Trash, its real path is noise: it starts at "Trash".
+        let mut components = self.dir.components();
+        let files = self.trash_files_root(&self.dir);
+        if let Some((f, rest)) = files.as_ref().and_then(|f| Some((f, self.dir.strip_prefix(f).ok()?))) {
+            // "Trash" opens the Trash view, and what's below it is where it really is.
+            parts.push(("Trash".into(), self.trash_dir.clone()));
+            acc = f.clone();
+            components = rest.components();
+        }
+        for c in components {
             acc.push(c);
             let label = match c {
                 std::path::Component::RootDir => "/".to_string(),
@@ -2211,6 +2330,14 @@ impl App {
             x += widths[i] + gap;
         }
         out
+    }
+
+    /// What a folder is called in the path bar and the window title.
+    pub fn crumb_label(&self, path: &Path) -> String {
+        if path == self.trash_dir {
+            return "Trash".into();
+        }
+        title_for(path)
     }
 
     fn crumb_at(&mut self, x: i32) -> Option<usize> {
@@ -2407,11 +2534,17 @@ impl App {
             Hit::Back => self.go_back(),
             Hit::Forward => self.go_forward(),
             Hit::Up => self.go_up(),
+            Hit::EmptyTrash => self.action(Action::EmptyTrash),
             Hit::Crumb(i) => {
                 if let Some((_, _, path)) = self.crumbs().into_iter().nth(i)
                     && path != self.dir
                 {
-                    let name = self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec());
+                    let name = if path == self.trash_dir && let Some(files) = self.trash_files_root(&self.dir) {
+                        // The Trash view finds rows by their real path, not their name.
+                        self.dir.strip_prefix(&files).ok().and_then(|r| r.components().next()).map(|c| files.join(c).into_os_string().into_vec())
+                    } else {
+                        self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec())
+                    };
                     self.navigate(path, name);
                 }
             }
@@ -2462,7 +2595,7 @@ impl App {
             Hit::DialogButton(_) | Hit::DialogCheck | Hit::PreviewBody => {}
             Hit::Row(row) => {
                 // Read first: a press that opens the row changes what's listed.
-                let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.name(self.rows[row]).to_vec());
+                let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
                 let band = (!self.on_row_name(row, x)).then(|| (self.save_selection(), self.list_y(y)));
                 if let Some(narrow) = self.click_row(row) {
                     self.file_drag = Some(FileDrag::Pressed { at: (x, y), row, dir: self.dir.clone(), name, narrow, band });
@@ -2484,10 +2617,11 @@ impl App {
     }
 
     /// The box the path or filter field draws in, for placing the caret from a click.
-    pub fn path_box(&self) -> Rect {
+    pub fn path_box(&mut self) -> Rect {
         let l = self.layout();
         let start = self.px(6.0) + self.px(36.0) * 3 + self.px(8.0);
         let end = self.filter_rect().map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
+        let end = self.empty_trash_rect().map_or(end, |r| r.x - self.px(8.0));
         Rect::new(start, self.px(7.0), end - start, l.toolbar.h - self.px(14.0))
     }
 
@@ -2509,8 +2643,8 @@ impl App {
     /// press opened it and there's nothing to drag.
     fn click_row(&mut self, row: usize) -> Option<bool> {
         let now = Instant::now();
-        // Compared by name: a reload between the clicks can move rows.
-        let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.name(self.rows[row]).to_vec());
+        // Compared by key: a reload between the clicks can move rows.
+        let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
         let double = self.last_click.as_ref().is_some_and(|(t, n)| *n == name && now.duration_since(*t) < DOUBLE_CLICK);
         let (ctrl, shift) = (self.mods_now.ctrl, self.mods_now.shift);
         if double && !ctrl && !shift {
@@ -2700,7 +2834,7 @@ impl App {
 
     /// Whether a pressed row is still what's at that position in the same folder.
     fn pressed_row_is_current(&self, row: usize, dir: &Path, name: &[u8]) -> bool {
-        self.dir == dir && self.rows.get(row).zip(self.listing.as_ref()).is_some_and(|(&id, l)| l.name(id) == name)
+        self.dir == dir && self.rows.get(row).zip(self.listing.as_ref()).is_some_and(|(&id, l)| *l.key(id) == *name)
     }
 
     fn start_file_drag(&mut self) {
@@ -3302,7 +3436,7 @@ fn verb_is_move(can_copy: bool, can_move: bool) -> bool {
 
 fn cursor_for(h: Hit) -> Cursor {
     match h {
-        Hit::Header(_) | Hit::Crumb(_) | Hit::Back | Hit::Forward | Hit::Up | Hit::Place(_) | Hit::MenuItem(_) | Hit::NoticeClose(_) | Hit::JobCancel(_) | Hit::DialogButton(_) | Hit::DialogCheck => Cursor::Pointer,
+        Hit::Header(_) | Hit::Crumb(_) | Hit::Back | Hit::Forward | Hit::Up | Hit::EmptyTrash | Hit::Place(_) | Hit::MenuItem(_) | Hit::NoticeClose(_) | Hit::JobCancel(_) | Hit::DialogButton(_) | Hit::DialogCheck => Cursor::Pointer,
         Hit::PathBar | Hit::FilterBox => Cursor::Text,
         _ => Cursor::Default,
     }
@@ -3404,7 +3538,9 @@ mod tests {
             let mut trash = TrashConfig::new(&root.join("data"), 1000);
             trash.mount_of = Arc::new(|_| None);
             let engine = Engine::new(trash, Arc::new(move |e| op_hub.send(Msg::Op(e))));
-            let app = App::new(hub, engine, root.join("data/Trash/files"), gannet_core::theme::builtin(false), Source::Default, Text::new(14.0, true), Vec::new(), root.join("work"), 1280, 800, 1.0);
+            let mut app = App::new(hub, engine, root.join("data/Trash/files"), gannet_core::theme::builtin(false), Source::Default, Text::new(14.0, true), Vec::new(), root.join("work"), 1280, 800, 1.0);
+            // Tests must never find a real disk's Trash.
+            app.trash_mounts = Some(Vec::new());
             Self { app, rx, root }
         }
 
@@ -5101,5 +5237,204 @@ mod tests {
         assert_eq!(next_enabled(&items, 3, 3), 1);
         assert_eq!(next_enabled(&items, 1, 3), 3);
         assert_eq!(next_enabled(&[item(false)], usize::MAX, 1), usize::MAX);
+    }
+
+    fn trash_names(r: &mut Rig, names: &[&str]) {
+        for n in names {
+            fs::write(r.work().join(n), n.as_bytes()).unwrap();
+        }
+        r.open(r.work());
+        for n in names {
+            r.select(n);
+            r.key(k::KEY_Delete, "");
+            r.idle();
+        }
+    }
+
+    fn open_trash(r: &mut Rig) {
+        let t = r.app.trash_dir.clone();
+        r.open(t);
+        assert!(r.app.listing.as_ref().unwrap().is_trash());
+    }
+
+    #[test]
+    fn the_trash_shows_where_items_came_from_and_restores_them() {
+        let mut r = Rig::new("trash-restore");
+        trash_names(&mut r, &["a.txt", "b.txt"]);
+        open_trash(&mut r);
+        let l = r.app.listing.clone().unwrap();
+        let a = (0..l.len() as u32).find(|&i| l.name(i) == b"a.txt").unwrap();
+        assert_eq!(l.original(a), Some(fs::canonicalize(r.work()).unwrap().join("a.txt").as_path()));
+        r.select("a.txt");
+        r.app.action(Action::Restore);
+        r.pump_until("restored and reloaded", |a| a.jobs.is_empty() && !a.loading && a.listing.as_ref().is_some_and(|l| l.len() == 1));
+        assert_eq!(fs::read(r.work().join("a.txt")).unwrap(), b"a.txt");
+        assert!(r.app.notices.is_empty(), "{:?}", r.app.notices);
+    }
+
+    #[test]
+    fn restoring_onto_something_new_leaves_both_and_says_why() {
+        let mut r = Rig::new("trash-restore-clash");
+        trash_names(&mut r, &["a.txt"]);
+        fs::write(r.work().join("a.txt"), b"new").unwrap();
+        open_trash(&mut r);
+        r.select("a.txt");
+        r.app.action(Action::Restore);
+        r.idle();
+        assert_eq!(fs::read(r.work().join("a.txt")).unwrap(), b"new");
+        assert_eq!(r.app.listing.as_ref().unwrap().len(), 1);
+        assert!(r.app.notices.iter().any(|n| n.contains("stayed in the Trash")), "{:?}", r.app.notices);
+    }
+
+    #[test]
+    fn emptying_the_trash_asks_first_then_takes_hidden_items_too() {
+        let mut r = Rig::new("trash-empty");
+        trash_names(&mut r, &["a.txt"]);
+        r.app.show_hidden = true;
+        trash_names(&mut r, &[".h"]);
+        r.app.show_hidden = false;
+        open_trash(&mut r);
+        assert_eq!(r.app.rows.len(), 1, "the hidden item isn't showing");
+        r.app.action(Action::EmptyTrash);
+        assert!(matches!(&r.app.dialog, Some(Dialog::ConfirmDelete { empty: true, paths, .. }) if paths.len() == 2));
+        r.key(k::KEY_Escape, "");
+        assert!(r.app.dialog.is_none());
+        assert_eq!(fs::read_dir(r.root.join("data/Trash/files")).unwrap().count(), 2, "Cancel deletes nothing");
+        r.app.action(Action::EmptyTrash);
+        r.key(k::KEY_e, "e");
+        r.pump_until("emptied", |a| a.jobs.is_empty() && !a.loading && a.listing.as_ref().is_some_and(|l| l.is_empty()));
+        for sub in ["files", "info"] {
+            assert_eq!(fs::read_dir(r.root.join("data/Trash").join(sub)).unwrap().count(), 0, "{sub}");
+        }
+    }
+
+    #[test]
+    fn the_trash_menu_offers_restore_and_empty_and_nothing_that_would_change_items() {
+        let mut r = Rig::new("trash-menu");
+        trash_names(&mut r, &["a.txt"]);
+        open_trash(&mut r);
+        r.select("a.txt");
+        let labels: Vec<&str> = r.app.context_items().iter().map(|m| m.label).collect();
+        for want in ["Restore", "Empty Trash", "Delete for good", "Sort by date deleted"] {
+            assert!(labels.contains(&want), "{want} missing from {labels:?}");
+        }
+        for unwanted in ["Cut", "Paste", "Rename", "Move to Trash", "New folder"] {
+            assert!(!labels.contains(&unwanted), "{unwanted} in {labels:?}");
+        }
+    }
+
+    #[test]
+    fn up_stays_out_of_the_trashs_own_folders() {
+        let mut r = Rig::new("trash-up");
+        fs::create_dir_all(r.root.join("work/d/inner")).unwrap();
+        r.open(r.work());
+        r.select("d");
+        r.key(k::KEY_Delete, "");
+        r.idle();
+        open_trash(&mut r);
+        assert!(r.app.up_target().is_none(), "nothing above the Trash view");
+        let d = r.app.trash_dir.join("d");
+        r.open(d.join("inner"));
+        assert_eq!(r.app.up_target().map(|s| s.dir), Some(d.clone()));
+        r.open(d);
+        assert_eq!(r.app.up_target().map(|s| s.dir), Some(r.app.trash_dir.clone()));
+        let other = r.root.join("disk/.Trash-1000/files/x");
+        fs::create_dir_all(&other).unwrap();
+        r.open(other);
+        assert_eq!(r.app.up_target().map(|s| s.dir), Some(r.app.trash_dir.clone()), "another disk's Trash goes up to the Trash view too");
+    }
+
+    #[test]
+    fn the_empty_trash_button_shows_only_in_the_trash_view() {
+        let mut r = Rig::new("trash-button");
+        trash_names(&mut r, &["a.txt"]);
+        assert!(r.app.empty_trash_rect().is_none());
+        open_trash(&mut r);
+        let b = r.app.empty_trash_rect().unwrap();
+        assert_eq!(r.app.hit(b.x + b.w / 2, b.y + b.h / 2), Hit::EmptyTrash);
+        assert!(r.app.crumbs().iter().all(|(x, w, _)| x + w <= b.x), "the path stops before the button");
+        r.app.input(Input::Move { x: (b.x + 4) as f64, y: (b.y + 4) as f64 });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        assert!(matches!(r.app.dialog, Some(Dialog::ConfirmDelete { empty: true, .. })));
+    }
+
+    #[test]
+    fn a_reload_keeps_the_selection_on_the_same_item_when_two_share_a_name() {
+        let mut r = Rig::new("trash-same-name");
+        trash_names(&mut r, &["a.txt"]);
+        trash_names(&mut r, &["a.txt"]);
+        open_trash(&mut r);
+        let l = r.app.listing.clone().unwrap();
+        // The lowest id is the one a lookup by name alone would lose.
+        let id = (0..l.len() as u32).find(|&i| l.name(i) == b"a.txt").unwrap();
+        let want = l.path(id);
+        let row = r.app.rows.iter().position(|&i| i == id).unwrap();
+        r.app.move_cursor(row, Mods::default());
+        r.app.reload();
+        r.pump_until("reloaded", |a| !a.loading && !a.listing.as_ref().is_some_and(|n| Arc::ptr_eq(n, &l)));
+        let l = r.app.listing.clone().unwrap();
+        let picked: Vec<PathBuf> = r.app.selected_ids().into_iter().map(|i| l.path(i)).collect();
+        assert_eq!(picked, std::slice::from_ref(&want));
+        assert_eq!(l.path(r.app.rows[r.app.cursor]), want);
+    }
+
+    #[test]
+    fn the_path_field_stops_before_the_empty_trash_button() {
+        let mut r = Rig::new("trash-path-box");
+        trash_names(&mut r, &["a.txt"]);
+        open_trash(&mut r);
+        let b = r.app.empty_trash_rect().unwrap();
+        assert!(r.app.path_box().right() <= b.x);
+    }
+
+    #[test]
+    fn an_empty_trash_has_no_button_to_press() {
+        let mut r = Rig::new("trash-empty-button");
+        open_trash(&mut r);
+        let b = r.app.empty_trash_rect().unwrap();
+        assert_eq!(r.app.hit(b.x + b.w / 2, b.y + b.h / 2), Hit::None);
+    }
+
+    #[test]
+    fn emptying_waits_until_every_disk_has_been_read() {
+        let mut r = Rig::new("trash-empty-loading");
+        trash_names(&mut r, &["a.txt"]);
+        open_trash(&mut r);
+        // As if another disk's Trash were still being read.
+        r.app.loading = true;
+        let b = r.app.empty_trash_rect().unwrap();
+        assert_eq!(r.app.hit(b.x + b.w / 2, b.y + b.h / 2), Hit::None);
+        assert!(!r.app.context_items().iter().any(|m| m.label == "Empty Trash" && m.enabled));
+        r.app.action(Action::EmptyTrash);
+        assert!(r.app.dialog.is_none());
+    }
+
+    #[test]
+    fn the_path_inside_another_disks_trash_starts_at_trash() {
+        let mut r = Rig::new("trash-crumbs");
+        let inner = r.root.join("disk/.Trash-1000/files/d/e");
+        fs::create_dir_all(&inner).unwrap();
+        r.open(inner.clone());
+        let crumbs: Vec<PathBuf> = r.app.crumbs().into_iter().map(|(_, _, p)| p).collect();
+        assert_eq!(crumbs, [r.app.trash_dir.clone(), r.root.join("disk/.Trash-1000/files/d"), inner]);
+    }
+
+    #[test]
+    fn leaving_a_folder_in_the_trash_puts_the_cursor_back_on_it() {
+        let mut r = Rig::new("trash-back-to-row");
+        fs::create_dir_all(r.root.join("work/d/inner")).unwrap();
+        trash_names(&mut r, &["z.txt"]);
+        r.open(r.work());
+        r.select("d");
+        r.key(k::KEY_Delete, "");
+        r.idle();
+        let d = r.app.trash_dir.join("d");
+        r.open(d.clone());
+        r.app.go_up();
+        r.pump_until("back in the Trash", |a| !a.loading && a.is_trash_view());
+        let l = r.app.listing.clone().unwrap();
+        assert!(r.app.cursor_shown);
+        assert_eq!(l.path(r.app.rows[r.app.cursor]), d);
     }
 }

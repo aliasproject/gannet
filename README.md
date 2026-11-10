@@ -122,6 +122,15 @@ a move, and the other app does the work. Gannet never deletes anything because o
 reports back. Dropped in, Gannet does the work and copies, unless the other app only offers a
 move.
 
+## Trash
+
+Trash in the sidebar lists everything you've trashed on every disk, with where each item
+came from and when it was deleted. Right-click to restore items or delete them for good, or
+use Empty Trash in the toolbar. Restoring never overwrites anything: if something new has
+taken an item's place, the item stays in the Trash and Gannet says why. Network shares'
+and automounted disks' Trash folders aren't shown. A disk that stops answering is left out
+after a few seconds, and the status bar says so.
+
 ## Preview
 
 Space shows the file under the cursor in a popup, and Space or Escape closes it. Arrows go to

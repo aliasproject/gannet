@@ -40,6 +40,8 @@ pub enum Request {
     Delete { paths: Vec<PathBuf> },
     Rename { from: PathBuf, to_name: OsString },
     NewFolder { parent: PathBuf, name: OsString },
+    /// Puts items from the Trash back where they came from. Never overwrites.
+    Restore { items: Vec<Trashed> },
     Undo(Undo),
 }
 
@@ -206,6 +208,7 @@ fn clean_request(r: Request) -> Request {
         Request::Delete { paths } => Request::Delete { paths: many(paths) },
         Request::Rename { from, to_name } => Request::Rename { from: clean_path(from), to_name },
         Request::NewFolder { parent, name } => Request::NewFolder { parent: clean_path(parent), name },
+        Request::Restore { items } => Request::Restore { items },
         Request::Undo(u) => Request::Undo(u),
     }
 }
@@ -228,6 +231,7 @@ fn label_for(r: &Request) -> String {
         Request::Delete { paths } => format!("Deleting {}", count(paths)),
         Request::Rename { from, to_name } => format!("Renaming {} to “{}”", count(std::slice::from_ref(from)), to_name.to_string_lossy()),
         Request::NewFolder { name, .. } => format!("Creating “{}”", name.to_string_lossy()),
+        Request::Restore { items } => format!("Restoring {}", count(&items.iter().map(|t| t.original.clone()).collect::<Vec<_>>())),
         Request::Undo(_) => "Undoing".to_string(),
     }
 }
@@ -409,10 +413,37 @@ impl Run {
                 }
                 None
             }
+            Request::Restore { items } => {
+                self.restore_all(items);
+                None
+            }
             Request::Undo(u) => {
                 self.undo(u);
                 None
             }
+        }
+    }
+
+    fn restore_all(&mut self, items: Vec<Trashed>) {
+        self.job.progress.total_items.store(items.len() as u64, Ordering::Relaxed);
+        for t in items {
+            if self.job.is_cancelled() {
+                break;
+            }
+            match trash::restore(&t) {
+                Ok(()) => {
+                    self.created.push(t.original.clone());
+                    self.touch_parent(&t.original);
+                    self.touch_parent(&t.file);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let at = t.original.parent().map_or_else(String::new, |p| format!(" in {}", p.display()));
+                    self.report(&t.original, format!("Something with this name is already{at}, so it stayed in the Trash"));
+                }
+                Err(e) => self.fail(&t.original, &e),
+            }
+            self.job.progress.done_items.fetch_add(1, Ordering::Relaxed);
+            self.tick();
         }
     }
 
@@ -2171,5 +2202,24 @@ mod tests {
         assert_eq!(job.progress.done_bytes.load(Ordering::Relaxed), 3000);
         assert_eq!(job.progress.total_items.load(Ordering::Relaxed), 3);
         assert_eq!(job.progress.done_items.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn restore_puts_items_back_and_leaves_a_clash_in_the_trash() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let a = trash::trash(&e.trash, &s.file("work/a", b"old a")).unwrap();
+        let b = trash::trash(&e.trash, &s.file("work/gone/b", b"b")).unwrap();
+        fs::remove_dir(s.path().join("work/gone")).unwrap();
+        fs::write(s.path().join("work/a"), b"new a").unwrap();
+        e.start(Request::Restore { items: vec![a.clone(), b.clone()] });
+        let d = finish(&rx, Vec::new());
+        assert_eq!(d.errors.len(), 1);
+        assert!(d.errors[0].1.contains("stayed in the Trash"), "{}", d.errors[0].1);
+        assert_eq!(fs::read(s.path().join("work/a")).unwrap(), b"new a");
+        assert!(a.file.exists() && a.info.exists());
+        assert_eq!(fs::read(&b.original).unwrap(), b"b");
+        assert!(!b.file.exists() && !b.info.exists());
+        assert!(d.outcome.touched.contains(&b.file.parent().unwrap().to_path_buf()));
     }
 }

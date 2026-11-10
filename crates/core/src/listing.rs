@@ -6,20 +6,22 @@
 //! hang only its own worker thread: nothing waits for one.
 
 use std::cmp::Ordering;
-use std::ffi::{CStr, CString, OsStr};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::mem::MaybeUninit;
 use std::os::fd::AsFd;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use rustix::fs::{AtFlags, FileType, RawDir, StatxFlags, statat, statx};
 
+use crate::mounts::read_mounts;
 use crate::sort::{natural_cmp, par_sort_by};
+use crate::trash::{self, Info, Root, Trashed};
 use crate::watch::Watch;
 
 const SIZE_UNKNOWN: u64 = u64::MAX;
@@ -73,6 +75,20 @@ pub struct Listing {
     /// Set if reading stopped early; the entries are what was read before that.
     pub read_error: Option<String>,
     slow_stat: Option<Duration>,
+    /// Set for the Trash view, whose rows come from several Trash folders.
+    trash: Option<Arc<TrashRows>>,
+}
+
+#[derive(Clone)]
+/// Where each row of the Trash view really is, and what its info file says.
+/// Rows are named after the item's original name, which can differ from its name in
+/// `files/` when several items with one name were trashed.
+pub struct TrashRows {
+    pub roots: Vec<Root>,
+    fds: Vec<Arc<File>>,
+    root_of: Vec<u16>,
+    file_names: Vec<OsString>,
+    info: Vec<Option<Info>>,
 }
 
 impl Listing {
@@ -94,7 +110,38 @@ impl Listing {
     }
 
     pub fn path(&self, i: u32) -> PathBuf {
-        self.dir.join(self.os_name(i))
+        match &self.trash {
+            Some(t) => t.roots[t.root_of[i as usize] as usize].files().join(&t.file_names[i as usize]),
+            None => self.dir.join(self.os_name(i)),
+        }
+    }
+
+    /// What tells this row apart from the others, for finding it again after a reload.
+    /// It's the name, except in the Trash view, where two rows can share a name.
+    pub fn key(&self, i: u32) -> std::borrow::Cow<'_, [u8]> {
+        match &self.trash {
+            Some(_) => std::borrow::Cow::Owned(self.path(i).into_os_string().into_vec()),
+            None => std::borrow::Cow::Borrowed(self.name(i)),
+        }
+    }
+
+    /// True for the Trash view.
+    pub fn is_trash(&self) -> bool {
+        self.trash.is_some()
+    }
+
+    /// Where a row of the Trash view came from, if its info file could be read.
+    pub fn original(&self, i: u32) -> Option<&Path> {
+        self.trash.as_ref()?.info[i as usize].as_ref().map(|inf| inf.original.as_path())
+    }
+
+    /// What restoring a row of the Trash view needs, if its info file could be read.
+    pub fn trashed(&self, i: u32) -> Option<Trashed> {
+        let t = self.trash.as_ref()?;
+        let info = t.info[i as usize].as_ref()?;
+        let root = &t.roots[t.root_of[i as usize] as usize];
+        let name = &t.file_names[i as usize];
+        Some(Trashed { original: info.original.clone(), file: root.files().join(name), info: trash::info_path(&root.root, name) })
     }
 
     pub fn kind(&self, i: u32) -> Kind {
@@ -126,17 +173,22 @@ impl Listing {
         if let Some(d) = self.slow_stat {
             std::thread::sleep(d);
         }
-        let Some(fd) = self.fd.as_ref() else {
+        let (fd, name) = match &self.trash {
+            Some(t) => (Some(&t.fds[t.root_of[i as usize] as usize]), t.file_names[i as usize].as_bytes()),
+            None => (self.fd.as_ref(), self.name(i)),
+        };
+        let Some(fd) = fd else {
             m.size.store(SIZE_FAILED, atomic::Ordering::Relaxed);
             return;
         };
-        let name = self.name(i);
+        // In the Trash, the date column is when the item was trashed.
+        let deleted = self.trash.as_ref().and_then(|t| t.info[i as usize].as_ref()).and_then(|inf| inf.deleted);
         let flags = AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT;
         let got = std::ffi::CString::new(name).ok().and_then(|n| statx(fd.as_fd(), n.as_c_str(), flags, StatxFlags::SIZE | StatxFlags::MTIME).ok());
         match got {
             Some(st) => {
                 // Release pairs with the Acquire in stat(): a reader that sees the size sees the time.
-                m.mtime.store(st.stx_mtime.tv_sec, atomic::Ordering::Relaxed);
+                m.mtime.store(deleted.unwrap_or(st.stx_mtime.tv_sec), atomic::Ordering::Relaxed);
                 m.size.store(st.stx_size, atomic::Ordering::Release);
             }
             None => m.size.store(SIZE_FAILED, atomic::Ordering::Relaxed),
@@ -186,6 +238,7 @@ impl Listing {
             complete: false,
             read_error: None,
             slow_stat: self.slow_stat,
+            trash: self.trash.clone(),
         }
     }
 }
@@ -301,7 +354,23 @@ pub struct LoadRequest {
     pub slow_read: Option<Duration>,
     /// Test seam: sleep this long before each stat, to imitate a dead mount under the folder.
     pub slow_stat: Option<Duration>,
+    /// List every Trash folder instead of `dir`, which should be the home Trash's `files`.
+    pub trash: Option<TrashSpec>,
 }
+
+#[derive(Clone, Debug)]
+pub struct TrashSpec {
+    /// `$XDG_DATA_HOME/Trash`.
+    pub home_trash: PathBuf,
+    pub uid: u32,
+    /// Test seam: the mount table to look for other disks' Trash folders in.
+    pub mounts: Option<Vec<crate::mounts::Mount>>,
+    /// How long other disks get before the list finishes without them.
+    pub disks_give_up: Duration,
+}
+
+/// What `TrashSpec::disks_give_up` normally is.
+pub const DISKS_GIVE_UP: Duration = Duration::from_secs(3);
 
 pub struct Loaded {
     pub generation: u64,
@@ -354,10 +423,15 @@ pub fn spawn_load_watching(req: LoadRequest, watch: Option<Arc<Watch>>, sink: im
     let (s2, r2) = (sink.clone(), req.clone());
     let spawned = std::thread::Builder::new().name("gannet-list".into()).spawn(move || {
         let (generation, dir) = (req.generation, req.dir.clone());
-        if let Some(w) = &watch {
-            w.set_dirs_unless(std::slice::from_ref(&dir), || c.load(atomic::Ordering::Relaxed));
-        }
-        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load(req, &c, &s2)));
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match req.trash.clone() {
+            Some(spec) => load_trash(req, &spec, watch.as_ref(), &c, &s2),
+            None => {
+                if let Some(w) = &watch {
+                    w.set_dirs_unless(std::slice::from_ref(&dir), || c.load(atomic::Ordering::Relaxed));
+                }
+                load(req, &c, &s2)
+            }
+        }));
         if done.is_err() {
             s2(LoadEvent::Failed { generation, dir, error: "Reading this folder failed unexpectedly".into() });
         }
@@ -381,7 +455,7 @@ fn load(req: LoadRequest, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
             return;
         }
     };
-    let mut l = Listing { dir: req.dir.clone(), fd: Some(file.clone()), names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat };
+    let mut l = Listing { dir: req.dir.clone(), fd: Some(file.clone()), names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None };
     // Small enough that a slow disk returns often, and big enough to be cheap on a fast one.
     let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); if req.slow_read.is_some() { 4096 } else { READ_BUFFER }];
     let mut iter = RawDir::new(file.as_fd(), &mut buf);
@@ -445,6 +519,162 @@ fn load(req: LoadRequest, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
     l.slots.shrink_to_fit();
     l.meta = l.slots.iter().map(|_| new_meta()).collect();
     publish_final(Arc::new(l), &req, cancel, sink);
+}
+
+/// What the thread reading other disks' Trash folders sends: the folders to watch, once
+/// they're known, then each folder as it's read.
+enum DiskMsg {
+    Watch(Vec<PathBuf>),
+    Root(Root, Arc<File>, Vec<TrashEntry>),
+}
+
+/// One row of a Trash folder: its name in `files/`, its kind, and its info file.
+type TrashEntry = (OsString, Kind, Option<Info>);
+
+/// Reads one Trash folder whole. Trash folders are small next to the folders `load` is
+/// built for, so there's no partial publishing within one.
+fn read_trash_root(root: &Root, slow_read: Option<Duration>, cancel: &AtomicBool) -> std::io::Result<(Arc<File>, Vec<TrashEntry>)> {
+    let files = root.files();
+    let file = Arc::new(open_dir(&files)?);
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(&files)? {
+        if cancel.load(atomic::Ordering::Relaxed) {
+            break;
+        }
+        let Ok(e) = e else { continue };
+        let name = e.file_name();
+        let kind = match e.file_type() {
+            Ok(ft) if ft.is_symlink() => CString::new(name.as_bytes()).map_or(Kind::Other, |n| resolved_kind(&file, &n)),
+            Ok(ft) if ft.is_dir() => Kind::Dir,
+            Ok(ft) if ft.is_file() => Kind::File,
+            _ => Kind::Other,
+        };
+        let info = read_small(&trash::info_path(&root.root, &name)).and_then(|b| trash::parse_info(&b, root.relative_to.as_deref()));
+        out.push((name, kind, info));
+        if let Some(d) = slow_read {
+            std::thread::sleep(d);
+        }
+    }
+    Ok((file, out))
+}
+
+/// Reads an info file, if it's a plain file of sensible size. Opening a FIFO without
+/// O_NONBLOCK would hang, and a huge file isn't a real info file.
+fn read_small(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    const MAX: u64 = 64 * 1024;
+    let f = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path).ok()?;
+    let m = f.metadata().ok()?;
+    if !m.is_file() || m.len() > MAX {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(m.len() as usize);
+    f.take(MAX).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn add_trash_root(l: &mut Listing, t: &mut TrashRows, root: Root, file: Arc<File>, entries: Vec<TrashEntry>) {
+    let ri = t.roots.len() as u16;
+    for (name, kind, info) in entries {
+        let shown = info.as_ref().and_then(|i| i.original.file_name()).unwrap_or(&name).as_bytes();
+        if shown.len() > u16::MAX as usize || l.names.len() + shown.len() > u32::MAX as usize {
+            continue;
+        }
+        l.slots.push(Slot { off: l.names.len() as u32, len: shown.len() as u16, kind });
+        l.names.extend_from_slice(shown);
+        t.root_of.push(ri);
+        t.file_names.push(name);
+        t.info.push(info);
+    }
+    t.roots.push(root);
+    t.fds.push(file);
+}
+
+/// Lists what's in every Trash folder, as one list. The home Trash is read first. Other
+/// disks are found and read on a thread of their own: a disk that stops answering can
+/// hang that thread, but the home Trash still shows.
+fn load_trash(req: LoadRequest, spec: &TrashSpec, watch: Option<&Arc<Watch>>, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
+    let stale = || cancel.load(atomic::Ordering::Relaxed);
+    let home = Root { root: spec.home_trash.clone(), relative_to: None };
+    // Made now, so the first item trashed later is noticed by the watch.
+    let _ = trash::ensure_dirs(&home.root);
+    if let Some(w) = watch {
+        w.set_dirs_unless(&[home.files()], stale);
+    }
+    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None };
+    let mut t = TrashRows { roots: Vec::new(), fds: Vec::new(), root_of: Vec::new(), file_names: Vec::new(), info: Vec::new() };
+    match read_trash_root(&home, req.slow_read, cancel) {
+        Ok((file, entries)) => add_trash_root(&mut l, &mut t, home, file, entries),
+        // Only the home Trash is always expected to be there.
+        Err(e) => l.read_error = Some(describe(&e)),
+    }
+    let (tx, rx) = mpsc::channel();
+    let (spec2, cancel2, slow) = (spec.clone(), cancel.clone(), req.slow_read);
+    let spawned = std::thread::Builder::new().name("gannet-trash-disks".into()).spawn(move || {
+        let mounts = spec2.mounts.clone().unwrap_or_else(read_mounts);
+        let others: Vec<Root> = trash::roots(&spec2.home_trash, spec2.uid, &mounts).into_iter().skip(1).collect();
+        let _ = tx.send(DiskMsg::Watch(others.iter().map(Root::files).collect()));
+        for root in others {
+            if cancel2.load(atomic::Ordering::Relaxed) {
+                return;
+            }
+            if let Ok((file, entries)) = read_trash_root(&root, slow, &cancel2) {
+                let _ = tx.send(DiskMsg::Root(root, file, entries));
+            }
+        }
+    });
+    if spawned.is_ok() {
+        let started = Instant::now();
+        // Rows on screen are behind what's been read: publish them at the next pause.
+        let (mut published, mut behind) = (false, false);
+        loop {
+            if stale() {
+                return;
+            }
+            let waited = started.elapsed();
+            if waited >= spec.disks_give_up {
+                // A disk that stops answering can keep the other thread stuck, but not this
+                // one: the list finishes without it, and says so.
+                if l.read_error.is_none() {
+                    l.read_error = Some("a disk's Trash didn't answer in time".into());
+                }
+                break;
+            }
+            let wait = if published { Duration::from_millis(100) } else { RESOLVE_HEAD_START.saturating_sub(waited) };
+            match rx.recv_timeout(wait.min(spec.disks_give_up - waited)) {
+                Ok(DiskMsg::Watch(dirs)) => {
+                    if let Some(w) = watch {
+                        let all: Vec<PathBuf> = std::iter::once(spec.home_trash.join("files")).chain(dirs).collect();
+                        w.set_dirs_unless(&all, stale);
+                    }
+                }
+                Ok(DiskMsg::Root(root, file, entries)) => {
+                    add_trash_root(&mut l, &mut t, root, file, entries);
+                    behind = true;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if !published || behind {
+                        publish_partial(trash_snapshot(&l, &t), &req, cancel, sink);
+                        (published, behind) = (true, false);
+                    }
+                }
+            }
+        }
+    }
+    if stale() {
+        return;
+    }
+    l.complete = true;
+    l.meta = l.slots.iter().map(|_| new_meta()).collect();
+    l.trash = Some(Arc::new(t));
+    publish_final(Arc::new(l), &req, cancel, sink);
+}
+
+fn trash_snapshot(l: &Listing, t: &TrashRows) -> Listing {
+    let mut s = l.snapshot();
+    s.trash = Some(Arc::new(t.clone()));
+    s
 }
 
 /// Works out what symlinks point at, on a thread of its own. If that stalls, the rows
@@ -602,11 +832,12 @@ impl Stater {
 mod tests {
     use super::*;
     use crate::testutil::Scratch;
+    use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::Path;
 
     fn request(dir: &Path) -> LoadRequest {
-        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None }
+        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None, trash: None }
     }
 
     /// Runs a load to completion, returning every event in order.
@@ -941,5 +1172,148 @@ mod tests {
         let l = last(run(request(s.path())));
         assert_eq!(l.rows.len(), 20_000);
         assert!(l.rows.windows(2).all(|w| natural_cmp(l.listing.name(w[0]), l.listing.name(w[1])) == Ordering::Less));
+    }
+
+    #[test]
+    fn the_trash_lists_every_trash_folder_under_original_names() {
+        let s = Scratch::new();
+        let uid = rustix::process::geteuid().as_raw();
+        let home = s.path().join("data/Trash");
+        let disk = s.dir("disk");
+        let cfg = |ignore_home: bool| {
+            let mut c = trash::TrashConfig::new(&s.path().join("data"), uid);
+            let top = disk.clone();
+            c.mount_of = Arc::new(move |p: &Path| p.starts_with(&top).then(|| top.clone()));
+            c.ignore_home_trash = ignore_home;
+            c
+        };
+        let a1 = trash::trash(&cfg(false), &s.file("work/a.txt", b"1")).unwrap();
+        let a2 = trash::trash(&cfg(false), &s.file("work/a.txt", b"22")).unwrap();
+        let far = trash::trash(&cfg(true), &s.file("disk/sub/far.txt", b"333")).unwrap();
+        // An item with no info file still shows, under its own name, but can't be restored.
+        fs::write(home.join("files/stray"), b"").unwrap();
+        let mut req = request(&home.join("files"));
+        req.trash = Some(TrashSpec { home_trash: home.clone(), uid, disks_give_up: DISKS_GIVE_UP, mounts: Some(vec![crate::mounts::Mount { point: disk.clone(), fs_type: "ext4".into(), source: "/dev/sdz1".into() }]) });
+        let l = last(run(req));
+        assert!(l.listing.is_trash());
+        assert_eq!(row_names(&l), ["a.txt", "a.txt", "far.txt", "stray"]);
+        let by_path = |p: &Path| (0..l.listing.len() as u32).find(|&i| l.listing.path(i) == p).unwrap();
+        for t in [&a1, &a2, &far] {
+            let i = by_path(&t.file);
+            assert_eq!(l.listing.trashed(i).as_ref(), Some(t));
+            assert_eq!(l.listing.original(i), Some(t.original.as_path()));
+        }
+        let stray = by_path(&home.join("files/stray"));
+        assert_eq!(l.listing.trashed(stray), None);
+        // Sizes come from the item where it is now, and the date from when it was trashed.
+        let i = by_path(&far.file);
+        l.listing.stat_entries(&[i]);
+        let deleted = trash::parse_info(&fs::read(&far.info).unwrap(), Some(&disk)).unwrap().deleted.unwrap();
+        assert_eq!(l.listing.stat(i), Stat::Known { size: 3, mtime: deleted });
+    }
+
+    #[test]
+    fn an_empty_trash_is_made_rather_than_failing() {
+        let s = Scratch::new();
+        let home = s.path().join("data/Trash");
+        let mut req = request(&home.join("files"));
+        req.trash = Some(TrashSpec { home_trash: home.clone(), uid: 1000, disks_give_up: DISKS_GIVE_UP, mounts: Some(Vec::new()) });
+        let l = last(run(req));
+        assert!(l.listing.is_empty() && l.listing.read_error.is_none());
+        assert!(home.join("info").is_dir());
+    }
+
+    fn disk_mount(point: &Path) -> crate::mounts::Mount {
+        crate::mounts::Mount { point: point.to_path_buf(), fs_type: "ext4".into(), source: "/dev/sdz1".into() }
+    }
+
+    #[test]
+    fn a_slow_disk_doesnt_hold_up_the_home_trash() {
+        let s = Scratch::new();
+        let uid = rustix::process::geteuid().as_raw();
+        let home = s.path().join("data/Trash");
+        let disk = s.dir("disk");
+        s.file(&format!("disk/.Trash-{uid}/files/far"), b"x");
+        let mut req = request(&home.join("files"));
+        // Each entry read waits this long, and only the other disk has one.
+        req.slow_read = Some(Duration::from_millis(400));
+        req.trash = Some(TrashSpec { home_trash: home.clone(), uid, disks_give_up: DISKS_GIVE_UP, mounts: Some(vec![disk_mount(&disk)]) });
+        let events = run(req);
+        let Some(LoadEvent::Ready(first)) = events.first() else { panic!("no rows") };
+        assert!(!first.settled && first.listing.is_empty() && first.listing.is_trash(), "the home Trash shows first");
+        let l = last(events);
+        assert_eq!(row_names(&l), ["far"]);
+    }
+
+    #[test]
+    fn a_fifo_for_an_info_file_doesnt_hang_the_trash() {
+        let s = Scratch::new();
+        let home = s.path().join("data/Trash");
+        s.file("data/Trash/files/x", b"");
+        fs::create_dir_all(home.join("info")).unwrap();
+        rustix::fs::mknodat(rustix::fs::CWD, home.join("info/x.trashinfo"), rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o600), 0).unwrap();
+        let mut req = request(&home.join("files"));
+        req.trash = Some(TrashSpec { home_trash: home.clone(), uid: 1000, disks_give_up: DISKS_GIVE_UP, mounts: Some(Vec::new()) });
+        let (tx, rx) = mpsc::channel();
+        spawn_load(req, move |e| {
+            let _ = tx.send(e);
+        });
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).expect("the load must finish") {
+                LoadEvent::Ready(l) if l.settled => {
+                    assert_eq!(row_names(&l), ["x"]);
+                    assert!(l.listing.trashed(l.rows[0]).is_none());
+                    break;
+                }
+                LoadEvent::Ready(_) => {}
+                LoadEvent::Failed { error, .. } => panic!("{error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rows_sharing_a_name_have_their_own_keys() {
+        let s = Scratch::new();
+        let home = s.path().join("data/Trash");
+        let mut c = trash::TrashConfig::new(&s.path().join("data"), 1000);
+        c.mount_of = Arc::new(|_| None);
+        trash::trash(&c, &s.file("work/a", b"1")).unwrap();
+        trash::trash(&c, &s.file("work/a", b"2")).unwrap();
+        let mut req = request(&home.join("files"));
+        req.trash = Some(TrashSpec { home_trash: home, uid: 1000, disks_give_up: DISKS_GIVE_UP, mounts: Some(Vec::new()) });
+        let l = last(run(req));
+        assert_eq!(row_names(&l), ["a", "a"]);
+        assert_ne!(l.listing.key(0), l.listing.key(1));
+    }
+
+    #[test]
+    fn a_disk_that_never_answers_doesnt_stop_the_trash_finishing() {
+        let s = Scratch::new();
+        let uid = rustix::process::geteuid().as_raw();
+        let home = s.path().join("data/Trash");
+        let disk = s.dir("disk");
+        s.file(&format!("disk/.Trash-{uid}/files/far"), b"");
+        let mut req = request(&home.join("files"));
+        // Each entry read waits a minute, and only the other disk has one: it stands in
+        // for a disk that's stopped answering.
+        req.slow_read = Some(Duration::from_secs(60));
+        req.trash = Some(TrashSpec { home_trash: home.clone(), uid, disks_give_up: Duration::from_millis(300), mounts: Some(vec![disk_mount(&disk)]) });
+        let (tx, rx) = mpsc::channel();
+        spawn_load(req, move |e| {
+            let _ = tx.send(e);
+        });
+        let started = Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).expect("the load must finish") {
+                LoadEvent::Ready(l) if l.settled => {
+                    assert!(l.listing.is_empty());
+                    assert!(l.listing.read_error.as_deref().is_some_and(|e| e.contains("didn't answer")));
+                    break;
+                }
+                LoadEvent::Ready(_) => {}
+                LoadEvent::Failed { error, .. } => panic!("{error}"),
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "finished without the other disk");
     }
 }
