@@ -123,13 +123,38 @@ fn run(rx: &Receiver<Vec<Window>>, idle: Duration, mut open: impl FnMut(&Window)
 
 /// Lets the name go, so D-Bus starts a new service for the next request, then opens
 /// whatever arrived meanwhile. zbus answers a call before passing it on, so a request
-/// can be answered and still on its way here.
+/// can be answered and still on its way here. Waiting 200 ms for those covers all but a
+/// badly overloaded machine, where one could still be lost.
 fn finish(bus: &Bus, rx: &Receiver<Vec<Window>>, mut open: impl FnMut(&Window)) {
-    let _ = zbus::block_on(bus.connection().release_name(NAME));
+    if let Err(e) = bus.release_name(NAME) {
+        eprintln!("gannet: couldn't let go of {NAME}: {e}");
+    }
     std::thread::sleep(Duration::from_millis(200));
     while let Ok(windows) = rx.try_recv() {
         windows.iter().for_each(&mut open);
     }
+}
+
+/// The command that opens a window. When D-Bus starts this service, it runs in a systemd
+/// unit of its own, and systemd stops everything left in that unit when the service
+/// exits, so windows would close with it. There, each window gets a scope of its own in
+/// `app.slice`, as app launchers do.
+fn window_command(exe: &Path, w: &Window, in_unit: bool) -> Command {
+    let mut c;
+    if in_unit {
+        c = Command::new("systemd-run");
+        c.args(["--user", "--scope", "--slice=app.slice", "--collect", "--quiet", "--"]).arg(exe);
+    } else {
+        c = Command::new(exe);
+    }
+    c.args(w.args());
+    c
+}
+
+/// Whether this runs in a systemd unit that systemd-run can make scopes beside.
+fn in_systemd_unit() -> bool {
+    std::env::var_os("INVOCATION_ID").is_some()
+        && std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("systemd-run").is_file()))
 }
 
 /// This program's path. After an upgrade replaces it while the service runs, Linux
@@ -174,8 +199,12 @@ pub fn main() -> ! {
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
         eprintln!("gannet: WAYLAND_DISPLAY isn't set for D-Bus services, so windows may not open; see \"Show in folder\" in the README");
     }
+    let in_unit = in_systemd_unit();
+    if std::env::var_os("INVOCATION_ID").is_some() && !in_unit {
+        eprintln!("gannet: systemd-run isn't on PATH, so windows opened here close when this service exits");
+    }
     let open = |w: &Window| {
-        gannet_core::open::spawn_detached_logged(Command::new(own_path()).args(w.args()), |why| eprintln!("gannet: couldn't open a window: {why}"));
+        gannet_core::open::spawn_detached_logged(&mut window_command(&own_path(), w, in_unit), |why| eprintln!("gannet: a window from \"Show in folder\" ended early: {why}"));
     };
     run(&rx, IDLE, open);
     finish(&bus, &rx, open);
@@ -222,6 +251,17 @@ mod tests {
     fn windows_get_the_arguments_that_show_them() {
         assert_eq!(Window::Folder("/a b".into()).args(), [OsString::from("/a b")]);
         assert_eq!(Window::Select(vec!["/a/x".into(), "/a/y".into()]).args(), [OsString::from("--select"), "/a/x".into(), "/a/y".into()]);
+    }
+
+    #[test]
+    fn inside_a_systemd_unit_windows_get_their_own_scope() {
+        let w = Window::Select(vec!["/d/a".into()]);
+        let args = |c: &Command| std::iter::once(c.get_program().to_owned()).chain(c.get_args().map(|a| a.to_owned())).collect::<Vec<OsString>>();
+        assert_eq!(args(&window_command(Path::new("/usr/bin/gannet"), &w, false)), ["/usr/bin/gannet", "--select", "/d/a"].map(OsString::from));
+        assert_eq!(
+            args(&window_command(Path::new("/usr/bin/gannet"), &w, true)),
+            ["systemd-run", "--user", "--scope", "--slice=app.slice", "--collect", "--quiet", "--", "/usr/bin/gannet", "--select", "/d/a"].map(OsString::from)
+        );
     }
 
     /// A bus of our own, so tests never touch the real session bus.

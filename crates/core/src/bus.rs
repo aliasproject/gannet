@@ -138,6 +138,12 @@ impl Bus {
         }
     }
 
+    /// Gives up a well-known name, so the bus can hand it to someone else, or start a new
+    /// owner for the next call to it.
+    pub fn release_name(&self, name: &str) -> zbus::Result<bool> {
+        block_on_for(self.conn.release_name(name), self.limit)
+    }
+
     /// Serves `iface` at `path`. Its methods run on zbus's helper thread. False if an
     /// interface of that name is already served there.
     pub fn serve<I: Interface>(&self, path: &str, iface: I) -> zbus::Result<bool> {
@@ -313,6 +319,17 @@ mod tests {
         let reply: String = other.call(NAME, PATH, IFACE, "Echo", &("hello",)).unwrap();
         assert_eq!(reply, "echo: hello");
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "hello");
+    }
+
+    #[test]
+    fn a_released_name_can_be_taken_by_another() {
+        let bus = PrivateBus::start();
+        let first = Bus::connect(&bus.address).unwrap();
+        let second = Bus::connect(&bus.address).unwrap();
+        assert!(first.own_name(NAME).unwrap());
+        assert!(!second.own_name(NAME).unwrap());
+        assert!(first.release_name(NAME).unwrap());
+        assert!(second.own_name(NAME).unwrap());
     }
 
     #[test]
