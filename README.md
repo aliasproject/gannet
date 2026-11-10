@@ -127,28 +127,27 @@ move.
 Other programs can show a file in Gannet, such as a browser's "Show in folder" for a
 download. Gannet opens the file's folder with it selected. This goes through the
 `org.freedesktop.FileManager1` D-Bus service, which Nautilus and other file managers also
-provide, so Gannet only answers it once you ask:
+provide.
+
+Packages install `packaging/com.aliasproject.Gannet.FileManager1.service` into
+`/usr/share/dbus-1/services`, named for Gannet so it can't clash with Nautilus's file. With
+more than one file manager installed, which one D-Bus starts depends on the bus, so to be
+sure it's Gannet:
 
     gannet --claim-show-in-folder      # Gannet answers "Show in folder" for you
     gannet --release-show-in-folder    # back to whatever answered before
 
 Claiming writes `~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service`, which
-D-Bus reads before any installed file, and asks D-Bus to reread its files. Releasing removes it
-again; a file there that Gannet didn't write is never touched. If Nautilus is already running,
-it keeps answering until it exits.
+D-Bus reads before any installed file, and asks D-Bus to reread its files. It records where
+`gannet` is, so claim again after moving it. Releasing removes that file again; a file there
+that Gannet didn't write is never touched. A file manager already running and answering keeps
+doing so until it exits.
 
 `gannet --file-manager-service` is what D-Bus starts. It has no window: it opens one for each
 request, and exits after ten minutes with none. Windows need `WAYLAND_DISPLAY` in the
 environment D-Bus gives services; check with `systemctl --user show-environment`, and if it's
 missing, have the compositor run `dbus-update-activation-environment --systemd WAYLAND_DISPLAY`
 at startup. The service's errors go to the journal.
-
-The service file records where `gannet` was when you claimed, so claim again after moving it.
-
-`packaging/com.aliasproject.Gannet.FileManager1.service` is for packages. It's named for
-Gannet so it can't clash with Nautilus's file, but installed into `/usr/share/dbus-1/services`
-it registers Gannet for every user, and with several file managers installed, which one
-D-Bus picks isn't defined. So install it only where Gannet is meant to be the default.
 
 ## Trash
 
