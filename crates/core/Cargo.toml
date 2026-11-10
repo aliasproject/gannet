@@ -8,3 +8,6 @@ license.workspace = true
 rustix.workspace = true
 libc.workspace = true
 md5 = "0.8.1"
+zbus.workspace = true
+futures-core = "0.3"
+serde = "1"

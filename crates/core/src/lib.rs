@@ -1,7 +1,8 @@
 //! Everything in Gannet that isn't drawing: folder listings, file operations, the
-//! Trash, the system theme. No code here reads the environment; every path comes in
+//! Trash, the system theme, D-Bus. No code here reads the environment; every path comes in
 //! as an argument, so tests can't reach real user data by accident.
 
+pub mod bus;
 pub mod clipboard;
 pub mod history;
 pub mod listing;
