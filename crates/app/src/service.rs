@@ -31,6 +31,10 @@ pub const PATH: &str = "/org/freedesktop/FileManager1";
 const IDLE: Duration = Duration::from_secs(10 * 60);
 /// A program asking for more windows than this at once gets this many.
 const MAX_WINDOWS: usize = 8;
+/// At most this many URIs of a request are looked at, and this many refusals logged, so
+/// a huge request can't keep the bus thread busy or flood the journal.
+const MAX_URIS: usize = 256;
+const MAX_REFUSALS_LOGGED: usize = 8;
 
 /// A window to open for a request.
 #[derive(Clone, Debug, PartialEq)]
@@ -80,7 +84,7 @@ fn usable(uri: &str, folder: bool) -> Result<PathBuf, &'static str> {
 pub fn plan(uris: &[String], folders: bool) -> (Vec<Window>, Vec<String>) {
     let mut out: Vec<Window> = Vec::new();
     let mut refused = Vec::new();
-    for uri in uris {
+    for uri in uris.iter().take(MAX_URIS) {
         let p = match usable(uri, folders) {
             Ok(p) => p,
             Err(why) => {
@@ -126,8 +130,11 @@ impl FileManager1 {
     /// isn't told it worked when nothing will open.
     fn ask(&self, uris: &[String], folders: bool) -> zbus::fdo::Result<()> {
         let (windows, refused) = plan(uris, folders);
-        for r in &refused {
+        for r in refused.iter().take(MAX_REFUSALS_LOGGED) {
             eprintln!("gannet: left out {r}");
+        }
+        if refused.len() > MAX_REFUSALS_LOGGED {
+            eprintln!("gannet: and {} more left out", refused.len() - MAX_REFUSALS_LOGGED);
         }
         if windows.is_empty() {
             return Err(zbus::fdo::Error::InvalidArgs("nothing to show: no URI named a local file that's there".into()));
@@ -235,28 +242,37 @@ fn service_text(exe: &Path) -> String {
     format!("{MARK}\n[D-BUS Service]\nName={NAME}\nExec=\"{quoted}\" {ARG}\n")
 }
 
+/// Whether anything is at `path`, a broken symlink included.
+fn taken(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Whether Gannet wrote the file at `path`. A symlink is never Gannet's.
 fn is_ours(path: &Path) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|t| t.lines().next() == Some(MARK))
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) && std::fs::read_to_string(path).is_ok_and(|t| t.lines().next() == Some(MARK))
 }
 
 /// Writes the user's service file. A file there that Gannet didn't write is left alone.
 fn claim(data_home: &Path, exe: &Path) -> Result<String, String> {
     let path = user_service_file(data_home);
-    if path.exists() && !is_ours(&path) {
+    if taken(&path) && !is_ours(&path) {
         return Err(format!("{} is already there and wasn't written by Gannet, so it's left alone", path.display()));
     }
     let dir = path.parent().unwrap_or(data_home);
     std::fs::create_dir_all(dir).map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
     // Written beside it and moved into place, so D-Bus never reads half a file.
     let tmp = dir.join(format!(".{NAME}.service.tmp"));
-    std::fs::write(&tmp, service_text(exe)).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
-    Ok(format!("\"Show in folder\" now opens Gannet ({})", path.display()))
+    if let Err(e) = std::fs::write(&tmp, service_text(exe)).and_then(|_| std::fs::rename(&tmp, &path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("couldn't write {}: {e}", path.display()));
+    }
+    Ok(format!("\"Show in folder\" opens Gannet from now on ({}). A file manager already running and answering it keeps doing so until it exits.", path.display()))
 }
 
 /// Removes the user's service file, if Gannet wrote it.
 fn release(data_home: &Path) -> Result<String, String> {
     let path = user_service_file(data_home);
-    if !path.exists() {
+    if !taken(&path) {
         return Ok("Gannet wasn't answering \"Show in folder\" for this user".into());
     }
     if !is_ours(&path) {
@@ -277,8 +293,14 @@ fn reload_bus() -> Result<(), String> {
 
 /// `gannet --claim-show-in-folder` or `--release-show-in-folder`. Never returns.
 pub fn claim_main(undo: bool) -> ! {
-    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| "/".into());
-    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(".local/share"));
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).or_else(|| home.map(|h| h.join(".local/share")));
+    // Without a home there's no right place for a per-user file, and guessing could write
+    // somewhere shared.
+    let Some(data_home) = data_home else {
+        eprintln!("gannet: neither XDG_DATA_HOME nor HOME is set to a full path, so there's nowhere to write this");
+        std::process::exit(1);
+    };
     let done = if undo { release(&data_home) } else { claim(&data_home, &own_path()) };
     match done {
         Ok(msg) => {
@@ -419,6 +441,14 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_request_is_only_looked_at_so_far() {
+        let uris: Vec<String> = (0..10_000).map(|i| format!("file:///nonexistent/{i}")).collect();
+        let (got, refused) = plan(&uris, false);
+        assert!(got.is_empty());
+        assert_eq!(refused.len(), MAX_URIS);
+    }
+
+    #[test]
     fn there_is_a_limit_on_windows() {
         let names: Vec<String> = (0..20).map(|i| format!("d{i}/x")).collect();
         let f = Files::new("many", &names.iter().map(String::as_str).collect::<Vec<_>>());
@@ -442,6 +472,12 @@ mod tests {
         release(&data).unwrap();
         assert!(!file.exists());
         assert!(release(&data).is_ok(), "nothing to release is fine");
+        // Nor is a symlink, even a broken one.
+        std::os::unix::fs::symlink("/nonexistent", &file).unwrap();
+        assert!(claim(&data, Path::new("/usr/bin/gannet")).is_err());
+        assert!(release(&data).is_err());
+        assert!(std::fs::symlink_metadata(&file).unwrap().file_type().is_symlink());
+        std::fs::remove_file(&file).unwrap();
         // Someone else's file is never touched.
         std::fs::write(&file, "[D-BUS Service]\nName=org.freedesktop.FileManager1\nExec=/usr/bin/other\n").unwrap();
         assert!(claim(&data, Path::new("/usr/bin/gannet")).is_err());

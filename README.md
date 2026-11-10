@@ -143,8 +143,12 @@ environment D-Bus gives services; check with `systemctl --user show-environment`
 missing, have the compositor run `dbus-update-activation-environment --systemd WAYLAND_DISPLAY`
 at startup. The service's errors go to the journal.
 
-Packages can install `packaging/com.aliasproject.Gannet.FileManager1.service` into
-`/usr/share/dbus-1/services`. It's named for Gannet so it can't clash with Nautilus's file.
+The service file records where `gannet` was when you claimed, so claim again after moving it.
+
+`packaging/com.aliasproject.Gannet.FileManager1.service` is for packages. It's named for
+Gannet so it can't clash with Nautilus's file, but installed into `/usr/share/dbus-1/services`
+it registers Gannet for every user, and with several file managers installed, which one
+D-Bus picks isn't defined. So install it only where Gannet is meant to be the default.
 
 ## Trash
 
