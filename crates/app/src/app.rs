@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use gannet_core::clipboard;
 use gannet_core::history::{History, Stop, parent_stop};
-use gannet_core::listing::{Kind, LoadEvent, LoadHandle, LoadRequest, Listing, Loaded, SortKey, SortSpec, Stat, Stater, TrashSpec, sort_entries, spawn_load_watching, visible_rows};
+use gannet_core::listing::{Kind, LoadEvent, LoadHandle, LoadRequest, Listing, Loaded, SortKey, SortSpec, Stat, Stater, DISKS_GIVE_UP, TrashSpec, sort_entries, spawn_load_watching, visible_rows};
 use gannet_core::mounts::Mount;
 use gannet_core::trash;
 use gannet_core::ops::{self, Answer, Choice, Conflict, Engine, Job, Request, Undo};
@@ -713,7 +713,7 @@ impl App {
             row_count: self.row_capacity(),
             slow_read: self.slow_read,
             slow_stat: None,
-            trash: self.is_trash_view().then(|| TrashSpec { home_trash: self.home_trash(), uid: rustix::process::geteuid().as_raw(), mounts: self.trash_mounts.clone() }),
+            trash: self.is_trash_view().then(|| TrashSpec { home_trash: self.home_trash(), uid: rustix::process::geteuid().as_raw(), mounts: self.trash_mounts.clone(), disks_give_up: DISKS_GIVE_UP }),
         };
         let hub = self.hub.clone();
         self.load = Some(spawn_load_watching(req, self.watch.clone(), move |e| hub.send(Msg::Load(e))));
@@ -1296,8 +1296,16 @@ impl App {
         self.invalidate_all();
     }
 
+    /// Emptying needs the whole list: while other disks are still being read, it waits.
+    pub fn can_empty_trash(&self) -> bool {
+        !self.loading && self.listing.as_ref().is_some_and(|l| l.is_trash() && !l.is_empty())
+    }
+
     fn ask_empty_trash(&mut self) {
-        let Some(l) = self.listing.clone().filter(|l| l.is_trash()) else { return };
+        if !self.can_empty_trash() {
+            return;
+        }
+        let Some(l) = self.listing.clone() else { return };
         // Hidden items go too, as they would in any other file manager.
         let paths: Vec<PathBuf> = (0..l.len() as u32).map(|i| l.path(i)).collect();
         if !paths.is_empty() {
@@ -1361,11 +1369,16 @@ impl App {
             return None;
         }
         let parent = self.dir.parent()?;
-        let (home, uid) = (self.home_trash(), rustix::process::geteuid().as_raw());
-        if parent.file_name().is_some_and(|n| n == "files") && trash::is_inside_trash(&home, uid, parent) && !parent.parent().is_some_and(|g| trash::is_inside_trash(&home, uid, g)) {
+        if self.trash_files_root(parent).is_some_and(|f| f == parent) {
             return Some(Stop { dir: self.trash_dir.clone(), cursor_name: None });
         }
         parent_stop(&self.dir)
+    }
+
+    /// The `files` folder of whichever of this user's Trash folders holds `path`, if any.
+    pub fn trash_files_root(&self, path: &Path) -> Option<PathBuf> {
+        let (home, uid) = (self.home_trash(), rustix::process::geteuid().as_raw());
+        path.ancestors().filter(|a| a.file_name().is_some_and(|n| n == "files")).find(|a| trash::is_inside_trash(&home, uid, a) && !a.parent().is_some_and(|g| trash::is_inside_trash(&home, uid, g))).map(Path::to_path_buf)
     }
 
     /// The toolbar's Empty Trash button, shown in the Trash view.
@@ -1588,7 +1601,9 @@ impl App {
                     None if view.is_some_and(|v| v.ends_undo) => self.undo.clear(),
                     None => {}
                 }
-                if o.touched.contains(&self.dir) {
+                // Another disk's Trash may not be watched, and the Trash view shows it too.
+                let trash_touched = self.is_trash_view() && o.touched.iter().any(|t| self.trash_files_root(t).is_some());
+                if o.touched.contains(&self.dir) || trash_touched {
                     use std::os::unix::ffi::OsStrExt;
                     // A selection made since the job began is the user's, and stays.
                     self.pending_select = o.created.iter().filter(|_| selection_untouched).filter(|p| p.parent() == Some(self.dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_bytes().to_vec()).collect();
@@ -1747,14 +1762,14 @@ impl App {
     fn context_items(&self) -> Vec<MenuItem> {
         let any = self.sel_count > 0;
         let one = self.sel_count == 1;
-        if let Some(l) = self.listing.as_ref().filter(|l| l.is_trash()) {
+        if self.listing.as_ref().is_some_and(|l| l.is_trash()) {
             return vec![
                 MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
                 MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
                 MenuItem { label: "Copy", keys: "Ctrl+C", action: Action::Copy, enabled: any },
                 MenuItem { label: "Restore", keys: "", action: Action::Restore, enabled: any },
                 MenuItem { label: "Delete for good", keys: "Delete", action: Action::DeleteForGood, enabled: any },
-                MenuItem { label: "Empty Trash", keys: "", action: Action::EmptyTrash, enabled: !l.is_empty() },
+                MenuItem { label: "Empty Trash", keys: "", action: Action::EmptyTrash, enabled: self.can_empty_trash() },
                 MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
                 MenuItem { label: "Sort by name", keys: "Ctrl+1", action: Action::SortBy(SortKey::Name), enabled: true },
                 MenuItem { label: "Sort by size", keys: "Ctrl+2", action: Action::SortBy(SortKey::Size), enabled: true },
@@ -2199,8 +2214,7 @@ impl App {
             }
             if self.empty_trash_rect().is_some_and(|r| r.contains(x, y)) {
                 // An empty Trash leaves the button greyed out, with nothing to press.
-                let any = self.listing.as_ref().is_some_and(|l| !l.is_empty());
-                return if any { Hit::EmptyTrash } else { Hit::None };
+                return if self.can_empty_trash() { Hit::EmptyTrash } else { Hit::None };
             }
             if let Edit::Path(_) = self.edit {
                 return Hit::PathBar;
@@ -2281,11 +2295,13 @@ impl App {
         let end = self.empty_trash_rect().map_or(end, |r| r.x - self.px(8.0));
         let mut parts: Vec<(String, PathBuf)> = Vec::new();
         let mut acc = PathBuf::new();
-        // Inside the home Trash, its real path is noise: it starts at "Trash".
+        // Inside any Trash, its real path is noise: it starts at "Trash".
         let mut components = self.dir.components();
-        if let Ok(rest) = self.dir.strip_prefix(&self.trash_dir) {
+        let files = self.trash_files_root(&self.dir);
+        if let Some((f, rest)) = files.as_ref().and_then(|f| Some((f, self.dir.strip_prefix(f).ok()?))) {
+            // "Trash" opens the Trash view, and what's below it is where it really is.
             parts.push(("Trash".into(), self.trash_dir.clone()));
-            acc = self.trash_dir.clone();
+            acc = f.clone();
             components = rest.components();
         }
         for c in components {
@@ -5371,5 +5387,29 @@ mod tests {
         open_trash(&mut r);
         let b = r.app.empty_trash_rect().unwrap();
         assert_eq!(r.app.hit(b.x + b.w / 2, b.y + b.h / 2), Hit::None);
+    }
+
+    #[test]
+    fn emptying_waits_until_every_disk_has_been_read() {
+        let mut r = Rig::new("trash-empty-loading");
+        trash_names(&mut r, &["a.txt"]);
+        open_trash(&mut r);
+        // As if another disk's Trash were still being read.
+        r.app.loading = true;
+        let b = r.app.empty_trash_rect().unwrap();
+        assert_eq!(r.app.hit(b.x + b.w / 2, b.y + b.h / 2), Hit::None);
+        assert!(!r.app.context_items().iter().any(|m| m.label == "Empty Trash" && m.enabled));
+        r.app.action(Action::EmptyTrash);
+        assert!(r.app.dialog.is_none());
+    }
+
+    #[test]
+    fn the_path_inside_another_disks_trash_starts_at_trash() {
+        let mut r = Rig::new("trash-crumbs");
+        let inner = r.root.join("disk/.Trash-1000/files/d/e");
+        fs::create_dir_all(&inner).unwrap();
+        r.open(inner.clone());
+        let crumbs: Vec<PathBuf> = r.app.crumbs().into_iter().map(|(_, _, p)| p).collect();
+        assert_eq!(crumbs, [r.app.trash_dir.clone(), r.root.join("disk/.Trash-1000/files/d"), inner]);
     }
 }

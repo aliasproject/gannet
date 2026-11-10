@@ -167,7 +167,7 @@ impl App {
             }
         }
         if let Some(r) = self.empty_trash_rect() {
-            let on = self.listing.as_ref().is_some_and(|l| !l.is_empty());
+            let on = self.can_empty_trash();
             if on && self.hover == Hit::EmptyTrash {
                 c.rrect(r, self.px(5.0), co.hover);
             }

@@ -315,7 +315,8 @@ impl Root {
 }
 
 /// Network shares can hang a stat for minutes, so their Trash folders aren't looked for.
-const SKIPPED_FS: [&str; 6] = ["nfs", "nfs4", "cifs", "smb3", "sshfs", "fuse.sshfs"];
+/// Nor are automount points: looking would mount them, waking a disk or a server.
+const SKIPPED_FS: [&str; 12] = ["nfs", "nfs4", "cifs", "smb3", "smbfs", "sshfs", "fuse.sshfs", "autofs", "9p", "ceph", "glusterfs", "davfs"];
 
 /// Every Trash folder holding this user's items: the home one first, then one per disk.
 /// Only folders that already exist count, and nothing is created.
