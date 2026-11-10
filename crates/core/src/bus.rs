@@ -41,7 +41,20 @@ pub fn session_address(env: Option<&str>, runtime_dir: Option<&Path>) -> Option<
         return Some(a.to_string());
     }
     let socket = runtime_dir?.join("bus");
-    socket.exists().then(|| format!("unix:path={}", socket.display()))
+    socket.exists().then(|| format!("unix:path={}", escape(socket.as_os_str().as_encoded_bytes())))
+}
+
+/// Escapes a value for a D-Bus address, where `,`, `;`, `=` and the like mean something.
+fn escape(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || b"-_/.\\*".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02x}"));
+        }
+    }
+    out
 }
 
 /// Where the system bus is: `DBUS_SYSTEM_BUS_ADDRESS` if it's set, or else the standard
@@ -93,6 +106,7 @@ fn block_on_for<T>(f: impl Future<Output = zbus::Result<T>>, limit: Duration) ->
 #[derive(Clone)]
 pub struct Bus {
     conn: Connection,
+    limit: Duration,
 }
 
 impl Bus {
@@ -104,7 +118,7 @@ impl Bus {
     /// As `connect`, giving up on connecting, and later on each method call, after `limit`.
     pub fn connect_with_limit(address: &str, limit: Duration) -> zbus::Result<Self> {
         let conn = block_on_for(zbus::conn::Builder::address(address).method_timeout(limit).build(), limit)?;
-        Ok(Self { conn })
+        Ok(Self { conn, limit })
     }
 
     /// The zbus connection, for anything this module doesn't wrap.
@@ -116,7 +130,7 @@ impl Bus {
     /// that already owns it keeps it: the request neither waits in line nor replaces it.
     /// Serve the objects first: a program can call them as soon as the name is ours.
     pub fn own_name(&self, name: &str) -> zbus::Result<bool> {
-        match block_on(self.conn.request_name_with_flags(name, RequestNameFlags::DO_NOT_QUEUE)) {
+        match block_on_for(self.conn.request_name_with_flags(name, RequestNameFlags::DO_NOT_QUEUE), self.limit) {
             Ok(reply) => Ok(matches!(reply, RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner)),
             // zbus reports a name someone else has as an error, but it's an ordinary answer.
             Err(zbus::Error::NameTaken) => Ok(false),
@@ -127,7 +141,7 @@ impl Bus {
     /// Serves `iface` at `path`. Its methods run on zbus's helper thread. False if an
     /// interface of that name is already served there.
     pub fn serve<I: Interface>(&self, path: &str, iface: I) -> zbus::Result<bool> {
-        Ok(block_on(self.conn.object_server().at(path, iface))?.is_none())
+        Ok(block_on_for(self.conn.object_server().at(path, iface), self.limit)?.is_none())
     }
 
     /// Calls a method on another program and waits for its reply, up to the connection's
@@ -147,7 +161,9 @@ impl Bus {
     /// match is in place before this returns, so nothing sent after it is missed.
     ///
     /// The thread keeps the connection open while it follows, so drop the `Following` to
-    /// let a connection go.
+    /// let a connection go. A panic in `on` ends following, and so does nothing else: keep
+    /// `on` from panicking. zbus queues up to 64 messages for it, and drops the oldest
+    /// past that, so `on` should hand work on rather than do it.
     pub fn follow(&self, rule: MatchRule<'static>, mut on: impl FnMut(zbus::Result<Message>) -> bool + Send + 'static) -> zbus::Result<Following> {
         let mut stream = block_on(MessageStream::for_match_rule(rule, &self.conn, None))?;
         let stop: Arc<StopFlag> = Arc::default();
@@ -368,6 +384,12 @@ mod tests {
         assert_eq!(session_address(None, None), None);
         assert_eq!(system_address(None), "unix:path=/run/dbus/system_bus_socket");
         assert_eq!(system_address(Some("unix:path=/y")), "unix:path=/y");
+        let odd = dir.path().join("a,b;c=d e");
+        std::fs::create_dir(&odd).unwrap();
+        std::fs::write(odd.join("bus"), b"").unwrap();
+        let a = session_address(None, Some(&odd)).unwrap();
+        assert!(a.ends_with("/a%2cb%3bc%3dd%20e/bus"), "{a}");
+        assert!(a.parse::<zbus::Address>().is_ok(), "{a}");
     }
 
     #[test]

@@ -186,8 +186,11 @@ Tests can destroy data, so they're fenced in:
     python3 -B tests/e2e.py       # the real app in a headless compositor, on scratch folders
     python3 -B bench/run.py       # budgets; see bench/README.md for what to build first
 
-Plain `cargo test` refuses to run anything that touches files. The D-Bus tests start a
-private `dbus-daemon` of their own and call it with `busctl`, so both need to be installed. For the end-to-end checks:
+Plain `cargo test` refuses to run anything that touches files, so run the unit tests with
+`scripts/test.sh`. The D-Bus tests start a private `dbus-daemon` of their own and call it with
+`busctl`, so both need to be installed.
+
+For the end-to-end checks:
 
     bench/harness/fetch-tools.sh
     CARGO_TARGET_DIR=target/bench cargo build --release -p gannet --features bench
