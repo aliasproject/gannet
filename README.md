@@ -126,21 +126,25 @@ move.
 
 Other programs can show a file in Gannet, such as a browser's "Show in folder" for a
 download. Gannet opens the file's folder with it selected. This goes through the
-`org.freedesktop.FileManager1` D-Bus service, which Nautilus also provides, so it's opt-in:
+`org.freedesktop.FileManager1` D-Bus service, which Nautilus and other file managers also
+provide, so Gannet only answers it once you ask:
 
-    mkdir -p ~/.local/share/dbus-1/services
-    sed "s|/usr/bin/gannet|$(command -v gannet)|" packaging/org.freedesktop.FileManager1.service \
-      > ~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service
+    gannet --claim-show-in-folder      # Gannet answers "Show in folder" for you
+    gannet --release-show-in-folder    # back to whatever answered before
 
-D-Bus reads the services folder when the session starts, so log out and back in, or have it
-reread it with `busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig`. If
-Nautilus is already running, it keeps answering until it exits. Windows opened this way
-need `WAYLAND_DISPLAY` in the environment D-Bus gives services; check with
-`systemctl --user show-environment`, and if it's missing, have the compositor run
-`dbus-update-activation-environment --systemd WAYLAND_DISPLAY` at startup. The service's
-errors go to the journal. `gannet
---file-manager-service` has no window: it opens one for each request, and exits after ten
-minutes with none.
+Claiming writes `~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service`, which
+D-Bus reads before any installed file, and asks D-Bus to reread its files. Releasing removes it
+again; a file there that Gannet didn't write is never touched. If Nautilus is already running,
+it keeps answering until it exits.
+
+`gannet --file-manager-service` is what D-Bus starts. It has no window: it opens one for each
+request, and exits after ten minutes with none. Windows need `WAYLAND_DISPLAY` in the
+environment D-Bus gives services; check with `systemctl --user show-environment`, and if it's
+missing, have the compositor run `dbus-update-activation-environment --systemd WAYLAND_DISPLAY`
+at startup. The service's errors go to the journal.
+
+Packages can install `packaging/com.aliasproject.Gannet.FileManager1.service` into
+`/usr/share/dbus-1/services`. It's named for Gannet so it can't clash with Nautilus's file.
 
 ## Trash
 

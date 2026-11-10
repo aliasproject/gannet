@@ -81,8 +81,11 @@ fn main() {
         if a == service::ARG {
             service::main();
         }
+        if a == service::CLAIM_ARG || a == service::RELEASE_ARG {
+            service::claim_main(a == service::RELEASE_ARG);
+        }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       gannet {}", service::ARG);
+            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       gannet {} | {}\n       gannet {}", service::CLAIM_ARG, service::RELEASE_ARG, service::ARG);
             return;
         }
         if a == "--version" {

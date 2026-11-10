@@ -19,7 +19,7 @@ SHOTS = ROOT / ".bench/shots"
 
 
 class App:
-    def __init__(self, h, start, extra_env=None, path_prefix=None, args=None, bwrap_extra=(), state_name="state.json", window=True):
+    def __init__(self, h, start, extra_env=None, path_prefix=None, args=None, bwrap_extra=(), state_name="state.json", window=True, launch=True):
         self.h = h
         self.fs = SCRATCH / "fs"
         self.state_file = SCRATCH / state_name
@@ -28,9 +28,11 @@ class App:
         self.env = h.env(SCRATCH / "client", {"GANNET_STATE": str(self.state_file), **(extra_env or {})})
         if path_prefix:
             self.env["PATH"] = f"{path_prefix}:{self.env['PATH']}"
-        home = os.path.expanduser("~")
-        cmd = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", home, *hide_real_trash(),
-               "--ro-bind", str(BIN), str(BIN), "--bind", str(SCRATCH), str(SCRATCH), *bwrap_extra, str(BIN), *(args if args is not None else [str(start)])]
+        self.proc = None
+        if not launch:
+            # Something else starts the window, and this only watches it.
+            return
+        cmd = sandboxed(args if args is not None else [str(start)], bwrap_extra)
         self.proc = subprocess.Popen(cmd, env=self.env, stderr=open(SCRATCH / "stderr.log", "a"), stdout=subprocess.DEVNULL)
         if window:
             h.wait_window(10)
@@ -93,7 +95,7 @@ class App:
         subprocess.run(["grim", str(SHOTS / f"{name}.png")], env=self.env, capture_output=True, timeout=10)
 
     def close(self):
-        if self.proc.poll() is None:
+        if self.proc and self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(3)
@@ -105,7 +107,15 @@ class App:
         time.sleep(0.3)
 
     def alive(self):
-        return self.proc.poll() is None
+        return self.proc is not None and self.proc.poll() is None
+
+
+def sandboxed(args, bwrap_extra=(), die_with_parent=True):
+    """The command that runs Gannet with the real home hidden and only the scratch folder writable."""
+    home = os.path.expanduser("~")
+    # A full path, because D-Bus starts services without searching PATH.
+    return [shutil.which("bwrap") or "/usr/bin/bwrap", *(["--die-with-parent"] if die_with_parent else []), "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", home, *hide_real_trash(),
+            "--ro-bind", str(BIN), str(BIN), "--bind", str(SCRATCH), str(SCRATCH), *bwrap_extra, str(BIN), *args]
 
 
 def hide_real_trash():
@@ -802,51 +812,65 @@ def the_trash_view_restores_and_empties_across_disks(h):
 
 
 class PrivateBus:
-    """A D-Bus session bus of our own, so nothing reaches the real one."""
+    """A D-Bus session bus of our own, so nothing reaches the real one. Services in
+    `services` are started by the bus itself, as on a desktop, with `env`."""
 
-    def __init__(self):
+    def __init__(self, services=None, env=None):
         conf = SCRATCH / "bus.conf"
         sock = SCRATCH / "bus.sock"
+        sdir = SCRATCH / "bus-services"
+        shutil.rmtree(sdir, ignore_errors=True)
+        sdir.mkdir()
+        for name, text in (services or {}).items():
+            (sdir / name).write_text(text)
         if sock.exists():
             sock.unlink()
         conf.write_text(f"""<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
  "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
 <busconfig><type>session</type><listen>unix:path={sock}</listen><auth>EXTERNAL</auth>
+<servicedir>{sdir}</servicedir>
 <policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy>
 </busconfig>
 """)
-        self.proc = subprocess.Popen(["dbus-daemon", "--nofork", "--print-address=1", f"--config-file={conf}"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        self.proc = subprocess.Popen(["dbus-daemon", "--nofork", "--print-address=1", f"--config-file={conf}"], stdout=subprocess.PIPE, stderr=open(SCRATCH / "stderr.log", "a"), env=env)
         self.address = self.proc.stdout.readline().decode().strip()
         assert self.address, "dbus-daemon printed no address"
 
     def call(self, *args):
-        return subprocess.run(["busctl", f"--address={self.address}", *args], capture_output=True, text=True, timeout=10)
+        return subprocess.run(["busctl", f"--address={self.address}", *args], capture_output=True, text=True, timeout=20)
 
     def stop(self):
         self.proc.kill()
         self.proc.wait()
 
 
+FM1 = ["org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1"]
+
+
 @check
-def show_in_folder_opens_a_window_with_the_items_selected(h):
+def show_in_folder_starts_the_service_and_opens_the_items_selected(h):
     fs = fresh_fs()
     tree(fs, {"dl/a.txt": "a", "dl/b.txt": "b", "dl/.hidden": "h", "other/c": "c"})
-    bus = PrivateBus()
+    # Nobody owns the name, so the bus starts the service from its file, as a desktop's does.
+    watch = App(h, None, launch=False)
+    # Not --die-with-parent: dbus-daemon starts services through a helper that exits soon
+    # after, which would take the service with it about one run in seven. The suite's
+    # pkill clears it up instead.
+    service = "[D-BUS Service]\nName=org.freedesktop.FileManager1\nExec=" + " ".join(sandboxed(["--file-manager-service"], die_with_parent=False)) + "\n"
+    bus = PrivateBus({"com.aliasproject.Gannet.FileManager1.service": service}, env=watch.env)
     try:
-        # The service has no window: it opens one for each request.
-        a = App(h, None, args=["--file-manager-service"], extra_env={"DBUS_SESSION_BUS_ADDRESS": bus.address}, window=False)
-        end = time.monotonic() + 5
-        while "org.freedesktop.FileManager1" not in bus.call("list", "--no-legend").stdout:
-            assert time.monotonic() < end, "the service never took the name"
-            time.sleep(0.05)
         uris = [f"file://{quote(str(fs / 'dl/b.txt'))}", f"file://{quote(str(fs / 'dl/.hidden'))}"]
-        r = bus.call("call", "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1", "ShowItems", "ass", "2", *uris, "")
+        r = bus.call("call", *FM1, "ShowItems", "ass", "2", *uris, "")
         assert r.returncode == 0, r.stderr
         h.wait_window(10)
-        s = a.wait(lambda s: s["dir"] == str(fs / "dl") and sorted(s["selected"]) == [".hidden", "b.txt"], "the folder, with both selected")
+        s = watch.wait(lambda s: s["dir"] == str(fs / "dl") and sorted(s["selected"]) == [".hidden", "b.txt"], "the folder, with both selected")
         assert s["hidden"], "a hidden item asked for by name shows"
-        a.shot("show-in-folder")
-        assert a.alive(), "the service stays for the next request"
+        watch.shot("show-in-folder")
+        # What Gannet can't do is refused, rather than answered as if done.
+        r = bus.call("call", *FM1, "ShowItemProperties", "ass", "1", uris[0], "")
+        assert r.returncode != 0 and "properties" in r.stderr, r.stderr
+        r = bus.call("call", *FM1, "ShowItems", "ass", "1", f"file://{fs}/dl/missing", "")
+        assert r.returncode != 0, "nothing to show is an error"
     finally:
         bus.stop()
 

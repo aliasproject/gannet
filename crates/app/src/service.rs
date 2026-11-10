@@ -19,6 +19,11 @@ pub const ARG: &str = "--file-manager-service";
 /// `gannet --select PATH...` opens the first path's folder with the paths in it selected.
 pub const SELECT_ARG: &str = "--select";
 
+/// `gannet --claim-show-in-folder` makes Gannet answer "Show in folder" for this user, and
+/// `gannet --release-show-in-folder` undoes that.
+pub const CLAIM_ARG: &str = "--claim-show-in-folder";
+pub const RELEASE_ARG: &str = "--release-show-in-folder";
+
 pub const NAME: &str = "org.freedesktop.FileManager1";
 pub const PATH: &str = "/org/freedesktop/FileManager1";
 
@@ -46,14 +51,45 @@ impl Window {
     }
 }
 
-/// The windows a request needs. `folders` is for ShowFolders, which shows what's in each
-/// folder; otherwise each item is shown selected in its folder, one window per folder.
-/// Anything that isn't a local `file:` URI of an absolute path is left out.
-pub fn plan(uris: &[String], folders: bool) -> Vec<Window> {
-    // A NUL can't be in a real path, and would stop the window's whole command.
-    let paths = uris.iter().filter_map(|u| from_file_uri(u)).filter(|p| !p.as_os_str().as_encoded_bytes().contains(&0)).map(|p| crate::app::clean(&p)).filter(|p| p.is_absolute());
+/// The path a URI from another program names, or why it can't be shown. These come
+/// from outside, so only a local `file:` URI of something that's there passes.
+fn usable(uri: &str, folder: bool) -> Result<PathBuf, &'static str> {
+    let path = from_file_uri(uri).ok_or("not a file: URI on this machine")?;
+    // A NUL can't be in a path at all, and a newline or other control character is far
+    // more likely a mangled URI than a real name.
+    if path.as_os_str().as_encoded_bytes().iter().any(|&b| b < 0x20 || b == 0x7f) {
+        return Err("has a control character in it");
+    }
+    let path = crate::app::clean(&path);
+    if !path.is_absolute() {
+        return Err("isn't an absolute path");
+    }
+    if folder {
+        if !path.is_dir() {
+            return Err("isn't a folder that's there");
+        }
+    } else if std::fs::symlink_metadata(&path).is_err() {
+        return Err("isn't there");
+    }
+    Ok(path)
+}
+
+/// The windows a request needs, and a line for each URI left out. `folders` is for
+/// ShowFolders, which shows what's in each folder; otherwise each item is shown
+/// selected in its folder, one window per folder.
+pub fn plan(uris: &[String], folders: bool) -> (Vec<Window>, Vec<String>) {
     let mut out: Vec<Window> = Vec::new();
-    for p in paths {
+    let mut refused = Vec::new();
+    for uri in uris {
+        let p = match usable(uri, folders) {
+            Ok(p) => p,
+            Err(why) => {
+                // Kept short: a caller can send anything at all.
+                let shown: String = uri.chars().take(120).collect();
+                refused.push(format!("{shown:?} {why}"));
+                continue;
+            }
+        };
         if folders {
             let w = Window::Folder(p);
             if !out.contains(&w) {
@@ -63,7 +99,10 @@ pub fn plan(uris: &[String], folders: bool) -> Vec<Window> {
         }
         // The root has no folder to show it in, so it's shown itself.
         let Some(parent) = p.parent().map(Path::to_path_buf) else {
-            out.push(Window::Folder(p));
+            let w = Window::Folder(p);
+            if !out.contains(&w) {
+                out.push(w);
+            }
             continue;
         };
         match out.iter_mut().find(|w| matches!(w, Window::Select(items) if items[0].parent() == Some(parent.as_path()))) {
@@ -73,7 +112,7 @@ pub fn plan(uris: &[String], folders: bool) -> Vec<Window> {
         }
     }
     out.truncate(MAX_WINDOWS);
-    out
+    (out, refused)
 }
 
 /// What gets served. Each call is answered at once, and the windows are opened by the
@@ -83,24 +122,35 @@ struct FileManager1 {
 }
 
 impl FileManager1 {
-    fn ask(&self, windows: Vec<Window>) {
+    /// Passes on what can be shown, and refuses the call if that's nothing, so the caller
+    /// isn't told it worked when nothing will open.
+    fn ask(&self, uris: &[String], folders: bool) -> zbus::fdo::Result<()> {
+        let (windows, refused) = plan(uris, folders);
+        for r in &refused {
+            eprintln!("gannet: left out {r}");
+        }
+        if windows.is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs("nothing to show: no URI named a local file that's there".into()));
+        }
         let _ = self.tx.lock().unwrap().send(windows);
+        Ok(())
     }
 }
 
 #[zbus::interface(name = "org.freedesktop.FileManager1")]
 impl FileManager1 {
-    fn show_folders(&self, uris: Vec<String>, _startup_id: String) {
-        self.ask(plan(&uris, true));
+    fn show_folders(&self, uris: Vec<String>, _startup_id: String) -> zbus::fdo::Result<()> {
+        self.ask(&uris, true)
     }
 
-    fn show_items(&self, uris: Vec<String>, _startup_id: String) {
-        self.ask(plan(&uris, false));
+    fn show_items(&self, uris: Vec<String>, _startup_id: String) -> zbus::fdo::Result<()> {
+        self.ask(&uris, false)
     }
 
-    /// Gannet has no properties window, so this shows the items, as ShowItems does.
-    fn show_item_properties(&self, uris: Vec<String>, _startup_id: String) {
-        self.ask(plan(&uris, false));
+    /// Gannet has no properties window. Showing the items instead would look to the caller
+    /// like what it asked for, so it's told plainly.
+    fn show_item_properties(&self, _uris: Vec<String>, _startup_id: String) -> zbus::fdo::Result<()> {
+        Err(zbus::fdo::Error::NotSupported("Gannet has no properties window".into()))
     }
 }
 
@@ -168,6 +218,83 @@ fn own_path() -> PathBuf {
     }
 }
 
+/// The first line of the service file `--claim-show-in-folder` writes, so it can tell
+/// its own file from one someone else put there.
+const MARK: &str = "# Written by gannet --claim-show-in-folder, and removed by gannet --release-show-in-folder.";
+
+/// Where a user's own service file goes. D-Bus reads this folder before the system's, so
+/// a file here decides who answers, whatever packages are installed.
+fn user_service_file(data_home: &Path) -> PathBuf {
+    data_home.join("dbus-1/services").join(format!("{NAME}.service"))
+}
+
+/// The service file's text, starting the service from `exe`. D-Bus splits `Exec` like a
+/// shell, so the path is quoted.
+fn service_text(exe: &Path) -> String {
+    let quoted = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    format!("{MARK}\n[D-BUS Service]\nName={NAME}\nExec=\"{quoted}\" {ARG}\n")
+}
+
+fn is_ours(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|t| t.lines().next() == Some(MARK))
+}
+
+/// Writes the user's service file. A file there that Gannet didn't write is left alone.
+fn claim(data_home: &Path, exe: &Path) -> Result<String, String> {
+    let path = user_service_file(data_home);
+    if path.exists() && !is_ours(&path) {
+        return Err(format!("{} is already there and wasn't written by Gannet, so it's left alone", path.display()));
+    }
+    let dir = path.parent().unwrap_or(data_home);
+    std::fs::create_dir_all(dir).map_err(|e| format!("couldn't make {}: {e}", dir.display()))?;
+    // Written beside it and moved into place, so D-Bus never reads half a file.
+    let tmp = dir.join(format!(".{NAME}.service.tmp"));
+    std::fs::write(&tmp, service_text(exe)).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| format!("couldn't write {}: {e}", path.display()))?;
+    Ok(format!("\"Show in folder\" now opens Gannet ({})", path.display()))
+}
+
+/// Removes the user's service file, if Gannet wrote it.
+fn release(data_home: &Path) -> Result<String, String> {
+    let path = user_service_file(data_home);
+    if !path.exists() {
+        return Ok("Gannet wasn't answering \"Show in folder\" for this user".into());
+    }
+    if !is_ours(&path) {
+        return Err(format!("{} wasn't written by Gannet, so it's left alone", path.display()));
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("couldn't remove {}: {e}", path.display()))?;
+    Ok(format!("\"Show in folder\" no longer opens Gannet (removed {})", path.display()))
+}
+
+/// Asks the session bus to read its service files again, so a change takes effect now.
+fn reload_bus() -> Result<(), String> {
+    let env = |k: &str| std::env::var(k).ok();
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let address = bus::session_address(env("DBUS_SESSION_BUS_ADDRESS").as_deref(), runtime.as_deref()).ok_or("no session bus")?;
+    let b = Bus::connect(&address).map_err(|e| e.to_string())?;
+    b.call::<_, ()>("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ReloadConfig", &()).map_err(|e| e.to_string())
+}
+
+/// `gannet --claim-show-in-folder` or `--release-show-in-folder`. Never returns.
+pub fn claim_main(undo: bool) -> ! {
+    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| "/".into());
+    let data_home = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(".local/share"));
+    let done = if undo { release(&data_home) } else { claim(&data_home, &own_path()) };
+    match done {
+        Ok(msg) => {
+            println!("{msg}");
+            if let Err(e) = reload_bus() {
+                println!("The session bus couldn't be told ({e}), so it takes effect after logging out and back in.");
+            }
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("gannet: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `gannet --file-manager-service`. Never returns.
 pub fn main() -> ! {
     let env = |k: &str| std::env::var(k).ok();
@@ -217,34 +344,109 @@ mod tests {
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Stdio};
 
-    fn uris(paths: &[&str]) -> Vec<String> {
-        paths.iter().map(|p| p.to_string()).collect()
+    /// A folder of files for a test, removed after it.
+    struct Files(PathBuf);
+
+    impl Files {
+        fn new(tag: &str, names: &[&str]) -> Self {
+            assert!(std::env::var_os("GANNET_TEST_SANDBOX").is_some(), "run tests with scripts/test.sh");
+            let root = std::env::temp_dir().join(format!("gannet-test-fm1-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for n in names {
+                let p = root.join(n);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                if n.ends_with('/') {
+                    std::fs::create_dir_all(&p).unwrap();
+                } else {
+                    std::fs::write(&p, b"").unwrap();
+                }
+            }
+            Self(root)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        fn uri(&self, name: &str) -> String {
+            gannet_core::uri::to_file_uri(&self.0.join(name))
+        }
+    }
+
+    impl Drop for Files {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn items_open_their_folder_selected_one_window_per_folder() {
-        let got = plan(&uris(&["file:///home/me/a.txt", "file:///home/me/b%20c.txt", "file:///tmp/x", "file:///home/me/a.txt"]), false);
-        assert_eq!(got, [Window::Select(vec!["/home/me/a.txt".into(), "/home/me/b c.txt".into()]), Window::Select(vec!["/tmp/x".into()])]);
+        let f = Files::new("items", &["home/a.txt", "home/b c.txt", "tmp/x"]);
+        let (got, refused) = plan(&[f.uri("home/a.txt"), f.uri("home/b c.txt"), f.uri("tmp/x"), f.uri("home/a.txt")], false);
+        assert_eq!(got, [Window::Select(vec![f.path("home/a.txt"), f.path("home/b c.txt")]), Window::Select(vec![f.path("tmp/x")])]);
+        assert!(refused.is_empty());
     }
 
     #[test]
     fn folders_open_themselves() {
-        let got = plan(&uris(&["file:///home/me/Downloads/", "file:///home/me/Downloads", "file:///"]), true);
-        assert_eq!(got, [Window::Folder("/home/me/Downloads".into()), Window::Folder("/".into())]);
+        let f = Files::new("folders", &["dl/"]);
+        let (got, _) = plan(&[format!("{}/", f.uri("dl")), f.uri("dl"), "file:///".into()], true);
+        assert_eq!(got, [Window::Folder(f.path("dl")), Window::Folder("/".into())]);
     }
 
     #[test]
-    fn only_local_files_count_and_there_is_a_limit() {
-        assert_eq!(plan(&uris(&["https://example.com/a", "file://otherhost/a", "relative", ""]), false), []);
-        assert_eq!(plan(&uris(&["file:///"]), false), [Window::Folder("/".into())]);
-        let many: Vec<String> = (0..50).map(|i| format!("file:///d{i}/x")).collect();
-        assert_eq!(plan(&many, false).len(), MAX_WINDOWS);
-        assert_eq!(plan(&uris(&["file:///a/../etc/x"]), false), [Window::Select(vec!["/etc/x".into()])]);
+    fn only_local_things_that_are_there_count_each_refused_with_a_reason() {
+        let f = Files::new("refused", &["d/good", "d/file"]);
+        let bad = [
+            "https://example.com/a".to_string(),
+            "file://otherhost/a".into(),
+            "relative".into(),
+            String::new(),
+            f.uri("d/missing"),
+            format!("{}%0Ax", f.uri("d/good")),
+            format!("{}%00x", f.uri("d/good")),
+        ];
+        let mut all = bad.to_vec();
+        all.push(f.uri("d/good"));
+        let (got, refused) = plan(&all, false);
+        assert_eq!(got, [Window::Select(vec![f.path("d/good")])], "one bad URI doesn't spoil the rest");
+        assert_eq!(refused.len(), bad.len(), "{refused:?}");
+        // A file isn't a folder to open.
+        let (got, refused) = plan(&[f.uri("d/file")], true);
+        assert!(got.is_empty() && refused.len() == 1);
+        // The root is shown itself, once.
+        assert_eq!(plan(&["file:///".into(), "file:///".into()], false).0, [Window::Folder("/".into())]);
     }
 
     #[test]
-    fn a_path_with_a_nul_is_left_out_without_spoiling_the_rest() {
-        assert_eq!(plan(&uris(&["file:///d/bad%00x", "file:///d/good"]), false), [Window::Select(vec!["/d/good".into()])]);
+    fn there_is_a_limit_on_windows() {
+        let names: Vec<String> = (0..20).map(|i| format!("d{i}/x")).collect();
+        let f = Files::new("many", &names.iter().map(String::as_str).collect::<Vec<_>>());
+        let uris: Vec<String> = names.iter().map(|n| f.uri(n)).collect();
+        assert_eq!(plan(&uris, false).0.len(), MAX_WINDOWS);
+    }
+
+    #[test]
+    fn claiming_writes_a_file_of_ours_and_releasing_removes_only_ours() {
+        let f = Files::new("claim", &[]);
+        let data = f.path("data");
+        let file = user_service_file(&data);
+        claim(&data, Path::new("/opt/My Apps/gannet")).unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.starts_with(MARK));
+        assert!(text.contains("Name=org.freedesktop.FileManager1"));
+        assert!(text.contains(r#"Exec="/opt/My Apps/gannet" --file-manager-service"#), "{text}");
+        // Claiming again just rewrites ours.
+        claim(&data, Path::new("/usr/bin/gannet")).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().contains(r#"Exec="/usr/bin/gannet""#));
+        release(&data).unwrap();
+        assert!(!file.exists());
+        assert!(release(&data).is_ok(), "nothing to release is fine");
+        // Someone else's file is never touched.
+        std::fs::write(&file, "[D-BUS Service]\nName=org.freedesktop.FileManager1\nExec=/usr/bin/other\n").unwrap();
+        assert!(claim(&data, Path::new("/usr/bin/gannet")).is_err());
+        assert!(release(&data).is_err());
+        assert!(std::fs::read_to_string(&file).unwrap().contains("/usr/bin/other"));
     }
 
     #[test]
@@ -319,15 +521,30 @@ mod tests {
     #[test]
     fn another_program_asking_to_show_items_gets_windows_opened() {
         let bus = PrivateBus::start("show");
+        let f = Files::new("show", &["me/a.txt"]);
         let gannet = Bus::connect(&bus.address).unwrap();
         let rx = start(&gannet).unwrap().expect("the name was free");
-        for (method, uris) in [("ShowItems", vec!["file:///home/me/a.txt"]), ("ShowFolders", vec!["file:///home/me"]), ("ShowItemProperties", vec!["file:///x/y"])] {
-            let out = busctl(&bus.address, method, &uris);
+        for (method, uri) in [("ShowItems", f.uri("me/a.txt")), ("ShowFolders", f.uri("me"))] {
+            let out = busctl(&bus.address, method, &[&uri]);
             assert!(out.status.success(), "{method}: {}", String::from_utf8_lossy(&out.stderr));
         }
         let mut opened = Vec::new();
         run(&rx, Duration::from_millis(300), |w| opened.push(w.clone()));
-        assert_eq!(opened, [Window::Select(vec!["/home/me/a.txt".into()]), Window::Folder("/home/me".into()), Window::Select(vec!["/x/y".into()])]);
+        assert_eq!(opened, [Window::Select(vec![f.path("me/a.txt")]), Window::Folder(f.path("me"))]);
+    }
+
+    #[test]
+    fn a_call_gannet_cant_honour_is_refused_not_answered_as_done() {
+        let bus = PrivateBus::start("refuse");
+        let f = Files::new("refuse", &["a"]);
+        let gannet = Bus::connect(&bus.address).unwrap();
+        let rx = start(&gannet).unwrap().expect("the name was free");
+        let props = busctl(&bus.address, "ShowItemProperties", &[&f.uri("a")]);
+        assert!(!props.status.success());
+        assert!(String::from_utf8_lossy(&props.stderr).contains("properties"), "{}", String::from_utf8_lossy(&props.stderr));
+        let nothing = busctl(&bus.address, "ShowItems", &[&f.uri("missing")]);
+        assert!(!nothing.status.success());
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "no window for either");
     }
 
     #[test]
@@ -335,11 +552,12 @@ mod tests {
         let bus = PrivateBus::start("finish");
         let gannet = Bus::connect(&bus.address).unwrap();
         let rx = start(&gannet).unwrap().expect("the name was free");
+        let f = Files::new("finish", &["late/x"]);
         // Answered, but not yet handled when the service decides it's idle.
-        assert!(busctl(&bus.address, "ShowItems", &["file:///late/x"]).status.success());
+        assert!(busctl(&bus.address, "ShowItems", &[&f.uri("late/x")]).status.success());
         let mut opened = Vec::new();
         finish(&gannet, &rx, |w| opened.push(w.clone()));
-        assert_eq!(opened, [Window::Select(vec!["/late/x".into()])]);
+        assert_eq!(opened, [Window::Select(vec![f.path("late/x")])]);
         // The next request starts a new service rather than reaching this one.
         let next = Bus::connect(&bus.address).unwrap();
         assert!(start(&next).unwrap().is_some());
