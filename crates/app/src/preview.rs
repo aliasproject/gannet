@@ -2,11 +2,9 @@
 //! Nothing here decodes. That happens in another process (see `decode`), and this thread only
 //! ever draws pixels that are ready.
 
-use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -593,7 +591,7 @@ impl App {
 
     fn path_at_cursor(&self) -> Option<PathBuf> {
         let id = *self.rows.get(self.cursor)?;
-        Some(self.dir.join(OsStr::from_bytes(self.listing.as_ref()?.name(id))))
+        Some(self.listing.as_ref()?.path(id))
     }
 
     fn stat_at_cursor(&self) -> Option<(u64, i64)> {

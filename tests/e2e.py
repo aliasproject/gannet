@@ -29,7 +29,7 @@ class App:
         if path_prefix:
             self.env["PATH"] = f"{path_prefix}:{self.env['PATH']}"
         home = os.path.expanduser("~")
-        cmd = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", home,
+        cmd = ["bwrap", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", home, *hide_real_trash(),
                "--ro-bind", str(BIN), str(BIN), "--bind", str(SCRATCH), str(SCRATCH), *bwrap_extra, str(BIN), *(args if args is not None else [str(start)])]
         self.proc = subprocess.Popen(cmd, env=self.env, stderr=open(SCRATCH / "stderr.log", "a"), stdout=subprocess.DEVNULL)
         h.wait_window(10)
@@ -105,6 +105,21 @@ class App:
 
     def alive(self):
         return self.proc.poll() is None
+
+
+def hide_real_trash():
+    """The Trash view looks on every disk, so real disks' Trash folders are covered over."""
+    uid = os.geteuid()
+    out = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        point = line.split()[4].replace("\\040", " ")
+        for t in (Path(point) / f".Trash-{uid}", Path(point) / ".Trash" / str(uid)):
+            try:
+                if t.is_dir() and not str(t).startswith(str(SCRATCH)):
+                    out += ["--tmpfs", str(t)]
+            except OSError:
+                pass
+    return out
 
 
 def AppWithDisk(h, start, disk):
@@ -701,6 +716,87 @@ def trash_on_another_disk_and_a_real_cross_disk_move(h):
     a.key("h", mods=["ctrl"])
     s = a.wait(lambda s: any(n.startswith(".Trash-") for n in s["names"]), "per-disk Trash folder")
     assert not (SCRATCH / "client/data/Trash/files/file.txt").exists()
+    a.close()
+
+
+@check
+def the_trash_view_restores_and_empties_across_disks(h):
+    fs = fresh_fs()
+    disk = SCRATCH / "otherdisk"
+    disk.mkdir(exist_ok=True)
+    tree(fs, {"home/a.txt": "a", "home/b.txt": "b", "home/c.txt": "c"})
+    trash = SCRATCH / "client/data/Trash"
+    shutil.rmtree(trash, ignore_errors=True)
+    a = AppWithDisk(h, fs / "home", disk)
+    a.wait(lambda s: s["count"] == 3)
+
+    def go(path):
+        a.key("l", mods=["ctrl"])
+        a.type(str(path))
+        a.key("Return")
+        a.wait(lambda s: s["dir"] == str(path) and not s["loading"], f"at {path}")
+
+    def pick(name):
+        time.sleep(1.0)  # Let type-ahead forget the last name.
+        a.type(name)
+        a.wait(lambda s: s["selected"] == [name], f"{name} selected")
+
+    def menu_pick(downs):
+        a.key("F10")
+        a.wait(lambda s: s["menu"], "menu open")
+        for _ in range(downs):
+            a.key("Down")
+        a.key("Return")
+
+    for n in ["a.txt", "b.txt"]:
+        pick(n)
+        a.key("Delete")
+        a.wait(lambda s, n=n: n not in s["names"] and s["jobs"] == 0, f"{n} trashed")
+    # c.txt goes to the other disk's own Trash. The app makes everything there itself.
+    pick("c.txt")
+    a.key("x", mods=["ctrl"])
+    time.sleep(0.1)
+    go(disk)
+    a.key("v", mods=["ctrl"])
+    a.wait(lambda s: s["names"] == ["c.txt"] and s["jobs"] == 0, "moved to the other disk")
+    pick("c.txt")
+    a.key("Delete")
+    a.wait(lambda s: s["names"] == [] and s["jobs"] == 0, "trashed on the other disk")
+
+    go(trash / "files")
+    s = a.wait(lambda s: sorted(s["names"]) == ["a.txt", "b.txt", "c.txt"], "every Trash folder in one list")
+    a.shot("trash-view")
+    pick("a.txt")
+    a.key("F10")
+    a.wait(lambda s: s["menu"])
+    a.shot("trash-menu")
+    a.key("Escape")
+    # The menu opens on Open, then Preview, Copy, and Restore.
+    menu_pick(3)
+    a.wait(lambda s: sorted(s["names"]) == ["b.txt", "c.txt"] and s["jobs"] == 0, "a.txt restored")
+    assert (fs / "home/a.txt").read_text() == "a"
+    assert not (trash / "files/a.txt").exists() and not (trash / "info/a.txt.trashinfo").exists()
+    pick("c.txt")
+    menu_pick(3)
+    s = a.wait(lambda s: s["names"] == ["b.txt"] and s["jobs"] == 0, "c.txt restored to its disk")
+    assert s["notices"] == [], s["notices"]
+    # Empty Trash is sixth, and asks first.
+    pick("b.txt")
+    menu_pick(5)
+    a.wait(lambda s: s["dialog"] == "empty", "asks before emptying")
+    a.shot("confirm-empty")
+    a.key("Return")
+    a.wait(lambda s: s["dialog"] == "", "enter takes the safe default")
+    assert (trash / "files/b.txt").exists()
+    # The toolbar's Empty Trash button, at the far right, asks the same.
+    a.click(1220, 22)
+    a.wait(lambda s: s["dialog"] == "empty", "the button asks too")
+    a.type("e")
+    a.wait(lambda s: s["names"] == [] and s["jobs"] == 0, "emptied")
+    a.shot("trash-emptied")
+    assert list((trash / "files").iterdir()) == [] and list((trash / "info").iterdir()) == []
+    go(disk)
+    a.wait(lambda s: s["names"] == ["c.txt"], "c.txt is back on its disk")
     a.close()
 
 

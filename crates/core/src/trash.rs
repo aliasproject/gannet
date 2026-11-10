@@ -19,10 +19,10 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::mounts::{mount_point_of, read_mounts};
+use crate::mounts::{Mount, mount_point_of, read_mounts};
 use crate::ops::rename_noreplace;
 use crate::time;
-use crate::uri::encode_path;
+use crate::uri::{decode_path, encode_path};
 
 /// `path -> mount point of the disk holding it`.
 pub type MountLookup = Arc<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
@@ -171,7 +171,7 @@ fn valid_admin_trash(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && m.mode() & 0o1000 != 0)
 }
 
-fn ensure_dirs(root: &Path) -> io::Result<()> {
+pub(crate) fn ensure_dirs(root: &Path) -> io::Result<()> {
     let mut b = fs::DirBuilder::new();
     b.recursive(true).mode(0o700);
     b.create(root.join("files"))?;
@@ -299,6 +299,109 @@ pub fn restore(t: &Trashed) -> io::Result<()> {
     rename_noreplace(&t.file, &t.original)?;
     let _ = fs::remove_file(&t.info);
     Ok(())
+}
+
+/// A Trash folder that exists and is ours, and what `Path=` in its info files is relative to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Root {
+    pub root: PathBuf,
+    pub relative_to: Option<PathBuf>,
+}
+
+impl Root {
+    pub fn files(&self) -> PathBuf {
+        self.root.join("files")
+    }
+}
+
+/// Network shares can hang a stat for minutes, so their Trash folders aren't looked for.
+const SKIPPED_FS: [&str; 6] = ["nfs", "nfs4", "cifs", "smb3", "sshfs", "fuse.sshfs"];
+
+/// Every Trash folder holding this user's items: the home one first, then one per disk.
+/// Only folders that already exist count, and nothing is created.
+pub fn roots(home_trash: &Path, uid: u32, mounts: &[Mount]) -> Vec<Root> {
+    let mut out = vec![Root { root: home_trash.to_path_buf(), relative_to: None }];
+    let home_canon = fs::canonicalize(home_trash).ok();
+    for m in mounts {
+        if SKIPPED_FS.contains(&m.fs_type.as_str()) || m.point.starts_with("/proc") || m.point.starts_with("/sys") || m.point.starts_with("/dev") || m.point.starts_with("/run/user") {
+            continue;
+        }
+        let admin = m.point.join(".Trash");
+        let mut candidates = Vec::new();
+        if valid_admin_trash(&admin) {
+            candidates.push(admin.join(uid.to_string()));
+        }
+        candidates.push(m.point.join(format!(".Trash-{uid}")));
+        for root in candidates {
+            let is_home = root == home_trash || home_canon.as_ref().is_some_and(|h| fs::canonicalize(&root).is_ok_and(|r| &r == h));
+            if is_home || out.iter().any(|r| r.root == root) {
+                continue;
+            }
+            if verify_ours(&root).is_ok() && root.join("files").is_dir() {
+                out.push(Root { root, relative_to: Some(m.point.clone()) });
+            }
+        }
+    }
+    out
+}
+
+/// What a `.trashinfo` file says: where the item came from, and when it was trashed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Info {
+    pub original: PathBuf,
+    /// Seconds since the epoch, if the date could be read.
+    pub deleted: Option<i64>,
+}
+
+/// Reads a `.trashinfo` file's text. A relative `Path=` is relative to the disk's top.
+pub fn parse_info(text: &[u8], relative_to: Option<&Path>) -> Option<Info> {
+    let text = std::str::from_utf8(text).ok()?;
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    if lines.next()? != "[Trash Info]" {
+        return None;
+    }
+    let (mut path, mut date) = (None, None);
+    for line in lines {
+        if line.starts_with('[') {
+            break;
+        }
+        if let Some(v) = line.strip_prefix("Path=") {
+            path.get_or_insert(v);
+        } else if let Some(v) = line.strip_prefix("DeletionDate=") {
+            date.get_or_insert(v);
+        }
+    }
+    let decoded = decode_path(path?);
+    let original = if decoded.is_absolute() {
+        decoded
+    } else {
+        relative_to?.join(decoded)
+    };
+    // `..` could aim a restore anywhere, so such a record isn't believed.
+    if original.components().any(|c| matches!(c, std::path::Component::ParentDir)) || original.file_name().is_none() {
+        return None;
+    }
+    let deleted = date.and_then(time::Local::parse_rfc3339_local).and_then(time::from_local);
+    Some(Info { original, deleted })
+}
+
+/// The info file that goes with `name` in `files/`.
+pub fn info_path(root: &Path, name: &OsStr) -> PathBuf {
+    let mut info = name.to_os_string();
+    info.push(".trashinfo");
+    root.join("info").join(info)
+}
+
+/// True for anything inside one of this user's Trash `files` folders, at any depth.
+pub fn is_inside_trash(home_trash: &Path, uid: u32, path: &Path) -> bool {
+    if path.starts_with(home_trash.join("files")) {
+        return true;
+    }
+    let uid = uid.to_string();
+    let parts: Vec<&OsStr> = path.iter().collect();
+    parts.windows(2).enumerate().any(|(i, w)| {
+        w[1] == "files" && (w[0].as_bytes() == format!(".Trash-{uid}").as_bytes() || (w[0] == uid.as_str() && i > 0 && parts[i - 1] == ".Trash"))
+    })
 }
 
 #[cfg(test)]
@@ -561,5 +664,78 @@ mod tests {
         fs::write(&f, b"x").unwrap();
         let t = trash(&c, &f).unwrap();
         assert!(info_lines(&t)[1].ends_with("bad%FF"));
+    }
+
+    fn mount(point: &Path, fs_type: &str) -> Mount {
+        Mount { point: point.to_path_buf(), fs_type: fs_type.into(), source: "/dev/sdz1".into() }
+    }
+
+    fn me() -> u32 {
+        rustix::process::geteuid().as_raw()
+    }
+
+    #[test]
+    fn info_files_are_read_with_paths_made_whole() {
+        let abs = parse_info(b"[Trash Info]\nPath=/home/me/a%20b.txt\nDeletionDate=2026-11-10T08:30:00\n", None).unwrap();
+        assert_eq!(abs.original, Path::new("/home/me/a b.txt"));
+        assert_eq!(abs.deleted, time::Local::parse_rfc3339_local("2026-11-10T08:30:00").and_then(time::from_local));
+        let rel = parse_info(b"[Trash Info]\nPath=sub/x\n", Some(Path::new("/mnt/usb"))).unwrap();
+        assert_eq!(rel.original, Path::new("/mnt/usb/sub/x"));
+        assert_eq!(rel.deleted, None);
+    }
+
+    #[test]
+    fn info_files_that_cant_be_trusted_are_refused() {
+        assert_eq!(parse_info(b"Path=/a\n", None), None, "no header");
+        assert_eq!(parse_info(b"[Trash Info]\nDeletionDate=2026-11-10T08:30:00\n", None), None, "no path");
+        assert_eq!(parse_info(b"[Trash Info]\nPath=x\n", None), None, "relative, with nothing to be relative to");
+        assert_eq!(parse_info(b"[Trash Info]\nPath=/home/me/../../etc/passwd\n", None), None, "climbs out");
+        assert_eq!(parse_info(b"[Trash Info]\nPath=/\n", None), None, "no name");
+        assert_eq!(parse_info(b"[Other]\n[Trash Info]\nPath=/a\n", None), None, "header not first");
+    }
+
+    #[test]
+    fn roots_are_home_first_then_each_disk_with_a_trash_of_ours() {
+        let s = Scratch::new();
+        let home = s.path().join("data/Trash");
+        let disk = s.dir("disk");
+        fs::create_dir_all(disk.join(format!(".Trash-{}/files", me()))).unwrap();
+        let admin = s.dir("admin");
+        fs::create_dir(admin.join(".Trash")).unwrap();
+        fs::set_permissions(admin.join(".Trash"), fs::Permissions::from_mode(0o1777)).unwrap();
+        fs::create_dir_all(admin.join(format!(".Trash/{}/files", me()))).unwrap();
+        let bare = s.dir("bare");
+        let net = s.dir("net");
+        fs::create_dir_all(net.join(format!(".Trash-{}/files", me()))).unwrap();
+        let mounts = vec![mount(&disk, "ext4"), mount(&admin, "vfat"), mount(&bare, "ext4"), mount(&net, "nfs4"), mount(&disk, "ext4")];
+        let got = roots(&home, me(), &mounts);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0], Root { root: home.clone(), relative_to: None });
+        assert_eq!(got[1], Root { root: disk.join(format!(".Trash-{}", me())), relative_to: Some(disk.clone()) });
+        assert_eq!(got[2], Root { root: admin.join(format!(".Trash/{}", me())), relative_to: Some(admin.clone()) });
+    }
+
+    #[test]
+    fn a_disk_trash_that_isnt_ours_or_is_a_symlink_is_left_out() {
+        let s = Scratch::new();
+        let disk = s.dir("disk");
+        let elsewhere = s.dir("elsewhere");
+        fs::create_dir(elsewhere.join("files")).unwrap();
+        symlink(&elsewhere, disk.join(format!(".Trash-{}", me()))).unwrap();
+        let got = roots(&s.path().join("data/Trash"), me(), &[mount(&disk, "ext4")]);
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn inside_trash_means_inside_a_files_folder_of_ours() {
+        let home = Path::new("/h/.local/share/Trash");
+        assert!(is_inside_trash(home, 1000, Path::new("/h/.local/share/Trash/files")));
+        assert!(is_inside_trash(home, 1000, Path::new("/h/.local/share/Trash/files/d/e")));
+        assert!(is_inside_trash(home, 1000, Path::new("/mnt/u/.Trash-1000/files/d")));
+        assert!(is_inside_trash(home, 1000, Path::new("/mnt/u/.Trash/1000/files")));
+        assert!(!is_inside_trash(home, 1000, Path::new("/mnt/u/.Trash-1001/files")));
+        assert!(!is_inside_trash(home, 1000, Path::new("/mnt/u/1000/files")));
+        assert!(!is_inside_trash(home, 1000, Path::new("/h/.local/share/Trash/info")));
+        assert!(!is_inside_trash(home, 1000, Path::new("/h/work/files")));
     }
 }
