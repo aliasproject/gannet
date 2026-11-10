@@ -50,7 +50,8 @@ impl Window {
 /// folder; otherwise each item is shown selected in its folder, one window per folder.
 /// Anything that isn't a local `file:` URI of an absolute path is left out.
 pub fn plan(uris: &[String], folders: bool) -> Vec<Window> {
-    let paths = uris.iter().filter_map(|u| from_file_uri(u)).map(|p| crate::app::clean(&p)).filter(|p| p.is_absolute());
+    // A NUL can't be in a real path, and would stop the window's whole command.
+    let paths = uris.iter().filter_map(|u| from_file_uri(u)).filter(|p| !p.as_os_str().as_encoded_bytes().contains(&0)).map(|p| crate::app::clean(&p)).filter(|p| p.is_absolute());
     let mut out: Vec<Window> = Vec::new();
     for p in paths {
         if folders {
@@ -120,6 +121,28 @@ fn run(rx: &Receiver<Vec<Window>>, idle: Duration, mut open: impl FnMut(&Window)
     }
 }
 
+/// Lets the name go, so D-Bus starts a new service for the next request, then opens
+/// whatever arrived meanwhile. zbus answers a call before passing it on, so a request
+/// can be answered and still on its way here.
+fn finish(bus: &Bus, rx: &Receiver<Vec<Window>>, mut open: impl FnMut(&Window)) {
+    let _ = zbus::block_on(bus.connection().release_name(NAME));
+    std::thread::sleep(Duration::from_millis(200));
+    while let Ok(windows) = rx.try_recv() {
+        windows.iter().for_each(&mut open);
+    }
+}
+
+/// This program's path. After an upgrade replaces it while the service runs, Linux
+/// reports the old file as "PATH (deleted)", and the new one is at PATH.
+fn own_path() -> PathBuf {
+    let Ok(me) = std::env::current_exe() else { return PathBuf::from("gannet") };
+    match me.as_os_str().as_encoded_bytes().strip_suffix(b" (deleted)") {
+        // SAFETY: cut from an OsStr's own bytes at an ASCII boundary.
+        Some(b) => PathBuf::from(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(b) }),
+        None => me,
+    }
+}
+
 /// `gannet --file-manager-service`. Never returns.
 pub fn main() -> ! {
     let env = |k: &str| std::env::var(k).ok();
@@ -146,10 +169,16 @@ pub fn main() -> ! {
             std::process::exit(1);
         }
     };
-    let me = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gannet"));
-    run(&rx, IDLE, |w| {
-        gannet_core::open::spawn_detached(Command::new(&me).args(w.args()), |why| eprintln!("gannet: couldn't open a window: {why}"));
-    });
+    // Windows need the compositor, which a service started by D-Bus only knows about if
+    // the session passed it on. Say so where it can be found, rather than fail quietly.
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        eprintln!("gannet: WAYLAND_DISPLAY isn't set for D-Bus services, so windows may not open; see \"Show in folder\" in the README");
+    }
+    let open = |w: &Window| {
+        gannet_core::open::spawn_detached_logged(Command::new(own_path()).args(w.args()), |why| eprintln!("gannet: couldn't open a window: {why}"));
+    };
+    run(&rx, IDLE, open);
+    finish(&bus, &rx, open);
     std::process::exit(0);
 }
 
@@ -182,6 +211,11 @@ mod tests {
         let many: Vec<String> = (0..50).map(|i| format!("file:///d{i}/x")).collect();
         assert_eq!(plan(&many, false).len(), MAX_WINDOWS);
         assert_eq!(plan(&uris(&["file:///a/../etc/x"]), false), [Window::Select(vec!["/etc/x".into()])]);
+    }
+
+    #[test]
+    fn a_path_with_a_nul_is_left_out_without_spoiling_the_rest() {
+        assert_eq!(plan(&uris(&["file:///d/bad%00x", "file:///d/good"]), false), [Window::Select(vec!["/d/good".into()])]);
     }
 
     #[test]
@@ -254,6 +288,21 @@ mod tests {
         let mut opened = Vec::new();
         run(&rx, Duration::from_millis(300), |w| opened.push(w.clone()));
         assert_eq!(opened, [Window::Select(vec!["/home/me/a.txt".into()]), Window::Folder("/home/me".into()), Window::Select(vec!["/x/y".into()])]);
+    }
+
+    #[test]
+    fn going_idle_lets_the_name_go_and_still_opens_what_was_on_its_way() {
+        let bus = PrivateBus::start("finish");
+        let gannet = Bus::connect(&bus.address).unwrap();
+        let rx = start(&gannet).unwrap().expect("the name was free");
+        // Answered, but not yet handled when the service decides it's idle.
+        assert!(busctl(&bus.address, "ShowItems", &["file:///late/x"]).status.success());
+        let mut opened = Vec::new();
+        finish(&gannet, &rx, |w| opened.push(w.clone()));
+        assert_eq!(opened, [Window::Select(vec!["/late/x".into()])]);
+        // The next request starts a new service rather than reaching this one.
+        let next = Bus::connect(&bus.address).unwrap();
+        assert!(start(&next).unwrap().is_some());
     }
 
     #[test]

@@ -1273,12 +1273,14 @@ impl App {
         }
     }
 
-    /// Selects these entries of the folder showing, once it's read, with the cursor on the
-    /// first. Hidden ones show, as they were asked for by name.
-    pub fn select_on_arrival(&mut self, names: Vec<Vec<u8>>) {
+    /// Opens `dir` with these entries selected once it's read, and the cursor on the first.
+    /// Hidden ones show, as they were asked for by name; that's decided before the read
+    /// starts, so they're among the rows the cursor can land on.
+    pub fn open_selecting(&mut self, dir: PathBuf, names: Vec<Vec<u8>>) {
         if names.iter().any(|n| n.first() == Some(&b'.')) {
             self.show_hidden = true;
         }
+        self.go(Stop { dir, cursor_name: names.first().cloned() });
         self.pending_select = names;
     }
 
@@ -5453,8 +5455,7 @@ mod tests {
         for n in ["a", "b", ".h"] {
             fs::write(r.work().join(n), b"").unwrap();
         }
-        r.app.go(Stop { dir: r.work(), cursor_name: None });
-        r.app.select_on_arrival(vec![b"b".to_vec(), b".h".to_vec()]);
+        r.app.open_selecting(r.work(), vec![b"b".to_vec(), b".h".to_vec()]);
         r.pump_until("loaded", |a| !a.loading);
         let mut got = r.selected_names();
         got.sort();
@@ -5462,5 +5463,19 @@ mod tests {
         assert!(r.app.show_hidden);
         let l = r.app.listing.clone().unwrap();
         assert_eq!(l.name(r.app.rows[r.app.cursor]), b"b", "the cursor is on the first");
+    }
+
+    #[test]
+    fn a_hidden_item_asked_for_first_gets_the_cursor() {
+        let mut r = Rig::new("select-hidden-first");
+        for n in ["a", ".h"] {
+            fs::write(r.work().join(n), b"").unwrap();
+        }
+        r.app.open_selecting(r.work(), vec![b".h".to_vec()]);
+        r.pump_until("loaded", |a| !a.loading);
+        assert_eq!(r.selected_names(), [".h"]);
+        assert!(r.app.cursor_shown);
+        let l = r.app.listing.clone().unwrap();
+        assert_eq!(l.name(r.app.rows[r.app.cursor]), b".h");
     }
 }

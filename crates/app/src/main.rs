@@ -142,8 +142,12 @@ fn main() {
         app.slow_read = std::env::var("GANNET_SLOW_READ_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
         app.slow_preview = std::env::var("GANNET_SLOW_PREVIEW_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
     }
-    app.go(gannet_core::history::Stop { dir: start_dir.clone(), cursor_name: None });
-    app.select_on_arrival(picks.iter().filter(|p| p.parent() == Some(start_dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_encoded_bytes().to_vec()).collect());
+    let names: Vec<Vec<u8>> = picks.iter().filter(|p| p.parent() == Some(start_dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_encoded_bytes().to_vec()).collect();
+    if names.is_empty() {
+        app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None });
+    } else {
+        app.open_selecting(start_dir, names);
+    }
     let mut first_frame = true;
     #[cfg(feature = "bench")]
     let mut bench = bench::Bench::new();

@@ -134,7 +134,11 @@ download. Gannet opens the file's folder with it selected. This goes through the
 
 D-Bus reads the services folder when the session starts, so log out and back in, or have it
 reread it with `busctl --user call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig`. If
-Nautilus is already running, it keeps answering until it exits. `gannet
+Nautilus is already running, it keeps answering until it exits. Windows opened this way
+need `WAYLAND_DISPLAY` in the environment D-Bus gives services; check with
+`systemctl --user show-environment`, and if it's missing, have the compositor run
+`dbus-update-activation-environment --systemd WAYLAND_DISPLAY` at startup. The service's
+errors go to the journal. `gannet
 --file-manager-service` has no window: it opens one for each request, and exits after ten
 minutes with none.
 

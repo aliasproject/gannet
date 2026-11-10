@@ -8,16 +8,24 @@ use std::process::{Command, Stdio};
 /// start or reports failure, with a reason for the user.
 pub fn open_with_default(path: &Path, on_fail: impl FnOnce(PathBuf, String) + Send + 'static) {
     let path = path.to_path_buf();
-    run_detached(Command::new("xdg-open").arg(&path), move |reason| on_fail(path, reason));
+    spawn_detached(Command::new("xdg-open").arg(&path), move |reason| on_fail(path, reason));
 }
 
 /// Starts another program, on its own, with its output discarded.
 pub fn spawn_detached(cmd: &mut Command, on_fail: impl FnOnce(String) + Send + 'static) {
+    cmd.stderr(Stdio::null());
+    run_detached(cmd, on_fail);
+}
+
+/// As `spawn_detached`, but the program's errors go where ours do, such as a service's
+/// journal, so a failure there can be found.
+pub fn spawn_detached_logged(cmd: &mut Command, on_fail: impl FnOnce(String) + Send + 'static) {
+    cmd.stderr(Stdio::inherit());
     run_detached(cmd, on_fail);
 }
 
 fn run_detached(cmd: &mut Command, on_fail: impl FnOnce(String) + Send + 'static) {
-    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.stdin(Stdio::null()).stdout(Stdio::null());
     // SAFETY: setsid is async-signal-safe and touches no memory.
     unsafe {
         cmd.pre_exec(|| {
