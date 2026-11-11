@@ -6,6 +6,7 @@ pub mod bus;
 pub mod clipboard;
 pub mod history;
 pub mod listing;
+pub mod mime;
 pub mod mounts;
 pub mod open;
 pub mod ops;

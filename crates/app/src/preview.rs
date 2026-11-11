@@ -1,19 +1,24 @@
-//! The preview popup: what's showing, the background work that fetches it, and drawing it.
-//! Nothing here decodes. That happens in another process (see `decode`), and this thread only
-//! ever draws pixels that are ready.
+//! The preview: what's showing, the background work that fetches it, and drawing it. It runs in a
+//! window of its own, in a process of its own (`gannet --preview`), which is an `App` with
+//! `viewer` set: its folder listing is what the arrows walk through. The file manager's side of
+//! it is at the end: opening and closing that process, and following each other's cursor.
+//! Nothing here decodes. That happens in yet another process (see `decode`), and this thread
+//! only ever draws pixels that are ready.
 
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use gannet_core::history::Stop;
 use gannet_core::listing::Stat;
+use gannet_core::mime::{self, MimeDb};
 use gannet_core::thumbcache;
 use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, eventfd, poll};
 use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, fstat, memfd_create};
@@ -21,10 +26,11 @@ use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::pipe::{PipeFlags, pipe_with};
 use xkbcommon::xkb::keysyms as k;
 
-use crate::app::{App, BTN_LEFT, Hit, Hub, Msg};
+use crate::app::{App, BTN_EXTRA, BTN_LEFT, BTN_SIDE, Cmd, Hit, Hub, Msg};
 use crate::canvas::{Canvas, Rect};
 use crate::decode;
 use crate::format;
+use crate::icons::{self, Icon};
 use crate::media::{self, Ending, Frames, PlayState, Remote, Said, StartError};
 use crate::wl::Mods;
 
@@ -39,10 +45,6 @@ const THUMBNAIL_LIMIT: Duration = Duration::from_secs(2);
 const DECODE_LIMIT: Duration = Duration::from_secs(30);
 /// A smooth copy this many times the popup's own size is mostly memory nobody can see.
 const SMOOTH_MAX_AREAS: i64 = 4;
-/// How much of the window the popup takes. It's the same for every file, so nothing moves while
-/// walking through a folder, and what's behind it stays in view.
-const WIDTH_SHARE: f64 = 0.5;
-const HEIGHT_SHARE: f64 = 0.6;
 const ZOOM_STEP: f64 = 1.25;
 const ZOOM_MAX: f64 = 16.0;
 const REPORTS_CATCH_UP: Duration = Duration::from_millis(250);
@@ -51,7 +53,6 @@ const VOLUME_STEP: f64 = 5.0;
 const TITLE_H: f64 = 38.0;
 const FOOT_H: f64 = 32.0;
 
-const NO_PREVIEW: &str = "No preview for this kind of file yet";
 const DAMAGED: &str = "This image can't be read. It may be damaged.";
 const TOO_LARGE: &str = "This image is too large to preview";
 const NO_BUBBLEWRAP: &str = "Video previews need bubblewrap, which isn't installed";
@@ -111,8 +112,44 @@ impl Drop for ImageBuf {
     }
 }
 
+/// The file-type database, read the first time a preview needs it rather than at startup.
+pub struct Kinds {
+    dirs: Vec<PathBuf>,
+    lang: Option<String>,
+    db: OnceLock<MimeDb>,
+}
+
+impl Kinds {
+    /// `dirs` are the `mime` folders, first wins; `lang` is the user's language, like `de_DE.UTF-8`.
+    pub fn new(dirs: Vec<PathBuf>, lang: Option<String>) -> Self {
+        Self { dirs, lang, db: OnceLock::new() }
+    }
+
+    fn db(&self) -> &MimeDb {
+        self.db.get_or_init(|| MimeDb::load(&self.dirs))
+    }
+}
+
+impl Default for Kinds {
+    fn default() -> Self {
+        Self::new(Vec::new(), None)
+    }
+}
+
+/// What can be said about any file, for the ones that have nothing better to show.
+pub struct Info {
+    pub mime: String,
+    pub description: String,
+    pub icon: Icon,
+    pub size: Option<u64>,
+    pub modified: Option<i64>,
+    /// A picture another program already made of it, if there is one.
+    pub thumbnail: Option<Arc<ImageBuf>>,
+}
+
 pub enum Found {
     Thumbnail(Arc<ImageBuf>),
+    Info(Info),
     Full { image: Arc<ImageBuf>, size: u64 },
     Message(String),
     Scaled { scale_gen: u64, w: i32, h: i32, rgba: Vec<u8> },
@@ -217,13 +254,14 @@ pub struct Job {
 }
 
 impl Job {
-    fn start(hub: Hub, generation: u64, path: PathBuf, cache_home: Option<PathBuf>, slow: Option<Duration>, video_size: (i32, i32)) -> Option<Self> {
+    fn start(hub: Hub, generation: u64, path: PathBuf, kinds: Arc<Kinds>, cache_home: Option<PathBuf>, slow: Option<Duration>, video_size: (i32, i32)) -> Option<Self> {
         let cancel = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).ok()?);
         let theirs = cancel.clone();
         std::thread::Builder::new()
             .name("gannet-preview".into())
             .spawn(move || {
-                if let Some(found) = fetch(&path, cache_home.as_deref(), slow, video_size, &theirs, &|found| hub.send(Msg::Preview(Event { generation, found }))) {
+                let place = Place { path: &path, kinds: &kinds, cache_home: cache_home.as_deref() };
+                if let Some(found) = fetch(&place, slow, video_size, &theirs, &|found| hub.send(Msg::Preview(Event { generation, found }))) {
                     hub.send(Msg::Preview(Event { generation, found }));
                 }
             })
@@ -242,9 +280,24 @@ fn message(text: &str) -> Option<Found> {
     Some(Found::Message(text.to_string()))
 }
 
+/// The file being fetched, and what's needed to describe it.
+struct Place<'a> {
+    path: &'a Path,
+    kinds: &'a Kinds,
+    cache_home: Option<&'a Path>,
+}
+
 /// Gets one file on screen. Returns its final answer, or `None` if it's been cancelled.
-fn fetch(path: &Path, cache_home: Option<&Path>, slow: Option<Duration>, video_size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Found)) -> Option<Found> {
-    // Non-blocking so a FIFO can't hang this on open. It's turned away just below.
+fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Found)) -> Option<Found> {
+    let path = at.path;
+    // Folders, pipes, sockets and devices are only described, never opened: a socket can't be,
+    // and a device may not be yours to read.
+    if let Ok(meta) = std::fs::metadata(path)
+        && !meta.is_file()
+    {
+        return Some(describe(at, &meta, None, None, cancel));
+    }
+    // Non-blocking so a FIFO swapped in since can't hang this on open. It's turned away just below.
     let file = match File::options().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return message("You don't have permission to read this file"),
@@ -252,23 +305,25 @@ fn fetch(path: &Path, cache_home: Option<&Path>, slow: Option<Duration>, video_s
         Err(_) => return message("This file can't be read"),
     };
     let Ok(meta) = file.metadata() else { return message("This file can't be read") };
-    if meta.is_dir() {
-        return message("Folders don't have a preview yet");
-    }
     if !meta.is_file() {
-        return message(NO_PREVIEW);
+        return Some(describe(at, &meta, None, None, cancel));
     }
+    // Read where it is rather than with `read`, which would move the decoder's starting point.
+    let mut head = vec![0u8; mime::HEAD];
+    let head = file.read_at(&mut head, 0).ok().map(|n| head[..n].to_vec());
     let mut helper = match Helper::spawn(file) {
         Ok(h) => h,
         Err(_) => return message("The previewer couldn't start"),
     };
     let mut waited = helper.wait(cancel, THUMBNAIL_AFTER);
+    // The thumbnail, once it's been looked for: `Some(None)` when there isn't one.
+    let mut looked: Option<Option<Arc<ImageBuf>>> = None;
     if slow.is_some() || matches!(waited, Waited::TimedOut) {
-        if let Some(cache_home) = cache_home
-            && let Some(image) = thumbnail(cache_home, path, meta.mtime(), cancel)
-        {
-            send(Found::Thumbnail(Arc::new(image)));
+        let found = at.cache_home.and_then(|cache_home| thumbnail(cache_home, path, meta.mtime(), cancel)).map(Arc::new);
+        if let Some(image) = &found {
+            send(Found::Thumbnail(image.clone()));
         }
+        looked = Some(found);
         if let Some(slow) = slow
             && cancelled_within(cancel, slow)
         {
@@ -276,26 +331,85 @@ fn fetch(path: &Path, cache_home: Option<&Path>, slow: Option<Duration>, video_s
         }
         waited = helper.wait(cancel, DECODE_LIMIT);
     }
+    let unsupported = || Some(describe(at, &meta, head.as_deref(), looked.clone(), cancel));
     match waited {
         Waited::Cancelled => None,
         Waited::TimedOut => message("This file is taking too long to read"),
-        Waited::Exited(status) if status.code() == Some(decode::EXIT_UNSUPPORTED) && is_video(path) => play_video(path, video_size, cancel, send),
-        Waited::Exited(status) => answer(status, &helper.output, meta.len()),
+        Waited::Exited(status) if status.code() == Some(decode::EXIT_UNSUPPORTED) && head.as_deref().is_some_and(media::looks_like_video) => play_video(path, video_size, cancel, send, &|| describe(at, &meta, head.as_deref(), looked.clone(), cancel)),
+        Waited::Exited(status) => answer(status, &helper.output, meta.len()).or_else(unsupported),
     }
 }
 
-fn is_video(path: &Path) -> bool {
-    let mut head = [0u8; 512];
-    let Ok(mut file) = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(path) else { return false };
-    file.read(&mut head).is_ok_and(|n| media::looks_like_video(&head[..n]))
+/// The type, name, size and date of anything, and a picture of it if another program made one.
+/// `looked` is the thumbnail if it's already been looked for.
+fn describe(at: &Place, meta: &std::fs::Metadata, head: Option<&[u8]>, looked: Option<Option<Arc<ImageBuf>>>, cancel: &OwnedFd) -> Found {
+    let name = at.path.file_name().map_or(&b""[..], |n| n.as_encoded_bytes());
+    let kind = meta.file_type();
+    let db = at.kinds.db();
+    let mime = if kind.is_dir() {
+        mime::FOLDER
+    } else if kind.is_fifo() {
+        "inode/fifo"
+    } else if kind.is_socket() {
+        "inode/socket"
+    } else if kind.is_char_device() {
+        "inode/chardevice"
+    } else if kind.is_block_device() {
+        "inode/blockdevice"
+    } else {
+        db.guess(name, head)
+    };
+    let description = db.describe(mime, at.kinds.lang.as_deref()).unwrap_or_else(|| fallback_description(mime));
+    let icon = icon_for(mime, &db.generic_icon(mime), name);
+    let thumbnail = match (looked, at.cache_home) {
+        (Some(looked), _) => looked,
+        (None, Some(cache_home)) if kind.is_file() => thumbnail(cache_home, at.path, meta.mtime(), cancel).map(Arc::new),
+        _ => None,
+    };
+    let size = kind.is_file().then_some(meta.len());
+    Found::Info(Info { mime: mime.to_string(), description, icon, size, modified: Some(meta.mtime()), thumbnail })
+}
+
+/// Words for a type the database doesn't name, which is what an empty database gives.
+fn fallback_description(mime: &str) -> String {
+    match mime {
+        mime::FOLDER => "Folder",
+        "inode/fifo" => "Pipe",
+        "inode/socket" => "Socket",
+        "inode/chardevice" | "inode/blockdevice" => "Device",
+        mime::PLAIN_TEXT => "Plain text document",
+        mime::EMPTY => "Empty file",
+        _ => return mime.to_string(),
+    }
+    .to_string()
+}
+
+/// One of Gannet's own icons for a type, by the generic icon the database gives it.
+fn icon_for(mime: &str, generic: &str, name: &[u8]) -> Icon {
+    if mime == mime::FOLDER {
+        return Icon::Folder;
+    }
+    match generic {
+        "image-x-generic" => Icon::Image,
+        "video-x-generic" => Icon::Video,
+        "audio-x-generic" => Icon::Audio,
+        "package-x-generic" => Icon::Archive,
+        "text-x-script" | "text-html" => Icon::Code,
+        "text-x-generic" | "x-office-document" | "x-office-spreadsheet" | "x-office-presentation" | "x-office-document-template" => Icon::Document,
+        _ => match icons::icon_for_name(name) {
+            Icon::File if mime.starts_with("text/") => Icon::Document,
+            other => other,
+        },
+    }
 }
 
 /// Plays a video until it's cancelled or something stops it. Returns the words to show if so.
-fn play_video(path: &Path, size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Found)) -> Option<Found> {
+/// A file that turns out to have no picture gets `otherwise` instead.
+fn play_video(path: &Path, size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Found), otherwise: &dyn Fn() -> Found) -> Option<Found> {
     let Ok(video) = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(path) else { return message("This file can't be read") };
     // It may have been swapped for something else since it was first looked at.
     if !video.metadata().is_ok_and(|m| m.is_file()) {
-        return message(NO_PREVIEW);
+        return message("This file has changed. Look at it again to see what it is now.");
     }
     let started = match media::start_jailed(video, size, &[media::ARG]) {
         Ok(started) => started,
@@ -308,8 +422,8 @@ fn play_video(path: &Path, size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Fou
         Said::Hello => hello = true,
         Said::Frame { index, w, h } => send(Found::VideoFrame { index, w, h }),
         Said::State(state) => send(Found::VideoState(state)),
-        // Showing words drops this job, and that stops the player.
-        Said::NoVideo => send(Found::Message(NO_PREVIEW.to_string())),
+        // Showing something else drops this job, and that stops the player.
+        Said::NoVideo => send(otherwise()),
         Said::CantPlay => send(Found::Message(CANT_PLAY.to_string())),
     })?;
     match media::ending(status, hello) {
@@ -325,13 +439,15 @@ fn play_video(path: &Path, size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Fou
     }
 }
 
+/// What the decoder's ending means. `None` when it doesn't know the format, so something else
+/// should say what the file is.
 fn answer(status: ExitStatus, output: &OwnedFd, size: u64) -> Option<Found> {
     match status.code() {
         Some(0) => match ImageBuf::from_memfd(output) {
             Some(image) => Some(Found::Full { image: Arc::new(image), size }),
             None => message(DAMAGED),
         },
-        Some(decode::EXIT_UNSUPPORTED) => message(NO_PREVIEW),
+        Some(decode::EXIT_UNSUPPORTED) => None,
         Some(decode::EXIT_TOO_LARGE) => message(TOO_LARGE),
         Some(decode::EXIT_NO_SANDBOX) => message(NO_SANDBOX),
         // Out of memory or CPU, which is what a limit looks like from out here. The kernel sends
@@ -417,6 +533,7 @@ pub fn box_scale(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize, cancel:
 pub enum Content {
     Waiting,
     Image { image: Arc<ImageBuf>, thumbnail: bool },
+    Info(Info),
     Video(Video),
     Message(String),
 }
@@ -472,8 +589,6 @@ pub struct Preview {
     pub zoom: Option<f64>,
     pub pan: (f64, f64),
     pub loading_shown: bool,
-    /// Whether a popup was already up, so there's no gap in it while the next file loads.
-    continuing: bool,
     /// The size and time the listing has for this file, to notice it being overwritten.
     seen: Option<(u64, i64)>,
     scaled: Option<Scaled>,
@@ -608,14 +723,14 @@ impl App {
         // Replacing the old one stops its decoder and frees its image.
         self.preview = Some(Preview {
             generation: self.preview_gen,
-            path,
+            path: path.clone(),
             content: Content::Waiting,
             size: None,
             zoom: None,
             pan: (0.0, 0.0),
             loading_shown: false,
-            continuing: old.is_some(),
-            seen: self.stat_at_cursor(),
+            // Only the cursor's row is this file, and only once the listing has caught up.
+            seen: if self.path_at_cursor().as_ref() == Some(&path) { self.stat_at_cursor() } else { None },
             scaled: None,
             scale_gen: 0,
             scale_wanted: (0, 0),
@@ -629,35 +744,67 @@ impl App {
         if !settle {
             self.preview_start_job();
         }
+        if self.viewer {
+            // What went wrong with the last file isn't news about this one.
+            self.notices.clear();
+            let name = self.preview.as_ref().map(|p| display_name(&p.path)).unwrap_or_default();
+            self.cmds.push(Cmd::Title(name));
+            self.tell_the_list();
+        }
         self.invalidate_popup(old.map_or(Rect::default(), |f| f.rect));
     }
 
     fn preview_start_job(&mut self) {
-        let (hub, cache_home, slow) = (self.hub.clone(), self.cache_home.clone(), self.slow_preview);
+        let (hub, kinds, cache_home, slow) = (self.hub.clone(), self.kinds.clone(), self.cache_home.clone(), self.slow_preview);
         let area = self.preview_geometry().area;
         let Some(p) = self.preview.as_mut() else { return };
         p.start_at = None;
-        p.job = Job::start(hub, p.generation, p.path.clone(), cache_home, slow, (area.w.max(1), area.h.max(1)));
+        p.job = Job::start(hub, p.generation, p.path.clone(), kinds, cache_home, slow, (area.w.max(1), area.h.max(1)));
         if p.job.is_none() {
             p.content = Content::Message("The previewer couldn't start".into());
             p.loading_at = None;
         }
     }
 
+    /// Opens the preview window on the item under the cursor, or shows that item in the one
+    /// that's open.
     pub fn open_preview(&mut self) {
+        if self.viewer {
+            return;
+        }
         if !self.cursor_shown {
             // Showing the cursor selects its row, unless there's a selection to keep.
             self.step(0, Mods { ctrl: self.sel_count > 0, ..Mods::default() });
         }
-        if let Some(path) = self.path_at_cursor() {
-            self.preview_begin(path, false);
+        let Some(path) = self.path_at_cursor() else { return };
+        if self.previewer.is_some() {
+            // Asked for by name, so it's shown even if the cursor hasn't moved: the window may
+            // have walked off somewhere the list doesn't follow.
+            self.previewer_cursor = Some(path.clone());
+            if self.previewer.as_ref() != Some(&path) {
+                self.previewer = Some(path.clone());
+                self.cmds.push(Cmd::PreviewShow(path));
+            }
+            return;
+        }
+        self.previewer_gen += 1;
+        self.cmds.push(Cmd::OpenPreview { generation: self.previewer_gen, path: path.clone(), hidden: self.show_hidden, sort: self.sort });
+        self.previewer = Some(path.clone());
+        self.previewer_cursor = Some(path);
+    }
+
+    /// The preview window closes: from the list, by telling it to; in it, by quitting.
+    pub fn close_preview(&mut self) {
+        if self.viewer {
+            self.cmds.push(Cmd::Quit);
+        } else if self.previewer.take().is_some() {
+            self.cmds.push(Cmd::ClosePreview);
         }
     }
 
-    pub fn close_preview(&mut self) {
-        if self.preview.take().is_some() {
-            self.invalidate_all();
-        }
+    /// Space in the list: opens the window, or closes the one that's open.
+    pub fn toggle_preview(&mut self) {
+        if self.previewer.is_some() { self.close_preview() } else { self.open_preview() }
     }
 
     /// Goes to the next or previous file. The selection follows, as with plain arrows, unless
@@ -719,7 +866,6 @@ impl App {
                 if matches!(p.content, Content::Waiting) {
                     p.content = Content::Image { image, thumbnail: true };
                     p.loading_at = None;
-                    p.continuing = true;
                 }
             }
             Found::Full { image, size } => {
@@ -731,6 +877,11 @@ impl App {
             }
             Found::Message(text) => {
                 p.content = Content::Message(text);
+                p.loading_at = None;
+                p.job = None;
+            }
+            Found::Info(info) => {
+                p.content = Content::Info(info);
                 p.loading_at = None;
                 p.job = None;
             }
@@ -781,25 +932,14 @@ impl App {
 
     // ---- Where things go ----
 
-    /// Where the popup goes, whatever it's showing.
+    /// The whole window: a line for the name, the picture, and a line for what it is.
     fn preview_geometry(&self) -> Frame {
-        let (w, h) = ((self.w as f64 * WIDTH_SHARE) as i32, (self.h as f64 * HEIGHT_SHARE) as i32);
         let (title, foot) = (self.px(TITLE_H), self.px(FOOT_H));
-        let (x, y) = ((self.w - w) / 2, (self.h - h) / 2);
-        Frame { rect: Rect::new(x, y, w, h), area: Rect::new(x + 1, y + title, (w - 2).max(0), (h - title - foot).max(0)) }
+        Frame { rect: Rect::new(0, 0, self.w, self.h), area: Rect::new(0, title, self.w, (self.h - title - foot).max(0)) }
     }
 
-    /// Nothing yet gets no popup at all, so a fast image doesn't flash an empty box first.
     fn preview_frame(&self) -> Option<Frame> {
-        let p = self.preview.as_ref()?;
-        let nothing_yet = match &p.content {
-            Content::Waiting => true,
-            Content::Video(video) => video.frame.is_none(),
-            _ => false,
-        };
-        if nothing_yet && !p.continuing && !p.loading_shown {
-            return None;
-        }
+        self.preview.as_ref()?;
         Some(self.preview_geometry())
     }
 
@@ -884,9 +1024,9 @@ impl App {
         let pan = self.px(80.0) as f64;
         match sym {
             k::KEY_q | k::KEY_w if m.ctrl => self.request_close(),
-            k::KEY_period if m.ctrl => self.stop_newest_job(),
             k::KEY_space if m.ctrl || self.key_is_repeat => {}
             k::KEY_space | k::KEY_Escape => self.close_preview(),
+            k::KEY_Return | k::KEY_KP_Enter if !self.key_is_repeat => self.preview_open_file(),
             k::KEY_Left if m.shift => self.preview_pan(pan, 0.0),
             k::KEY_Right if m.shift => self.preview_pan(-pan, 0.0),
             k::KEY_Up if m.shift => self.preview_pan(0.0, pan),
@@ -1024,8 +1164,11 @@ impl App {
     }
 
     pub fn preview_button(&mut self, button: u32, hit: Hit) {
-        if button != BTN_LEFT {
-            return;
+        match button {
+            BTN_SIDE => return self.preview_move(-1),
+            BTN_EXTRA => return self.preview_move(1),
+            BTN_LEFT => {}
+            _ => return,
         }
         if hit == Hit::Outside {
             return self.close_preview();
@@ -1033,6 +1176,9 @@ impl App {
         let (x, y) = self.pointer;
         if self.video_mut().is_some() {
             return self.video_click(x, y);
+        }
+        if self.info_open_rect().is_some_and(|r| r.contains(x, y)) {
+            return self.preview_open_file();
         }
         let Some(view) = self.preview_view() else { return };
         if view.dest.w > view.area.w || view.dest.h > view.area.h {
@@ -1098,13 +1244,15 @@ impl App {
             return;
         }
         let view = self.preview_view();
+        let open = self.info_open_rect();
         let Some(p) = self.preview.take() else { return };
         let co = self.colors;
-        c.rrect(r, self.px(8.0), co.surface);
-        c.frame(r, 1, co.border);
+        c.fill(r, co.surface);
+        c.fill(Rect::new(r.x, area.y - 1, r.w, 1), co.border);
+        c.fill(Rect::new(r.x, area.bottom(), r.w, 1), co.border);
         let pad = self.px(14.0);
         let max = (r.w - pad * 2).max(0) as f32;
-        let name = p.path.file_name().map_or_else(|| p.path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let name = display_name(&p.path);
         let title_y = self.baseline(r.y, self.px(TITLE_H));
         self.text.draw_fitted(c, &name, (r.x + pad) as f32, title_y, max, co.foreground);
         if !area.is_empty() {
@@ -1122,6 +1270,7 @@ impl App {
                     App::with_clip(c, area, |c| c.xrgb(frames.frame(*index, *w, *h), *w as i32, *h as i32, dest));
                 }
                 (Content::Message(text), _) => self.paint_center(c, area, text, co.muted),
+                (Content::Info(info), _) => self.paint_info(c, area, info, open),
                 _ if p.loading_shown => self.paint_center(c, area, "Loading…", co.muted),
                 _ => {}
             }
@@ -1131,16 +1280,185 @@ impl App {
                     format!("{} × {}{size}  ·  {:.0}%", image.w, image.h, view.scale * 100.0)
                 }
                 (Content::Image { thumbnail: true, .. }, _) => "Loading the full image…".to_string(),
+                (Content::Info(info), _) => info.mime.clone(),
                 _ => String::new(),
             };
             let foot_y = self.baseline(area.bottom(), self.px(FOOT_H));
-            if let Content::Video(video) = &p.content {
+            // The window has no other place for something going wrong, like a file that
+            // wouldn't open.
+            if let Some(notice) = self.notices.last().cloned() {
+                self.text.draw_fitted(c, &notice, (r.x + pad) as f32, foot_y, max, co.danger);
+            } else if let Content::Video(video) = &p.content {
                 self.paint_video_controls(c, Frame { rect: r, area }, video.state, foot_y);
             } else {
                 self.text.draw_fitted(c, &foot, (r.x + pad) as f32, foot_y, max, co.muted);
             }
         }
         self.preview = Some(p);
+    }
+}
+
+/// A file's name as it's shown, or its whole path if it has none.
+fn display_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
+}
+
+/// Where the parts of the view for any file go.
+struct InfoLayout {
+    picture: Rect,
+    lines: [Rect; 2],
+    open: Rect,
+}
+
+impl App {
+    fn info_layout(&self, area: Rect) -> InfoLayout {
+        let side = ((area.w.min(area.h) as f64 * 0.4) as i32).clamp(self.px(48.0), self.px(256.0));
+        let (gap, line, button) = (self.px(18.0), self.px(24.0), self.px(32.0));
+        let top = area.y + (area.h - (side + gap + line * 2 + gap + button)).max(0) / 2;
+        let picture = Rect::new(area.x + (area.w - side) / 2, top, side, side);
+        let first = Rect::new(area.x, picture.bottom() + gap, area.w, line);
+        let second = Rect::new(area.x, first.bottom(), area.w, line);
+        let open_w = self.px(104.0);
+        let open = Rect::new(area.x + (area.w - open_w) / 2, second.bottom() + gap, open_w, button);
+        InfoLayout { picture, lines: [first, second], open }
+    }
+
+    /// The Open button, when the view for any file is showing.
+    fn info_open_rect(&self) -> Option<Rect> {
+        let p = self.preview.as_ref()?;
+        matches!(p.content, Content::Info(_)).then(|| self.info_layout(self.preview_geometry().area).open)
+    }
+
+    fn paint_info(&mut self, c: &mut Canvas, area: Rect, info: &Info, open: Option<Rect>) {
+        let co = self.colors;
+        let l = self.info_layout(area);
+        match &info.thumbnail {
+            Some(image) => {
+                let (scale, fit) = image_scale((l.picture.w, l.picture.h), image.w, image.h, false, None);
+                let dest = place(l.picture, image.w, image.h, scale, fit, (0.0, 0.0)).dest;
+                App::with_clip(c, area, |c| c.image(image.pixels(), image.w as i32, image.h as i32, dest));
+            }
+            None => self.icons.draw(c, info.icon, l.picture.x, l.picture.y, l.picture.w, co.muted),
+        }
+        let now = gannet_core::time::now();
+        let details: Vec<String> = [info.size.map(format::size), info.modified.map(|m| format!("Modified {}", format::date(m, now)))].into_iter().flatten().collect();
+        self.paint_line(c, l.lines[0], &info.description, co.foreground);
+        self.paint_line(c, l.lines[1], &details.join("  ·  "), co.muted);
+        if let Some(open) = open {
+            c.rrect(open, self.px(6.0), co.accent);
+            self.paint_line(c, open, "Open", co.on_accent);
+        }
+    }
+
+    /// One line of text in the middle of `r`, cut short if it doesn't fit.
+    fn paint_line(&mut self, c: &mut Canvas, r: Rect, text: &str, color: u32) {
+        let pad = self.px(12.0);
+        let max = (r.w - pad * 2).max(0) as f32;
+        let w = self.text.measure(text).min(max);
+        let x = r.x as f32 + (r.w as f32 - w) / 2.0;
+        let y = self.baseline(r.y, r.h);
+        self.text.draw_fitted(c, text, x, y, max, color);
+    }
+
+    /// Enter in the preview window: the file opens in its app, and the preview stays.
+    fn preview_open_file(&mut self) {
+        let Some(path) = self.preview.as_ref().map(|p| p.path.clone()) else { return };
+        let hub = self.hub.clone();
+        gannet_core::open::open_with_default(&path, move |p, why| hub.send(Msg::Notice(format!("Couldn't open {}: {why}", display_name(&p)))));
+    }
+
+    // ---- The preview window's side ----
+
+    /// Sets this app up as the preview window, showing `path` straight away while its folder is
+    /// read for the arrows to walk through.
+    pub fn start_viewer(&mut self, path: PathBuf) {
+        self.viewer = true;
+        let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        let name = path.file_name().map(|n| n.as_encoded_bytes().to_vec());
+        // A hidden file has to be in the listing, or the cursor can't be on it.
+        if name.as_ref().is_some_and(|n| n.first() == Some(&b'.')) {
+            self.show_hidden = true;
+        }
+        self.previewer = Some(path.clone());
+        self.go(Stop { dir, cursor_name: name });
+        self.preview_begin(path, false);
+    }
+
+    /// The list moved its cursor: show what it's on now.
+    pub fn on_preview_show(&mut self, path: PathBuf) {
+        if !self.viewer || self.preview.as_ref().is_some_and(|p| p.path == path) {
+            return;
+        }
+        self.previewer = Some(path.clone());
+        let name = path.file_name().map(|n| n.as_encoded_bytes().to_vec());
+        if name.as_ref().is_some_and(|n| n.first() == Some(&b'.')) && !self.show_hidden {
+            self.show_hidden = true;
+            self.rederive(false);
+        }
+        let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+        let row = self.listing.as_ref().filter(|l| l.dir == dir && !self.loading).and_then(|l| name.as_ref().and_then(|n| self.rows.iter().position(|&i| *l.key(i) == **n)));
+        match row {
+            Some(row) => self.move_cursor(row, Mods::default()),
+            None => self.go(Stop { dir, cursor_name: name }),
+        }
+        // Settling, as the list's arrows can run through files as fast as the key repeats.
+        self.preview_begin(path, true);
+    }
+
+    /// Tells the list which file is showing, if it doesn't know.
+    fn tell_the_list(&mut self) {
+        let Some(path) = self.preview.as_ref().map(|p| p.path.clone()) else { return };
+        if self.previewer.as_ref() != Some(&path) {
+            self.previewer = Some(path.clone());
+            self.cmds.push(Cmd::PreviewStepped(path));
+        }
+    }
+
+    // ---- The list's side ----
+
+    /// Tells the preview window where the cursor is now, if it's moved.
+    pub fn preview_follow(&mut self) {
+        if self.viewer || self.previewer.is_none() || !self.cursor_shown {
+            return;
+        }
+        let Some(path) = self.path_at_cursor() else { return };
+        if self.previewer_cursor.as_ref() != Some(&path) {
+            self.previewer_cursor = Some(path.clone());
+            if self.previewer.as_ref() != Some(&path) {
+                self.previewer = Some(path.clone());
+                self.cmds.push(Cmd::PreviewShow(path));
+            }
+        }
+    }
+
+    /// The preview window stepped to another file: the cursor follows, and the selection with
+    /// it as arrows do, unless that would lose a selection of several things.
+    pub fn on_preview_stepped(&mut self, generation: u64, path: PathBuf) {
+        if generation != self.previewer_gen || self.previewer.is_none() {
+            return;
+        }
+        self.previewer = Some(path.clone());
+        if path.parent() != Some(self.dir.as_path()) {
+            return;
+        }
+        let Some(name) = path.file_name().map(|n| n.as_encoded_bytes()) else { return };
+        // A file the list doesn't show (its filter hides it, say) leaves the cursor where it is.
+        let Some(row) = self.listing.as_ref().and_then(|l| self.rows.iter().position(|&i| *l.key(i) == *name)) else { return };
+        if row != self.cursor || !self.cursor_shown {
+            self.move_cursor(row, Mods { ctrl: self.sel_count > 1, ..Mods::default() });
+        }
+        self.previewer_cursor = Some(path);
+    }
+
+    /// The preview window has gone. Said so if it wasn't asked to.
+    pub fn on_preview_ended(&mut self, generation: u64, crashed: bool) {
+        if generation != self.previewer_gen {
+            return;
+        }
+        self.previewer = None;
+        if crashed {
+            self.notice("The preview stopped unexpectedly".to_string());
+        }
     }
 }
 
@@ -1244,6 +1562,27 @@ mod tests {
         assert!(!worth_smoothing(&view(100, 50, false, Some(2.0), (0.0, 0.0))));
     }
 
+    #[test]
+    fn sockets_and_folders_are_described_without_being_opened() {
+        assert!(std::env::var_os("GANNET_TEST_SANDBOX").is_some(), "run tests with scripts/test.sh");
+        let dir = std::env::temp_dir().join(format!("gannet-test-describe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.join("socket")).unwrap();
+        let kinds = Kinds::default();
+        let cancel = event();
+        for (name, mime) in [("socket", "inode/socket"), ("folder", mime::FOLDER)] {
+            let path = dir.join(name);
+            let at = Place { path: &path, kinds: &kinds, cache_home: None };
+            match fetch(&at, None, (100, 100), &cancel, &|_| {}) {
+                Some(Found::Info(info)) => assert_eq!(info.mime, mime),
+                Some(Found::Message(m)) => panic!("{name}: {m}"),
+                _ => panic!("{name}: no answer"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn sleeper(script: &str) -> Helper {
         let output = memfd_create("test", MemfdFlags::CLOEXEC).unwrap();
         let mut command = Command::new("sh");
@@ -1315,7 +1654,7 @@ mod tests {
             _ => panic!("expected a message"),
         };
         let exit = |code: i32| code << 8;
-        assert_eq!(said(exit(decode::EXIT_UNSUPPORTED)), NO_PREVIEW);
+        assert!(answer(ExitStatus::from_raw(exit(decode::EXIT_UNSUPPORTED)), &fd, 0).is_none(), "not known, so something else says what it is");
         assert_eq!(said(exit(decode::EXIT_TOO_LARGE)), TOO_LARGE);
         assert_eq!(said(exit(decode::EXIT_DAMAGED)), DAMAGED);
         assert_eq!(said(exit(decode::EXIT_NO_SANDBOX)), NO_SANDBOX);

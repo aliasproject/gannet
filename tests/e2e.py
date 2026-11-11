@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "bench/harness"))
 from hl import Headless, Ipc, tree as hl_tree
 
 BIN = ROOT / "target/bench/release/gannet"
+PREVIEW_APP_ID = "com.aliasproject.Gannet.Preview"
 SCRATCH = Path("/tmp/gne2e")
 SHOTS = ROOT / ".bench/shots"
 
@@ -23,8 +24,11 @@ class App:
         self.h = h
         self.fs = SCRATCH / "fs"
         self.state_file = SCRATCH / state_name
-        if self.state_file.exists():
-            self.state_file.unlink()
+        # The preview window writes its own beside it.
+        self.preview_file = SCRATCH / (state_name + ".preview")
+        for f in (self.state_file, self.preview_file):
+            if f.exists():
+                f.unlink()
         self.env = h.env(SCRATCH / "client", {"GANNET_STATE": str(self.state_file), **(extra_env or {})})
         if path_prefix:
             self.env["PATH"] = f"{path_prefix}:{self.env['PATH']}"
@@ -38,10 +42,42 @@ class App:
             h.wait_window(10)
 
     def state(self):
+        """The list's state, with "preview" being what its preview window is showing, if one's open."""
         try:
-            return json.loads(self.state_file.read_text())
+            s = json.loads(self.state_file.read_text())
         except (OSError, ValueError):
             return {}
+        if s.get("previewing") is None:
+            # The window has gone, so whatever it last wrote is out of date.
+            self.preview_file.unlink(missing_ok=True)
+            s["preview"] = None
+        else:
+            try:
+                s["preview"] = json.loads(self.preview_file.read_text()).get("preview")
+            except (OSError, ValueError):
+                s["preview"] = None
+        return s
+
+    def preview_window(self):
+        """The preview window's place on screen, as sway has it: x, y, w, h."""
+        def find(node):
+            if node.get("app_id") == PREVIEW_APP_ID:
+                return node
+            for child in node.get("nodes", []) + node.get("floating_nodes", []):
+                found = find(child)
+                if found:
+                    return found
+            return None
+        node = find(self.h.cmd.call(4))
+        assert node, "no preview window"
+        r = node["rect"]
+        return r["x"], r["y"], r["width"], r["height"]
+
+    def resize_preview(self, w, h):
+        self.sway(f'[app_id="{PREVIEW_APP_ID}"] resize set {w} {h}')
+
+    def focus_list(self):
+        self.sway('[app_id="^com\\.aliasproject\\.Gannet$"] focus')
 
     def wait(self, pred, what="", timeout=6):
         end = time.monotonic() + timeout
@@ -1196,25 +1232,121 @@ def space_previews_images_and_walks_the_folder(h):
     s = a.wait(lambda s: preview_of(s).get("name") == "claims.png" and preview_of(s)["state"] == "message", "a huge image")
     assert "too large" in preview_of(s)["message"], s["preview"]
     a.key("Right")
-    s = a.wait(lambda s: preview_of(s).get("name") == "notes.txt" and preview_of(s)["state"] == "message", "a text file")
-    assert "No preview" in preview_of(s)["message"], s["preview"]
+    s = a.wait(lambda s: preview_of(s).get("name") == "notes.txt" and preview_of(s)["state"] == "info", "a text file")
+    assert preview_of(s)["kind"] == "text/plain", s["preview"]
+    a.shot("preview-info")
     a.key("Right")
     s = a.wait(lambda s: preview_of(s).get("name") == "small.png" and preview_of(s)["state"] == "image", "a small image")
     assert not preview_of(s)["scaled"], "shown at its own size, so nothing to shrink"
     a.key("Up")
     a.wait(lambda s: preview_of(s).get("name") == "notes.txt", "back again")
-    # Space closes, Escape closes, and neither touches the selection or anything else.
+    # The list's cursor followed the window, and moving it moves the window.
+    s = a.state()
+    assert s["selected"] == ["notes.txt"], s["selected"]
+    a.focus_list()
+    a.key("Down")
+    a.wait(lambda s: s["selected"] == ["small.png"] and preview_of(s).get("name") == "small.png", "the window follows the list")
+    a.key("Up")
+    a.wait(lambda s: preview_of(s).get("name") == "notes.txt", "and back")
+    # Space in the list closes it, as Space and Escape in the window do, and none of them
+    # touches the selection or anything else.
     a.key("space")
-    s = a.wait(lambda s: s["preview"] is None, "Space closes")
+    s = a.wait(lambda s: s["preview"] is None, "Space in the list closes")
     assert s["selected"] == ["notes.txt"]
+    a.key("space")
+    a.wait(lambda s: s["preview"], "open again")
+    a.key("space")
+    s = a.wait(lambda s: s["preview"] is None, "Space in the window closes")
     a.key("space")
     a.wait(lambda s: s["preview"], "open again")
     a.key("Escape")
     s = a.wait(lambda s: s["preview"] is None, "Escape closes")
-    assert s["selected"] == ["notes.txt"], "Escape only closed the popup"
+    assert s["selected"] == ["notes.txt"], "Escape only closed the window"
     assert sorted(p.name for p in fs.iterdir()) == ["big.png", "broken.png", "claims.png", "notes.txt", "small.png"]
     assert a.alive()
     a.close()
+
+
+def preview_pid(a):
+    for pid in hl_tree(a.proc.pid):
+        try:
+            if Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[1:2] == [b"--preview"]:
+                return pid
+        except OSError:
+            pass
+    return None
+
+
+@check
+def any_file_says_what_it_is_and_opens_in_its_app(h):
+    fs = fresh_fs()
+    (fs / "a-report.pdf").write_bytes(b"%PDF-1.4\n" + b"\0" * 100)
+    (fs / "b-no-extension").write_bytes(b"%PDF-1.4\n" + b"\0" * 100)
+    (fs / "c-blob.xyz").write_bytes(bytes(range(256)))
+    bin_dir = SCRATCH / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    log = SCRATCH / "opened.log"
+    log.unlink(missing_ok=True)
+    opener = bin_dir / "xdg-open"
+    opener.write_text(f'#!/bin/sh\necho "$1" >> {log}\ncase "$1" in *.xyz) exit 3;; esac\nexit 0\n')
+    opener.chmod(0o755)
+    a = App(h, fs, path_prefix=str(bin_dir), extra_env={"LANG": "C.UTF-8"})
+    a.wait(lambda s: s["count"] == 3, "listing")
+    a.key("space")
+    s = a.wait(lambda s: preview_of(s).get("state") == "info", "the PDF")
+    assert preview_of(s)["kind"] == "application/pdf" and preview_of(s)["message"] == "PDF document", s["preview"]
+    a.shot("preview-any-file")
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "b-no-extension" and preview_of(s)["state"] == "info", "known by its contents")
+    assert preview_of(s)["kind"] == "application/pdf", s["preview"]
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "unknown bytes")
+    assert preview_of(s)["kind"] == "application/octet-stream", s["preview"]
+    # Enter, or the Open button, opens it in its app and leaves the preview up.
+    a.key("Up", "Up")
+    a.wait(lambda s: preview_of(s).get("name") == "a-report.pdf", "back to the PDF")
+    a.key("Return")
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not log.exists():
+        time.sleep(0.02)
+    assert log.read_text().strip() == str(fs / "a-report.pdf"), log.read_text()
+    assert a.state()["preview"], "still previewing"
+    a.key("Down", "Down")
+    a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "the blob")
+    x, y, w, h_ = a.preview_window()
+    # The button sits below the picture and two lines of words, in the middle.
+    a.click(x + w // 2, y + 533)
+    a.wait(lambda s: json.loads(a.preview_file.read_text())["notices"], "a failure shows in the window", timeout=5)
+    assert "c-blob.xyz" in log.read_text()
+    a.shot("preview-open-failed")
+    a.close()
+
+
+@check
+def a_crash_in_the_preview_closes_only_the_preview_and_closing_the_list_closes_both(h):
+    fs = fresh_fs()
+    tree(fs, {"a": "x", "b": "y"})
+    a = App(h, fs)
+    a.wait(lambda s: s["count"] == 2, "listing")
+    a.key("space")
+    a.wait(lambda s: s["preview"], "the preview window")
+    pid = preview_pid(a)
+    assert pid, "a process of its own"
+    os.kill(pid, signal.SIGKILL)
+    s = a.wait(lambda s: s["previewing"] is None, "the list notices")
+    assert any("stopped unexpectedly" in n for n in s["notices"]), s["notices"]
+    assert a.alive()
+    a.focus_list()
+    a.key("space")
+    a.wait(lambda s: s["preview"], "a new one opens")
+    pid = preview_pid(a)
+    a.focus_list()
+    a.key("q", mods=["ctrl"])
+    a.proc.wait(5)
+    end = time.monotonic() + 3
+    while time.monotonic() < end and Path(f"/proc/{pid}").exists():
+        time.sleep(0.02)
+    assert not Path(f"/proc/{pid}").exists(), "the preview went with the list"
 
 
 @check
@@ -1274,24 +1406,30 @@ def zooming_and_panning_a_preview(h):
     s = a.wait(lambda s: preview_of(s)["pan"][0] < 0, "panned with the keyboard")
     assert preview_of(s)["name"] == "wide.png"
     pan = preview_of(s)["pan"][0]
-    # The mouse drags it, a click inside doesn't close it, and a click outside does.
-    a.move(640, 400)
+    # The mouse drags it, and a click on it doesn't close it.
+    x0, y0, _, _ = a.preview_window()
+    a.move(x0 + 480, y0 + 360)
     h.pointer("button 272 1")
-    a.move(740, 400)
+    a.move(x0 + 580, y0 + 360)
     s = a.wait(lambda s: preview_of(s)["pan"][0] > pan, "dragged")
     h.pointer("button 272 0")
     time.sleep(0.03)
     pan = preview_of(a.state())["pan"][0]
-    a.move(900, 400)
+    a.move(x0 + 740, y0 + 360)
     time.sleep(0.05)
     assert preview_of(a.state())["pan"][0] == pan, "the drag ended with the button"
-    a.click(640, 400)
+    a.click(x0 + 480, y0 + 360)
     time.sleep(0.05)
-    assert a.state()["preview"], "a click on the popup leaves it open"
+    assert a.state()["preview"], "a click on the window leaves it open"
     a.key("0")
     a.wait(lambda s: preview_of(s)["zoom"] is None and preview_of(s)["pan"] == [0, 0] and preview_of(s)["scaled"], "0 fits again")
-    a.click(8, 8)
-    a.wait(lambda s: s["preview"] is None, "a click outside closes")
+    # The mouse's back and forward buttons step through the folder.
+    (a.fs / "x.png").write_bytes(png_bytes(40, 40))
+    a.wait(lambda s: s["count"] == 2, "a second file")
+    a.click(x0 + 480, y0 + 360, button=0x114)
+    a.wait(lambda s: preview_of(s).get("name") == "x.png", "forward")
+    a.click(x0 + 480, y0 + 360, button=0x113)
+    a.wait(lambda s: preview_of(s).get("name") == "wide.png", "back")
     a.close()
 
 
@@ -1313,13 +1451,14 @@ def an_open_preview_follows_a_theme_swap(h):
     (next_dir / "colors.toml").write_text('background = "#112233"\nforeground = "#ddeeff"\naccent = "#ff8800"\n')
     os.rename(next_dir, cur / "theme")
     s = a.wait(lambda s: s["base"] == 0x112233, "the theme arrives")
-    assert preview_of(s).get("state") == "image", "and the popup stays open through it"
+    assert preview_of(s).get("state") == "image", "and the window stays open through it"
+    a.wait(lambda s: json.loads(a.preview_file.read_text())["base"] == 0x112233, "in the preview window too")
     a.shot("preview-dark")
     a.close()
 
 
 @check
-def the_popup_stays_the_same_size_through_a_folder(h):
+def the_preview_fills_its_window_through_a_folder(h):
     fs = fresh_fs()
     (fs / "a-wide.png").write_bytes(png_bytes(2000, 500))
     (fs / "b-tall.png").write_bytes(png_bytes(500, 2000))
@@ -1329,32 +1468,24 @@ def the_popup_stays_the_same_size_through_a_folder(h):
     a.wait(lambda s: s["count"] == 4, "listing")
     rect = lambda s: preview_of(s)["rect"]
     a.key("space")
-    # Nothing drawn at first, so a fast image doesn't flash an empty box.
-    s = a.wait(lambda s: s["preview"], "just opened")
-    if preview_of(s)["state"] == "waiting":  # A busy machine could miss this moment.
-        assert rect(s)[2:] == [0, 0], s["preview"]
     s = a.wait(lambda s: preview_of(s).get("state") == "image", "wide image")
-    frame = rect(s)
-    assert frame == [320, 160, 640, 480], "half the width and 60% of the height, centered"
+    assert rect(s) == [0, 0, 960, 720], "the whole window"
+    assert a.preview_window()[2:] == (960, 720), "as the window rule sized it"
     a.shot("static-wide")
-    for name, state in (("b-tall.png", "image"), ("c-small.png", "image"), ("d-notes.txt", "message")):
+    for name, state in (("b-tall.png", "image"), ("c-small.png", "image"), ("d-notes.txt", "info")):
         a.key("Down")
         s = a.wait(lambda s: preview_of(s).get("name") == name, f"moved to {name}")
-        assert rect(s) == frame, f"same size while {name} loads"
         s = a.wait(lambda s: preview_of(s)["state"] == state, name)
-        assert rect(s) == frame, f"same size showing {name}"
+        assert rect(s) == [0, 0, 960, 720], f"showing {name}"
         a.shot(f"static-{name.split('.')[0]}")
-    # Zooming happens inside the frame.
-    a.key("Up")
-    a.wait(lambda s: preview_of(s).get("name") == "c-small.png" and preview_of(s)["state"] == "image", "small again")
-    a.key("plus")
-    s = a.wait(lambda s: preview_of(s)["zoom"] is not None, "zoomed")
-    assert rect(s) == frame
+    # The window can be resized, and what's in it follows.
+    a.resize_preview(640, 480)
+    a.wait(lambda s: rect(s) == [0, 0, 640, 480], "resized")
     a.close()
 
 
 @check
-def a_job_can_be_stopped_from_under_the_popup(h):
+def a_job_can_be_stopped_while_previewing(h):
     fs = fresh_fs()
     tree(fs, {"dst/x": ""})
     with open(fs / "big.bin", "wb") as f:
@@ -1372,11 +1503,13 @@ def a_job_can_be_stopped_from_under_the_popup(h):
     a.key("v", mods=["ctrl"])
     a.wait(lambda s: s["jobs"] == 1, "the copy starts", timeout=10)
     a.key("space")
-    a.wait(lambda s: s["preview"], "popup over it")
+    a.wait(lambda s: s["preview"], "the preview window")
+    # The list is still there to use.
+    a.focus_list()
     a.key("period", mods=["ctrl"])
     s = a.wait(lambda s: s["jobs"] == 0, "the copy ends", timeout=20)
     assert not (fs / "dst/big.bin").exists(), "Ctrl+. stopped it, rather than it finishing"
-    assert s["preview"], "and the popup stays"
+    assert s["preview"], "and the preview stays"
     a.close()
 
 
@@ -1448,8 +1581,10 @@ def a_video_plays_in_the_popup_and_answers_its_controls(h):
     a.wait(lambda s: video_of(s)["muted"], "muted")
     a.key("m")
     a.wait(lambda s: not video_of(s)["muted"], "unmuted")
-    # The mouse: the frame is 640x480 at 320,160 here, with the footer at the bottom.
+    # The mouse: the frame is the whole window, with the footer at the bottom.
+    wx, wy, _, _ = a.preview_window()
     x, y, w, h_ = preview_of(a.state())["rect"]
+    x, y = x + wx, y + wy
     foot = y + h_ - 16
     a.click(x + w // 2, y + h_ // 2)
     a.wait(lambda s: video_of(s)["paused"], "a click on the picture pauses")
@@ -1475,9 +1610,8 @@ def a_video_plays_in_the_popup_and_answers_its_controls(h):
     a.key("Up")
     a.wait(lambda s: video_of(s).get("shown", 0) > 2, "playing again")
     w_before = preview_of(a.state())["w"]
-    a.sway("output HEADLESS-1 resolution 960x600")
+    a.resize_preview(640, 480)
     a.wait(lambda s: preview_of(s)["w"] < w_before, "smaller frames after a resize")
-    a.sway("output HEADLESS-1 resolution 1280x800")
     a.key("space")
     a.wait(lambda s: s["preview"] is None, "closed")
     end = time.monotonic() + 3
@@ -1553,12 +1687,11 @@ def a_video_keeps_playing_through_a_stream_of_resizes(h):
     pid = players(a)[0]
     threads = [Path(f"/proc/{pid}/task/{t}/comm").read_text().strip() for t in os.listdir(f"/proc/{pid}/task")]
     assert not [t for t in threads if t.startswith("lua")], threads
-    sizes = [(1280 - i * 6, 800 - i * 3) for i in range(70)] + [(860 + i * 6, 590 + i * 3) for i in range(70)]
+    sizes = [(960 - i * 6, 720 - i * 3) for i in range(70)] + [(540 + i * 6, 510 + i * 3) for i in range(70)]
     for w, h_ in sizes * 2:
-        a.sway(f"output HEADLESS-1 resolution {w}x{h_}")
+        a.resize_preview(w, h_)
         s = a.state()
         assert preview_of(s).get("state") == "video", s["preview"]
-    a.sway("output HEADLESS-1 resolution 1280x800")
     shown = video_of(a.state())["shown"]
     a.wait(lambda s: video_of(s)["shown"] > shown + 10, "still playing afterwards")
     assert players(a), "the same player is still there"
@@ -1633,8 +1766,8 @@ def a_heic_photo_isnt_treated_as_a_video(h):
     a = App(h, fs)
     a.wait(lambda s: s["count"] == 1, "listing")
     a.key("space")
-    s = a.wait(lambda s: preview_of(s).get("state") == "message", "words")
-    assert "No preview" in preview_of(s)["message"], s["preview"]
+    s = a.wait(lambda s: preview_of(s).get("state") == "info", "what it is")
+    assert preview_of(s)["kind"].startswith("image/hei"), s["preview"]
     a.close()
 
 
@@ -1651,10 +1784,13 @@ def files_that_wont_play_say_why(h):
     a = App(h, fs)
     a.wait(lambda s: s["count"] == 3, "listing")
     a.key("space")
-    for name, words in (("a-cut-short.mp4", "can't be played"), ("b-rubbish.mp4", "can't be played"), ("c-sound-only.m4a", "No preview")):
+    for name, words in (("a-cut-short.mp4", "can't be played"), ("b-rubbish.mp4", "can't be played")):
         s = a.wait(lambda s: preview_of(s).get("name") == name and preview_of(s)["state"] == "message", name, timeout=10)
         assert words in preview_of(s)["message"], s["preview"]
         a.key("Down")
+    # No picture, so it says what it is.
+    s = a.wait(lambda s: preview_of(s).get("name") == "c-sound-only.m4a" and preview_of(s)["state"] == "info", "sound only", timeout=10)
+    assert preview_of(s)["kind"].startswith("audio/"), s["preview"]
     assert a.alive()
     a.close()
 
@@ -1809,6 +1945,7 @@ def the_decoder_is_locked_down_and_moving_on_frees_everything(h):
         time.sleep(0.01)
     assert mapped_previews(a.proc.pid) == 0, "nothing still mapped after closing"
     # Leaving mid-decode kills the decoder rather than letting it finish.
+    a.focus_list()
     a.key("Up")
     a.wait(lambda s: s["cursor"] == 0, "back on the huge one")
     a.key("space")
@@ -1881,25 +2018,27 @@ def odd_things_to_preview(h):
     a = App(h, fs)
     a.wait(lambda s: s["count"] == 7, "listing")
     a.key("space")
+    # Words for what's wrong, a picture, or what the thing is.
     want = {
-        "folder": "Folders",
-        "dangling.png": "no longer here",
-        "empty": "No preview",
-        "locked.png": "permission",
-        "ok.png": None,
-        "pipe": "No preview",
-        "shortcut.png": None,
+        "folder": ("info", "inode/directory"),
+        "dangling.png": ("message", "no longer here"),
+        "empty": ("info", "application/x-zerosize"),
+        "locked.png": ("message", "permission"),
+        "ok.png": ("image", None),
+        "pipe": ("info", "inode/fifo"),
+        "shortcut.png": ("image", None),
     }
     try:
-        for i, (name, words) in enumerate(want.items()):
+        for i, (name, (state, words)) in enumerate(want.items()):
             if i:
                 a.key("Down")
-            s = a.wait(lambda s: preview_of(s).get("name") == name and preview_of(s)["state"] in ("image", "message"), name)
+            s = a.wait(lambda s: preview_of(s).get("name") == name and preview_of(s)["state"] in ("image", "message", "info"), name)
             p = preview_of(s)
-            if words is None:
-                assert p["state"] == "image", p
-            else:
-                assert p["state"] == "message" and words in p["message"], p
+            assert p["state"] == state, p
+            if state == "message":
+                assert words in p["message"], p
+            if state == "info":
+                assert p["kind"] == words, p
     finally:
         os.chmod(fs / "locked.png", 0o600)
     assert a.alive()
@@ -1919,15 +2058,15 @@ def a_file_deleted_while_previewing_and_a_tiny_window(h):
     a.wait(lambda s: preview_of(s).get("name") == "b.png", "moves on to what's still there")
     a.wait(lambda s: preview_of(s)["state"] == "image", "and shows it")
     # Resizing down to almost nothing and back, with every key that does arithmetic.
-    a.sway("output HEADLESS-1 resolution 200x60")
+    a.resize_preview(60, 20)
     time.sleep(0.3)
     a.key("plus")
     a.key("minus")
     a.key("Right", mods=["shift"])
     a.key("0")
     time.sleep(0.2)
-    assert a.alive(), "tiny window"
-    a.sway("output HEADLESS-1 resolution 1280x800")
+    assert a.alive() and a.state()["preview"], "tiny window"
+    a.resize_preview(960, 720)
     time.sleep(0.3)
     assert a.alive() and a.state()["preview"]
     (fs / "b.png").unlink()

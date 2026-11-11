@@ -9,6 +9,7 @@ mod icons;
 mod media;
 mod paint;
 mod preview;
+mod preview_window;
 mod service;
 mod text;
 mod wl;
@@ -37,13 +38,30 @@ struct Dirs {
     config: PathBuf,
     cache: PathBuf,
     data: PathBuf,
+    /// The shared-mime-info folders, first wins.
+    mime: Vec<PathBuf>,
 }
 
 /// The one place Gannet reads where things live. Everything else gets paths as arguments.
 fn dirs() -> Dirs {
     let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| "/".into());
     let var = |name: &str, default: &str| std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(default));
-    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data: var("XDG_DATA_HOME", ".local/share"), home }
+    let data = var("XDG_DATA_HOME", ".local/share");
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS").filter(|d| !d.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    let mut mime = vec![data.join("mime")];
+    mime.extend(std::env::split_paths(&data_dirs).filter(|p| p.is_absolute()).map(|p| p.join("mime")));
+    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data, home, mime }
+}
+
+/// The language messages are in, as GLib chooses it for GTK apps: the first of `LANGUAGE`, then
+/// the locale.
+fn language() -> Option<String> {
+    language_from(|v| std::env::var(v).ok())
+}
+
+fn language_from(var: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let preferred = var("LANGUAGE").and_then(|l| l.split(':').find(|l| !l.is_empty()).map(str::to_string));
+    preferred.or_else(|| ["LC_ALL", "LC_MESSAGES", "LANG"].iter().find_map(|v| var(v).filter(|l| !l.is_empty())))
 }
 
 /// What to show: the folder, and an entry to put the cursor on if a file was named.
@@ -85,7 +103,7 @@ fn main() {
             service::claim_main(a == service::RELEASE_ARG);
         }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       gannet {} | {}\n       gannet {}", service::CLAIM_ARG, service::RELEASE_ARG, service::ARG);
+            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       gannet {} | {}\n       gannet {}", preview_window::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG);
             return;
         }
         if a == "--version" {
@@ -94,18 +112,38 @@ fn main() {
         }
     }
     let d = dirs();
+    // `--preview FILE`: the preview window, on its own.
+    let viewing = match arg.as_deref().is_some_and(|a| a == preview_window::ARG) {
+        false => None,
+        true => match preview_window::parse(std::env::args_os().skip(2)) {
+            Some(mut v) => {
+                let abs = start_location(Some(v.path.into_os_string()), &d.home);
+                v.path = abs;
+                Some(v)
+            }
+            None => {
+                eprintln!("usage: {}", preview_window::USAGE);
+                std::process::exit(2);
+            }
+        },
+    };
     // `--select PATH...`: the first path's folder, with the paths in it selected.
     let selecting = arg.as_deref().is_some_and(|a| a == service::SELECT_ARG);
     let picks: Vec<PathBuf> = if selecting { std::env::args_os().skip(2).map(|a| start_location(Some(a), &d.home)).collect() } else { Vec::new() };
-    let start_dir = match picks.first() {
-        Some(first) => first.parent().map_or_else(|| first.clone(), Path::to_path_buf),
-        None if selecting => d.home.clone(),
-        None => start_location(arg, &d.home),
+    let start_dir = match (picks.first(), &viewing) {
+        (_, Some(v)) => v.path.parent().map_or_else(|| v.path.clone(), Path::to_path_buf),
+        (Some(first), _) => first.parent().map_or_else(|| first.clone(), Path::to_path_buf),
+        (None, _) if selecting => d.home.clone(),
+        (None, _) => start_location(arg, &d.home),
     };
     let theme_paths = ThemePaths::for_home(&d.home, &d.config);
     let (colors, source) = theme::load(&theme_paths);
 
-    let mut wl = match wl::Wl::connect("Gannet", "com.aliasproject.Gannet", 1100, 700) {
+    let window = match &viewing {
+        Some(_) => wl::Wl::connect("Preview", preview_window::APP_ID, 960, 720),
+        None => wl::Wl::connect("Gannet", "com.aliasproject.Gannet", 1100, 700),
+    };
+    let mut wl = match window {
         Ok(w) => w,
         Err(e) => {
             eprintln!("gannet: {e}");
@@ -138,6 +176,7 @@ fn main() {
     let dir_watch = Watch::new().ok().map(Arc::new);
     app.watch = dir_watch.clone();
     app.cache_home = Some(d.cache.clone());
+    app.kinds = Arc::new(preview::Kinds::new(d.mime.clone(), language()));
     let mut theme_watch = ThemeWatch::new(theme_paths.clone()).ok();
     let mut theme_due: Option<Instant> = None;
     #[cfg(feature = "bench")]
@@ -146,14 +185,24 @@ fn main() {
         app.slow_preview = std::env::var("GANNET_SLOW_PREVIEW_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
     }
     let names: Vec<Vec<u8>> = picks.iter().filter(|p| p.parent() == Some(start_dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_encoded_bytes().to_vec()).collect();
-    if names.is_empty() {
+    // The list's preview window, while one is open.
+    let mut previewer: Option<preview_window::Child> = None;
+    let following = viewing.as_ref().is_some_and(|v| v.follow);
+    if let Some(v) = viewing {
+        app.show_hidden = v.hidden;
+        app.sort = v.sort;
+        app.start_viewer(v.path);
+        if v.follow {
+            preview_window::listen_to_the_list(hub.clone());
+        }
+    } else if names.is_empty() {
         app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None });
     } else {
         app.open_selecting(start_dir, names);
     }
     let mut first_frame = true;
     #[cfg(feature = "bench")]
-    let mut bench = bench::Bench::new();
+    let mut bench = bench::Bench::new(app.viewer);
 
     loop {
         #[cfg(feature = "bench")]
@@ -200,6 +249,28 @@ fn main() {
                 Cmd::ReadDrop { dest, trash, decided } => read_drop(&wl, &hub, dest, trash, decided),
                 Cmd::FinishDrop => wl.finish_drop(),
                 Cmd::AbandonDrop => wl.abandon_drop(),
+                Cmd::OpenPreview { generation, path, hidden, sort } => {
+                    // Replacing one closes it.
+                    previewer = None;
+                    match preview_window::Child::start(&hub, generation, &path, hidden, sort) {
+                        Ok(child) => previewer = Some(child),
+                        Err(e) => {
+                            hub.send(Msg::Notice(format!("Couldn't open the preview: {e}")));
+                            hub.send(Msg::PreviewEnded { generation, crashed: false });
+                        }
+                    }
+                }
+                Cmd::ClosePreview => previewer = None,
+                Cmd::PreviewShow(path) => {
+                    if let Some(p) = previewer.as_mut() {
+                        p.show(&path);
+                    }
+                }
+                Cmd::PreviewStepped(path) => {
+                    if following {
+                        preview_window::tell_the_list(&path);
+                    }
+                }
                 Cmd::Quit => return,
             }
         }
@@ -405,6 +476,16 @@ mod tests {
     }
 
     #[test]
+    fn the_language_is_glibs() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |v: &str| pairs.iter().find(|(k, _)| *k == v).map(|(_, x)| x.to_string());
+        assert_eq!(language_from(env(&[("LANG", "en_US.UTF-8"), ("LANGUAGE", "de:fr")])).as_deref(), Some("de"));
+        assert_eq!(language_from(env(&[("LANG", "en_US.UTF-8")])).as_deref(), Some("en_US.UTF-8"));
+        assert_eq!(language_from(env(&[("LANG", "en_US.UTF-8"), ("LC_ALL", "pt_BR.UTF-8")])).as_deref(), Some("pt_BR.UTF-8"));
+        assert_eq!(language_from(env(&[("LANG", "C.UTF-8"), ("LANGUAGE", ":de")])).as_deref(), Some("de"), "as GLib reads it, in any locale");
+        assert_eq!(language_from(env(&[])), None);
+    }
+
+    #[test]
     fn a_really_broken_connection_is() {
         assert!(read_is_fatal(&WaylandError::Io(Error::from(ErrorKind::BrokenPipe))));
         assert!(read_is_fatal(&WaylandError::Io(Error::from(ErrorKind::ConnectionReset))));
@@ -435,10 +516,12 @@ mod bench {
     }
 
     impl Bench {
-        pub fn new() -> Self {
+        /// The preview window writes beside the list, as both see the same environment.
+        pub fn new(viewer: bool) -> Self {
+            let suffix = if viewer { ".preview" } else { "" };
             Self {
-                log: std::env::var("GANNET_BENCH_LOG").ok().and_then(|p| std::fs::File::create(p).ok()),
-                state_path: std::env::var("GANNET_STATE").ok(),
+                log: std::env::var("GANNET_BENCH_LOG").ok().and_then(|p| std::fs::File::create(format!("{p}{suffix}")).ok()),
+                state_path: std::env::var("GANNET_STATE").ok().map(|p| format!("{p}{suffix}")),
                 last_state: String::new(),
                 rows_stamped: None,
             }
@@ -512,7 +595,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"drag\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -544,6 +627,7 @@ mod bench {
             a.undo.len(),
             a.panel_rows(),
             preview(a),
+            a.previewer.as_ref().and_then(|p| p.file_name()).map_or_else(|| "null".to_string(), |n| esc(&n.to_string_lossy())),
             esc(&drag(a)),
         )
     }
@@ -569,6 +653,11 @@ mod bench {
             Content::Image { image, thumbnail: false } => ("image", image.w, image.h, ""),
             Content::Video(video) => ("video", video.frame.map_or(0, |f| f.1), video.frame.map_or(0, |f| f.2), ""),
             Content::Message(m) => ("message", 0, 0, m.as_str()),
+            Content::Info(i) => ("info", i.thumbnail.as_ref().map_or(0, |t| t.w), i.thumbnail.as_ref().map_or(0, |t| t.h), i.description.as_str()),
+        };
+        let kind = match &p.content {
+            Content::Info(i) => esc(&i.mime),
+            _ => "null".to_string(),
         };
         let rect = a.preview_rect();
         let video = match &p.content {
@@ -580,7 +669,7 @@ mod bench {
         };
         let zoom = p.zoom.map_or_else(|| "null".to_string(), |z| format!("{z:.3}"));
         format!(
-            "{{\"name\":{},\"state\":{},\"w\":{w},\"h\":{h},\"message\":{},\"zoom\":{zoom},\"pan\":[{:.0},{:.0}],\"scaled\":{},\"size\":{},\"rect\":[{},{},{},{}],\"video\":{video}}}",
+            "{{\"name\":{},\"state\":{},\"kind\":{kind},\"w\":{w},\"h\":{h},\"message\":{},\"zoom\":{zoom},\"pan\":[{:.0},{:.0}],\"scaled\":{},\"size\":{},\"rect\":[{},{},{},{}],\"video\":{video}}}",
             esc(&name),
             esc(state),
             esc(message),

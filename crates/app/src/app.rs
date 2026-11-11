@@ -71,6 +71,20 @@ pub enum Msg {
     /// `data` is `None` if it was too big to trust.
     Clipboard(Option<Vec<u8>>, String, Paste),
     Preview(preview::Event),
+    /// The preview window stepped to another file.
+    PreviewStepped {
+        generation: u64,
+        path: PathBuf,
+    },
+    /// The preview window has gone, and whether it went wrong.
+    PreviewEnded {
+        generation: u64,
+        crashed: bool,
+    },
+    /// In the preview window: the list's cursor is on another file.
+    PreviewShow(PathBuf),
+    /// In the preview window: the list that opened it has gone.
+    ListGone,
     /// A file list dropped from a Wayland drag, read and looked at off the main thread.
     Dropped(Dropped),
     DragSource { drag: u64, facts: Option<(u64, bool)> },
@@ -114,6 +128,18 @@ pub enum Cmd {
     ReadDrop { dest: PathBuf, trash: bool, decided: Option<DropAction> },
     FinishDrop,
     AbandonDrop,
+    /// Starts the preview window on a file, sorted and filtered as this list is.
+    OpenPreview {
+        generation: u64,
+        path: PathBuf,
+        hidden: bool,
+        sort: SortSpec,
+    },
+    ClosePreview,
+    /// Tells the preview window to show another file.
+    PreviewShow(PathBuf),
+    /// In the preview window: tells the list which file is showing now.
+    PreviewStepped(PathBuf),
     Quit,
 }
 
@@ -450,6 +476,18 @@ pub struct App {
 
     pub preview: Option<Preview>,
     pub(crate) preview_gen: u64,
+    /// This app is the preview window rather than a file manager.
+    pub viewer: bool,
+    /// The file the other side last heard about. In the list, `Some` while a preview window is
+    /// open.
+    pub previewer: Option<PathBuf>,
+    /// In the list: where its cursor was when it last told the window, or followed it. Only
+    /// the cursor moving from there is news; the window showing something the list doesn't
+    /// have, like a file its filter hides, isn't.
+    pub(crate) previewer_cursor: Option<PathBuf>,
+    pub(crate) previewer_gen: u64,
+    /// The file-type database, for saying what any file is.
+    pub kinds: Arc<preview::Kinds>,
     /// Where other programs keep thumbnails.
     pub cache_home: Option<PathBuf>,
     pub slow_preview: Option<Duration>,
@@ -547,6 +585,11 @@ impl App {
             trash_mounts: None,
             preview: None,
             preview_gen: 0,
+            viewer: false,
+            previewer: None,
+            previewer_cursor: None,
+            previewer_gen: 0,
+            kinds: Arc::new(preview::Kinds::default()),
             cache_home: None,
             slow_preview: None,
             key_is_repeat: false,
@@ -941,6 +984,7 @@ impl App {
     pub fn on_msg(&mut self, m: Msg) {
         self.handle_msg(m);
         self.preview_sync();
+        self.preview_follow();
         // A reload can move the rows under a drag, and a disk can have just answered.
         self.refresh_file_drag();
         self.refresh_incoming();
@@ -949,6 +993,10 @@ impl App {
     fn handle_msg(&mut self, m: Msg) {
         match m {
             Msg::Preview(e) => self.on_preview(e),
+            Msg::PreviewStepped { generation, path } => self.on_preview_stepped(generation, path),
+            Msg::PreviewEnded { generation, crashed } => self.on_preview_ended(generation, crashed),
+            Msg::PreviewShow(path) => self.on_preview_show(path),
+            Msg::ListGone => self.cmds.push(Cmd::Quit),
             Msg::Dropped(d) => self.on_dropped(d),
             Msg::DragSource { drag, facts } => {
                 if let Some(FileDrag::Active(d)) = &mut self.file_drag
@@ -1188,7 +1236,7 @@ impl App {
     }
 
     /// Moves the cursor. Plain moves select the row they land on, as in most file managers.
-    fn move_cursor(&mut self, to: usize, m: Mods) {
+    pub(crate) fn move_cursor(&mut self, to: usize, m: Mods) {
         if self.rows.is_empty() {
             return;
         }
@@ -1764,7 +1812,7 @@ impl App {
 
     /// Closing the window would stop what's running, so that gets asked first.
     pub(crate) fn request_close(&mut self) {
-        if self.jobs.is_empty() {
+        if self.jobs.is_empty() || self.viewer {
             self.cmds.push(Cmd::Quit);
         } else if self.dialog.is_none() {
             self.dialog = Some(Dialog::ConfirmQuit { at: 1 });
@@ -1833,6 +1881,7 @@ impl App {
         self.handle_input(i);
         // Whatever just happened may have opened a menu or dialog, like a close request.
         self.refresh_file_drag();
+        self.preview_follow();
     }
 
     fn handle_input(&mut self, i: Input) {
@@ -2107,7 +2156,7 @@ impl App {
             (k::KEY_Return | k::KEY_KP_Enter, _, _) => self.action(Action::Open),
             // Holding either of these would flicker, and neither means anything repeated.
             (k::KEY_space, _, false) if self.key_is_repeat => {}
-            (k::KEY_space, false, false) => self.action(Action::Preview),
+            (k::KEY_space, false, false) => self.toggle_preview(),
             (k::KEY_space, true, false) => {
                 if let Some(&id) = self.rows.get(self.cursor) {
                     self.selection_epoch += 1;
@@ -2120,7 +2169,9 @@ impl App {
             // Each press undoes one thing, and holding it shouldn't run through them all.
             (k::KEY_Escape, _, _) if self.key_is_repeat => {}
             (k::KEY_Escape, _, _) => {
-                if !self.filter.is_empty() {
+                if self.previewer.is_some() {
+                    self.close_preview();
+                } else if !self.filter.is_empty() {
                     self.filter.clear();
                     self.rederive(false);
                     self.invalidate(self.layout().toolbar);
@@ -2476,10 +2527,6 @@ impl App {
         }
         // The release of a drag can go missing if the compositor takes the pointer away.
         self.cancel_file_drag();
-        // A popup that hasn't appeared yet can't be what this click was aimed at.
-        if self.preview.is_some() && self.preview_rect().is_empty() {
-            self.close_preview();
-        }
         let (x, y) = self.pointer;
         let hit = self.hit(x, y);
         if self.dialog.is_some() {
@@ -5015,31 +5062,64 @@ mod tests {
         r
     }
 
+    /// The name of the file the preview window is showing, as the list knows it.
     fn previewing(r: &Rig) -> Option<String> {
-        r.app.preview.as_ref().map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
+        r.app.previewer.as_ref().map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
     }
 
     fn with_mods(r: &mut Rig, sym: u32, utf8: &str, mods: Mods) {
         r.app.input(Input::Key { keysym: sym, utf8: utf8.into(), mods, repeat: false });
     }
 
+    /// The names the list asked a preview window to open, or to show, since the last look.
+    fn sent(r: &mut Rig) -> Vec<String> {
+        let name = |p: &PathBuf| p.file_name().unwrap().to_string_lossy().into_owned();
+        r.app
+            .cmds
+            .drain(..)
+            .filter_map(|c| match c {
+                Cmd::OpenPreview { path, .. } => Some(format!("open {}", name(&path))),
+                Cmd::PreviewShow(path) => Some(format!("show {}", name(&path))),
+                Cmd::ClosePreview => Some("close".to_string()),
+                Cmd::PreviewStepped(path) => Some(format!("stepped {}", name(&path))),
+                Cmd::Quit => Some("quit".to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn space_previews_and_closes_and_leaves_the_selection_alone() {
+    fn space_opens_the_preview_window_and_closes_it_and_leaves_the_selection_alone() {
         let mut r = preview_rig("space");
+        r.app.cmds.clear();
         r.key(k::KEY_space, " ");
+        assert_eq!(sent(&mut r), ["open a"]);
         assert_eq!(previewing(&r).as_deref(), Some("a"));
         assert_eq!(r.selected_names(), ["a"], "showing the first row selects it, as arrows do");
         r.key(k::KEY_space, " ");
+        assert_eq!(sent(&mut r), ["close"]);
         assert_eq!(previewing(&r), None);
         assert_eq!(r.selected_names(), ["a"]);
         r.key(k::KEY_space, " ");
         r.key(k::KEY_Escape, "");
-        assert_eq!(previewing(&r), None);
-        assert_eq!(r.selected_names(), ["a"], "Escape closes the popup first, and nothing else");
+        assert_eq!(sent(&mut r), ["open a", "close"]);
+        assert_eq!(r.selected_names(), ["a"], "Escape closes the preview first, and nothing else");
     }
 
     #[test]
-    fn ctrl_space_toggles_selection_without_a_popup() {
+    fn the_window_opens_sorted_and_filtered_as_the_list_is() {
+        let mut r = preview_rig("settings");
+        r.app.show_hidden = true;
+        r.app.sort = SortSpec { key: SortKey::Size, descending: true };
+        r.app.cmds.clear();
+        r.key(k::KEY_space, " ");
+        let Some(Cmd::OpenPreview { hidden, sort, .. }) = r.app.cmds.pop() else { panic!("no window") };
+        assert!(hidden);
+        assert_eq!(sort, SortSpec { key: SortKey::Size, descending: true });
+    }
+
+    #[test]
+    fn ctrl_space_toggles_selection_without_a_preview() {
         let mut r = preview_rig("ctrl-space");
         let ctrl = Mods { ctrl: true, ..Mods::default() };
         with_mods(&mut r, k::KEY_space, " ", ctrl);
@@ -5050,6 +5130,7 @@ mod tests {
         assert_eq!(r.selected_names(), ["a", "b"]);
         with_mods(&mut r, k::KEY_space, " ", ctrl);
         assert_eq!(r.selected_names(), ["a"]);
+        assert!(sent(&mut r).is_empty());
     }
 
     #[test]
@@ -5066,83 +5147,109 @@ mod tests {
     }
 
     #[test]
-    fn arrows_walk_the_files_and_the_ends_stay_put() {
-        let mut r = preview_rig("arrows");
+    fn moving_in_the_list_tells_the_window_once() {
+        let mut r = preview_rig("follow");
         r.key(k::KEY_space, " ");
-        r.key(k::KEY_Up, "");
-        assert_eq!(previewing(&r).as_deref(), Some("a"));
-        r.key(k::KEY_Down, "");
-        assert_eq!(previewing(&r).as_deref(), Some("b"));
-        r.key(k::KEY_Right, "");
-        assert_eq!(previewing(&r).as_deref(), Some("c"));
-        r.key(k::KEY_Down, "");
-        assert_eq!(previewing(&r).as_deref(), Some("c"));
-        r.key(k::KEY_Left, "");
-        assert_eq!(previewing(&r).as_deref(), Some("b"));
-        assert_eq!(r.selected_names(), ["b"], "the selection follows, so Enter opens what's showing");
+        r.app.cmds.clear();
+        for _ in 0..3 {
+            with_mods(&mut r, k::KEY_Down, "", Mods::default());
+        }
+        assert_eq!(sent(&mut r), ["show b", "show c"], "the end stays put, and isn't sent again");
+        // The list can do everything else while the window is up.
+        r.key(k::KEY_F2, "");
+        assert!(matches!(r.app.edit, Edit::Rename { .. }));
     }
 
     #[test]
-    fn walking_doesnt_lose_a_selection_of_several() {
+    fn the_windows_steps_move_the_cursor() {
+        let mut r = preview_rig("stepped");
+        r.key(k::KEY_space, " ");
+        let generation = r.app.previewer_gen;
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::PreviewStepped { generation, path: r.work().join("c") });
+        assert_eq!(r.app.cursor, 2);
+        assert_eq!(r.selected_names(), ["c"], "the selection follows, so Enter opens what's showing");
+        assert!(sent(&mut r).is_empty(), "and nothing is sent back");
+        // From a window that's since been replaced, or a folder the list has left.
+        r.app.on_msg(Msg::PreviewStepped { generation: generation - 1, path: r.work().join("a") });
+        r.app.on_msg(Msg::PreviewStepped { generation, path: r.root.join("elsewhere/a") });
+        assert_eq!(r.app.cursor, 2);
+    }
+
+    #[test]
+    fn a_step_to_a_file_the_list_hides_isnt_undone() {
+        let mut r = preview_rig("filtered");
+        fs::write(r.work().join("ab"), "x").unwrap();
+        r.app.reload();
+        r.pump_until("the new file", |a| !a.loading && a.rows.len() == 4);
+        r.app.filter = "a".into();
+        r.app.rederive(false);
+        r.pump_until("filtered", |a| a.rows.len() == 2);
+        r.key(k::KEY_space, " ");
+        let generation = r.app.previewer_gen;
+        r.app.cmds.clear();
+        // The window walks on to "b", which the filter hides from the list.
+        r.app.on_msg(Msg::PreviewStepped { generation, path: r.work().join("b") });
+        assert_eq!(r.app.cursor, 0, "the list's cursor stays");
+        assert!(sent(&mut r).is_empty(), "and doesn't pull the window back");
+        assert_eq!(previewing(&r).as_deref(), Some("b"));
+        // Moving in the list is still news.
+        with_mods(&mut r, k::KEY_Down, "", Mods::default());
+        assert_eq!(sent(&mut r), ["show ab"]);
+    }
+
+    #[test]
+    fn the_menus_preview_brings_the_window_back_to_the_cursor() {
+        let mut r = preview_rig("menu-back");
+        r.key(k::KEY_space, " ");
+        let generation = r.app.previewer_gen;
+        // The window walked off to something the list doesn't follow.
+        r.app.on_msg(Msg::PreviewStepped { generation, path: r.root.join("elsewhere/x") });
+        r.app.cmds.clear();
+        r.app.action(Action::Preview);
+        assert_eq!(sent(&mut r), ["show a"]);
+        r.app.action(Action::Preview);
+        assert!(sent(&mut r).is_empty(), "and only once");
+    }
+
+    #[test]
+    fn stepping_doesnt_lose_a_selection_of_several() {
         let mut r = preview_rig("several");
         r.app.select_all();
         r.key(k::KEY_space, " ");
-        r.key(k::KEY_Down, "");
-        assert_eq!(previewing(&r).as_deref(), Some("b"));
+        let generation = r.app.previewer_gen;
+        r.app.on_msg(Msg::PreviewStepped { generation, path: r.work().join("b") });
+        assert_eq!(r.app.cursor, 1);
         assert_eq!(r.selected_names(), ["a", "b", "c"]);
     }
 
     #[test]
-    fn other_keys_dont_reach_the_list_under_the_popup() {
-        let mut r = preview_rig("keys");
+    fn a_window_that_ends_is_forgotten_and_a_crash_is_reported() {
+        let mut r = preview_rig("ended");
         r.key(k::KEY_space, " ");
-        r.key(k::KEY_c, "c");
-        r.key(k::KEY_Delete, "");
-        r.key(k::KEY_F2, "");
-        assert_eq!(r.app.cursor, 0, "typing didn't jump");
-        assert!(r.app.jobs.is_empty(), "Delete didn't trash");
-        assert!(matches!(r.app.edit, Edit::None), "F2 didn't rename");
-        assert!(r.work().join("a").exists());
+        let generation = r.app.previewer_gen;
+        r.app.on_msg(Msg::PreviewEnded { generation: generation - 1, crashed: true });
+        assert!(r.app.previewer.is_some(), "an older window's ending isn't this one's");
+        r.app.on_msg(Msg::PreviewEnded { generation, crashed: false });
+        assert!(r.app.previewer.is_none());
+        assert!(r.app.notices.is_empty(), "closing it from the window is ordinary");
+        r.key(k::KEY_space, " ");
+        r.app.on_msg(Msg::PreviewEnded { generation: r.app.previewer_gen, crashed: true });
+        assert!(r.app.previewer.is_none());
+        assert!(r.app.notices.iter().any(|n| n.contains("stopped unexpectedly")), "{:?}", r.app.notices);
+        r.app.cmds.clear();
+        r.key(k::KEY_space, " ");
+        assert_eq!(sent(&mut r), ["open a"], "and Space opens a new one");
     }
 
     #[test]
     fn nothing_to_preview_in_an_empty_folder() {
         let mut r = Rig::new("empty");
         r.open(r.work());
+        r.app.cmds.clear();
         r.key(k::KEY_space, " ");
         assert_eq!(previewing(&r), None);
-    }
-
-    #[test]
-    fn a_file_removed_underneath_moves_on_and_an_empty_folder_closes() {
-        let mut r = preview_rig("removed");
-        r.key(k::KEY_space, " ");
-        fs::remove_file(r.work().join("a")).unwrap();
-        r.app.reload();
-        r.pump_until("the next file", |a| a.preview.as_ref().is_some_and(|p| p.path.ends_with("b")));
-        for name in ["b", "c"] {
-            fs::remove_file(r.work().join(name)).unwrap();
-        }
-        r.app.reload();
-        r.pump_until("the popup to close", |a| a.preview.is_none());
-    }
-
-    #[test]
-    fn a_file_overwritten_while_showing_is_read_again() {
-        let mut r = preview_rig("overwritten");
-        r.pump_until("a size for the first row", |a| a.listing.as_ref().is_some_and(|l| matches!(l.stat(a.rows[0]), Stat::Known { .. })));
-        r.key(k::KEY_space, " ");
-        let before = r.app.preview_gen;
-        // Nothing changed: reloading leaves it alone, so a busy folder doesn't restart it.
-        r.app.reload();
-        r.pump_until("the reload", |a| !a.loading);
-        r.pump_until("the new size", |a| a.listing.as_ref().is_some_and(|l| matches!(l.stat(a.rows[0]), Stat::Known { .. })));
-        r.idle();
-        assert_eq!(r.app.preview_gen, before, "the same file isn't read twice");
-        fs::write(r.work().join("a"), "a good deal longer").unwrap();
-        r.app.reload();
-        r.pump_until("reading it again", |a| a.preview_gen > before);
-        assert_eq!(previewing(&r).as_deref(), Some("a"));
+        assert!(sent(&mut r).is_empty());
     }
 
     #[test]
@@ -5175,24 +5282,156 @@ mod tests {
     }
 
     #[test]
-    fn a_click_before_the_popup_appears_still_lands() {
-        let mut r = preview_rig("early-click");
-        r.app.resized(1000, 700, 1.0);
-        r.key(k::KEY_space, " ");
-        assert_eq!(r.app.preview_rect(), Rect::default(), "nothing drawn yet");
-        let l = r.app.layout();
-        r.app.input(Input::Move { x: (l.list.x + 50) as f64, y: (l.list.y + l.row_h + l.row_h / 2) as f64 });
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
-        assert_eq!(previewing(&r), None);
-        assert_eq!(r.selected_names(), ["b"], "the click selected the row it was on");
+    fn the_context_menu_previews_and_doesnt_close_an_open_window() {
+        let mut r = preview_rig("menu");
+        r.key(k::KEY_Down, "");
+        r.app.action(Action::Preview);
+        assert_eq!(previewing(&r).as_deref(), Some("a"));
+        r.key(k::KEY_Down, "");
+        r.app.cmds.clear();
+        r.app.action(Action::Preview);
+        assert_eq!(previewing(&r).as_deref(), Some("b"));
+        assert!(!sent(&mut r).contains(&"close".to_string()));
+    }
+
+    // ---- The preview window itself ----
+
+    /// The preview window on `name` in a folder of plain files, its listing read.
+    fn viewer_rig(tag: &str, name: &str) -> Rig {
+        let mut r = Rig::new(tag);
+        for name in ["a", "b", "c"] {
+            fs::write(r.work().join(name), "x").unwrap();
+        }
+        r.app.start_viewer(r.work().join(name));
+        r.pump_until("folder loaded", |a| !a.loading);
+        r
+    }
+
+    fn showing(r: &Rig) -> Option<String> {
+        r.app.preview.as_ref().map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn the_window_shows_its_file_at_once_then_walks_its_folder() {
+        let mut r = Rig::new("viewer-start");
+        for name in ["a", "b", "c"] {
+            fs::write(r.work().join(name), "x").unwrap();
+        }
+        r.app.start_viewer(r.work().join("b"));
+        assert_eq!(showing(&r).as_deref(), Some("b"), "before the folder is read");
+        assert!(matches!(r.app.cmds.last(), Some(Cmd::Title(t)) if t == "b"), "named for the file");
+        r.pump_until("folder loaded", |a| !a.loading);
+        assert_eq!(showing(&r).as_deref(), Some("b"), "the cursor landed on it");
+        r.app.cmds.clear();
+        r.key(k::KEY_Down, "");
+        r.key(k::KEY_Right, "");
+        assert_eq!(showing(&r).as_deref(), Some("c"));
+        r.key(k::KEY_Up, "");
+        r.key(k::KEY_Left, "");
+        r.key(k::KEY_Left, "");
+        assert_eq!(showing(&r).as_deref(), Some("a"));
+        assert_eq!(sent(&mut r), ["stepped c", "stepped b", "stepped a"], "each step is told to the list, and the ends stay put");
+    }
+
+    #[test]
+    fn the_window_follows_the_list_without_echoing() {
+        let mut r = viewer_rig("viewer-follow", "a");
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::PreviewShow(r.work().join("c")));
+        assert_eq!(showing(&r).as_deref(), Some("c"));
+        assert_eq!(r.app.cursor, 2, "its own cursor moves too, for the arrows to go on from");
+        assert!(sent(&mut r).is_empty(), "the list already knows");
+        // The list went to another folder.
+        let other = r.root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("z"), "x").unwrap();
+        r.app.on_msg(Msg::PreviewShow(other.join("z")));
+        assert_eq!(showing(&r).as_deref(), Some("z"));
+        let generation = r.app.preview_gen;
+        r.pump_until("the other folder", |a| !a.loading && a.dir == other);
+        r.pump_until("its size", |a| a.listing.as_ref().is_some_and(|l| a.rows.first().is_some_and(|&i| matches!(l.stat(i), Stat::Known { .. }))));
+        r.idle();
+        assert_eq!(showing(&r).as_deref(), Some("z"));
+        assert_eq!(r.app.preview_gen, generation, "the folder arriving doesn't make it read the file again");
+        assert!(sent(&mut r).iter().all(|c| !c.starts_with("stepped")));
+    }
+
+    #[test]
+    fn a_hidden_file_is_shown_and_walked_from() {
+        let mut r = Rig::new("viewer-hidden");
+        for name in [".h", "a"] {
+            fs::write(r.work().join(name), "x").unwrap();
+        }
+        r.app.start_viewer(r.work().join(".h"));
+        r.pump_until("folder loaded", |a| !a.loading);
+        assert_eq!(showing(&r).as_deref(), Some(".h"), "the listing didn't move it to another file");
+        r.key(k::KEY_Down, "");
+        assert_eq!(showing(&r).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn space_escape_and_the_list_going_all_close_the_window() {
+        for (tag, how) in [("viewer-space", 0), ("viewer-escape", 1), ("viewer-gone", 2), ("viewer-ctrl-w", 3)] {
+            let mut r = viewer_rig(tag, "a");
+            r.app.cmds.clear();
+            match how {
+                0 => r.key(k::KEY_space, " "),
+                1 => r.key(k::KEY_Escape, ""),
+                2 => r.app.on_msg(Msg::ListGone),
+                _ => with_mods(&mut r, k::KEY_w, "w", Mods { ctrl: true, ..Mods::default() }),
+            }
+            assert_eq!(sent(&mut r), ["quit"], "{tag}");
+        }
+    }
+
+    #[test]
+    fn other_keys_do_nothing_in_the_window() {
+        let mut r = viewer_rig("viewer-keys", "a");
+        r.key(k::KEY_c, "c");
+        r.key(k::KEY_Delete, "");
+        r.key(k::KEY_F2, "");
+        assert_eq!(r.app.cursor, 0, "typing didn't jump");
+        assert!(r.app.jobs.is_empty(), "Delete didn't trash");
+        assert!(matches!(r.app.edit, Edit::None), "F2 didn't rename");
+        assert!(r.work().join("a").exists());
+    }
+
+    #[test]
+    fn a_file_removed_underneath_moves_on_and_an_empty_folder_closes() {
+        let mut r = viewer_rig("removed", "a");
+        fs::remove_file(r.work().join("a")).unwrap();
+        r.app.reload();
+        r.pump_until("the next file", |a| a.preview.as_ref().is_some_and(|p| p.path.ends_with("b")));
+        for name in ["b", "c"] {
+            fs::remove_file(r.work().join(name)).unwrap();
+        }
+        r.app.cmds.clear();
+        r.app.reload();
+        r.pump_until("the window to close", |a| a.cmds.iter().any(|c| matches!(c, Cmd::Quit)));
+    }
+
+    #[test]
+    fn a_file_overwritten_while_showing_is_read_again() {
+        let mut r = viewer_rig("overwritten", "a");
+        r.pump_until("a size for the first row", |a| a.listing.as_ref().is_some_and(|l| matches!(l.stat(a.rows[0]), Stat::Known { .. })));
+        let before = r.app.preview_gen;
+        // Nothing changed: reloading leaves it alone, so a busy folder doesn't restart it.
+        r.app.reload();
+        r.pump_until("the reload", |a| !a.loading);
+        r.pump_until("the new size", |a| a.listing.as_ref().is_some_and(|l| matches!(l.stat(a.rows[0]), Stat::Known { .. })));
+        r.idle();
+        assert_eq!(r.app.preview_gen, before, "the same file isn't read twice");
+        fs::write(r.work().join("a"), "a good deal longer").unwrap();
+        r.app.reload();
+        r.pump_until("reading it again", |a| a.preview_gen > before);
+        assert_eq!(showing(&r).as_deref(), Some("a"));
     }
 
     #[test]
     fn a_report_from_before_a_key_press_doesnt_undo_it() {
         use crate::media::{PlayState, parts_for_test};
         use crate::preview::{Content, Event, Found};
-        let mut r = preview_rig("stale-report");
-        r.key(k::KEY_space, " ");
+        let mut r = viewer_rig("stale-report", "a");
         let generation = r.app.preview_gen;
         let (remote, frames) = parts_for_test();
         r.app.on_msg(Msg::Preview(Event { generation, found: Found::VideoStarted { remote, frames } }));
@@ -5218,17 +5457,8 @@ mod tests {
     }
 
     #[test]
-    fn the_context_menu_can_preview() {
-        let mut r = preview_rig("menu");
-        r.key(k::KEY_Down, "");
-        r.app.action(Action::Preview);
-        assert_eq!(previewing(&r).as_deref(), Some("a"));
-    }
-
-    #[test]
     fn answers_for_a_file_youve_moved_past_are_dropped() {
-        let mut r = preview_rig("stale");
-        r.key(k::KEY_space, " ");
+        let mut r = viewer_rig("stale", "a");
         let old = r.app.preview_gen;
         r.key(k::KEY_Down, "");
         r.app.on_msg(Msg::Preview(preview::Event { generation: old, found: preview::Found::Message("old news".into()) }));

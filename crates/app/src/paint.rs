@@ -16,6 +16,9 @@ use crate::icons::Icon;
 
 impl App {
     pub fn paint(&mut self, c: &mut Canvas) {
+        if self.viewer {
+            return self.paint_preview(c);
+        }
         let l = self.layout();
         let clip = c.clip();
         if clip.intersects(l.list) {
@@ -45,9 +48,6 @@ impl App {
         }
         if self.menu.is_some() {
             self.paint_menu(c);
-        }
-        if self.preview.is_some() {
-            self.paint_preview(c);
         }
         if self.dialog.is_some() {
             self.paint_dialog(c);
