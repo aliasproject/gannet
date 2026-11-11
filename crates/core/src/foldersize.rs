@@ -1,8 +1,8 @@
 //! What a folder holds: how many items are in it, and how much everything under it adds up to.
 //! Counting a big tree takes a while, so it reports as it goes and stops when asked.
 //!
-//! Like `du`, it doesn't follow symlinks or cross onto other disks, and a file with several hard
-//! links counts once. Sizes are what the files say they hold, as the list shows them.
+//! Like `du`, it doesn't follow symlinks inside the folder or cross onto other disks, and a file
+//! with several hard links counts once. A link to a folder is counted as the folder it leads to. Sizes are what the files say they hold, as the list shows them.
 
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;

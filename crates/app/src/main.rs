@@ -453,6 +453,9 @@ fn after_first_frame(hub: &Hub, cache: &Path, primary: Option<(PathBuf, u32)>) {
     });
 }
 
+/// Lookups for one batch of missing characters. Characters left over show blank.
+const MAX_FONT_LOOKUPS: usize = 64;
+
 fn find_fallback_fonts(hub: &Hub, chars: Vec<char>) {
     let hub = hub.clone();
     let _ = std::thread::Builder::new().name("gannet-fonts".into()).spawn(move || {
@@ -460,10 +463,17 @@ fn find_fallback_fonts(hub: &Hub, chars: Vec<char>) {
         // A long document can need thousands of characters, and one font found for the first
         // usually has the rest, so it's asked before fontconfig is.
         let mut have: Vec<(Vec<u8>, u32)> = Vec::new();
+        // fontconfig always answers with something, even for a character no font has, so a file
+        // full of those would still be a process each without a limit.
+        let mut asked = 0;
         for ch in chars {
+            if asked >= MAX_FONT_LOOKUPS {
+                break;
+            }
             if have.iter().any(|(bytes, index)| text::font_has(bytes, *index, ch)) {
                 continue;
             }
+            asked += 1;
             if let Some((path, index)) = text::fc_match(&format!("sans:charset={:x}", ch as u32))
                 && !found.contains(&path)
             {

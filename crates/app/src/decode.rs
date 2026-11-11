@@ -432,7 +432,11 @@ pub fn document(input: impl Read, mut output: impl Write, markdown: bool) -> Res
     // One byte past the limit says whether there's more.
     input.take(doc::TEXT_LIMIT as u64 + 1).read_to_end(&mut raw).map_err(|_| Failure::Damaged)?;
     let (text, cut) = doc::excerpt(&raw).ok_or(Failure::Unsupported)?;
-    let doc = if markdown { doc::markdown(&text, cut) } else { doc::plain(text, cut) };
+    // Markdown that's all HTML would show nothing, so it shows as it is instead.
+    let doc = match markdown.then(|| doc::markdown(&text, cut)) {
+        Some(doc) if !doc.blocks.is_empty() => doc,
+        _ => doc::plain(text, cut),
+    };
     output.write_all(&doc::encode(&doc)).map_err(|_| Failure::TooLarge)
 }
 
@@ -636,6 +640,10 @@ mod tests {
         document(&b"# Hi\n"[..], &mut out, false).unwrap();
         assert_eq!(crate::doc::decode(&out).unwrap().blocks[0].kind, crate::doc::Kind::Plain, "as it is, not as Markdown");
         assert_eq!(document(&b"\x7fELF\x02\x01\x01\0\0\0"[..], &mut Vec::new(), false), Err(Failure::Unsupported));
+        let mut out = Vec::new();
+        document(&b"<div align=\"center\">\n<img src=\"logo.png\">\n</div>\n"[..], &mut out, true).unwrap();
+        let doc = crate::doc::decode(&out).unwrap();
+        assert!(doc.blocks[0].kind == crate::doc::Kind::Plain && doc.blocks[0].spans[0].text.starts_with("<div"), "all HTML shows as it is");
     }
 
     #[test]
