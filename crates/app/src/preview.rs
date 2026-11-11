@@ -566,6 +566,7 @@ const TOOL_LIMIT: Duration = Duration::from_secs(30);
 const LOCKED_PDF: &str = "This PDF is locked with a password";
 const DAMAGED_PDF: &str = "This PDF can't be read. It may be damaged.";
 const PAGE_FAILED: &str = "This page can't be drawn";
+const SLOW_PDF: &str = "This PDF took too long to open";
 const PDF_NO_BUBBLEWRAP: &str = "PDF previews need bubblewrap, which isn't installed";
 
 fn is_pdf(at: &Place, head: Option<&[u8]>) -> bool {
@@ -609,18 +610,24 @@ fn decode_output(output: &OwnedFd, cancel: &OwnedFd) -> Option<ImageBuf> {
 /// A picture of the file made by the system's thumbnailer for its type, the biggest that makes
 /// sense for a window this size. `None` if there's no thumbnailer for it or it didn't work.
 fn picture(at: &Place, mime: &str, area: (i32, i32), cancel: &OwnedFd) -> Option<Found> {
-    // The first one for the type that's actually installed where the jail can see it.
-    let (thumbnailer, program) = at.kinds.thumbnailers().find_all(mime).find_map(|t| Some((t, t.program(&[PathBuf::from(tools::PROGRAMS)])?)))?;
     let ext = tools::extension(at.path);
     let size = area.0.max(area.1).clamp(256, 2048) as u32;
-    let argv = tools::thumbnailer(|input, output| thumbnailer.command(&program, input, output, size), &ext)?;
-    let (status, output) = run_tool(&argv, reopen(at.path)?, Some(&ext), cancel).ok()?;
-    if !status.success() {
-        return None;
+    // Each one for the type that's installed where the jail can see it, until one works.
+    for thumbnailer in at.kinds.thumbnailers().find_all(mime) {
+        if cancelled_within(cancel, Duration::ZERO) {
+            return None;
+        }
+        let Some(program) = thumbnailer.program(&[PathBuf::from(tools::PROGRAMS)]) else { continue };
+        let Some(argv) = tools::thumbnailer(|input, output| thumbnailer.command(&program, input, output, size), &ext) else { continue };
+        let Ok((status, output)) = run_tool(&argv, reopen(at.path)?, Some(&ext), cancel) else { continue };
+        if !status.success() {
+            continue;
+        }
+        let Some(image) = decode_output(&output, cancel) else { continue };
+        let by = program.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        return Some(Found::Picture { image: Arc::new(image), by });
     }
-    let image = decode_output(&output, cancel)?;
-    let by = program.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    Some(Found::Picture { image: Arc::new(image), by })
+    None
 }
 
 /// A picture of something nothing else here can show, by its type.
@@ -637,7 +644,7 @@ fn open_pdf(at: &Place, cancel: &OwnedFd, describe: &dyn Fn() -> Found) -> Optio
     let (status, out) = match run_tool(&tools::pdfinfo(), reopen(at.path)?, Some(tools::PDF_EXT), cancel) {
         Ok(ran) => ran,
         Err(NotRun::NoBubblewrap) => return message(PDF_NO_BUBBLEWRAP),
-        Err(NotRun::Stopped) => return (!cancelled_within(cancel, Duration::ZERO)).then(|| Found::Message(DAMAGED_PDF.to_string())),
+        Err(NotRun::Stopped) => return (!cancelled_within(cancel, Duration::ZERO)).then(|| Found::Message(SLOW_PDF.to_string())),
     };
     match tools::parse_pdfinfo(&String::from_utf8_lossy(&read_capped(&out)), status.success()) {
         tools::PdfInfo::Pages(pages) => match describe() {

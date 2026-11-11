@@ -162,11 +162,9 @@ pub enum PdfInfo {
 
 /// What `pdfinfo` said, which is believed only as far as it makes sense.
 pub fn parse_pdfinfo(out: &str, success: bool) -> PdfInfo {
-    if out.contains("Incorrect password") {
-        return PdfInfo::Locked;
-    }
+    // Only when it failed: a PDF's own title could say this.
     if !success {
-        return PdfInfo::Unreadable;
+        return if out.contains("Incorrect password") { PdfInfo::Locked } else { PdfInfo::Unreadable };
     }
     let count = out.lines().find_map(|l| l.strip_prefix("Pages:")).and_then(|n| n.trim().parse::<usize>().ok()).map_or(MAX_PAGES, |n| n.min(MAX_PAGES));
     let mut sizes: Vec<Option<(f32, f32)>> = Vec::new();
@@ -224,6 +222,8 @@ mod tests {
         assert_eq!(parse_pdfinfo("Command Line Error: Incorrect password\n", false), PdfInfo::Locked);
         assert_eq!(parse_pdfinfo("Syntax Error: Couldn't find trailer dictionary\n", false), PdfInfo::Unreadable);
         assert_eq!(parse_pdfinfo("Pages: 0\n", true), PdfInfo::Unreadable);
+        let titled = "Title:          Incorrect password\nPages:          1\nPage    1 size: 612 x 792 pts\n";
+        assert_eq!(parse_pdfinfo(titled, true), PdfInfo::Pages(vec![page(612.0, 792.0, false)]), "a title isn't a lock");
         // A page that makes no sense keeps its place, so the ones after it still show.
         let odd = "Pages: 4\nPage 1 size: 612 x 792 pts\nPage 2 size: NaN x 5 pts\nPage 3 size: 100 x 200 pts\nPage 4 size: -4 x 5 pts\nPage 99 size: 5 x 5 pts\n";
         let letter = page(612.0, 792.0, false);

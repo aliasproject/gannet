@@ -15,9 +15,9 @@ const MAX_ENTRY: u64 = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Thumbnailer {
-    /// The command line, before its `%` codes are filled in.
+    /// The command line, before its `%` codes are filled in. Whether its program is installed is
+    /// `program`'s to say, so `TryExec` isn't kept.
     pub exec: Vec<String>,
-    pub try_exec: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -73,7 +73,7 @@ impl Thumbnailers {
 /// The entry's command, and the types it's for.
 fn parse(text: &str) -> Option<(Thumbnailer, Vec<String>)> {
     let mut in_entry = false;
-    let (mut exec, mut try_exec, mut mimes) = (None, None, Vec::new());
+    let (mut exec, mut mimes) = (None, Vec::new());
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -86,13 +86,12 @@ fn parse(text: &str) -> Option<(Thumbnailer, Vec<String>)> {
         let Some((key, value)) = line.split_once('=') else { continue };
         match key.trim() {
             "Exec" => exec = split_exec(value.trim()),
-            "TryExec" => try_exec = Some(value.trim().to_string()).filter(|v| !v.is_empty()),
             "MimeType" => mimes = value.split(';').map(str::trim).filter(|m| !m.is_empty()).map(str::to_string).collect(),
             _ => {}
         }
     }
     let exec = exec.filter(|e: &Vec<String>| !e.is_empty())?;
-    (!mimes.is_empty()).then_some((Thumbnailer { exec, try_exec }, mimes))
+    (!mimes.is_empty()).then_some((Thumbnailer { exec }, mimes))
 }
 
 /// An `Exec` line as words, as the desktop entry spec quotes them: double quotes around a word
@@ -206,7 +205,7 @@ mod tests {
         let all: Vec<&str> = t.find_all("image/svg+xml").map(|t| t.exec[0].as_str()).collect();
         assert_eq!(all, ["my-thumbs", "glycin"], "and the system's after it");
         assert_eq!(t.find("image/jxl").unwrap().exec[0], "glycin");
-        assert_eq!(t.find("application/msword").unwrap().try_exec.as_deref(), Some("gsf-office-thumbnailer"));
+        assert_eq!(t.find("application/msword").unwrap().exec[0], "gsf-office-thumbnailer");
         assert!(t.find("text/x-nothing").is_none(), "no command");
         assert!(t.find("image/png").is_none(), "not a .thumbnailer file");
     }
