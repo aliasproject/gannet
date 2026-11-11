@@ -39,6 +39,7 @@ BUDGETS = [
     ("Space to a 1600x1200 photo in the preview", 100, "ms"),
     ("Space to 128 kB of text in the preview", 100, "ms"),
     ("Space to 128 kB of Markdown in the preview", 150, "ms"),
+    ("Space to the first page of a PDF in the preview", 200, "ms"),
 ]
 
 
@@ -331,6 +332,43 @@ def measure_preview_documents(h, results, runs):
         results[label] = median(times)
 
 
+def measure_preview_pdf(h, results, runs):
+    """Space on a 20-page PDF: until its first page is drawn in the preview window."""
+    folder = DATA / "fixture-pdf"
+    folder.mkdir(parents=True, exist_ok=True)
+    pdf = folder / "report.pdf"
+    if not pdf.exists():
+        ps = folder / "report.ps"
+        ps.write_text("%!PS\n/Helvetica findfont 14 scalefont setfont\n1 1 20 { /n exch def 60 1 40 { /l exch def 72 760 l 16 mul sub moveto (Page ) show n 4 string cvs show ( line ) show l 4 string cvs show ( of some words set in a PDF.) show } for showpage } for\n")
+        subprocess.run(["ps2pdf", str(ps), str(pdf)], check=True)
+        ps.unlink()
+    state = Path("/tmp/gnbench-client/pdf-state.json")
+    shown = Path(str(state) + ".preview")
+    log, env = log_env(h, "pdf", {"GANNET_STATE": str(state)})
+    times = []
+    for _ in range(runs):
+        shown.unlink(missing_ok=True)
+        p = subprocess.Popen([str(BENCH), str(folder)], env=env, stderr=subprocess.DEVNULL)
+        h.wait_window(30)
+        wait_log(log, "rows")
+        time.sleep(0.2)
+        t0 = time.monotonic()
+        key(env, "space")
+        end = time.monotonic() + 20
+        while time.monotonic() < end:
+            try:
+                drawn = (((json.loads(shown.read_text()).get("preview") or {}).get("pdf") or {}).get("drawn") or [])
+                if any(page[0] == 0 and page[2] for page in drawn):
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.002)
+        times.append((time.monotonic() - t0) * 1000)
+        stop(p)
+        time.sleep(0.3)
+    results["Space to the first page of a PDF in the preview"] = median(times)
+
+
 def measure_copy(results):
     src = DATA / "copy-1g.bin"
     if not src.exists() or src.stat().st_size != 1 << 30:
@@ -434,6 +472,7 @@ def main():
         measure_theme(h, results, a.runs)
         measure_preview(h, results, a.runs)
         measure_preview_documents(h, results, a.runs)
+        measure_preview_pdf(h, results, a.runs)
     finally:
         h.stop()
     h = Headless("/tmp/gnbench-h", "3840x2160")

@@ -1279,8 +1279,8 @@ def preview_pid(a):
 @check
 def any_file_says_what_it_is_and_opens_in_its_app(h):
     fs = fresh_fs()
-    (fs / "a-report.pdf").write_bytes(b"%PDF-1.4\n" + b"\0" * 100)
-    (fs / "b-no-extension").write_bytes(b"%PDF-1.4\n" + b"\0" * 100)
+    (fs / "a-archive.zip").write_bytes(b"PK\x03\x04" + b"\0" * 100)
+    (fs / "b-no-extension").write_bytes(b"PK\x03\x04" + b"\0" * 100)
     (fs / "c-blob.xyz").write_bytes(bytes(range(256)))
     bin_dir = SCRATCH / "fakebin"
     bin_dir.mkdir(exist_ok=True)
@@ -1292,23 +1292,23 @@ def any_file_says_what_it_is_and_opens_in_its_app(h):
     a = App(h, fs, path_prefix=str(bin_dir), extra_env={"LANG": "C.UTF-8"})
     a.wait(lambda s: s["count"] == 3, "listing")
     a.key("space")
-    s = a.wait(lambda s: preview_of(s).get("state") == "info", "the PDF")
-    assert preview_of(s)["kind"] == "application/pdf" and preview_of(s)["message"] == "PDF document", s["preview"]
+    s = a.wait(lambda s: preview_of(s).get("state") == "info", "the archive")
+    assert preview_of(s)["kind"] == "application/zip" and preview_of(s)["message"] == "Zip archive", s["preview"]
     a.shot("preview-any-file")
     a.key("Down")
     s = a.wait(lambda s: preview_of(s).get("name") == "b-no-extension" and preview_of(s)["state"] == "info", "known by its contents")
-    assert preview_of(s)["kind"] == "application/pdf", s["preview"]
+    assert preview_of(s)["kind"] == "application/zip", s["preview"]
     a.key("Down")
     s = a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "unknown bytes")
     assert preview_of(s)["kind"] == "application/octet-stream", s["preview"]
     # Enter, or the Open button, opens it in its app and leaves the preview up.
     a.key("Up", "Up")
-    a.wait(lambda s: preview_of(s).get("name") == "a-report.pdf", "back to the PDF")
+    a.wait(lambda s: preview_of(s).get("name") == "a-archive.zip", "back to the archive")
     a.key("Return")
     end = time.monotonic() + 5
     while time.monotonic() < end and not log.exists():
         time.sleep(0.02)
-    assert log.read_text().strip() == str(fs / "a-report.pdf"), log.read_text()
+    assert log.read_text().strip() == str(fs / "a-archive.zip"), log.read_text()
     assert a.state()["preview"], "still previewing"
     a.key("Down", "Down")
     a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "the blob")
@@ -1441,6 +1441,105 @@ def a_folder_says_what_it_holds(h):
     a.key("Down")
     s = a.wait(lambda s: preview_of(s).get("name") == "empty" and (preview_of(s).get("folder") or {}).get("done"), "the empty one")
     assert preview_of(s)["folder"]["items"] == 0
+    a.close()
+
+
+def make_pdf(path, pages, password=None):
+    ps = path.with_suffix(".ps")
+    ps.write_text("%!PS\n/Helvetica findfont 48 scalefont setfont\n1 1 " + str(pages) + " { /n exch def 72 650 moveto (Page ) show n 4 string cvs show showpage } for\n")
+    extra = [f"-sOwnerPassword=o{password}", f"-sUserPassword={password}"] if password else []
+    subprocess.run(["ps2pdf", *extra, str(ps), str(path)], check=True, capture_output=True)
+    ps.unlink()
+
+
+def plain_pdf(path, rotate=0):
+    """A one-page PDF written by hand, all in plain ASCII, as some programs write them."""
+    content = b"BT /F1 24 Tf 72 700 Td (Hello) Tj ET"
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /CropBox [0 0 300 400] /Rotate %d /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>" % rotate,
+            b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offsets = b"%PDF-1.4\n", []
+    for i, o in enumerate(objs):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % (i + 1) + o + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    path.write_bytes(out)
+
+
+def pdf_of(s):
+    return preview_of(s).get("pdf") or {}
+
+
+def drawn(s):
+    """The pages drawn, with whether each worked."""
+    return {i: ok for i, _, ok in pdf_of(s).get("drawn", [])}
+
+
+@check
+def pdfs_draw_their_pages_as_they_scroll(h):
+    fs = fresh_fs()
+    make_pdf(fs / "a-long.pdf", 12)
+    make_pdf(fs / "b-locked.pdf", 2, password="secret")
+    make_pdf(fs / "c-broken.pdf", 3)
+    data = (fs / "c-broken.pdf").read_bytes()
+    (fs / "c-broken.pdf").write_bytes(data[: len(data) // 3])
+    plain_pdf(fs / "d-plain.pdf")
+    plain_pdf(fs / "e-turned.pdf", rotate=90)
+    a = App(h, fs, extra_env={"LANG": "C.UTF-8"})
+    a.wait(lambda s: s["count"] == 5, "listing")
+    a.key("space")
+    s = a.wait(lambda s: preview_of(s).get("state") == "pdf" and drawn(s).get(0), "the first page", timeout=10)
+    assert pdf_of(s)["pages"] == 12, s["preview"]
+    assert preview_of(s)["kind"] == "application/pdf"
+    assert not drawn(s).get(8), "pages far down aren't drawn yet"
+    a.shot("preview-pdf")
+    a.key("End")
+    s = a.wait(lambda s: drawn(s).get(11), "the last page, once scrolled to", timeout=10)
+    assert 0 not in drawn(s), f"pages far up are let go: {pdf_of(s)}"
+    a.shot("preview-pdf-end")
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "b-locked.pdf" and preview_of(s)["state"] == "message", "locked", timeout=10)
+    assert "password" in preview_of(s)["message"], s["preview"]
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "c-broken.pdf" and preview_of(s)["state"] == "message", "broken", timeout=10)
+    assert "can't be read" in preview_of(s)["message"], s["preview"]
+    # All plain words, and cropped: still a PDF, not text.
+    for name in ("d-plain.pdf", "e-turned.pdf"):
+        a.key("Down")
+        s = a.wait(lambda s: preview_of(s).get("name") == name and drawn(s).get(0), name, timeout=10)
+        assert preview_of(s)["state"] == "pdf", s["preview"]
+    a.shot("preview-pdf-turned")
+    assert a.alive()
+    a.close()
+
+
+@check
+def thumbnailers_show_what_nothing_else_can(h):
+    fs = fresh_fs()
+    (fs / "a-drawing.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="300" height="200"><rect width="300" height="200" fill="#c33"/><circle cx="150" cy="100" r="70" fill="#fff"/></svg>')
+    (fs / "src.png").write_bytes(png_bytes(320, 240, rgb=(30, 160, 90)))
+    subprocess.run(["cjxl", "--quiet", str(fs / "src.png"), str(fs / "b-photo.jxl")], check=True, capture_output=True)
+    subprocess.run(["heif-enc", "-q", "50", "-o", str(fs / "c-photo.heic"), str(fs / "src.png")], check=True, capture_output=True)
+    (fs / "src.png").unlink()
+    # An office document carries its own picture, which is what its thumbnailer shows.
+    import zipfile
+    with zipfile.ZipFile(fs / "d-letter.odt", "w") as z:
+        z.writestr(zipfile.ZipInfo("mimetype"), "application/vnd.oasis.opendocument.text")
+        z.writestr("META-INF/manifest.xml", '<?xml version="1.0"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0"><manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.text"/></manifest:manifest>')
+        z.writestr("Thumbnails/thumbnail.png", png_bytes(181, 256, rgb=(200, 200, 60)))
+    a = App(h, fs)
+    a.wait(lambda s: s["count"] == 4, "listing")
+    a.key("space")
+    for name, w, h_, by in (("a-drawing.svg", 300, 200, "glycin-thumbnailer"), ("b-photo.jxl", 320, 240, "glycin-thumbnailer"), ("c-photo.heic", 320, 240, "glycin-thumbnailer"), ("d-letter.odt", 181, 256, "gsf-office-thumbnailer")):
+        s = a.wait(lambda s: preview_of(s).get("name") == name and preview_of(s)["state"] in ("image", "info", "message"), name, timeout=15)
+        p = preview_of(s)
+        assert p["state"] == "image" and p["by"] == by, p
+        assert abs(p["w"] * h_ - p["h"] * w) <= max(w, h_), f"{name} keeps its shape: {p}"
+        if name == "a-drawing.svg":
+            a.shot("preview-svg")
+        a.key("Down")
     a.close()
 
 
@@ -1921,6 +2020,7 @@ def files_that_wont_play_say_why(h):
 def video_says_what_it_needs_when_a_program_is_missing(h):
     fs = fresh_fs()
     make_video(fs / "clip.mp4", seconds=2)
+    make_pdf(fs / "report.pdf", 1)
     # Everything else on the PATH, but no bubblewrap.
     bin_dir = SCRATCH / "no-bwrap"
     shutil.rmtree(bin_dir, ignore_errors=True)
@@ -1929,11 +2029,14 @@ def video_says_what_it_needs_when_a_program_is_missing(h):
         if shutil.which(tool):
             os.symlink(shutil.which(tool), bin_dir / tool)
     a = App(h, fs, bwrap_extra=("--setenv", "PATH", str(bin_dir)))
-    a.wait(lambda s: s["count"] == 1, "listing")
+    a.wait(lambda s: s["count"] == 2, "listing")
     a.key("space")
     s = a.wait(lambda s: preview_of(s).get("state") == "message", "a clear message", timeout=10)
     assert "bubblewrap" in preview_of(s)["message"], s["preview"]
     a.shot("video-no-bwrap")
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "report.pdf" and preview_of(s)["state"] == "message", "a PDF says so too", timeout=10)
+    assert "bubblewrap" in preview_of(s)["message"], s["preview"]
     a.close()
     shutil.rmtree(bin_dir, ignore_errors=True)
 

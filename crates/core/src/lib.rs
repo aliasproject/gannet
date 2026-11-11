@@ -15,6 +15,7 @@ pub mod places;
 pub mod sort;
 pub mod theme;
 pub mod thumbcache;
+pub mod thumbnailers;
 pub mod time;
 pub mod trash;
 pub mod uri;
