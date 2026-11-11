@@ -68,8 +68,14 @@ pub enum TrashError {
 impl std::fmt::Display for TrashError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TrashError::NoTrashHere(e) => write!(f, "This disk has no usable Trash ({}). Shift+Delete deletes for good.", crate::listing::describe(e)),
-            TrashError::AlreadyTrashed => write!(f, "Already in the Trash. Shift+Delete deletes for good."),
+            TrashError::NoTrashHere(e) => write!(
+                f,
+                "This disk has no usable Trash ({}). Shift+Delete deletes for good.",
+                crate::listing::describe(e)
+            ),
+            TrashError::AlreadyTrashed => {
+                write!(f, "Already in the Trash. Shift+Delete deletes for good.")
+            }
             TrashError::Io(e) => write!(f, "{}", crate::listing::describe(e)),
         }
     }
@@ -103,7 +109,11 @@ pub fn trash(cfg: &TrashConfig, path: &Path) -> Result<Trashed, TrashError> {
     trash_in_batch(cfg, path, &mut MountCache::default())
 }
 
-pub fn trash_in_batch(cfg: &TrashConfig, path: &Path, mounts: &mut MountCache) -> Result<Trashed, TrashError> {
+pub fn trash_in_batch(
+    cfg: &TrashConfig,
+    path: &Path,
+    mounts: &mut MountCache,
+) -> Result<Trashed, TrashError> {
     let abs = absolute_parent(path).map_err(TrashError::Io)?;
     let meta = fs::symlink_metadata(&abs).map_err(TrashError::Io)?;
     let top = abs.parent().and_then(|p| mounts.top(cfg, p));
@@ -111,10 +121,16 @@ pub fn trash_in_batch(cfg: &TrashConfig, path: &Path, mounts: &mut MountCache) -
         return Err(TrashError::AlreadyTrashed);
     }
     let mut last_err = None;
-    let same_disk_as_home = !cfg.ignore_home_trash && ensure_dirs(&cfg.home_trash).is_ok() && fs::metadata(&cfg.home_trash).is_ok_and(|m| m.dev() == meta.dev());
+    let same_disk_as_home = !cfg.ignore_home_trash
+        && ensure_dirs(&cfg.home_trash).is_ok()
+        && fs::metadata(&cfg.home_trash).is_ok_and(|m| m.dev() == meta.dev());
     let mut places = Vec::new();
     if same_disk_as_home {
-        places.push(Place { root: cfg.home_trash.clone(), relative_to: None, shared: false });
+        places.push(Place {
+            root: cfg.home_trash.clone(),
+            relative_to: None,
+            shared: false,
+        });
     }
     if let Some(top) = top
         // The home Trash can still fail with EXDEV across bind mounts, so these follow it.
@@ -122,18 +138,30 @@ pub fn trash_in_batch(cfg: &TrashConfig, path: &Path, mounts: &mut MountCache) -
     {
         let admin = top.join(".Trash");
         if valid_admin_trash(&admin) {
-            places.push(Place { root: admin.join(cfg.uid.to_string()), relative_to: Some(top.clone()), shared: true });
+            places.push(Place {
+                root: admin.join(cfg.uid.to_string()),
+                relative_to: Some(top.clone()),
+                shared: true,
+            });
         }
-        places.push(Place { root: top.join(format!(".Trash-{}", cfg.uid)), relative_to: Some(top), shared: true });
+        places.push(Place {
+            root: top.join(format!(".Trash-{}", cfg.uid)),
+            relative_to: Some(top),
+            shared: true,
+        });
     }
     for place in places {
         match move_into(&place, &abs) {
             Ok(t) => return Ok(t),
-            Err(Failure::Move(e)) if e.raw_os_error() != Some(libc::EXDEV) => return Err(TrashError::Io(e)),
+            Err(Failure::Move(e)) if e.raw_os_error() != Some(libc::EXDEV) => {
+                return Err(TrashError::Io(e));
+            }
             Err(Failure::Move(e) | Failure::Place(e)) => last_err = Some(e),
         }
     }
-    Err(TrashError::NoTrashHere(last_err.unwrap_or_else(|| io::Error::other("no Trash folder found"))))
+    Err(TrashError::NoTrashHere(last_err.unwrap_or_else(|| {
+        io::Error::other("no Trash folder found")
+    })))
 }
 
 /// Why an attempt failed: this Trash folder is unusable, so try the next one, or the
@@ -151,8 +179,13 @@ fn top_trash_would_be_home(cfg: &TrashConfig, top: &Path) -> bool {
 
 /// Canonicalizes the folder, not the item: a symlink gets trashed, not its target.
 fn absolute_parent(path: &Path) -> io::Result<PathBuf> {
-    let name = path.file_name().ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     Ok(fs::canonicalize(parent)?.join(name))
 }
 
@@ -163,7 +196,10 @@ fn inside_a_trash(cfg: &TrashConfig, abs: &Path, top: Option<&Path>) -> bool {
     if abs.starts_with(&home) {
         return true;
     }
-    top.is_some_and(|t| abs.starts_with(t.join(format!(".Trash-{}", cfg.uid))) || abs.starts_with(t.join(".Trash").join(cfg.uid.to_string())))
+    top.is_some_and(|t| {
+        abs.starts_with(t.join(format!(".Trash-{}", cfg.uid)))
+            || abs.starts_with(t.join(".Trash").join(cfg.uid.to_string()))
+    })
 }
 
 /// The spec: `.Trash` must be a real folder with the sticky bit, not a symlink.
@@ -185,14 +221,14 @@ fn verify_ours(root: &Path) -> io::Result<()> {
     if m.is_dir() && m.uid() == rustix::process::geteuid().as_raw() {
         Ok(())
     } else {
-        Err(io::Error::other("the Trash folder on this disk isn't safe to use"))
+        Err(io::Error::other(
+            "the Trash folder on this disk isn't safe to use",
+        ))
     }
 }
 
 fn move_into(place: &Place, abs: &Path) -> Result<Trashed, Failure> {
-    if place.shared
-        && fs::symlink_metadata(&place.root).is_ok()
-    {
+    if place.shared && fs::symlink_metadata(&place.root).is_ok() {
         verify_ours(&place.root).map_err(Failure::Place)?;
     }
     ensure_dirs(&place.root).map_err(Failure::Place)?;
@@ -203,11 +239,21 @@ fn move_into(place: &Place, abs: &Path) -> Result<Trashed, Failure> {
         Some(top) => abs.strip_prefix(top).unwrap_or(abs),
         None => abs,
     };
-    let name = abs.file_name().ok_or_else(|| Failure::Move(io::Error::from(io::ErrorKind::InvalidInput)))?;
-    let body = format!("[Trash Info]\nPath={}\nDeletionDate={}\n", encode_path(shown), time::local(time::now()).rfc3339_local());
+    let name = abs
+        .file_name()
+        .ok_or_else(|| Failure::Move(io::Error::from(io::ErrorKind::InvalidInput)))?;
+    let body = format!(
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        encode_path(shown),
+        time::local(time::now()).rfc3339_local()
+    );
     let (info, file) = reserve(&place.root, name, body.as_bytes()).map_err(Failure::Place)?;
     match rename_noreplace(abs, &file) {
-        Ok(()) => Ok(Trashed { original: abs.to_path_buf(), file, info }),
+        Ok(()) => Ok(Trashed {
+            original: abs.to_path_buf(),
+            file,
+            info,
+        }),
         Err(e) => {
             let _ = fs::remove_file(&info);
             Err(Failure::Move(e))
@@ -219,7 +265,11 @@ fn move_into(place: &Place, abs: &Path) -> Result<Trashed, Failure> {
 fn reserve(root: &Path, name: &OsStr, body: &[u8]) -> io::Result<(PathBuf, PathBuf)> {
     let base = shorten(name);
     for n in 1u32.. {
-        let candidate = if n == 1 { base.clone() } else { numbered(&base, n) };
+        let candidate = if n == 1 {
+            base.clone()
+        } else {
+            numbered(&base, n)
+        };
         let mut info_name = candidate.clone();
         info_name.push(".trashinfo");
         let info = root.join("info").join(&info_name);
@@ -227,7 +277,12 @@ fn reserve(root: &Path, name: &OsStr, body: &[u8]) -> io::Result<(PathBuf, PathB
         if fs::symlink_metadata(&file).is_ok() {
             continue;
         }
-        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(&info) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&info)
+        {
             Ok(mut f) => {
                 if let Err(e) = f.write_all(body) {
                     let _ = fs::remove_file(&info);
@@ -282,7 +337,12 @@ pub fn info_file_for(cfg: &TrashConfig, path: &Path) -> Option<PathBuf> {
     }
     let root = files.parent()?;
     let name = root.file_name()?.as_bytes();
-    let is_trash = root == cfg.home_trash || name.starts_with(b".Trash-") || root.parent().and_then(Path::file_name).is_some_and(|n| n == ".Trash");
+    let is_trash = root == cfg.home_trash
+        || name.starts_with(b".Trash-")
+        || root
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == ".Trash");
     if !is_trash {
         return None;
     }
@@ -316,17 +376,38 @@ impl Root {
 
 /// Network shares can hang a stat for minutes, so their Trash folders aren't looked for.
 /// Nor are automount points: looking would mount them, waking a disk or a server.
-const SKIPPED_FS: [&str; 12] = ["nfs", "nfs4", "cifs", "smb3", "smbfs", "sshfs", "fuse.sshfs", "autofs", "9p", "ceph", "glusterfs", "davfs"];
+const SKIPPED_FS: [&str; 12] = [
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "smbfs",
+    "sshfs",
+    "fuse.sshfs",
+    "autofs",
+    "9p",
+    "ceph",
+    "glusterfs",
+    "davfs",
+];
 
 /// Every Trash folder holding this user's items: the home one first, then one per disk.
 /// Only folders that already exist count, and nothing is created.
 pub fn roots(home_trash: &Path, uid: u32, mounts: &[Mount]) -> Vec<Root> {
-    let mut out = vec![Root { root: home_trash.to_path_buf(), relative_to: None }];
+    let mut out = vec![Root {
+        root: home_trash.to_path_buf(),
+        relative_to: None,
+    }];
     // A disk mounted twice, or bind-mounted, would list the same Trash twice.
     let id = |p: &Path| fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
     let mut seen: Vec<(u64, u64)> = id(home_trash).into_iter().collect();
     for m in mounts {
-        if SKIPPED_FS.contains(&m.fs_type.as_str()) || m.point.starts_with("/proc") || m.point.starts_with("/sys") || m.point.starts_with("/dev") || m.point.starts_with("/run/user") {
+        if SKIPPED_FS.contains(&m.fs_type.as_str())
+            || m.point.starts_with("/proc")
+            || m.point.starts_with("/sys")
+            || m.point.starts_with("/dev")
+            || m.point.starts_with("/run/user")
+        {
             continue;
         }
         let admin = m.point.join(".Trash");
@@ -342,7 +423,10 @@ pub fn roots(home_trash: &Path, uid: u32, mounts: &[Mount]) -> Vec<Root> {
             let Some(key) = id(&root) else { continue };
             if !seen.contains(&key) {
                 seen.push(key);
-                out.push(Root { root, relative_to: Some(m.point.clone()) });
+                out.push(Root {
+                    root,
+                    relative_to: Some(m.point.clone()),
+                });
             }
         }
     }
@@ -382,10 +466,16 @@ pub fn parse_info(text: &[u8], relative_to: Option<&Path>) -> Option<Info> {
         relative_to?.join(decoded)
     };
     // `..` could aim a restore anywhere, so such a record isn't believed.
-    if original.components().any(|c| matches!(c, std::path::Component::ParentDir)) || original.file_name().is_none() {
+    if original
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+        || original.file_name().is_none()
+    {
         return None;
     }
-    let deleted = date.and_then(time::Local::parse_rfc3339_local).and_then(time::from_local);
+    let deleted = date
+        .and_then(time::Local::parse_rfc3339_local)
+        .and_then(time::from_local);
     Some(Info { original, deleted })
 }
 
@@ -404,7 +494,9 @@ pub fn is_inside_trash(home_trash: &Path, uid: u32, path: &Path) -> bool {
     let uid = uid.to_string();
     let parts: Vec<&OsStr> = path.iter().collect();
     parts.windows(2).enumerate().any(|(i, w)| {
-        w[1] == "files" && (w[0].as_bytes() == format!(".Trash-{uid}").as_bytes() || (w[0] == uid.as_str() && i > 0 && parts[i - 1] == ".Trash"))
+        w[1] == "files"
+            && (w[0].as_bytes() == format!(".Trash-{uid}").as_bytes()
+                || (w[0] == uid.as_str() && i > 0 && parts[i - 1] == ".Trash"))
     })
 }
 
@@ -422,7 +514,11 @@ mod tests {
     }
 
     fn info_lines(t: &Trashed) -> Vec<String> {
-        fs::read_to_string(&t.info).unwrap().lines().map(str::to_string).collect()
+        fs::read_to_string(&t.info)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 
     #[test]
@@ -436,7 +532,13 @@ mod tests {
         assert_eq!(t.info, s.path().join("data/Trash/info/a b.txt.trashinfo"));
         let lines = info_lines(&t);
         assert_eq!(lines[0], "[Trash Info]");
-        assert_eq!(lines[1], format!("Path={}", encode_path(&fs::canonicalize(s.path()).unwrap().join("work/a b.txt"))));
+        assert_eq!(
+            lines[1],
+            format!(
+                "Path={}",
+                encode_path(&fs::canonicalize(s.path()).unwrap().join("work/a b.txt"))
+            )
+        );
         assert!(lines[1].contains("a%20b.txt"));
         let date = lines[2].strip_prefix("DeletionDate=").unwrap();
         assert_eq!(date.len(), 19);
@@ -467,7 +569,12 @@ mod tests {
         let link = s.path().join("work/lnk");
         symlink(&target, &link).unwrap();
         let t = trash(&c, &link).unwrap();
-        assert!(fs::symlink_metadata(&t.file).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&t.file)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert_eq!(fs::read(&target).unwrap(), b"keep");
     }
 
@@ -503,7 +610,10 @@ mod tests {
         let s = Scratch::new();
         let c = cfg(&s);
         let t = trash(&c, &s.file("work/a", b"")).unwrap();
-        assert!(matches!(trash(&c, &t.file), Err(TrashError::AlreadyTrashed)));
+        assert!(matches!(
+            trash(&c, &t.file),
+            Err(TrashError::AlreadyTrashed)
+        ));
     }
 
     #[test]
@@ -517,7 +627,12 @@ mod tests {
         fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(r.is_err(), "rename out of a read-only folder must fail");
         assert!(f.exists());
-        assert_eq!(fs::read_dir(s.path().join("data/Trash/info")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(s.path().join("data/Trash/info"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     fn other_disk(s: &Scratch) -> (TrashConfig, PathBuf) {
@@ -538,7 +653,13 @@ mod tests {
         let t = trash(&c, &f).unwrap();
         assert_eq!(t.file, top.join(".Trash-1000/files/a.txt"));
         assert_eq!(info_lines(&t)[1], "Path=sub/a.txt");
-        assert_eq!(fs::symlink_metadata(top.join(".Trash-1000")).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::symlink_metadata(top.join(".Trash-1000"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o700
+        );
     }
 
     #[test]
@@ -592,7 +713,10 @@ mod tests {
         fs::set_permissions(&d, fs::Permissions::from_mode(0o500)).unwrap();
         let r = trash(&c, &f);
         fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(matches!(r, Err(TrashError::Io(_))), "must not suggest deleting for good");
+        assert!(
+            matches!(r, Err(TrashError::Io(_))),
+            "must not suggest deleting for good"
+        );
     }
 
     #[test]
@@ -613,7 +737,10 @@ mod tests {
         c.mount_of = Arc::new(|_| None);
         let t = trash(&c, &s.file("work/a", b"x")).unwrap();
         let in_trash = fs::canonicalize(&t.file).unwrap();
-        assert!(matches!(trash(&c, &in_trash), Err(TrashError::AlreadyTrashed)));
+        assert!(matches!(
+            trash(&c, &in_trash),
+            Err(TrashError::AlreadyTrashed)
+        ));
     }
 
     #[test]
@@ -643,8 +770,14 @@ mod tests {
         let c = cfg(&s);
         let t = trash(&c, &s.file("work/a", b"")).unwrap();
         assert_eq!(info_file_for(&c, &t.file), Some(t.info.clone()));
-        assert_eq!(info_file_for(&c, Path::new("/m/.Trash-1000/files/x")), Some("/m/.Trash-1000/info/x.trashinfo".into()));
-        assert_eq!(info_file_for(&c, Path::new("/m/.Trash/1000/files/x")), Some("/m/.Trash/1000/info/x.trashinfo".into()));
+        assert_eq!(
+            info_file_for(&c, Path::new("/m/.Trash-1000/files/x")),
+            Some("/m/.Trash-1000/info/x.trashinfo".into())
+        );
+        assert_eq!(
+            info_file_for(&c, Path::new("/m/.Trash/1000/files/x")),
+            Some("/m/.Trash/1000/info/x.trashinfo".into())
+        );
         assert_eq!(info_file_for(&c, Path::new("/home/me/files/x")), None);
     }
 
@@ -671,7 +804,11 @@ mod tests {
     }
 
     fn mount(point: &Path, fs_type: &str) -> Mount {
-        Mount { point: point.to_path_buf(), fs_type: fs_type.into(), source: "/dev/sdz1".into() }
+        Mount {
+            point: point.to_path_buf(),
+            fs_type: fs_type.into(),
+            source: "/dev/sdz1".into(),
+        }
     }
 
     fn me() -> u32 {
@@ -680,9 +817,16 @@ mod tests {
 
     #[test]
     fn info_files_are_read_with_paths_made_whole() {
-        let abs = parse_info(b"[Trash Info]\nPath=/home/me/a%20b.txt\nDeletionDate=2026-11-10T08:30:00\n", None).unwrap();
+        let abs = parse_info(
+            b"[Trash Info]\nPath=/home/me/a%20b.txt\nDeletionDate=2026-11-10T08:30:00\n",
+            None,
+        )
+        .unwrap();
         assert_eq!(abs.original, Path::new("/home/me/a b.txt"));
-        assert_eq!(abs.deleted, time::Local::parse_rfc3339_local("2026-11-10T08:30:00").and_then(time::from_local));
+        assert_eq!(
+            abs.deleted,
+            time::Local::parse_rfc3339_local("2026-11-10T08:30:00").and_then(time::from_local)
+        );
         let rel = parse_info(b"[Trash Info]\nPath=sub/x\n", Some(Path::new("/mnt/usb"))).unwrap();
         assert_eq!(rel.original, Path::new("/mnt/usb/sub/x"));
         assert_eq!(rel.deleted, None);
@@ -691,11 +835,27 @@ mod tests {
     #[test]
     fn info_files_that_cant_be_trusted_are_refused() {
         assert_eq!(parse_info(b"Path=/a\n", None), None, "no header");
-        assert_eq!(parse_info(b"[Trash Info]\nDeletionDate=2026-11-10T08:30:00\n", None), None, "no path");
-        assert_eq!(parse_info(b"[Trash Info]\nPath=x\n", None), None, "relative, with nothing to be relative to");
-        assert_eq!(parse_info(b"[Trash Info]\nPath=/home/me/../../etc/passwd\n", None), None, "climbs out");
+        assert_eq!(
+            parse_info(b"[Trash Info]\nDeletionDate=2026-11-10T08:30:00\n", None),
+            None,
+            "no path"
+        );
+        assert_eq!(
+            parse_info(b"[Trash Info]\nPath=x\n", None),
+            None,
+            "relative, with nothing to be relative to"
+        );
+        assert_eq!(
+            parse_info(b"[Trash Info]\nPath=/home/me/../../etc/passwd\n", None),
+            None,
+            "climbs out"
+        );
         assert_eq!(parse_info(b"[Trash Info]\nPath=/\n", None), None, "no name");
-        assert_eq!(parse_info(b"[Other]\n[Trash Info]\nPath=/a\n", None), None, "header not first");
+        assert_eq!(
+            parse_info(b"[Other]\n[Trash Info]\nPath=/a\n", None),
+            None,
+            "header not first"
+        );
     }
 
     #[test]
@@ -711,12 +871,36 @@ mod tests {
         let bare = s.dir("bare");
         let net = s.dir("net");
         fs::create_dir_all(net.join(format!(".Trash-{}/files", me()))).unwrap();
-        let mounts = vec![mount(&disk, "ext4"), mount(&admin, "vfat"), mount(&bare, "ext4"), mount(&net, "nfs4"), mount(&disk, "ext4")];
+        let mounts = vec![
+            mount(&disk, "ext4"),
+            mount(&admin, "vfat"),
+            mount(&bare, "ext4"),
+            mount(&net, "nfs4"),
+            mount(&disk, "ext4"),
+        ];
         let got = roots(&home, me(), &mounts);
         assert_eq!(got.len(), 3, "{got:?}");
-        assert_eq!(got[0], Root { root: home.clone(), relative_to: None });
-        assert_eq!(got[1], Root { root: disk.join(format!(".Trash-{}", me())), relative_to: Some(disk.clone()) });
-        assert_eq!(got[2], Root { root: admin.join(format!(".Trash/{}", me())), relative_to: Some(admin.clone()) });
+        assert_eq!(
+            got[0],
+            Root {
+                root: home.clone(),
+                relative_to: None
+            }
+        );
+        assert_eq!(
+            got[1],
+            Root {
+                root: disk.join(format!(".Trash-{}", me())),
+                relative_to: Some(disk.clone())
+            }
+        );
+        assert_eq!(
+            got[2],
+            Root {
+                root: admin.join(format!(".Trash/{}", me())),
+                relative_to: Some(admin.clone())
+            }
+        );
     }
 
     #[test]
@@ -733,13 +917,37 @@ mod tests {
     #[test]
     fn inside_trash_means_inside_a_files_folder_of_ours() {
         let home = Path::new("/h/.local/share/Trash");
-        assert!(is_inside_trash(home, 1000, Path::new("/h/.local/share/Trash/files")));
-        assert!(is_inside_trash(home, 1000, Path::new("/h/.local/share/Trash/files/d/e")));
-        assert!(is_inside_trash(home, 1000, Path::new("/mnt/u/.Trash-1000/files/d")));
-        assert!(is_inside_trash(home, 1000, Path::new("/mnt/u/.Trash/1000/files")));
-        assert!(!is_inside_trash(home, 1000, Path::new("/mnt/u/.Trash-1001/files")));
+        assert!(is_inside_trash(
+            home,
+            1000,
+            Path::new("/h/.local/share/Trash/files")
+        ));
+        assert!(is_inside_trash(
+            home,
+            1000,
+            Path::new("/h/.local/share/Trash/files/d/e")
+        ));
+        assert!(is_inside_trash(
+            home,
+            1000,
+            Path::new("/mnt/u/.Trash-1000/files/d")
+        ));
+        assert!(is_inside_trash(
+            home,
+            1000,
+            Path::new("/mnt/u/.Trash/1000/files")
+        ));
+        assert!(!is_inside_trash(
+            home,
+            1000,
+            Path::new("/mnt/u/.Trash-1001/files")
+        ));
         assert!(!is_inside_trash(home, 1000, Path::new("/mnt/u/1000/files")));
-        assert!(!is_inside_trash(home, 1000, Path::new("/h/.local/share/Trash/info")));
+        assert!(!is_inside_trash(
+            home,
+            1000,
+            Path::new("/h/.local/share/Trash/info")
+        ));
         assert!(!is_inside_trash(home, 1000, Path::new("/h/work/files")));
     }
 
@@ -750,7 +958,11 @@ mod tests {
         fs::create_dir_all(disk.join(format!(".Trash-{}/files", me()))).unwrap();
         let again = s.path().join("again");
         symlink(&disk, &again).unwrap();
-        let got = roots(&s.path().join("data/Trash"), me(), &[mount(&disk, "ext4"), mount(&again, "ext4")]);
+        let got = roots(
+            &s.path().join("data/Trash"),
+            me(),
+            &[mount(&disk, "ext4"), mount(&again, "ext4")],
+        );
         assert_eq!(got.len(), 2, "{got:?}");
     }
 }

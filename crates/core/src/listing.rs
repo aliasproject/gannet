@@ -111,7 +111,9 @@ impl Listing {
 
     pub fn path(&self, i: u32) -> PathBuf {
         match &self.trash {
-            Some(t) => t.roots[t.root_of[i as usize] as usize].files().join(&t.file_names[i as usize]),
+            Some(t) => t.roots[t.root_of[i as usize] as usize]
+                .files()
+                .join(&t.file_names[i as usize]),
             None => self.dir.join(self.os_name(i)),
         }
     }
@@ -132,7 +134,9 @@ impl Listing {
 
     /// Where a row of the Trash view came from, if its info file could be read.
     pub fn original(&self, i: u32) -> Option<&Path> {
-        self.trash.as_ref()?.info[i as usize].as_ref().map(|inf| inf.original.as_path())
+        self.trash.as_ref()?.info[i as usize]
+            .as_ref()
+            .map(|inf| inf.original.as_path())
     }
 
     /// What restoring a row of the Trash view needs, if its info file could be read.
@@ -141,7 +145,11 @@ impl Listing {
         let info = t.info[i as usize].as_ref()?;
         let root = &t.roots[t.root_of[i as usize] as usize];
         let name = &t.file_names[i as usize];
-        Some(Trashed { original: info.original.clone(), file: root.files().join(name), info: trash::info_path(&root.root, name) })
+        Some(Trashed {
+            original: info.original.clone(),
+            file: root.files().join(name),
+            info: trash::info_path(&root.root, name),
+        })
     }
 
     pub fn kind(&self, i: u32) -> Kind {
@@ -157,7 +165,10 @@ impl Listing {
         match m.size.load(atomic::Ordering::Acquire) {
             SIZE_UNKNOWN => Stat::Unknown,
             SIZE_FAILED => Stat::Failed,
-            size => Stat::Known { size, mtime: m.mtime.load(atomic::Ordering::Relaxed) },
+            size => Stat::Known {
+                size,
+                mtime: m.mtime.load(atomic::Ordering::Relaxed),
+            },
         }
     }
 
@@ -174,7 +185,10 @@ impl Listing {
             std::thread::sleep(d);
         }
         let (fd, name) = match &self.trash {
-            Some(t) => (Some(&t.fds[t.root_of[i as usize] as usize]), t.file_names[i as usize].as_bytes()),
+            Some(t) => (
+                Some(&t.fds[t.root_of[i as usize] as usize]),
+                t.file_names[i as usize].as_bytes(),
+            ),
             None => (self.fd.as_ref(), self.name(i)),
         };
         let Some(fd) = fd else {
@@ -182,13 +196,28 @@ impl Listing {
             return;
         };
         // In the Trash, the date column is when the item was trashed.
-        let deleted = self.trash.as_ref().and_then(|t| t.info[i as usize].as_ref()).and_then(|inf| inf.deleted);
+        let deleted = self
+            .trash
+            .as_ref()
+            .and_then(|t| t.info[i as usize].as_ref())
+            .and_then(|inf| inf.deleted);
         let flags = AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT;
-        let got = std::ffi::CString::new(name).ok().and_then(|n| statx(fd.as_fd(), n.as_c_str(), flags, StatxFlags::SIZE | StatxFlags::MTIME).ok());
+        let got = std::ffi::CString::new(name).ok().and_then(|n| {
+            statx(
+                fd.as_fd(),
+                n.as_c_str(),
+                flags,
+                StatxFlags::SIZE | StatxFlags::MTIME,
+            )
+            .ok()
+        });
         match got {
             Some(st) => {
                 // Release pairs with the Acquire in stat(): a reader that sees the size sees the time.
-                m.mtime.store(deleted.unwrap_or(st.stx_mtime.tv_sec), atomic::Ordering::Relaxed);
+                m.mtime.store(
+                    deleted.unwrap_or(st.stx_mtime.tv_sec),
+                    atomic::Ordering::Relaxed,
+                );
                 m.size.store(st.stx_size, atomic::Ordering::Release);
             }
             None => m.size.store(SIZE_FAILED, atomic::Ordering::Relaxed),
@@ -210,7 +239,9 @@ impl Listing {
     /// Stats every entry on several threads. Stops early if `cancel` gets set.
     pub fn stat_all(&self, cancel: &AtomicBool) {
         let next = AtomicUsize::new(0);
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(4);
         std::thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
@@ -244,7 +275,10 @@ impl Listing {
 }
 
 fn new_meta() -> Meta {
-    Meta { size: AtomicU64::new(SIZE_UNKNOWN), mtime: AtomicI64::new(0) }
+    Meta {
+        size: AtomicU64::new(SIZE_UNKNOWN),
+        mtime: AtomicI64::new(0),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,7 +296,10 @@ pub struct SortSpec {
 
 impl Default for SortSpec {
     fn default() -> Self {
-        Self { key: SortKey::Name, descending: false }
+        Self {
+            key: SortKey::Name,
+            descending: false,
+        }
     }
 }
 
@@ -294,7 +331,11 @@ fn sort_known(l: &Listing, spec: SortSpec) -> Vec<u32> {
                 SortKey::Size if da => Ordering::Equal,
                 _ => keys[a as usize].cmp(&keys[b as usize]),
             };
-            let by_key = if spec.descending { by_key.reverse() } else { by_key };
+            let by_key = if spec.descending {
+                by_key.reverse()
+            } else {
+                by_key
+            };
             by_key.then_with(|| natural_cmp(l.name(a), l.name(b)))
         })
     });
@@ -321,7 +362,10 @@ pub fn visible_rows(l: &Listing, sorted: &[u32], show_hidden: bool, filter: &str
     sorted
         .iter()
         .copied()
-        .filter(|&i| (show_hidden || !l.hidden(i)) && (needle.is_empty() || name_contains(l.name(i), &needle)))
+        .filter(|&i| {
+            (show_hidden || !l.hidden(i))
+                && (needle.is_empty() || name_contains(l.name(i), &needle))
+        })
         .collect()
 }
 
@@ -332,9 +376,14 @@ pub fn name_contains(name: &[u8], needle: &str) -> bool {
     }
     if name.is_ascii() && needle.is_ascii() {
         let n = needle.as_bytes();
-        n.len() <= name.len() && name.windows(n.len()).any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
+        n.len() <= name.len()
+            && name
+                .windows(n.len())
+                .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
     } else {
-        String::from_utf8_lossy(name).to_lowercase().contains(needle)
+        String::from_utf8_lossy(name)
+            .to_lowercase()
+            .contains(needle)
     }
 }
 
@@ -386,7 +435,11 @@ pub struct Loaded {
 pub enum LoadEvent {
     /// A snapshot. More follow unless `settled`.
     Ready(Loaded),
-    Failed { generation: u64, dir: PathBuf, error: String },
+    Failed {
+        generation: u64,
+        dir: PathBuf,
+        error: String,
+    },
 }
 
 pub struct LoadHandle {
@@ -409,55 +462,100 @@ type LoadSink = Arc<dyn Fn(LoadEvent) + Send + Sync>;
 /// Reads the folder on a new thread. `sink` runs on that thread, except if no thread
 /// can be started, when it runs here with the failure. A hung read leaves only that
 /// thread stuck; cancelling means its results get ignored.
-pub fn spawn_load(req: LoadRequest, sink: impl Fn(LoadEvent) + Send + Sync + 'static) -> LoadHandle {
+pub fn spawn_load(
+    req: LoadRequest,
+    sink: impl Fn(LoadEvent) + Send + Sync + 'static,
+) -> LoadHandle {
     spawn_load_watching(req, None, sink)
 }
 
 /// As `spawn_load`, also pointing `watch` at the folder first, on the same thread: that
 /// can hang just as reading can, and a change after the watch but before the read can't
 /// be missed.
-pub fn spawn_load_watching(req: LoadRequest, watch: Option<Arc<Watch>>, sink: impl Fn(LoadEvent) + Send + Sync + 'static) -> LoadHandle {
+pub fn spawn_load_watching(
+    req: LoadRequest,
+    watch: Option<Arc<Watch>>,
+    sink: impl Fn(LoadEvent) + Send + Sync + 'static,
+) -> LoadHandle {
     let cancel = Arc::new(AtomicBool::new(false));
     let c = cancel.clone();
     let sink: LoadSink = Arc::new(sink);
     let (s2, r2) = (sink.clone(), req.clone());
-    let spawned = std::thread::Builder::new().name("gannet-list".into()).spawn(move || {
-        let (generation, dir) = (req.generation, req.dir.clone());
-        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match req.trash.clone() {
-            Some(spec) => load_trash(req, &spec, watch.as_ref(), &c, &s2),
-            None => {
-                if let Some(w) = &watch {
-                    w.set_dirs_unless(std::slice::from_ref(&dir), || c.load(atomic::Ordering::Relaxed));
+    let spawned = std::thread::Builder::new()
+        .name("gannet-list".into())
+        .spawn(move || {
+            let (generation, dir) = (req.generation, req.dir.clone());
+            let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match req.trash.clone() {
+                    Some(spec) => load_trash(req, &spec, watch.as_ref(), &c, &s2),
+                    None => {
+                        if let Some(w) = &watch {
+                            w.set_dirs_unless(std::slice::from_ref(&dir), || {
+                                c.load(atomic::Ordering::Relaxed)
+                            });
+                        }
+                        load(req, &c, &s2)
+                    }
                 }
-                load(req, &c, &s2)
+            }));
+            if done.is_err() {
+                s2(LoadEvent::Failed {
+                    generation,
+                    dir,
+                    error: "Reading this folder failed unexpectedly".into(),
+                });
             }
-        }));
-        if done.is_err() {
-            s2(LoadEvent::Failed { generation, dir, error: "Reading this folder failed unexpectedly".into() });
-        }
-    });
+        });
     if let Err(e) = spawned {
-        sink(LoadEvent::Failed { generation: r2.generation, dir: r2.dir, error: describe(&e) });
+        sink(LoadEvent::Failed {
+            generation: r2.generation,
+            dir: r2.dir,
+            error: describe(&e),
+        });
     }
     LoadHandle { cancel }
 }
 
 fn open_dir(path: &std::path::Path) -> std::io::Result<File> {
     // O_DIRECTORY fails at once on anything else; opening a FIFO without it would hang.
-    OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK).open(path)
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(path)
 }
 
 fn load(req: LoadRequest, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
     let file = match open_dir(&req.dir) {
         Ok(f) => Arc::new(f),
         Err(e) => {
-            sink(LoadEvent::Failed { generation: req.generation, dir: req.dir.clone(), error: describe(&e) });
+            sink(LoadEvent::Failed {
+                generation: req.generation,
+                dir: req.dir.clone(),
+                error: describe(&e),
+            });
             return;
         }
     };
-    let mut l = Listing { dir: req.dir.clone(), fd: Some(file.clone()), names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None };
+    let mut l = Listing {
+        dir: req.dir.clone(),
+        fd: Some(file.clone()),
+        names: Vec::new(),
+        slots: Vec::new(),
+        meta: Vec::new(),
+        complete: false,
+        read_error: None,
+        slow_stat: req.slow_stat,
+        trash: None,
+    };
     // Small enough that a slow disk returns often, and big enough to be cheap on a fast one.
-    let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); if req.slow_read.is_some() { 4096 } else { READ_BUFFER }];
+    let mut buf: Vec<MaybeUninit<u8>> = vec![
+        MaybeUninit::uninit();
+        if req.slow_read.is_some() {
+            4096
+        } else {
+            READ_BUFFER
+        }
+    ];
     let mut iter = RawDir::new(file.as_fd(), &mut buf);
     let started = Instant::now();
     let mut next_publish = Duration::from_millis(50);
@@ -494,7 +592,11 @@ fn load(req: LoadRequest, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
             }
             _ => Kind::Other,
         };
-        l.slots.push(Slot { off: l.names.len() as u32, len: b.len() as u16, kind });
+        l.slots.push(Slot {
+            off: l.names.len() as u32,
+            len: b.len() as u16,
+            kind,
+        });
         l.names.extend_from_slice(b);
         // The end of a buffer is where the next read, the slow part, would start.
         if iter.is_buffer_empty() {
@@ -533,7 +635,11 @@ type TrashEntry = (OsString, Kind, Option<Info>);
 
 /// Reads one Trash folder whole. Trash folders are small next to the folders `load` is
 /// built for, so there's no partial publishing within one.
-fn read_trash_root(root: &Root, slow_read: Option<Duration>, cancel: &AtomicBool) -> std::io::Result<(Arc<File>, Vec<TrashEntry>)> {
+fn read_trash_root(
+    root: &Root,
+    slow_read: Option<Duration>,
+    cancel: &AtomicBool,
+) -> std::io::Result<(Arc<File>, Vec<TrashEntry>)> {
     let files = root.files();
     let file = Arc::new(open_dir(&files)?);
     let mut out = Vec::new();
@@ -544,12 +650,15 @@ fn read_trash_root(root: &Root, slow_read: Option<Duration>, cancel: &AtomicBool
         let Ok(e) = e else { continue };
         let name = e.file_name();
         let kind = match e.file_type() {
-            Ok(ft) if ft.is_symlink() => CString::new(name.as_bytes()).map_or(Kind::Other, |n| resolved_kind(&file, &n)),
+            Ok(ft) if ft.is_symlink() => {
+                CString::new(name.as_bytes()).map_or(Kind::Other, |n| resolved_kind(&file, &n))
+            }
             Ok(ft) if ft.is_dir() => Kind::Dir,
             Ok(ft) if ft.is_file() => Kind::File,
             _ => Kind::Other,
         };
-        let info = read_small(&trash::info_path(&root.root, &name)).and_then(|b| trash::parse_info(&b, root.relative_to.as_deref()));
+        let info = read_small(&trash::info_path(&root.root, &name))
+            .and_then(|b| trash::parse_info(&b, root.relative_to.as_deref()));
         out.push((name, kind, info));
         if let Some(d) = slow_read {
             std::thread::sleep(d);
@@ -563,7 +672,11 @@ fn read_trash_root(root: &Root, slow_read: Option<Duration>, cancel: &AtomicBool
 fn read_small(path: &Path) -> Option<Vec<u8>> {
     use std::io::Read;
     const MAX: u64 = 64 * 1024;
-    let f = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(path).ok()?;
+    let f = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
     let m = f.metadata().ok()?;
     if !m.is_file() || m.len() > MAX {
         return None;
@@ -573,14 +686,28 @@ fn read_small(path: &Path) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-fn add_trash_root(l: &mut Listing, t: &mut TrashRows, root: Root, file: Arc<File>, entries: Vec<TrashEntry>) {
+fn add_trash_root(
+    l: &mut Listing,
+    t: &mut TrashRows,
+    root: Root,
+    file: Arc<File>,
+    entries: Vec<TrashEntry>,
+) {
     let ri = t.roots.len() as u16;
     for (name, kind, info) in entries {
-        let shown = info.as_ref().and_then(|i| i.original.file_name()).unwrap_or(&name).as_bytes();
+        let shown = info
+            .as_ref()
+            .and_then(|i| i.original.file_name())
+            .unwrap_or(&name)
+            .as_bytes();
         if shown.len() > u16::MAX as usize || l.names.len() + shown.len() > u32::MAX as usize {
             continue;
         }
-        l.slots.push(Slot { off: l.names.len() as u32, len: shown.len() as u16, kind });
+        l.slots.push(Slot {
+            off: l.names.len() as u32,
+            len: shown.len() as u16,
+            kind,
+        });
         l.names.extend_from_slice(shown);
         t.root_of.push(ri);
         t.file_names.push(name);
@@ -593,16 +720,41 @@ fn add_trash_root(l: &mut Listing, t: &mut TrashRows, root: Root, file: Arc<File
 /// Lists what's in every Trash folder, as one list. The home Trash is read first. Other
 /// disks are found and read on a thread of their own: a disk that stops answering can
 /// hang that thread, but the home Trash still shows.
-fn load_trash(req: LoadRequest, spec: &TrashSpec, watch: Option<&Arc<Watch>>, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
+fn load_trash(
+    req: LoadRequest,
+    spec: &TrashSpec,
+    watch: Option<&Arc<Watch>>,
+    cancel: &Arc<AtomicBool>,
+    sink: &LoadSink,
+) {
     let stale = || cancel.load(atomic::Ordering::Relaxed);
-    let home = Root { root: spec.home_trash.clone(), relative_to: None };
+    let home = Root {
+        root: spec.home_trash.clone(),
+        relative_to: None,
+    };
     // Made now, so the first item trashed later is noticed by the watch.
     let _ = trash::ensure_dirs(&home.root);
     if let Some(w) = watch {
         w.set_dirs_unless(&[home.files()], stale);
     }
-    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None };
-    let mut t = TrashRows { roots: Vec::new(), fds: Vec::new(), root_of: Vec::new(), file_names: Vec::new(), info: Vec::new() };
+    let mut l = Listing {
+        dir: req.dir.clone(),
+        fd: None,
+        names: Vec::new(),
+        slots: Vec::new(),
+        meta: Vec::new(),
+        complete: false,
+        read_error: None,
+        slow_stat: req.slow_stat,
+        trash: None,
+    };
+    let mut t = TrashRows {
+        roots: Vec::new(),
+        fds: Vec::new(),
+        root_of: Vec::new(),
+        file_names: Vec::new(),
+        info: Vec::new(),
+    };
     match read_trash_root(&home, req.slow_read, cancel) {
         Ok((file, entries)) => add_trash_root(&mut l, &mut t, home, file, entries),
         // Only the home Trash is always expected to be there.
@@ -610,19 +762,24 @@ fn load_trash(req: LoadRequest, spec: &TrashSpec, watch: Option<&Arc<Watch>>, ca
     }
     let (tx, rx) = mpsc::channel();
     let (spec2, cancel2, slow) = (spec.clone(), cancel.clone(), req.slow_read);
-    let spawned = std::thread::Builder::new().name("gannet-trash-disks".into()).spawn(move || {
-        let mounts = spec2.mounts.clone().unwrap_or_else(read_mounts);
-        let others: Vec<Root> = trash::roots(&spec2.home_trash, spec2.uid, &mounts).into_iter().skip(1).collect();
-        let _ = tx.send(DiskMsg::Watch(others.iter().map(Root::files).collect()));
-        for root in others {
-            if cancel2.load(atomic::Ordering::Relaxed) {
-                return;
+    let spawned = std::thread::Builder::new()
+        .name("gannet-trash-disks".into())
+        .spawn(move || {
+            let mounts = spec2.mounts.clone().unwrap_or_else(read_mounts);
+            let others: Vec<Root> = trash::roots(&spec2.home_trash, spec2.uid, &mounts)
+                .into_iter()
+                .skip(1)
+                .collect();
+            let _ = tx.send(DiskMsg::Watch(others.iter().map(Root::files).collect()));
+            for root in others {
+                if cancel2.load(atomic::Ordering::Relaxed) {
+                    return;
+                }
+                if let Ok((file, entries)) = read_trash_root(&root, slow, &cancel2) {
+                    let _ = tx.send(DiskMsg::Root(root, file, entries));
+                }
             }
-            if let Ok((file, entries)) = read_trash_root(&root, slow, &cancel2) {
-                let _ = tx.send(DiskMsg::Root(root, file, entries));
-            }
-        }
-    });
+        });
     if spawned.is_ok() {
         let started = Instant::now();
         // Rows on screen are behind what's been read: publish them at the next pause.
@@ -640,11 +797,17 @@ fn load_trash(req: LoadRequest, spec: &TrashSpec, watch: Option<&Arc<Watch>>, ca
                 }
                 break;
             }
-            let wait = if published { Duration::from_millis(100) } else { RESOLVE_HEAD_START.saturating_sub(waited) };
+            let wait = if published {
+                Duration::from_millis(100)
+            } else {
+                RESOLVE_HEAD_START.saturating_sub(waited)
+            };
             match rx.recv_timeout(wait.min(spec.disks_give_up - waited)) {
                 Ok(DiskMsg::Watch(dirs)) => {
                     if let Some(w) = watch {
-                        let all: Vec<PathBuf> = std::iter::once(spec.home_trash.join("files")).chain(dirs).collect();
+                        let all: Vec<PathBuf> = std::iter::once(spec.home_trash.join("files"))
+                            .chain(dirs)
+                            .collect();
                         w.set_dirs_unless(&all, stale);
                     }
                 }
@@ -679,7 +842,13 @@ fn trash_snapshot(l: &Listing, t: &TrashRows) -> Listing {
 
 /// Works out what symlinks point at, on a thread of its own. If that stalls, the rows
 /// go out as they are in the meantime.
-fn resolve_kinds(l: &mut Listing, unresolved: Vec<u32>, req: &LoadRequest, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
+fn resolve_kinds(
+    l: &mut Listing,
+    unresolved: Vec<u32>,
+    req: &LoadRequest,
+    cancel: &Arc<AtomicBool>,
+    sink: &LoadSink,
+) {
     if unresolved.is_empty() {
         return;
     }
@@ -687,13 +856,18 @@ fn resolve_kinds(l: &mut Listing, unresolved: Vec<u32>, req: &LoadRequest, cance
     let Some(fd) = l.fd.clone() else { return };
     let slow = req.slow_stat;
     let (tx, rx) = mpsc::channel();
-    let spawned = std::thread::Builder::new().name("gannet-links".into()).spawn(move || {
-        if let Some(d) = slow {
-            std::thread::sleep(d);
-        }
-        let kinds: Vec<Kind> = names.iter().map(|n| CString::new(n.as_slice()).map_or(Kind::Other, |n| resolved_kind(&fd, &n))).collect();
-        let _ = tx.send(kinds);
-    });
+    let spawned = std::thread::Builder::new()
+        .name("gannet-links".into())
+        .spawn(move || {
+            if let Some(d) = slow {
+                std::thread::sleep(d);
+            }
+            let kinds: Vec<Kind> = names
+                .iter()
+                .map(|n| CString::new(n.as_slice()).map_or(Kind::Other, |n| resolved_kind(&fd, &n)))
+                .collect();
+            let _ = tx.send(kinds);
+        });
     if spawned.is_err() {
         return;
     }
@@ -713,12 +887,16 @@ fn resolve_kinds(l: &mut Listing, unresolved: Vec<u32>, req: &LoadRequest, cance
 }
 
 fn resolved_kind(dir: &File, name: &CStr) -> Kind {
-    let Ok(st) = statat(dir.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) else { return Kind::Other };
+    let Ok(st) = statat(dir.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW) else {
+        return Kind::Other;
+    };
     match FileType::from_raw_mode(st.st_mode as _) {
         FileType::RegularFile => Kind::File,
         FileType::Directory => Kind::Dir,
         FileType::Symlink => match statat(dir.as_fd(), name, AtFlags::empty()) {
-            Ok(t) if FileType::from_raw_mode(t.st_mode as _) == FileType::Directory => Kind::LinkDir,
+            Ok(t) if FileType::from_raw_mode(t.st_mode as _) == FileType::Directory => {
+                Kind::LinkDir
+            }
             _ => Kind::Link,
         },
         _ => Kind::Other,
@@ -728,7 +906,10 @@ fn resolved_kind(dir: &File, name: &CStr) -> Kind {
 /// Partial results are always in name order: a size or time order would mean statting
 /// everything read so far, again for each partial result, while the read waits.
 fn publish_partial(l: Listing, req: &LoadRequest, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
-    let order = SortSpec { key: SortKey::Name, descending: false };
+    let order = SortSpec {
+        key: SortKey::Name,
+        descending: false,
+    };
     emit(Arc::new(l), order, req, cancel, false, sink);
 }
 
@@ -736,10 +917,12 @@ fn publish_final(l: Arc<Listing>, req: &LoadRequest, cancel: &Arc<AtomicBool>, s
     if req.sort.key != SortKey::Name {
         let (tx, rx) = mpsc::channel();
         let (l2, c2) = (l.clone(), cancel.clone());
-        let spawned = std::thread::Builder::new().name("gannet-stat-all".into()).spawn(move || {
-            l2.stat_all(&c2);
-            let _ = tx.send(());
-        });
+        let spawned = std::thread::Builder::new()
+            .name("gannet-stat-all".into())
+            .spawn(move || {
+                l2.stat_all(&c2);
+                let _ = tx.send(());
+            });
         if spawned.is_err() {
             l.stat_all(cancel);
         } else if rx.recv_timeout(SORT_STAT_HEAD_START).is_err() {
@@ -750,7 +933,14 @@ fn publish_final(l: Arc<Listing>, req: &LoadRequest, cancel: &Arc<AtomicBool>, s
     emit(l, req.sort, req, cancel, true, sink);
 }
 
-fn emit(l: Arc<Listing>, order: SortSpec, req: &LoadRequest, cancel: &Arc<AtomicBool>, settled: bool, sink: &LoadSink) {
+fn emit(
+    l: Arc<Listing>,
+    order: SortSpec,
+    req: &LoadRequest,
+    cancel: &Arc<AtomicBool>,
+    settled: bool,
+    sink: &LoadSink,
+) {
     let sorted = sort_known(&l, order);
     let rows = visible_rows(&l, &sorted, req.show_hidden, &req.filter);
     let start = req.first_row.min(rows.len());
@@ -759,7 +949,14 @@ fn emit(l: Arc<Listing>, order: SortSpec, req: &LoadRequest, cancel: &Arc<Atomic
         head_start_stats(&l, rows[start..end].to_vec());
     }
     if !cancel.load(atomic::Ordering::Relaxed) {
-        sink(LoadEvent::Ready(Loaded { generation: req.generation, listing: l, sorted, rows, sort: req.sort, settled }));
+        sink(LoadEvent::Ready(Loaded {
+            generation: req.generation,
+            listing: l,
+            sorted,
+            rows,
+            sort: req.sort,
+            settled,
+        }));
     }
 }
 
@@ -767,10 +964,12 @@ fn emit(l: Arc<Listing>, order: SortSpec, req: &LoadRequest, cancel: &Arc<Atomic
 fn head_start_stats(l: &Arc<Listing>, ids: Vec<u32>) {
     let (tx, rx) = mpsc::channel();
     let l2 = l.clone();
-    let spawned = std::thread::Builder::new().name("gannet-stat-first".into()).spawn(move || {
-        l2.stat_entries(&ids);
-        let _ = tx.send(());
-    });
+    let spawned = std::thread::Builder::new()
+        .name("gannet-stat-first".into())
+        .spawn(move || {
+            l2.stat_entries(&ids);
+            let _ = tx.send(());
+        });
     if spawned.is_ok() {
         let _ = rx.recv_timeout(STAT_HEAD_START);
     }
@@ -837,7 +1036,18 @@ mod tests {
     use std::path::Path;
 
     fn request(dir: &Path) -> LoadRequest {
-        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None, trash: None }
+        LoadRequest {
+            dir: dir.into(),
+            generation: 1,
+            sort: SortSpec::default(),
+            show_hidden: false,
+            filter: String::new(),
+            first_row: 0,
+            row_count: 64,
+            slow_read: None,
+            slow_stat: None,
+            trash: None,
+        }
     }
 
     /// Runs a load to completion, returning every event in order.
@@ -868,7 +1078,10 @@ mod tests {
     }
 
     fn row_names(l: &Loaded) -> Vec<String> {
-        l.rows.iter().map(|&i| String::from_utf8_lossy(l.listing.name(i)).into_owned()).collect()
+        l.rows
+            .iter()
+            .map(|&i| String::from_utf8_lossy(l.listing.name(i)).into_owned())
+            .collect()
     }
 
     #[test]
@@ -878,7 +1091,10 @@ mod tests {
             s.file(n, b"");
         }
         s.dir("zdir");
-        assert_eq!(row_names(&last(run(request(s.path())))), ["zdir", "A", "b9", "b10"]);
+        assert_eq!(
+            row_names(&last(run(request(s.path())))),
+            ["zdir", "A", "b9", "b10"]
+        );
     }
 
     #[test]
@@ -912,7 +1128,9 @@ mod tests {
     fn missing_folder_reports_a_failure_not_a_panic() {
         let s = Scratch::new();
         let events = run(request(&s.path().join("gone")));
-        assert!(matches!(&events[0], LoadEvent::Failed { error, .. } if error.contains("No such file")));
+        assert!(
+            matches!(&events[0], LoadEvent::Failed { error, .. } if error.contains("No such file"))
+        );
     }
 
     #[test]
@@ -932,7 +1150,10 @@ mod tests {
         let mut r = request(s.path());
         r.row_count = 10;
         let l = last(run(r));
-        assert!(matches!(l.listing.stat(l.rows[0]), Stat::Known { size: 5, .. }));
+        assert!(matches!(
+            l.listing.stat(l.rows[0]),
+            Stat::Known { size: 5, .. }
+        ));
         assert_eq!(l.listing.stat(l.rows[100]), Stat::Unknown);
     }
 
@@ -944,10 +1165,16 @@ mod tests {
         s.file("mid", &[0; 10]);
         s.dir("adir");
         let mut r = request(s.path());
-        r.sort = SortSpec { key: SortKey::Size, descending: true };
+        r.sort = SortSpec {
+            key: SortKey::Size,
+            descending: true,
+        };
         assert_eq!(row_names(&last(run(r))), ["adir", "big", "mid", "small"]);
         let mut r = request(s.path());
-        r.sort = SortSpec { key: SortKey::Modified, descending: false };
+        r.sort = SortSpec {
+            key: SortKey::Modified,
+            descending: false,
+        };
         assert_eq!(last(run(r)).rows.len(), 4);
     }
 
@@ -984,8 +1211,14 @@ mod tests {
         let mut r = request(s.path());
         r.slow_read = Some(Duration::from_millis(10));
         let events = run(r);
-        assert!(events.len() >= 2, "expected partial results, got {} events", events.len());
-        let LoadEvent::Ready(first) = &events[0] else { panic!() };
+        assert!(
+            events.len() >= 2,
+            "expected partial results, got {} events",
+            events.len()
+        );
+        let LoadEvent::Ready(first) = &events[0] else {
+            panic!()
+        };
         assert!(!first.listing.complete);
         assert!(first.rows.len() < 3000);
         assert_eq!(last(events).rows.len(), 3000);
@@ -1024,7 +1257,10 @@ mod tests {
         .unwrap();
         st.request(vec![l.rows[50]]);
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(matches!(l.listing.stat(l.rows[50]), Stat::Known { size: 3, .. }));
+        assert!(matches!(
+            l.listing.stat(l.rows[50]),
+            Stat::Known { size: 3, .. }
+        ));
     }
 
     #[test]
@@ -1038,7 +1274,9 @@ mod tests {
         spawn_load(request(&fifo), move |e| {
             let _ = tx.send(e);
         });
-        let got = rx.recv_timeout(Duration::from_secs(3)).expect("opening a FIFO must not block");
+        let got = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("opening a FIFO must not block");
         assert!(matches!(got, LoadEvent::Failed { .. }));
     }
 
@@ -1055,18 +1293,30 @@ mod tests {
         spawn_load(r, move |e| {
             let _ = tx.send(e);
         });
-        let Ok(LoadEvent::Ready(first)) = rx.recv_timeout(Duration::from_secs(5)) else { panic!("no result") };
-        assert!(start.elapsed() < Duration::from_millis(1000), "rows took {:?}", start.elapsed());
+        let Ok(LoadEvent::Ready(first)) = rx.recv_timeout(Duration::from_secs(5)) else {
+            panic!("no result")
+        };
+        assert!(
+            start.elapsed() < Duration::from_millis(1000),
+            "rows took {:?}",
+            start.elapsed()
+        );
         assert!(!first.settled);
         assert_eq!(first.rows.len(), 3);
-        assert_eq!(first.listing.kind(first.listing.find(b"lnk").unwrap()), Kind::Link);
+        assert_eq!(
+            first.listing.kind(first.listing.find(b"lnk").unwrap()),
+            Kind::Link
+        );
         let last = loop {
             match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
                 LoadEvent::Ready(l) if l.settled => break l,
                 _ => {}
             }
         };
-        assert_eq!(last.listing.kind(last.listing.find(b"lnk").unwrap()), Kind::LinkDir);
+        assert_eq!(
+            last.listing.kind(last.listing.find(b"lnk").unwrap()),
+            Kind::LinkDir
+        );
     }
 
     #[test]
@@ -1080,8 +1330,14 @@ mod tests {
         spawn_load(r, move |e| {
             let _ = tx.send(e);
         });
-        let Ok(LoadEvent::Ready(first)) = rx.recv_timeout(Duration::from_secs(5)) else { panic!("no result") };
-        assert!(start.elapsed() < Duration::from_millis(1000), "rows took {:?}", start.elapsed());
+        let Ok(LoadEvent::Ready(first)) = rx.recv_timeout(Duration::from_secs(5)) else {
+            panic!("no result")
+        };
+        assert!(
+            start.elapsed() < Duration::from_millis(1000),
+            "rows took {:?}",
+            start.elapsed()
+        );
         assert_eq!(first.listing.stat(first.rows[0]), Stat::Unknown);
     }
 
@@ -1091,11 +1347,16 @@ mod tests {
         s.file("a", &[0; 1]);
         s.file("b", &[0; 9]);
         let mut r = request(s.path());
-        r.sort = SortSpec { key: SortKey::Size, descending: true };
+        r.sort = SortSpec {
+            key: SortKey::Size,
+            descending: true,
+        };
         r.row_count = 0;
         r.slow_stat = Some(Duration::from_millis(800));
         let events = run(r);
-        let LoadEvent::Ready(first) = &events[0] else { panic!() };
+        let LoadEvent::Ready(first) = &events[0] else {
+            panic!()
+        };
         assert!(!first.settled);
         assert_eq!(row_names(first), ["a", "b"]);
         assert_eq!(row_names(&last(events)), ["b", "a"]);
@@ -1108,13 +1369,23 @@ mod tests {
             s.file(&format!("f{i}"), b"");
         }
         let mut r = request(s.path());
-        r.sort = SortSpec { key: SortKey::Size, descending: false };
+        r.sort = SortSpec {
+            key: SortKey::Size,
+            descending: false,
+        };
         r.row_count = 0;
         r.slow_read = Some(Duration::from_millis(10));
         let events = run(r);
-        let LoadEvent::Ready(first) = &events[0] else { panic!() };
+        let LoadEvent::Ready(first) = &events[0] else {
+            panic!()
+        };
         assert!(!first.settled);
-        assert!(first.rows.iter().all(|&i| first.listing.stat(i) == Stat::Unknown));
+        assert!(
+            first
+                .rows
+                .iter()
+                .all(|&i| first.listing.stat(i) == Stat::Unknown)
+        );
     }
 
     #[test]
@@ -1127,7 +1398,11 @@ mod tests {
         let mut r = request(s.path());
         r.slow_read = Some(Duration::from_millis(10));
         let events = run(r);
-        assert!(events.len() >= 2, "expected partial results, got {}", events.len());
+        assert!(
+            events.len() >= 2,
+            "expected partial results, got {}",
+            events.len()
+        );
     }
 
     #[test]
@@ -1145,7 +1420,10 @@ mod tests {
             let pid = libc::fork();
             assert!(pid >= 0);
             if pid == 0 {
-                let lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+                let lim = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
                 libc::setrlimit(libc::RLIMIT_NPROC, &lim);
                 let (tx, rx) = mpsc::channel();
                 let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1158,7 +1436,10 @@ mod tests {
             }
             let mut status = 0;
             libc::waitpid(pid, &mut status, 0);
-            assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0, "status {status}");
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "status {status}"
+            );
         }
     }
 
@@ -1171,7 +1452,11 @@ mod tests {
         }
         let l = last(run(request(s.path())));
         assert_eq!(l.rows.len(), 20_000);
-        assert!(l.rows.windows(2).all(|w| natural_cmp(l.listing.name(w[0]), l.listing.name(w[1])) == Ordering::Less));
+        assert!(
+            l.rows
+                .windows(2)
+                .all(|w| natural_cmp(l.listing.name(w[0]), l.listing.name(w[1])) == Ordering::Less)
+        );
     }
 
     #[test]
@@ -1193,11 +1478,24 @@ mod tests {
         // An item with no info file still shows, under its own name, but can't be restored.
         fs::write(home.join("files/stray"), b"").unwrap();
         let mut req = request(&home.join("files"));
-        req.trash = Some(TrashSpec { home_trash: home.clone(), uid, disks_give_up: DISKS_GIVE_UP, mounts: Some(vec![crate::mounts::Mount { point: disk.clone(), fs_type: "ext4".into(), source: "/dev/sdz1".into() }]) });
+        req.trash = Some(TrashSpec {
+            home_trash: home.clone(),
+            uid,
+            disks_give_up: DISKS_GIVE_UP,
+            mounts: Some(vec![crate::mounts::Mount {
+                point: disk.clone(),
+                fs_type: "ext4".into(),
+                source: "/dev/sdz1".into(),
+            }]),
+        });
         let l = last(run(req));
         assert!(l.listing.is_trash());
         assert_eq!(row_names(&l), ["a.txt", "a.txt", "far.txt", "stray"]);
-        let by_path = |p: &Path| (0..l.listing.len() as u32).find(|&i| l.listing.path(i) == p).unwrap();
+        let by_path = |p: &Path| {
+            (0..l.listing.len() as u32)
+                .find(|&i| l.listing.path(i) == p)
+                .unwrap()
+        };
         for t in [&a1, &a2, &far] {
             let i = by_path(&t.file);
             assert_eq!(l.listing.trashed(i).as_ref(), Some(t));
@@ -1208,8 +1506,17 @@ mod tests {
         // Sizes come from the item where it is now, and the date from when it was trashed.
         let i = by_path(&far.file);
         l.listing.stat_entries(&[i]);
-        let deleted = trash::parse_info(&fs::read(&far.info).unwrap(), Some(&disk)).unwrap().deleted.unwrap();
-        assert_eq!(l.listing.stat(i), Stat::Known { size: 3, mtime: deleted });
+        let deleted = trash::parse_info(&fs::read(&far.info).unwrap(), Some(&disk))
+            .unwrap()
+            .deleted
+            .unwrap();
+        assert_eq!(
+            l.listing.stat(i),
+            Stat::Known {
+                size: 3,
+                mtime: deleted
+            }
+        );
     }
 
     #[test]
@@ -1217,14 +1524,23 @@ mod tests {
         let s = Scratch::new();
         let home = s.path().join("data/Trash");
         let mut req = request(&home.join("files"));
-        req.trash = Some(TrashSpec { home_trash: home.clone(), uid: 1000, disks_give_up: DISKS_GIVE_UP, mounts: Some(Vec::new()) });
+        req.trash = Some(TrashSpec {
+            home_trash: home.clone(),
+            uid: 1000,
+            disks_give_up: DISKS_GIVE_UP,
+            mounts: Some(Vec::new()),
+        });
         let l = last(run(req));
         assert!(l.listing.is_empty() && l.listing.read_error.is_none());
         assert!(home.join("info").is_dir());
     }
 
     fn disk_mount(point: &Path) -> crate::mounts::Mount {
-        crate::mounts::Mount { point: point.to_path_buf(), fs_type: "ext4".into(), source: "/dev/sdz1".into() }
+        crate::mounts::Mount {
+            point: point.to_path_buf(),
+            fs_type: "ext4".into(),
+            source: "/dev/sdz1".into(),
+        }
     }
 
     #[test]
@@ -1237,10 +1553,20 @@ mod tests {
         let mut req = request(&home.join("files"));
         // Each entry read waits this long, and only the other disk has one.
         req.slow_read = Some(Duration::from_millis(400));
-        req.trash = Some(TrashSpec { home_trash: home.clone(), uid, disks_give_up: DISKS_GIVE_UP, mounts: Some(vec![disk_mount(&disk)]) });
+        req.trash = Some(TrashSpec {
+            home_trash: home.clone(),
+            uid,
+            disks_give_up: DISKS_GIVE_UP,
+            mounts: Some(vec![disk_mount(&disk)]),
+        });
         let events = run(req);
-        let Some(LoadEvent::Ready(first)) = events.first() else { panic!("no rows") };
-        assert!(!first.settled && first.listing.is_empty() && first.listing.is_trash(), "the home Trash shows first");
+        let Some(LoadEvent::Ready(first)) = events.first() else {
+            panic!("no rows")
+        };
+        assert!(
+            !first.settled && first.listing.is_empty() && first.listing.is_trash(),
+            "the home Trash shows first"
+        );
         let l = last(events);
         assert_eq!(row_names(&l), ["far"]);
     }
@@ -1251,15 +1577,30 @@ mod tests {
         let home = s.path().join("data/Trash");
         s.file("data/Trash/files/x", b"");
         fs::create_dir_all(home.join("info")).unwrap();
-        rustix::fs::mknodat(rustix::fs::CWD, home.join("info/x.trashinfo"), rustix::fs::FileType::Fifo, rustix::fs::Mode::from_raw_mode(0o600), 0).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            home.join("info/x.trashinfo"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
         let mut req = request(&home.join("files"));
-        req.trash = Some(TrashSpec { home_trash: home.clone(), uid: 1000, disks_give_up: DISKS_GIVE_UP, mounts: Some(Vec::new()) });
+        req.trash = Some(TrashSpec {
+            home_trash: home.clone(),
+            uid: 1000,
+            disks_give_up: DISKS_GIVE_UP,
+            mounts: Some(Vec::new()),
+        });
         let (tx, rx) = mpsc::channel();
         spawn_load(req, move |e| {
             let _ = tx.send(e);
         });
         loop {
-            match rx.recv_timeout(Duration::from_secs(5)).expect("the load must finish") {
+            match rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the load must finish")
+            {
                 LoadEvent::Ready(l) if l.settled => {
                     assert_eq!(row_names(&l), ["x"]);
                     assert!(l.listing.trashed(l.rows[0]).is_none());
@@ -1280,7 +1621,12 @@ mod tests {
         trash::trash(&c, &s.file("work/a", b"1")).unwrap();
         trash::trash(&c, &s.file("work/a", b"2")).unwrap();
         let mut req = request(&home.join("files"));
-        req.trash = Some(TrashSpec { home_trash: home, uid: 1000, disks_give_up: DISKS_GIVE_UP, mounts: Some(Vec::new()) });
+        req.trash = Some(TrashSpec {
+            home_trash: home,
+            uid: 1000,
+            disks_give_up: DISKS_GIVE_UP,
+            mounts: Some(Vec::new()),
+        });
         let l = last(run(req));
         assert_eq!(row_names(&l), ["a", "a"]);
         assert_ne!(l.listing.key(0), l.listing.key(1));
@@ -1297,23 +1643,39 @@ mod tests {
         // Each entry read waits a minute, and only the other disk has one: it stands in
         // for a disk that's stopped answering.
         req.slow_read = Some(Duration::from_secs(60));
-        req.trash = Some(TrashSpec { home_trash: home.clone(), uid, disks_give_up: Duration::from_millis(300), mounts: Some(vec![disk_mount(&disk)]) });
+        req.trash = Some(TrashSpec {
+            home_trash: home.clone(),
+            uid,
+            disks_give_up: Duration::from_millis(300),
+            mounts: Some(vec![disk_mount(&disk)]),
+        });
         let (tx, rx) = mpsc::channel();
         spawn_load(req, move |e| {
             let _ = tx.send(e);
         });
         let started = Instant::now();
         loop {
-            match rx.recv_timeout(Duration::from_secs(10)).expect("the load must finish") {
+            match rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the load must finish")
+            {
                 LoadEvent::Ready(l) if l.settled => {
                     assert!(l.listing.is_empty());
-                    assert!(l.listing.read_error.as_deref().is_some_and(|e| e.contains("didn't answer")));
+                    assert!(
+                        l.listing
+                            .read_error
+                            .as_deref()
+                            .is_some_and(|e| e.contains("didn't answer"))
+                    );
                     break;
                 }
                 LoadEvent::Ready(_) => {}
                 LoadEvent::Failed { error, .. } => panic!("{error}"),
             }
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "finished without the other disk");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "finished without the other disk"
+        );
     }
 }

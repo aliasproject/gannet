@@ -14,10 +14,16 @@ pub fn size(bytes: u64) -> String {
         v /= 1000.0;
         u += 1;
     }
-    if v < 100.0 { format!("{v:.1} {}", UNITS[u]) } else { format!("{v:.0} {}", UNITS[u]) }
+    if v < 100.0 {
+        format!("{v:.1} {}", UNITS[u])
+    } else {
+        format!("{v:.0} {}", UNITS[u])
+    }
 }
 
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// `14:03` today, `Nov 3 14:03` this year, `Nov 3 2024` before that.
 pub fn date(seconds: i64, now: i64) -> String {
@@ -61,7 +67,14 @@ mod tests {
     }
 
     fn t(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> Local {
-        Local { year, month, day, hour, minute, second: 0 }
+        Local {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second: 0,
+        }
     }
 
     #[test]

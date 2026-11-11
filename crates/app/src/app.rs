@@ -4,20 +4,23 @@
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gannet_core::clipboard;
 use gannet_core::history::{History, Stop, parent_stop};
-use gannet_core::listing::{Kind, LoadEvent, LoadHandle, LoadRequest, Listing, Loaded, SortKey, SortSpec, Stat, Stater, DISKS_GIVE_UP, TrashSpec, sort_entries, spawn_load_watching, visible_rows};
+use gannet_core::listing::{
+    DISKS_GIVE_UP, Kind, Listing, LoadEvent, LoadHandle, LoadRequest, Loaded, SortKey, SortSpec,
+    Stat, Stater, TrashSpec, sort_entries, spawn_load_watching, visible_rows,
+};
 use gannet_core::mounts::Mount;
-use gannet_core::trash;
 use gannet_core::ops::{self, Answer, Choice, Conflict, Engine, Job, Request, Undo};
-use gannet_core::watch::Watch;
 use gannet_core::places::{Place, PlaceKind};
 use gannet_core::theme::{Colors, Source};
+use gannet_core::trash;
+use gannet_core::watch::Watch;
 use rustix::fd::OwnedFd;
 use xkbcommon::xkb::keysyms as k;
 
@@ -62,7 +65,13 @@ impl Hub {
 pub enum Msg {
     Load(LoadEvent),
     Stats(u64),
-    Derived { generation: u64, listing: Arc<Listing>, sorted: Arc<Vec<u32>>, rows: Vec<u32>, sort: SortSpec },
+    Derived {
+        generation: u64,
+        listing: Arc<Listing>,
+        sorted: Arc<Vec<u32>>,
+        rows: Vec<u32>,
+        sort: SortSpec,
+    },
     Font(PathBuf, u32),
     PrimaryFont(PathBuf, u32),
     DesktopDark(bool),
@@ -71,10 +80,31 @@ pub enum Msg {
     /// `data` is `None` if it was too big to trust.
     Clipboard(Option<Vec<u8>>, String, Paste),
     Preview(preview::Event),
+    /// The preview window stepped to another file.
+    PreviewStepped {
+        generation: u64,
+        path: PathBuf,
+    },
+    /// The preview window has gone, and whether it went wrong.
+    PreviewEnded {
+        generation: u64,
+        crashed: bool,
+    },
+    /// In the preview window: the list's cursor is on another file.
+    PreviewShow(PathBuf),
+    /// In the preview window: the list that opened it has gone.
+    ListGone,
     /// A file list dropped from a Wayland drag, read and looked at off the main thread.
     Dropped(Dropped),
-    DragSource { drag: u64, facts: Option<(u64, bool)> },
-    DragDevice { drag: u64, path: PathBuf, device: Option<u64> },
+    DragSource {
+        drag: u64,
+        facts: Option<(u64, bool)>,
+    },
+    DragDevice {
+        drag: u64,
+        path: PathBuf,
+        device: Option<u64>,
+    },
 }
 
 pub struct Dropped {
@@ -108,12 +138,33 @@ pub enum Cmd {
     ClearClipboard,
     ReadClipboard(Paste),
     /// Hands the drag over to the compositor, which then carries it to other programs.
-    StartDrag { formats: Vec<(&'static str, Vec<u8>)>, marker: Option<clipboard::DragMarker>, move_only: bool, icon: Option<crate::wl::DragIcon> },
+    StartDrag {
+        formats: Vec<(&'static str, Vec<u8>)>,
+        marker: Option<clipboard::DragMarker>,
+        move_only: bool,
+        icon: Option<crate::wl::DragIcon>,
+    },
     CancelDrag,
     AcceptDrop(bool),
-    ReadDrop { dest: PathBuf, trash: bool, decided: Option<DropAction> },
+    ReadDrop {
+        dest: PathBuf,
+        trash: bool,
+        decided: Option<DropAction>,
+    },
     FinishDrop,
     AbandonDrop,
+    /// Starts the preview window on a file, sorted and filtered as this list is.
+    OpenPreview {
+        generation: u64,
+        path: PathBuf,
+        hidden: bool,
+        sort: SortSpec,
+    },
+    ClosePreview,
+    /// Tells the preview window to show another file.
+    PreviewShow(PathBuf),
+    /// In the preview window: tells the list which file is showing now.
+    PreviewStepped(PathBuf),
     Quit,
 }
 
@@ -127,10 +178,20 @@ pub struct JobView {
 
 /// A question that has to be answered before anything else happens.
 pub enum Dialog {
-    Conflict { conflict: Conflict, apply_to_all: bool, at: usize },
+    Conflict {
+        conflict: Conflict,
+        apply_to_all: bool,
+        at: usize,
+    },
     /// `empty` is for emptying the Trash, which words the question differently.
-    ConfirmDelete { paths: Vec<PathBuf>, at: usize, empty: bool },
-    ConfirmQuit { at: usize },
+    ConfirmDelete {
+        paths: Vec<PathBuf>,
+        at: usize,
+        empty: bool,
+    },
+    ConfirmQuit {
+        at: usize,
+    },
 }
 
 /// One dialog button: its label and the key that presses it.
@@ -336,7 +397,12 @@ pub enum Edit {
     None,
     Path(Field),
     Filter(Field),
-    Rename { initial: String, name: Vec<u8>, path: PathBuf, field: Field },
+    Rename {
+        initial: String,
+        name: Vec<u8>,
+        path: PathBuf,
+        field: Field,
+    },
     NewFolder(Field),
 }
 
@@ -450,6 +516,14 @@ pub struct App {
 
     pub preview: Option<Preview>,
     pub(crate) preview_gen: u64,
+    /// This app is the preview window rather than a file manager.
+    pub viewer: bool,
+    /// The file the other side last heard about. In the list, `Some` while a preview window is
+    /// open.
+    pub previewer: Option<PathBuf>,
+    pub(crate) previewer_gen: u64,
+    /// The file-type database, for saying what any file is.
+    pub kinds: Arc<preview::Kinds>,
     /// Where other programs keep thumbnails.
     pub cache_home: Option<PathBuf>,
     pub slow_preview: Option<Duration>,
@@ -466,7 +540,19 @@ const FULL: Rect = Rect::new(0, 0, i32::MAX / 2, i32::MAX / 2);
 
 impl App {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(hub: Hub, engine: Engine, trash_dir: PathBuf, colors: Colors, theme_source: Source, text: Text, places: Vec<Place>, dir: PathBuf, w: i32, h: i32, scale: f64) -> Self {
+    pub fn new(
+        hub: Hub,
+        engine: Engine,
+        trash_dir: PathBuf,
+        colors: Colors,
+        theme_source: Source,
+        text: Text,
+        places: Vec<Place>,
+        dir: PathBuf,
+        w: i32,
+        h: i32,
+        scale: f64,
+    ) -> Self {
         Self {
             hub,
             colors,
@@ -547,6 +633,10 @@ impl App {
             trash_mounts: None,
             preview: None,
             preview_gen: 0,
+            viewer: false,
+            previewer: None,
+            previewer_gen: 0,
+            kinds: Arc::new(preview::Kinds::default()),
             cache_home: None,
             slow_preview: None,
             key_is_repeat: false,
@@ -611,7 +701,9 @@ impl App {
 
     /// Quick operations never show, so the layout doesn't flicker.
     pub fn visible_jobs(&self) -> impl Iterator<Item = &JobView> {
-        self.jobs.iter().filter(|j| j.started.elapsed() >= JOB_SHOW_AFTER)
+        self.jobs
+            .iter()
+            .filter(|j| j.started.elapsed() >= JOB_SHOW_AFTER)
     }
 
     // ---- Loading ----
@@ -630,8 +722,17 @@ impl App {
 
     fn current_stop(&self) -> Stop {
         // With no cursor showing there's nothing to come back to.
-        let cursor_name = if self.cursor_shown { self.listing.as_ref().and_then(|l| self.rows.get(self.cursor).map(|&i| l.key(i).into_owned())) } else { None };
-        Stop { dir: self.dir.clone(), cursor_name }
+        let cursor_name = if self.cursor_shown {
+            self.listing
+                .as_ref()
+                .and_then(|l| self.rows.get(self.cursor).map(|&i| l.key(i).into_owned()))
+        } else {
+            None
+        };
+        Stop {
+            dir: self.dir.clone(),
+            cursor_name,
+        }
     }
 
     /// Shows a folder now if it's cached, and reads it either way.
@@ -714,10 +815,17 @@ impl App {
             row_count: self.row_capacity(),
             slow_read: self.slow_read,
             slow_stat: None,
-            trash: self.is_trash_view().then(|| TrashSpec { home_trash: self.home_trash(), uid: rustix::process::geteuid().as_raw(), mounts: self.trash_mounts.clone(), disks_give_up: DISKS_GIVE_UP }),
+            trash: self.is_trash_view().then(|| TrashSpec {
+                home_trash: self.home_trash(),
+                uid: rustix::process::geteuid().as_raw(),
+                mounts: self.trash_mounts.clone(),
+                disks_give_up: DISKS_GIVE_UP,
+            }),
         };
         let hub = self.hub.clone();
-        self.load = Some(spawn_load_watching(req, self.watch.clone(), move |e| hub.send(Msg::Load(e))));
+        self.load = Some(spawn_load_watching(req, self.watch.clone(), move |e| {
+            hub.send(Msg::Load(e))
+        }));
     }
 
     /// A change on disk: reload soon, but less often when reloading is expensive.
@@ -725,7 +833,8 @@ impl App {
         if self.loading {
             self.reload_after_load = true;
         } else if self.reload_at.is_none() {
-            let wait = (self.last_load_cost * 5).clamp(Duration::from_millis(50), Duration::from_secs(5));
+            let wait =
+                (self.last_load_cost * 5).clamp(Duration::from_millis(50), Duration::from_secs(5));
             self.reload_at = Some(Instant::now() + wait);
         }
     }
@@ -751,9 +860,27 @@ impl App {
 
     pub fn next_deadline(&self) -> Option<Instant> {
         // A running job that hasn't shown yet needs one wake-up, when it's due to.
-        let job = self.jobs.iter().map(|j| j.started + JOB_SHOW_AFTER).filter(|&t| t > Instant::now()).min();
-        let band = if let Some(FileDrag::Band(b)) = &self.file_drag { b.scroll_at } else { None };
-        [self.reload_at, self.hold_paint, job, self.preview_deadline(), band].into_iter().flatten().min()
+        let job = self
+            .jobs
+            .iter()
+            .map(|j| j.started + JOB_SHOW_AFTER)
+            .filter(|&t| t > Instant::now())
+            .min();
+        let band = if let Some(FileDrag::Band(b)) = &self.file_drag {
+            b.scroll_at
+        } else {
+            None
+        };
+        [
+            self.reload_at,
+            self.hold_paint,
+            job,
+            self.preview_deadline(),
+            band,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     fn on_loaded(&mut self, l: Loaded) {
@@ -762,7 +889,10 @@ impl App {
         }
         self.hold_paint = None;
         self.first_load = false;
-        let same_dir = self.listing.as_ref().is_some_and(|o| o.dir == l.listing.dir);
+        let same_dir = self
+            .listing
+            .as_ref()
+            .is_some_and(|o| o.dir == l.listing.dir);
         let old = self.listing.clone();
         // A partial reload of a folder we can already show would make rows and the
         // selection vanish for a moment. The complete listing stays up until the new one is.
@@ -770,7 +900,11 @@ impl App {
             return;
         }
         // Whatever a finished operation wants selected, now that it's in the listing.
-        let select = if l.settled { std::mem::take(&mut self.pending_select) } else { Vec::new() };
+        let select = if l.settled {
+            std::mem::take(&mut self.pending_select)
+        } else {
+            Vec::new()
+        };
         if l.settled {
             self.loading = false;
             self.last_load_cost = self.load_started.elapsed();
@@ -779,20 +913,35 @@ impl App {
             }
         }
         self.load_error = l.listing.read_error.clone();
-        let name_at = |row: usize, rows: &[u32]| old.as_ref().filter(|_| same_dir).and_then(|o| rows.get(row).map(|&i| o.key(i).into_owned()));
+        let name_at = |row: usize, rows: &[u32]| {
+            old.as_ref()
+                .filter(|_| same_dir)
+                .and_then(|o| rows.get(row).map(|&i| o.key(i).into_owned()))
+        };
         let picks: Vec<Vec<u8>> = match &old {
-            Some(o) if same_dir && self.sel_count > 0 => self.rows.iter().filter(|&&i| self.is_selected(i)).map(|&i| o.key(i).into_owned()).collect(),
+            Some(o) if same_dir && self.sel_count > 0 => self
+                .rows
+                .iter()
+                .filter(|&&i| self.is_selected(i))
+                .map(|&i| o.key(i).into_owned())
+                .collect(),
             _ => Vec::new(),
         };
         self.rows_changing();
-        let (keep_cursor, keep_anchor) = (name_at(self.cursor, &self.rows), name_at(self.anchor, &self.rows));
+        let (keep_cursor, keep_anchor) = (
+            name_at(self.cursor, &self.rows),
+            name_at(self.anchor, &self.rows),
+        );
         self.listing = Some(l.listing.clone());
         self.sorted = Arc::new(l.sorted);
         self.rows = l.rows;
         self.selected = vec![0; l.listing.len().div_ceil(64)];
         self.sel_count = 0;
         if !picks.is_empty() {
-            let lookup: std::collections::HashMap<std::borrow::Cow<[u8]>, u32> = (0..l.listing.len() as u32).map(|i| (l.listing.key(i), i)).collect();
+            let lookup: std::collections::HashMap<std::borrow::Cow<[u8]>, u32> = (0
+                ..l.listing.len() as u32)
+                .map(|i| (l.listing.key(i), i))
+                .collect();
             for p in &picks {
                 if let Some(&i) = lookup.get(p.as_slice()) {
                     self.set_selected(i, true);
@@ -802,7 +951,12 @@ impl App {
         self.new_stater(l.listing.clone());
         // Same folder: everything stays where it was, by name. A cursor that wasn't
         // showing stays hidden, and the view doesn't jump.
-        let row_of = |name: &Option<Vec<u8>>, rows: &[u32]| name.as_ref().and_then(|n| rows.iter().position(|&i| *l.listing.key(i) == *n.as_slice()));
+        let row_of = |name: &Option<Vec<u8>>, rows: &[u32]| {
+            name.as_ref().and_then(|n| {
+                rows.iter()
+                    .position(|&i| *l.listing.key(i) == *n.as_slice())
+            })
+        };
         if same_dir {
             let last = self.rows.len().saturating_sub(1);
             self.cursor = row_of(&keep_cursor, &self.rows).unwrap_or(self.cursor.min(last));
@@ -812,13 +966,20 @@ impl App {
         if !select.is_empty() {
             self.clear_selection();
             let first = select.first().cloned();
-            let lookup: std::collections::HashMap<std::borrow::Cow<[u8]>, u32> = (0..l.listing.len() as u32).map(|i| (l.listing.key(i), i)).collect();
+            let lookup: std::collections::HashMap<std::borrow::Cow<[u8]>, u32> = (0
+                ..l.listing.len() as u32)
+                .map(|i| (l.listing.key(i), i))
+                .collect();
             for name in &select {
                 if let Some(&i) = lookup.get(name.as_slice()) {
                     self.set_selected(i, true);
                 }
             }
-            if let Some(row) = first.and_then(|n| self.rows.iter().position(|&i| *l.listing.key(i) == *n.as_slice())) {
+            if let Some(row) = first.and_then(|n| {
+                self.rows
+                    .iter()
+                    .position(|&i| *l.listing.key(i) == *n.as_slice())
+            }) {
                 self.cursor = row;
                 self.anchor = row;
                 self.cursor_shown = true;
@@ -852,8 +1013,14 @@ impl App {
             return;
         }
         self.cache.retain(|c| c.listing.dir != listing.dir);
-        self.cache.push(Cached { listing, sorted: self.sorted.clone(), sort });
-        while self.cache.len() > CACHE_ENTRIES || self.cache.iter().map(|c| c.listing.len()).sum::<usize>() > CACHE_TOTAL_ROWS {
+        self.cache.push(Cached {
+            listing,
+            sorted: self.sorted.clone(),
+            sort,
+        });
+        while self.cache.len() > CACHE_ENTRIES
+            || self.cache.iter().map(|c| c.listing.len()).sum::<usize>() > CACHE_TOTAL_ROWS
+        {
             if self.cache.len() <= 1 {
                 break;
             }
@@ -871,9 +1038,17 @@ impl App {
 
     /// Puts the cursor on the entry named when we arrived, if any.
     fn place_pending_cursor(&mut self, select: bool, settled: bool) {
-        let Some(name) = self.pending_cursor.take() else { return };
-        let Some(l) = self.listing.clone() else { return };
-        if let Some(row) = self.rows.iter().position(|&i| *l.key(i) == *name.as_slice()) {
+        let Some(name) = self.pending_cursor.take() else {
+            return;
+        };
+        let Some(l) = self.listing.clone() else {
+            return;
+        };
+        if let Some(row) = self
+            .rows
+            .iter()
+            .position(|&i| *l.key(i) == *name.as_slice())
+        {
             self.cursor = row;
             self.anchor = row;
             self.cursor_shown = true;
@@ -895,7 +1070,9 @@ impl App {
     /// Recomputes rows after the sort, hidden setting or filter changed. Big folders do
     /// it on a thread, and the old rows stay up until it's done.
     pub fn rederive(&mut self, resort: bool) {
-        let Some(l) = self.listing.clone() else { return };
+        let Some(l) = self.listing.clone() else {
+            return;
+        };
         self.derive_cancel.store(true, Ordering::Relaxed);
         self.derive_cancel = Arc::new(AtomicBool::new(false));
         self.derive_gen += 1;
@@ -906,16 +1083,37 @@ impl App {
             self.apply_rows(rows);
             return;
         }
-        let (hub, generation, sort, hidden, filter, cancel, sorted) = (self.hub.clone(), self.derive_gen, self.sort, self.show_hidden, self.filter.clone(), self.derive_cancel.clone(), self.sorted.clone());
-        let spawned = std::thread::Builder::new().name("gannet-derive".into()).spawn(move || {
-            let sorted = if resort { Arc::new(sort_entries(&l, sort, &cancel)) } else { sorted };
-            let rows = visible_rows(&l, &sorted, hidden, &filter);
-            if !cancel.load(Ordering::Relaxed) {
-                hub.send(Msg::Derived { generation, listing: l, sorted, rows, sort });
-            }
-        });
+        let (hub, generation, sort, hidden, filter, cancel, sorted) = (
+            self.hub.clone(),
+            self.derive_gen,
+            self.sort,
+            self.show_hidden,
+            self.filter.clone(),
+            self.derive_cancel.clone(),
+            self.sorted.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("gannet-derive".into())
+            .spawn(move || {
+                let sorted = if resort {
+                    Arc::new(sort_entries(&l, sort, &cancel))
+                } else {
+                    sorted
+                };
+                let rows = visible_rows(&l, &sorted, hidden, &filter);
+                if !cancel.load(Ordering::Relaxed) {
+                    hub.send(Msg::Derived {
+                        generation,
+                        listing: l,
+                        sorted,
+                        rows,
+                        sort,
+                    });
+                }
+            });
         if spawned.is_err() {
-            self.notices.push("Couldn't start a thread to sort this folder".into());
+            self.notices
+                .push("Couldn't start a thread to sort this folder".into());
             self.invalidate_all();
         }
     }
@@ -926,7 +1124,9 @@ impl App {
         }
         let at = self.rows.get(self.cursor).copied();
         self.rows = rows;
-        self.cursor = at.and_then(|id| self.rows.iter().position(|&i| i == id)).unwrap_or(0);
+        self.cursor = at
+            .and_then(|id| self.rows.iter().position(|&i| i == id))
+            .unwrap_or(0);
         self.anchor = self.cursor;
         self.recount_selection();
         self.clamp_scroll();
@@ -941,6 +1141,7 @@ impl App {
     pub fn on_msg(&mut self, m: Msg) {
         self.handle_msg(m);
         self.preview_sync();
+        self.preview_follow();
         // A reload can move the rows under a drag, and a disk can have just answered.
         self.refresh_file_drag();
         self.refresh_incoming();
@@ -949,6 +1150,13 @@ impl App {
     fn handle_msg(&mut self, m: Msg) {
         match m {
             Msg::Preview(e) => self.on_preview(e),
+            Msg::PreviewStepped { generation, path } => self.on_preview_stepped(generation, path),
+            Msg::PreviewEnded {
+                generation,
+                crashed,
+            } => self.on_preview_ended(generation, crashed),
+            Msg::PreviewShow(path) => self.on_preview_show(path),
+            Msg::ListGone => self.cmds.push(Cmd::Quit),
             Msg::Dropped(d) => self.on_dropped(d),
             Msg::DragSource { drag, facts } => {
                 if let Some(FileDrag::Active(d)) = &mut self.file_drag
@@ -970,13 +1178,20 @@ impl App {
                 }
             }
             Msg::Load(LoadEvent::Ready(l)) => self.on_loaded(l),
-            Msg::Load(LoadEvent::Failed { generation, error, dir }) => {
+            Msg::Load(LoadEvent::Failed {
+                generation,
+                error,
+                dir,
+            }) => {
                 if generation == self.load_gen {
                     // `gannet some/file`: show its folder with the file under the cursor.
                     if std::mem::take(&mut self.first_load) && error == "Not a directory" {
                         use std::os::unix::ffi::OsStrExt;
                         if let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) {
-                            return self.go(Stop { dir: parent.to_path_buf(), cursor_name: Some(name.as_bytes().to_vec()) });
+                            return self.go(Stop {
+                                dir: parent.to_path_buf(),
+                                cursor_name: Some(name.as_bytes().to_vec()),
+                            });
                         }
                     }
                     self.reload_after_load = false;
@@ -997,8 +1212,17 @@ impl App {
                     self.invalidate(self.layout().status);
                 }
             }
-            Msg::Derived { generation, listing, sorted, rows, sort } => {
-                let current = self.listing.as_ref().is_some_and(|l| Arc::ptr_eq(l, &listing));
+            Msg::Derived {
+                generation,
+                listing,
+                sorted,
+                rows,
+                sort,
+            } => {
+                let current = self
+                    .listing
+                    .as_ref()
+                    .is_some_and(|l| Arc::ptr_eq(l, &listing));
                 if generation == self.derive_gen && current {
                     self.resort_pending = false;
                     self.sorted = sorted;
@@ -1031,7 +1255,8 @@ impl App {
                 }
             }
             Msg::Clipboard(data, _, Paste::IntoField { edit }) => {
-                let text = String::from_utf8_lossy(data.as_deref().unwrap_or_default()).into_owned();
+                let text =
+                    String::from_utf8_lossy(data.as_deref().unwrap_or_default()).into_owned();
                 let line = text.lines().next().unwrap_or("").to_string();
                 if edit != self.edit_gen {
                     return;
@@ -1053,7 +1278,10 @@ impl App {
 
     fn field_mut(&mut self) -> Option<&mut Field> {
         match &mut self.edit {
-            Edit::Path(f) | Edit::Filter(f) | Edit::NewFolder(f) | Edit::Rename { field: f, .. } => Some(f),
+            Edit::Path(f)
+            | Edit::Filter(f)
+            | Edit::NewFolder(f)
+            | Edit::Rename { field: f, .. } => Some(f),
             Edit::None => None,
         }
     }
@@ -1069,16 +1297,25 @@ impl App {
 
     /// Asks for sizes and times of the rows on screen, and a screenful around them.
     pub fn request_stats(&mut self) {
-        let (Some(l), Some(st)) = (self.listing.clone(), self.stater.as_ref()) else { return };
+        let (Some(l), Some(st)) = (self.listing.clone(), self.stater.as_ref()) else {
+            return;
+        };
         let row_h = self.layout().row_h.max(1) as f64;
         let cap = self.row_capacity();
         let first = (self.scroll / row_h) as usize;
-        let range = (first.saturating_sub(cap / 2).min(self.rows.len()), (first + cap + cap / 2).min(self.rows.len()));
+        let range = (
+            first.saturating_sub(cap / 2).min(self.rows.len()),
+            (first + cap + cap / 2).min(self.rows.len()),
+        );
         if range == self.stats_range {
             return;
         }
         self.stats_range = range;
-        let ids: Vec<u32> = self.rows[range.0..range.1].iter().copied().filter(|&i| l.stat(i) == Stat::Unknown).collect();
+        let ids: Vec<u32> = self.rows[range.0..range.1]
+            .iter()
+            .copied()
+            .filter(|&i| l.stat(i) == Stat::Unknown)
+            .collect();
         if !ids.is_empty() {
             st.request(ids);
         }
@@ -1087,11 +1324,15 @@ impl App {
     // ---- Selection and scrolling ----
 
     pub fn is_selected(&self, id: u32) -> bool {
-        self.selected.get(id as usize / 64).is_some_and(|w| w >> (id % 64) & 1 == 1)
+        self.selected
+            .get(id as usize / 64)
+            .is_some_and(|w| w >> (id % 64) & 1 == 1)
     }
 
     fn set_selected(&mut self, id: u32, on: bool) {
-        let Some(w) = self.selected.get_mut(id as usize / 64) else { return };
+        let Some(w) = self.selected.get_mut(id as usize / 64) else {
+            return;
+        };
         let bit = 1u64 << (id % 64);
         if on && *w & bit == 0 {
             *w |= bit;
@@ -1140,7 +1381,11 @@ impl App {
         if self.sel_count == 0 {
             return Vec::new();
         }
-        self.rows.iter().copied().filter(|&i| self.is_selected(i)).collect()
+        self.rows
+            .iter()
+            .copied()
+            .filter(|&i| self.is_selected(i))
+            .collect()
     }
 
     fn content_height(&self) -> f64 {
@@ -1188,7 +1433,7 @@ impl App {
     }
 
     /// Moves the cursor. Plain moves select the row they land on, as in most file managers.
-    fn move_cursor(&mut self, to: usize, m: Mods) {
+    pub(crate) fn move_cursor(&mut self, to: usize, m: Mods) {
         if self.rows.is_empty() {
             return;
         }
@@ -1235,7 +1480,17 @@ impl App {
                 self.invalidate_all();
             }
             Action::SortBy(key) => {
-                self.sort = if self.sort.key == key { SortSpec { key, descending: !self.sort.descending } } else { SortSpec { key, descending: false } };
+                self.sort = if self.sort.key == key {
+                    SortSpec {
+                        key,
+                        descending: !self.sort.descending,
+                    }
+                } else {
+                    SortSpec {
+                        key,
+                        descending: false,
+                    }
+                };
                 self.rederive(true);
                 self.invalidate(self.layout().header);
             }
@@ -1243,7 +1498,10 @@ impl App {
             Action::NewWindow => {
                 let hub = self.hub.clone();
                 if let Ok(me) = std::env::current_exe() {
-                    gannet_core::open::spawn_detached(std::process::Command::new(me).arg(&self.dir), move |e| hub.send(Msg::Notice(format!("Couldn't open a new window: {e}"))));
+                    gannet_core::open::spawn_detached(
+                        std::process::Command::new(me).arg(&self.dir),
+                        move |e| hub.send(Msg::Notice(format!("Couldn't open a new window: {e}"))),
+                    );
                 }
             }
             Action::Cut if self.in_trash() => self.trash_is_read_only(),
@@ -1255,7 +1513,9 @@ impl App {
                     self.trash_is_read_only();
                 } else if !self.paste_in_flight {
                     self.paste_in_flight = true;
-                    self.cmds.push(Cmd::ReadClipboard(Paste::Files { dest: self.dir.clone() }));
+                    self.cmds.push(Cmd::ReadClipboard(Paste::Files {
+                        dest: self.dir.clone(),
+                    }));
                 }
             }
             Action::Rename | Action::NewFolder if self.in_trash() => self.trash_is_read_only(),
@@ -1280,7 +1540,10 @@ impl App {
         if names.iter().any(|n| n.first() == Some(&b'.')) {
             self.show_hidden = true;
         }
-        self.go(Stop { dir, cursor_name: names.first().cloned() });
+        self.go(Stop {
+            dir,
+            cursor_name: names.first().cloned(),
+        });
         self.pending_select = names;
     }
 
@@ -1290,16 +1553,23 @@ impl App {
     }
 
     fn home_trash(&self) -> PathBuf {
-        self.trash_dir.parent().map_or_else(|| self.trash_dir.clone(), Path::to_path_buf)
+        self.trash_dir
+            .parent()
+            .map_or_else(|| self.trash_dir.clone(), Path::to_path_buf)
     }
 
     fn restore_selection(&mut self) {
-        let Some(l) = self.listing.clone().filter(|l| l.is_trash()) else { return };
+        let Some(l) = self.listing.clone().filter(|l| l.is_trash()) else {
+            return;
+        };
         let mut items = Vec::new();
         for id in self.selected_ids() {
             match l.trashed(id) {
                 Some(t) => items.push(t),
-                None => self.notices.push(format!("“{}” can't be restored: the Trash has no record of where it came from", String::from_utf8_lossy(l.name(id)))),
+                None => self.notices.push(format!(
+                    "“{}” can't be restored: the Trash has no record of where it came from",
+                    String::from_utf8_lossy(l.name(id))
+                )),
             }
         }
         if !items.is_empty() {
@@ -1310,24 +1580,36 @@ impl App {
 
     /// Emptying needs the whole list: while other disks are still being read, it waits.
     pub fn can_empty_trash(&self) -> bool {
-        !self.loading && self.listing.as_ref().is_some_and(|l| l.is_trash() && !l.is_empty())
+        !self.loading
+            && self
+                .listing
+                .as_ref()
+                .is_some_and(|l| l.is_trash() && !l.is_empty())
     }
 
     fn ask_empty_trash(&mut self) {
         if !self.can_empty_trash() {
             return;
         }
-        let Some(l) = self.listing.clone() else { return };
+        let Some(l) = self.listing.clone() else {
+            return;
+        };
         // Hidden items go too, as they would in any other file manager.
         let paths: Vec<PathBuf> = (0..l.len() as u32).map(|i| l.path(i)).collect();
         if !paths.is_empty() {
-            self.dialog = Some(Dialog::ConfirmDelete { paths, at: 1, empty: true });
+            self.dialog = Some(Dialog::ConfirmDelete {
+                paths,
+                at: 1,
+                empty: true,
+            });
             self.invalidate_all();
         }
     }
 
     fn open_selection(&mut self) {
-        let Some(l) = self.listing.clone() else { return };
+        let Some(l) = self.listing.clone() else {
+            return;
+        };
         let mut ids = self.selected_ids();
         if ids.is_empty() && self.cursor_shown {
             ids.extend(self.rows.get(self.cursor));
@@ -1338,7 +1620,8 @@ impl App {
         // Opening a pile of files by accident is hard to undo.
         const MANY: usize = 20;
         if ids.len() > MANY {
-            self.notices.push(format!("Select {MANY} items or fewer to open them at once"));
+            self.notices
+                .push(format!("Select {MANY} items or fewer to open them at once"));
             self.invalidate_all();
             return;
         }
@@ -1346,7 +1629,11 @@ impl App {
         for &i in ids.iter().filter(|&&i| !l.kind(i).is_dirlike()) {
             let hub = self.hub.clone();
             gannet_core::open::open_with_default(&l.path(i), move |p, why| {
-                hub.send(Msg::Notice(format!("Couldn't open {}: {why}", p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()))));
+                hub.send(Msg::Notice(format!(
+                    "Couldn't open {}: {why}",
+                    p.file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                )));
             });
         }
         if let Some(i) = first_dir {
@@ -1383,7 +1670,10 @@ impl App {
         let parent = self.dir.parent()?;
         if self.trash_files_root(parent).is_some_and(|f| f == parent) {
             // The Trash view finds rows by their real path, which is where we are.
-            return Some(Stop { dir: self.trash_dir.clone(), cursor_name: Some(self.dir.clone().into_os_string().into_vec()) });
+            return Some(Stop {
+                dir: self.trash_dir.clone(),
+                cursor_name: Some(self.dir.clone().into_os_string().into_vec()),
+            });
         }
         parent_stop(&self.dir)
     }
@@ -1391,7 +1681,15 @@ impl App {
     /// The `files` folder of whichever of this user's Trash folders holds `path`, if any.
     pub fn trash_files_root(&self, path: &Path) -> Option<PathBuf> {
         let (home, uid) = (self.home_trash(), rustix::process::geteuid().as_raw());
-        path.ancestors().filter(|a| a.file_name().is_some_and(|n| n == "files")).find(|a| trash::is_inside_trash(&home, uid, a) && !a.parent().is_some_and(|g| trash::is_inside_trash(&home, uid, g))).map(Path::to_path_buf)
+        path.ancestors()
+            .filter(|a| a.file_name().is_some_and(|n| n == "files"))
+            .find(|a| {
+                trash::is_inside_trash(&home, uid, a)
+                    && !a
+                        .parent()
+                        .is_some_and(|g| trash::is_inside_trash(&home, uid, g))
+            })
+            .map(Path::to_path_buf)
     }
 
     /// The toolbar's Empty Trash button, shown in the Trash view.
@@ -1400,9 +1698,16 @@ impl App {
             return None;
         }
         let l = self.layout();
-        let end = self.filter_rect().map_or(l.toolbar.right() - self.px(8.0), |r| r.x - self.px(8.0));
+        let end = self
+            .filter_rect()
+            .map_or(l.toolbar.right() - self.px(8.0), |r| r.x - self.px(8.0));
         let w = self.text.measure("Empty Trash") as i32 + self.px(24.0);
-        Some(Rect::new(end - w, self.px(7.0), w, l.toolbar.h - self.px(14.0)))
+        Some(Rect::new(
+            end - w,
+            self.px(7.0),
+            w,
+            l.toolbar.h - self.px(14.0),
+        ))
     }
 
     fn set_edit(&mut self, e: Edit) {
@@ -1439,7 +1744,8 @@ impl App {
         let expanded = expand_home(text, self.places.first().map(|p| p.path.as_path()));
         self.set_edit(Edit::None);
         if !expanded.is_absolute() {
-            self.notices.push("Enter a full path, starting with / or ~".to_string());
+            self.notices
+                .push("Enter a full path, starting with / or ~".to_string());
             self.invalidate_all();
             return;
         }
@@ -1452,7 +1758,9 @@ impl App {
         }
         self.type_ahead_at = Instant::now();
         self.type_ahead.push_str(&s.to_lowercase());
-        let Some(l) = self.listing.clone() else { return };
+        let Some(l) = self.listing.clone() else {
+            return;
+        };
         let needle = self.type_ahead.clone();
         let n = self.rows.len();
         if n == 0 {
@@ -1462,36 +1770,64 @@ impl App {
         let mut letters = needle.chars();
         let first = letters.next();
         let repeating = needle.chars().count() > 1 && letters.all(|c| Some(c) == first);
-        let needle = if repeating { first.map_or(String::new(), String::from) } else { needle };
+        let needle = if repeating {
+            first.map_or(String::new(), String::from)
+        } else {
+            needle
+        };
         // Otherwise the current row stays if it still matches. A first key looks past it,
         // unless no cursor is showing yet, when the top row counts too.
         let single = needle.chars().count() == 1;
-        let start = if single && self.cursor_shown { self.cursor + 1 } else { self.cursor };
-        let matches = |row: usize| String::from_utf8_lossy(l.name(self.rows[row])).to_lowercase().starts_with(&needle);
+        let start = if single && self.cursor_shown {
+            self.cursor + 1
+        } else {
+            self.cursor
+        };
+        let matches = |row: usize| {
+            String::from_utf8_lossy(l.name(self.rows[row]))
+                .to_lowercase()
+                .starts_with(&needle)
+        };
         if let Some(found) = (0..n).map(|d| (start + d) % n).find(|&r| matches(r)) {
             self.move_cursor(found, Mods::default());
         }
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
-        let Some(l) = &self.listing else { return Vec::new() };
+        let Some(l) = &self.listing else {
+            return Vec::new();
+        };
         self.selected_ids().into_iter().map(|i| l.path(i)).collect()
     }
 
     /// The Trash's `files` and `info` folders have to stay paired, so items can only
     /// leave as copies, or be deleted for good.
     fn trash_is_read_only(&mut self) {
-        self.notice("Items in the Trash can't be changed. Copy them out, or delete them for good".into());
+        self.notice(
+            "Items in the Trash can't be changed. Copy them out, or delete them for good".into(),
+        );
     }
 
     fn start_job(&mut self, r: Request) {
-        let ends_undo = matches!(r, Request::Copy { .. } | Request::Link { .. } | Request::Delete { .. });
+        let ends_undo = matches!(
+            r,
+            Request::Copy { .. } | Request::Link { .. } | Request::Delete { .. }
+        );
         let job = self.engine.start(r);
-        self.jobs.push(JobView { job, started: Instant::now(), ends_undo, selection_epoch: self.selection_epoch });
+        self.jobs.push(JobView {
+            job,
+            started: Instant::now(),
+            ends_undo,
+            selection_epoch: self.selection_epoch,
+        });
     }
 
     fn in_trash(&self) -> bool {
-        trash::is_inside_trash(&self.home_trash(), rustix::process::geteuid().as_raw(), &self.dir)
+        trash::is_inside_trash(
+            &self.home_trash(),
+            rustix::process::geteuid().as_raw(),
+            &self.dir,
+        )
     }
 
     fn put_on_clipboard(&mut self, cut: bool) {
@@ -1499,7 +1835,8 @@ impl App {
         if paths.is_empty() {
             return;
         }
-        self.cmds.push(Cmd::SetClipboard(clipboard::encode(&paths, cut)));
+        self.cmds
+            .push(Cmd::SetClipboard(clipboard::encode(&paths, cut)));
         self.cut_paths = if cut { paths } else { Vec::new() };
         self.invalidate_list();
     }
@@ -1515,14 +1852,22 @@ impl App {
             self.cut_paths.clear();
             self.cmds.push(Cmd::ClearClipboard);
             self.invalidate_list();
-            self.start_job(Request::Move { sources: paths, dest });
+            self.start_job(Request::Move {
+                sources: paths,
+                dest,
+            });
         } else {
-            self.start_job(Request::Copy { sources: paths, dest });
+            self.start_job(Request::Copy {
+                sources: paths,
+                dest,
+            });
         }
     }
 
     fn start_rename(&mut self) {
-        let Some(l) = self.listing.clone() else { return };
+        let Some(l) = self.listing.clone() else {
+            return;
+        };
         let ids = self.selected_ids();
         let [id] = ids.as_slice() else {
             if ids.len() > 1 {
@@ -1542,7 +1887,12 @@ impl App {
             self.ensure_visible();
         }
         self.edit_gen += 1;
-        self.edit = Edit::Rename { initial: field.text.clone(), name, path: l.path(*id), field };
+        self.edit = Edit::Rename {
+            initial: field.text.clone(),
+            name,
+            path: l.path(*id),
+            field,
+        };
         self.invalidate_all();
     }
 
@@ -1562,7 +1912,11 @@ impl App {
         }
         // Items already in the Trash have nowhere further to go.
         if self.in_trash() {
-            self.dialog = Some(Dialog::ConfirmDelete { paths, at: 1, empty: false });
+            self.dialog = Some(Dialog::ConfirmDelete {
+                paths,
+                at: 1,
+                empty: false,
+            });
             self.invalidate_all();
             return;
         }
@@ -1573,7 +1927,11 @@ impl App {
         let paths = self.selected_paths();
         if !paths.is_empty() {
             // Cancel has the focus: Enter shouldn't destroy anything by reflex.
-            self.dialog = Some(Dialog::ConfirmDelete { paths, at: 1, empty: false });
+            self.dialog = Some(Dialog::ConfirmDelete {
+                paths,
+                at: 1,
+                empty: false,
+            });
             self.invalidate_all();
         }
     }
@@ -1590,13 +1948,22 @@ impl App {
                 }
             }
             ops::Event::Error { path, message, .. } => {
-                let name = path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+                let name = path.file_name().map_or_else(
+                    || path.to_string_lossy().into_owned(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
                 self.notice(format!("{name}: {message}"));
             }
             ops::Event::Finished(o) => {
                 self.answer_drop(&o);
-                let view = self.jobs.iter().position(|j| j.job.id == o.job).map(|i| self.jobs.remove(i));
-                let selection_untouched = view.as_ref().is_some_and(|v| v.selection_epoch == self.selection_epoch);
+                let view = self
+                    .jobs
+                    .iter()
+                    .position(|j| j.job.id == o.job)
+                    .map(|i| self.jobs.remove(i));
+                let selection_untouched = view
+                    .as_ref()
+                    .is_some_and(|v| v.selection_epoch == self.selection_epoch);
                 if o.cancelled
                     && let Some(v) = &view
                 {
@@ -1615,11 +1982,19 @@ impl App {
                     None => {}
                 }
                 // Another disk's Trash may not be watched, and the Trash view shows it too.
-                let trash_touched = self.is_trash_view() && o.touched.iter().any(|t| self.trash_files_root(t).is_some());
+                let trash_touched = self.is_trash_view()
+                    && o.touched.iter().any(|t| self.trash_files_root(t).is_some());
                 if o.touched.contains(&self.dir) || trash_touched {
                     use std::os::unix::ffi::OsStrExt;
                     // A selection made since the job began is the user's, and stays.
-                    self.pending_select = o.created.iter().filter(|_| selection_untouched).filter(|p| p.parent() == Some(self.dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_bytes().to_vec()).collect();
+                    self.pending_select = o
+                        .created
+                        .iter()
+                        .filter(|_| selection_untouched)
+                        .filter(|p| p.parent() == Some(self.dir.as_path()))
+                        .filter_map(|p| p.file_name())
+                        .map(|n| n.as_bytes().to_vec())
+                        .collect();
                     self.reload_at = None;
                     self.reload();
                 }
@@ -1639,16 +2014,29 @@ impl App {
                 let mut v = Vec::new();
                 if conflict.can_replace {
                     // No letter: this one overwrites, so it takes a deliberate choice.
-                    v.push(b(if conflict.both_folders { "Merge" } else { "Replace" }, "", !conflict.both_folders));
+                    v.push(b(
+                        if conflict.both_folders {
+                            "Merge"
+                        } else {
+                            "Replace"
+                        },
+                        "",
+                        !conflict.both_folders,
+                    ));
                 }
                 v.push(b("Skip", "S", false));
                 v.push(b("Keep both", "K", false));
                 v.push(b("Cancel", "Esc", false));
                 v
             }
-            Dialog::ConfirmDelete { empty: true, .. } => vec![b("Empty Trash", "E", true), b("Cancel", "Esc", false)],
+            Dialog::ConfirmDelete { empty: true, .. } => {
+                vec![b("Empty Trash", "E", true), b("Cancel", "Esc", false)]
+            }
             Dialog::ConfirmDelete { .. } => vec![b("Delete", "D", true), b("Cancel", "Esc", false)],
-            Dialog::ConfirmQuit { .. } => vec![b("Stop them and close", "S", true), b("Keep working", "Esc", false)],
+            Dialog::ConfirmQuit { .. } => vec![
+                b("Stop them and close", "S", true),
+                b("Keep working", "Esc", false),
+            ],
         }
     }
 
@@ -1656,12 +2044,17 @@ impl App {
     /// moment after one pops up.
     fn show_conflict(&mut self, conflict: Conflict) {
         let at = usize::from(conflict.can_replace);
-        self.dialog = Some(Dialog::Conflict { conflict, apply_to_all: false, at });
+        self.dialog = Some(Dialog::Conflict {
+            conflict,
+            apply_to_all: false,
+            at,
+        });
         self.dialog_guard = Some(Instant::now());
     }
 
     fn dialog_guarded(&self) -> bool {
-        self.dialog_guard.is_some_and(|t| t.elapsed() < DIALOG_GUARD)
+        self.dialog_guard
+            .is_some_and(|t| t.elapsed() < DIALOG_GUARD)
     }
 
     fn press_dialog_button(&mut self, i: usize) {
@@ -1672,14 +2065,21 @@ impl App {
             return;
         };
         match d {
-            Dialog::Conflict { conflict, apply_to_all, .. } => {
+            Dialog::Conflict {
+                conflict,
+                apply_to_all,
+                ..
+            } => {
                 let choice = match label {
                     "Replace" | "Merge" => Choice::Replace,
                     "Skip" => Choice::Skip,
                     "Keep both" => Choice::KeepBoth,
                     _ => Choice::Cancel,
                 };
-                let _ = conflict.reply.send(Answer { choice, apply_to_all });
+                let _ = conflict.reply.send(Answer {
+                    choice,
+                    apply_to_all,
+                });
             }
             Dialog::ConfirmDelete { paths, .. } => {
                 if label == "Delete" || label == "Empty Trash" {
@@ -1708,11 +2108,15 @@ impl App {
         if self.dialog_guarded() {
             return;
         }
-        let Some(d) = self.dialog.as_mut() else { return };
+        let Some(d) = self.dialog.as_mut() else {
+            return;
+        };
         let buttons = Self::dialog_buttons(d);
         let n = buttons.len();
         let at = match d {
-            Dialog::Conflict { at, .. } | Dialog::ConfirmDelete { at, .. } | Dialog::ConfirmQuit { at } => at,
+            Dialog::Conflict { at, .. }
+            | Dialog::ConfirmDelete { at, .. }
+            | Dialog::ConfirmQuit { at } => at,
         };
         match sym {
             k::KEY_Left => *at = (*at + n - 1) % n,
@@ -1727,7 +2131,10 @@ impl App {
                     && utf8.eq_ignore_ascii_case("a")
                 {
                     *apply_to_all = !*apply_to_all;
-                } else if let Some(i) = buttons.iter().position(|b| !utf8.is_empty() && b.key.eq_ignore_ascii_case(utf8)) {
+                } else if let Some(i) = buttons
+                    .iter()
+                    .position(|b| !utf8.is_empty() && b.key.eq_ignore_ascii_case(utf8))
+                {
                     return self.press_dialog_button(i);
                 }
             }
@@ -1759,12 +2166,17 @@ impl App {
 
     pub fn dialog_check_rect(&self) -> Rect {
         let r = self.dialog_rect();
-        Rect::new(r.x + self.px(16.0), r.bottom() - self.px(76.0), r.w - self.px(32.0), self.px(24.0))
+        Rect::new(
+            r.x + self.px(16.0),
+            r.bottom() - self.px(76.0),
+            r.w - self.px(32.0),
+            self.px(24.0),
+        )
     }
 
     /// Closing the window would stop what's running, so that gets asked first.
     pub(crate) fn request_close(&mut self) {
-        if self.jobs.is_empty() {
+        if self.jobs.is_empty() || self.viewer {
             self.cmds.push(Cmd::Quit);
         } else if self.dialog.is_none() {
             self.dialog = Some(Dialog::ConfirmQuit { at: 1 });
@@ -1777,42 +2189,195 @@ impl App {
         let one = self.sel_count == 1;
         if self.listing.as_ref().is_some_and(|l| l.is_trash()) {
             return vec![
-                MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
-                MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
-                MenuItem { label: "Copy", keys: "Ctrl+C", action: Action::Copy, enabled: any },
-                MenuItem { label: "Restore", keys: "", action: Action::Restore, enabled: any },
-                MenuItem { label: "Delete for good", keys: "Delete", action: Action::DeleteForGood, enabled: any },
-                MenuItem { label: "Empty Trash", keys: "", action: Action::EmptyTrash, enabled: self.can_empty_trash() },
-                MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
-                MenuItem { label: "Sort by name", keys: "Ctrl+1", action: Action::SortBy(SortKey::Name), enabled: true },
-                MenuItem { label: "Sort by size", keys: "Ctrl+2", action: Action::SortBy(SortKey::Size), enabled: true },
-                MenuItem { label: "Sort by date deleted", keys: "Ctrl+3", action: Action::SortBy(SortKey::Modified), enabled: true },
-                MenuItem { label: "Reload", keys: "F5", action: Action::Reload, enabled: true },
-                MenuItem { label: "New window", keys: "Ctrl+N", action: Action::NewWindow, enabled: true },
+                MenuItem {
+                    label: "Open",
+                    keys: "Enter",
+                    action: Action::Open,
+                    enabled: any,
+                },
+                MenuItem {
+                    label: "Preview",
+                    keys: "Space",
+                    action: Action::Preview,
+                    enabled: any,
+                },
+                MenuItem {
+                    label: "Copy",
+                    keys: "Ctrl+C",
+                    action: Action::Copy,
+                    enabled: any,
+                },
+                MenuItem {
+                    label: "Restore",
+                    keys: "",
+                    action: Action::Restore,
+                    enabled: any,
+                },
+                MenuItem {
+                    label: "Delete for good",
+                    keys: "Delete",
+                    action: Action::DeleteForGood,
+                    enabled: any,
+                },
+                MenuItem {
+                    label: "Empty Trash",
+                    keys: "",
+                    action: Action::EmptyTrash,
+                    enabled: self.can_empty_trash(),
+                },
+                MenuItem {
+                    label: if self.show_hidden {
+                        "Hide hidden files"
+                    } else {
+                        "Show hidden files"
+                    },
+                    keys: "Ctrl+H",
+                    action: Action::ToggleHidden,
+                    enabled: true,
+                },
+                MenuItem {
+                    label: "Sort by name",
+                    keys: "Ctrl+1",
+                    action: Action::SortBy(SortKey::Name),
+                    enabled: true,
+                },
+                MenuItem {
+                    label: "Sort by size",
+                    keys: "Ctrl+2",
+                    action: Action::SortBy(SortKey::Size),
+                    enabled: true,
+                },
+                MenuItem {
+                    label: "Sort by date deleted",
+                    keys: "Ctrl+3",
+                    action: Action::SortBy(SortKey::Modified),
+                    enabled: true,
+                },
+                MenuItem {
+                    label: "Reload",
+                    keys: "F5",
+                    action: Action::Reload,
+                    enabled: true,
+                },
+                MenuItem {
+                    label: "New window",
+                    keys: "Ctrl+N",
+                    action: Action::NewWindow,
+                    enabled: true,
+                },
             ];
         }
         vec![
-            MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
-            MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
-            MenuItem { label: "Cut", keys: "Ctrl+X", action: Action::Cut, enabled: any },
-            MenuItem { label: "Copy", keys: "Ctrl+C", action: Action::Copy, enabled: any },
-            MenuItem { label: "Paste", keys: "Ctrl+V", action: Action::Paste, enabled: true },
-            MenuItem { label: "Rename", keys: "F2", action: Action::Rename, enabled: one },
-            MenuItem { label: "Move to Trash", keys: "Delete", action: Action::Trash, enabled: any },
-            MenuItem { label: "Delete for good", keys: "Shift+Delete", action: Action::DeleteForGood, enabled: any },
-            MenuItem { label: "New folder", keys: "Ctrl+Shift+N", action: Action::NewFolder, enabled: true },
-            MenuItem { label: "Undo", keys: "Ctrl+Z", action: Action::Undo, enabled: !self.undo.is_empty() },
-            MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
-            MenuItem { label: "Sort by name", keys: "Ctrl+1", action: Action::SortBy(SortKey::Name), enabled: true },
-            MenuItem { label: "Sort by size", keys: "Ctrl+2", action: Action::SortBy(SortKey::Size), enabled: true },
-            MenuItem { label: "Sort by modified", keys: "Ctrl+3", action: Action::SortBy(SortKey::Modified), enabled: true },
-            MenuItem { label: "Reload", keys: "F5", action: Action::Reload, enabled: true },
-            MenuItem { label: "New window", keys: "Ctrl+N", action: Action::NewWindow, enabled: true },
+            MenuItem {
+                label: "Open",
+                keys: "Enter",
+                action: Action::Open,
+                enabled: any,
+            },
+            MenuItem {
+                label: "Preview",
+                keys: "Space",
+                action: Action::Preview,
+                enabled: any,
+            },
+            MenuItem {
+                label: "Cut",
+                keys: "Ctrl+X",
+                action: Action::Cut,
+                enabled: any,
+            },
+            MenuItem {
+                label: "Copy",
+                keys: "Ctrl+C",
+                action: Action::Copy,
+                enabled: any,
+            },
+            MenuItem {
+                label: "Paste",
+                keys: "Ctrl+V",
+                action: Action::Paste,
+                enabled: true,
+            },
+            MenuItem {
+                label: "Rename",
+                keys: "F2",
+                action: Action::Rename,
+                enabled: one,
+            },
+            MenuItem {
+                label: "Move to Trash",
+                keys: "Delete",
+                action: Action::Trash,
+                enabled: any,
+            },
+            MenuItem {
+                label: "Delete for good",
+                keys: "Shift+Delete",
+                action: Action::DeleteForGood,
+                enabled: any,
+            },
+            MenuItem {
+                label: "New folder",
+                keys: "Ctrl+Shift+N",
+                action: Action::NewFolder,
+                enabled: true,
+            },
+            MenuItem {
+                label: "Undo",
+                keys: "Ctrl+Z",
+                action: Action::Undo,
+                enabled: !self.undo.is_empty(),
+            },
+            MenuItem {
+                label: if self.show_hidden {
+                    "Hide hidden files"
+                } else {
+                    "Show hidden files"
+                },
+                keys: "Ctrl+H",
+                action: Action::ToggleHidden,
+                enabled: true,
+            },
+            MenuItem {
+                label: "Sort by name",
+                keys: "Ctrl+1",
+                action: Action::SortBy(SortKey::Name),
+                enabled: true,
+            },
+            MenuItem {
+                label: "Sort by size",
+                keys: "Ctrl+2",
+                action: Action::SortBy(SortKey::Size),
+                enabled: true,
+            },
+            MenuItem {
+                label: "Sort by modified",
+                keys: "Ctrl+3",
+                action: Action::SortBy(SortKey::Modified),
+                enabled: true,
+            },
+            MenuItem {
+                label: "Reload",
+                keys: "F5",
+                action: Action::Reload,
+                enabled: true,
+            },
+            MenuItem {
+                label: "New window",
+                keys: "Ctrl+N",
+                action: Action::NewWindow,
+                enabled: true,
+            },
         ]
     }
 
     fn open_menu(&mut self, x: i32, y: i32) {
-        self.menu = Some(Menu { items: self.context_items(), x, y, at: usize::MAX });
+        self.menu = Some(Menu {
+            items: self.context_items(),
+            x,
+            y,
+            at: usize::MAX,
+        });
         self.invalidate_all();
     }
 
@@ -1833,6 +2398,7 @@ impl App {
         self.handle_input(i);
         // Whatever just happened may have opened a menu or dialog, like a close request.
         self.refresh_file_drag();
+        self.preview_follow();
     }
 
     fn handle_input(&mut self, i: Input) {
@@ -1849,7 +2415,12 @@ impl App {
                     self.invalidate_list();
                 }
             }
-            Input::Key { keysym, utf8, mods, repeat } => {
+            Input::Key {
+                keysym,
+                utf8,
+                mods,
+                repeat,
+            } => {
                 self.key_is_repeat = repeat;
                 self.key(keysym, &utf8, mods);
             }
@@ -1888,7 +2459,14 @@ impl App {
                     self.cancel_file_drag();
                 }
             }
-            Input::DragEnter { x, y, files, can_copy, can_move, marker } => self.drag_entered(x, y, files, can_copy, can_move, marker),
+            Input::DragEnter {
+                x,
+                y,
+                files,
+                can_copy,
+                can_move,
+                marker,
+            } => self.drag_entered(x, y, files, can_copy, can_move, marker),
             Input::DragMove { x, y } => {
                 self.set_pointer(x, y);
                 if let Some(FileDrag::Active(d)) = &mut self.file_drag
@@ -1937,11 +2515,13 @@ impl App {
             return;
         }
         let hub = self.hub.clone();
-        let _ = std::thread::Builder::new().name("gannet-gsettings".into()).spawn(move || {
-            if let Some(dark) = gannet_core::theme::query_gsettings_dark() {
-                hub.send(Msg::DesktopDark(dark));
-            }
-        });
+        let _ = std::thread::Builder::new()
+            .name("gannet-gsettings".into())
+            .spawn(move || {
+                if let Some(dark) = gannet_core::theme::query_gsettings_dark() {
+                    hub.send(Msg::DesktopDark(dark));
+                }
+            });
     }
 
     fn key(&mut self, sym: u32, utf8: &str, m: Mods) {
@@ -1971,12 +2551,20 @@ impl App {
     }
 
     fn menu_key(&mut self, sym: u32) {
-        let Some(menu) = self.menu.as_mut() else { return };
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
         let n = menu.items.len();
         match sym {
             k::KEY_Escape | k::KEY_Menu | k::KEY_F10 => return self.close_menu(),
             k::KEY_Down => menu.at = next_enabled(&menu.items, menu.at, 1),
-            k::KEY_Up => menu.at = next_enabled(&menu.items, if menu.at == usize::MAX { n } else { menu.at }, n - 1),
+            k::KEY_Up => {
+                menu.at = next_enabled(
+                    &menu.items,
+                    if menu.at == usize::MAX { n } else { menu.at },
+                    n - 1,
+                )
+            }
             k::KEY_Return | k::KEY_KP_Enter => {
                 if let Some(item) = menu.items.get(menu.at).filter(|i| i.enabled) {
                     let a = item.action;
@@ -1996,9 +2584,16 @@ impl App {
             let (a, b) = f.selection();
             f.text[a..b].to_string()
         });
-        if m.ctrl && matches!(sym, k::KEY_c | k::KEY_x) && selected.as_ref().is_some_and(|t| !t.is_empty()) {
+        if m.ctrl
+            && matches!(sym, k::KEY_c | k::KEY_x)
+            && selected.as_ref().is_some_and(|t| !t.is_empty())
+        {
             let t = selected.unwrap_or_default().into_bytes();
-            self.cmds.push(Cmd::SetClipboard(vec![(clipboard::TEXT, t.clone()), (clipboard::TEXT_PLAIN, t.clone()), (clipboard::UTF8_STRING, t)]));
+            self.cmds.push(Cmd::SetClipboard(vec![
+                (clipboard::TEXT, t.clone()),
+                (clipboard::TEXT_PLAIN, t.clone()),
+                (clipboard::UTF8_STRING, t),
+            ]));
             if sym == k::KEY_x
                 && let Some(f) = self.field_mut()
             {
@@ -2009,7 +2604,9 @@ impl App {
             return;
         }
         if m.ctrl && sym == k::KEY_v {
-            self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: self.edit_gen }));
+            self.cmds.push(Cmd::ReadClipboard(Paste::IntoField {
+                edit: self.edit_gen,
+            }));
             return;
         }
         let Some(f) = self.field_mut() else { return };
@@ -2031,7 +2628,12 @@ impl App {
                 return;
             }
             _ => {
-                if !m.ctrl && !m.alt && !m.logo && !utf8.is_empty() && !utf8.chars().any(char::is_control) {
+                if !m.ctrl
+                    && !m.alt
+                    && !m.logo
+                    && !utf8.is_empty()
+                    && !utf8.chars().any(char::is_control)
+                {
                     f.insert(utf8);
                 } else {
                     return;
@@ -2061,7 +2663,12 @@ impl App {
                     self.step(0, Mods::default());
                 }
             }
-            Edit::Rename { initial, path, field, .. } => {
+            Edit::Rename {
+                initial,
+                path,
+                field,
+                ..
+            } => {
                 self.invalidate_all();
                 // Against what the field started with: a name that isn't valid UTF-8 shows
                 // differently from its bytes, and pressing Enter on it must not rewrite it.
@@ -2069,7 +2676,10 @@ impl App {
                     if let Err(e) = ops::validate_name(&field.text) {
                         self.notice(e.to_string());
                     } else {
-                        self.start_job(Request::Rename { from: path, to_name: field.text.into() });
+                        self.start_job(Request::Rename {
+                            from: path,
+                            to_name: field.text.into(),
+                        });
                     }
                 }
             }
@@ -2079,7 +2689,10 @@ impl App {
                     self.notice(e.to_string());
                 } else {
                     let parent = self.dir.clone();
-                    self.start_job(Request::NewFolder { parent, name: field.text.into() });
+                    self.start_job(Request::NewFolder {
+                        parent,
+                        name: field.text.into(),
+                    });
                 }
             }
             Edit::None => {}
@@ -2107,7 +2720,7 @@ impl App {
             (k::KEY_Return | k::KEY_KP_Enter, _, _) => self.action(Action::Open),
             // Holding either of these would flicker, and neither means anything repeated.
             (k::KEY_space, _, false) if self.key_is_repeat => {}
-            (k::KEY_space, false, false) => self.action(Action::Preview),
+            (k::KEY_space, false, false) => self.toggle_preview(),
             (k::KEY_space, true, false) => {
                 if let Some(&id) = self.rows.get(self.cursor) {
                     self.selection_epoch += 1;
@@ -2120,7 +2733,9 @@ impl App {
             // Each press undoes one thing, and holding it shouldn't run through them all.
             (k::KEY_Escape, _, _) if self.key_is_repeat => {}
             (k::KEY_Escape, _, _) => {
-                if !self.filter.is_empty() {
+                if self.previewer.is_some() {
+                    self.close_preview();
+                } else if !self.filter.is_empty() {
                     self.filter.clear();
                     self.rederive(false);
                     self.invalidate(self.layout().toolbar);
@@ -2137,9 +2752,19 @@ impl App {
             (k::KEY_Delete, _, _) if m.shift => self.action(Action::DeleteForGood),
             (k::KEY_Delete, _, _) => self.action(Action::Trash),
             (k::KEY_c | k::KEY_C, true, _) if m.shift => {
-                let text = self.selected_paths().iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("\n").into_bytes();
+                let text = self
+                    .selected_paths()
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into_bytes();
                 if !text.is_empty() {
-                    self.cmds.push(Cmd::SetClipboard(vec![(clipboard::TEXT, text.clone()), (clipboard::TEXT_PLAIN, text.clone()), (clipboard::UTF8_STRING, text)]));
+                    self.cmds.push(Cmd::SetClipboard(vec![
+                        (clipboard::TEXT, text.clone()),
+                        (clipboard::TEXT_PLAIN, text.clone()),
+                        (clipboard::UTF8_STRING, text),
+                    ]));
                 }
             }
             (k::KEY_c, true, _) => self.action(Action::Copy),
@@ -2160,14 +2785,22 @@ impl App {
             (k::KEY_2, true, _) => self.action(Action::SortBy(SortKey::Size)),
             (k::KEY_3, true, _) => self.action(Action::SortBy(SortKey::Modified)),
             (_, false, true) => {
-                if let Some(d) = utf8.chars().next().and_then(|c| c.to_digit(10)).filter(|&d| d > 0)
+                if let Some(d) = utf8
+                    .chars()
+                    .next()
+                    .and_then(|c| c.to_digit(10))
+                    .filter(|&d| d > 0)
                     && let Some(p) = self.places.get(d as usize - 1).map(|p| p.path.clone())
                 {
                     self.navigate(p, None);
                 }
             }
             (_, false, false) if !m.logo && utf8 == "/" => self.start_filter(""),
-            (_, false, false) if !m.logo && !utf8.is_empty() && !utf8.chars().any(char::is_control) => self.type_ahead(utf8),
+            (_, false, false)
+                if !m.logo && !utf8.is_empty() && !utf8.chars().any(char::is_control) =>
+            {
+                self.type_ahead(utf8)
+            }
             _ => {}
         }
     }
@@ -2180,11 +2813,15 @@ impl App {
 
     fn keyboard_menu(&mut self) {
         let l = self.layout();
-        let row_y = (l.list.y as f64 + self.cursor as f64 * l.row_h as f64 - self.scroll + l.row_h as f64) as i32;
+        let row_y = (l.list.y as f64 + self.cursor as f64 * l.row_h as f64 - self.scroll
+            + l.row_h as f64) as i32;
         if !self.cursor_shown {
             self.step(0, Mods::default());
         }
-        self.open_menu(l.list.x + self.px(40.0), row_y.min(l.list.bottom()).max(l.list.y));
+        self.open_menu(
+            l.list.x + self.px(40.0),
+            row_y.min(l.list.bottom()).max(l.list.y),
+        );
         if let Some(m) = self.menu.as_mut() {
             m.at = next_enabled(&m.items, usize::MAX, 1);
         }
@@ -2193,15 +2830,23 @@ impl App {
     pub fn hit(&mut self, x: i32, y: i32) -> Hit {
         if let Some(d) = self.dialog.take() {
             let rects = self.dialog_button_rects(&d);
-            let check = matches!(d, Dialog::Conflict { .. }) && self.dialog_check_rect().contains(x, y);
+            let check =
+                matches!(d, Dialog::Conflict { .. }) && self.dialog_check_rect().contains(x, y);
             self.dialog = Some(d);
             if check {
                 return Hit::DialogCheck;
             }
-            return rects.iter().position(|r| r.contains(x, y)).map_or(Hit::Outside, Hit::DialogButton);
+            return rects
+                .iter()
+                .position(|r| r.contains(x, y))
+                .map_or(Hit::Outside, Hit::DialogButton);
         }
         if self.preview.is_some() {
-            return if self.preview_rect().contains(x, y) { Hit::PreviewBody } else { Hit::Outside };
+            return if self.preview_rect().contains(x, y) {
+                Hit::PreviewBody
+            } else {
+                Hit::Outside
+            };
         }
         if let Some(m) = &self.menu {
             let r = self.menu_rect(m);
@@ -2227,7 +2872,11 @@ impl App {
             }
             if self.empty_trash_rect().is_some_and(|r| r.contains(x, y)) {
                 // An empty Trash leaves the button greyed out, with nothing to press.
-                return if self.can_empty_trash() { Hit::EmptyTrash } else { Hit::None };
+                return if self.can_empty_trash() {
+                    Hit::EmptyTrash
+                } else {
+                    Hit::None
+                };
             }
             if let Edit::Path(_) = self.edit {
                 return Hit::PathBar;
@@ -2260,7 +2909,11 @@ impl App {
             let i = ((y - l.notices.y) / self.px(30.0).max(1)) as usize;
             if x >= l.notices.right() - self.px(30.0) {
                 let jobs = self.visible_jobs().count().min(4);
-                return if i < jobs { Hit::JobCancel(i) } else { Hit::NoticeClose(i - jobs) };
+                return if i < jobs {
+                    Hit::JobCancel(i)
+                } else {
+                    Hit::NoticeClose(i - jobs)
+                };
             }
             return Hit::None;
         }
@@ -2285,10 +2938,16 @@ impl App {
     pub fn scrollbar_thumb(&self) -> (i32, i32) {
         let l = self.layout();
         let content = self.content_height().max(1.0);
-        let h = ((l.list.h as f64 / content * l.list.h as f64) as i32).max(self.px(24.0)).min(l.list.h);
+        let h = ((l.list.h as f64 / content * l.list.h as f64) as i32)
+            .max(self.px(24.0))
+            .min(l.list.h);
         let travel = (l.list.h - h) as f64;
         let max = self.max_scroll();
-        let y = if max > 0.0 { (self.scroll / max * travel) as i32 } else { 0 };
+        let y = if max > 0.0 {
+            (self.scroll / max * travel) as i32
+        } else {
+            0
+        };
         (y, h)
     }
 
@@ -2298,20 +2957,30 @@ impl App {
         }
         let w = self.px(220.0);
         let l = self.layout();
-        Some(Rect::new(l.toolbar.right() - w - self.px(8.0), self.px(7.0), w, l.toolbar.h - self.px(14.0)))
+        Some(Rect::new(
+            l.toolbar.right() - w - self.px(8.0),
+            self.px(7.0),
+            w,
+            l.toolbar.h - self.px(14.0),
+        ))
     }
 
     /// The path's clickable parts: (start x, width, folder), trimmed from the left to fit.
     pub fn crumbs(&mut self) -> Vec<(i32, i32, PathBuf)> {
         let start = self.px(6.0) + self.px(36.0) * 3 + self.px(8.0);
-        let end = self.filter_rect().map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
+        let end = self
+            .filter_rect()
+            .map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
         let end = self.empty_trash_rect().map_or(end, |r| r.x - self.px(8.0));
         let mut parts: Vec<(String, PathBuf)> = Vec::new();
         let mut acc = PathBuf::new();
         // Inside any Trash, its real path is noise: it starts at "Trash".
         let mut components = self.dir.components();
         let files = self.trash_files_root(&self.dir);
-        if let Some((f, rest)) = files.as_ref().and_then(|f| Some((f, self.dir.strip_prefix(f).ok()?))) {
+        if let Some((f, rest)) = files
+            .as_ref()
+            .and_then(|f| Some((f, self.dir.strip_prefix(f).ok()?)))
+        {
             // "Trash" opens the Trash view, and what's below it is where it really is.
             parts.push(("Trash".into(), self.trash_dir.clone()));
             acc = f.clone();
@@ -2326,10 +2995,14 @@ impl App {
             parts.push((label, acc.clone()));
         }
         let gap = self.px(14.0) as f32;
-        let widths: Vec<f32> = parts.iter().map(|(s, _)| self.text.measure(s) + self.px(12.0) as f32).collect();
+        let widths: Vec<f32> = parts
+            .iter()
+            .map(|(s, _)| self.text.measure(s) + self.px(12.0) as f32)
+            .collect();
         let room = (end - start) as f32;
         let mut first = 0;
-        let mut total: f32 = widths.iter().sum::<f32>() + gap * parts.len().saturating_sub(1) as f32;
+        let mut total: f32 =
+            widths.iter().sum::<f32>() + gap * parts.len().saturating_sub(1) as f32;
         while total > room && first + 1 < parts.len() {
             total -= widths[first] + gap;
             first += 1;
@@ -2352,12 +3025,17 @@ impl App {
     }
 
     fn crumb_at(&mut self, x: i32) -> Option<usize> {
-        self.crumbs().iter().position(|(cx, w, _)| x >= *cx && x < cx + w)
+        self.crumbs()
+            .iter()
+            .position(|(cx, w, _)| x >= *cx && x < cx + w)
     }
 
     fn set_hover(&mut self, h: Hit) {
         // A drag has its own cursor and highlight, and scrolling mustn't replace them.
-        if h == self.hover || matches!(self.file_drag, Some(FileDrag::Active(_))) || matches!(&self.file_drag, Some(FileDrag::Band(b)) if b.active) {
+        if h == self.hover
+            || matches!(self.file_drag, Some(FileDrag::Active(_)))
+            || matches!(&self.file_drag, Some(FileDrag::Band(b)) if b.active)
+        {
             return;
         }
         let old = std::mem::replace(&mut self.hover, h);
@@ -2428,12 +3106,15 @@ impl App {
                 return self.band_update();
             }
         }
-        if matches!(&self.file_drag, Some(FileDrag::Active(d)) if !d.wayland) && (px < 0 || py < 0 || px >= self.w || py >= self.h) {
+        if matches!(&self.file_drag, Some(FileDrag::Active(d)) if !d.wayland)
+            && (px < 0 || py < 0 || px >= self.w || py >= self.h)
+        {
             self.start_wayland_drag();
             return;
         }
         // Pointer events stop during a compositor's drag, so these mean it refused this one.
-        if matches!(&self.file_drag, Some(FileDrag::Active(d)) if d.wayland && d.handed_over.is_some_and(|t| t.elapsed() > WAYLAND_DRAG_GRACE)) {
+        if matches!(&self.file_drag, Some(FileDrag::Active(d)) if d.wayland && d.handed_over.is_some_and(|t| t.elapsed() > WAYLAND_DRAG_GRACE))
+        {
             self.cancel_file_drag();
         }
         if matches!(&self.file_drag, Some(FileDrag::Active(d)) if d.wayland) {
@@ -2476,10 +3157,6 @@ impl App {
         }
         // The release of a drag can go missing if the compositor takes the pointer away.
         self.cancel_file_drag();
-        // A popup that hasn't appeared yet can't be what this click was aimed at.
-        if self.preview.is_some() && self.preview_rect().is_empty() {
-            self.close_preview();
-        }
         let (x, y) = self.pointer;
         let hit = self.hit(x, y);
         if self.dialog.is_some() {
@@ -2521,7 +3198,13 @@ impl App {
             if let Hit::Row(row) = self.hit(x, y) {
                 // The menu's about this row, selected or not, so the cursor comes here either way.
                 let keep_selection = self.is_selected(self.rows[row]);
-                self.move_cursor(row, Mods { ctrl: keep_selection, ..Mods::default() });
+                self.move_cursor(
+                    row,
+                    Mods {
+                        ctrl: keep_selection,
+                        ..Mods::default()
+                    },
+                );
                 self.open_menu(x, y);
             } else if matches!(self.hit(x, y), Hit::ListEmpty) {
                 self.clear_selection();
@@ -2535,7 +3218,12 @@ impl App {
         }
         match hit {
             Hit::MenuItem(i) => {
-                let item = self.menu.as_ref().and_then(|m| m.items.get(i)).filter(|i| i.enabled).map(|i| i.action);
+                let item = self
+                    .menu
+                    .as_ref()
+                    .and_then(|m| m.items.get(i))
+                    .filter(|i| i.enabled)
+                    .map(|i| i.action);
                 self.close_menu();
                 if let Some(a) = item {
                     self.action(a);
@@ -2550,11 +3238,21 @@ impl App {
                 if let Some((_, _, path)) = self.crumbs().into_iter().nth(i)
                     && path != self.dir
                 {
-                    let name = if path == self.trash_dir && let Some(files) = self.trash_files_root(&self.dir) {
+                    let name = if path == self.trash_dir
+                        && let Some(files) = self.trash_files_root(&self.dir)
+                    {
                         // The Trash view finds rows by their real path, not their name.
-                        self.dir.strip_prefix(&files).ok().and_then(|r| r.components().next()).map(|c| files.join(c).into_os_string().into_vec())
+                        self.dir
+                            .strip_prefix(&files)
+                            .ok()
+                            .and_then(|r| r.components().next())
+                            .map(|c| files.join(c).into_os_string().into_vec())
                     } else {
-                        self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec())
+                        self.dir
+                            .strip_prefix(&path)
+                            .ok()
+                            .and_then(|r| r.components().next())
+                            .map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec())
                     };
                     self.navigate(path, name);
                 }
@@ -2606,10 +3304,21 @@ impl App {
             Hit::DialogButton(_) | Hit::DialogCheck | Hit::PreviewBody => {}
             Hit::Row(row) => {
                 // Read first: a press that opens the row changes what's listed.
-                let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
-                let band = (!self.on_row_name(row, x)).then(|| (self.save_selection(), self.list_y(y)));
+                let name = self
+                    .listing
+                    .as_ref()
+                    .map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
+                let band =
+                    (!self.on_row_name(row, x)).then(|| (self.save_selection(), self.list_y(y)));
                 if let Some(narrow) = self.click_row(row) {
-                    self.file_drag = Some(FileDrag::Pressed { at: (x, y), row, dir: self.dir.clone(), name, narrow, band });
+                    self.file_drag = Some(FileDrag::Pressed {
+                        at: (x, y),
+                        row,
+                        dir: self.dir.clone(),
+                        name,
+                        narrow,
+                        band,
+                    });
                 }
             }
             Hit::ListEmpty => {
@@ -2621,7 +3330,15 @@ impl App {
                     self.invalidate_list();
                 }
                 let start_y = self.list_y(y);
-                self.file_drag = Some(FileDrag::Band(Band { at: (x, y), active: false, start_y, saved, range: None, rect: Rect::default(), scroll_at: None }));
+                self.file_drag = Some(FileDrag::Band(Band {
+                    at: (x, y),
+                    active: false,
+                    start_y,
+                    saved,
+                    range: None,
+                    rect: Rect::default(),
+                    scroll_at: None,
+                }));
             }
             Hit::None => {}
         }
@@ -2631,19 +3348,32 @@ impl App {
     pub fn path_box(&mut self) -> Rect {
         let l = self.layout();
         let start = self.px(6.0) + self.px(36.0) * 3 + self.px(8.0);
-        let end = self.filter_rect().map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
+        let end = self
+            .filter_rect()
+            .map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
         let end = self.empty_trash_rect().map_or(end, |r| r.x - self.px(8.0));
-        Rect::new(start, self.px(7.0), end - start, l.toolbar.h - self.px(14.0))
+        Rect::new(
+            start,
+            self.px(7.0),
+            end - start,
+            l.toolbar.h - self.px(14.0),
+        )
     }
 
     fn click_in_field(&mut self, x: i32) {
-        let r = if matches!(self.edit, Edit::Filter(_)) { self.filter_rect().unwrap_or_default() } else { self.path_box() };
+        let r = if matches!(self.edit, Edit::Filter(_)) {
+            self.filter_rect().unwrap_or_default()
+        } else {
+            self.path_box()
+        };
         let text = self.field_mut().map(|f| (f.text.clone(), f.caret));
         let Some((text, caret)) = text else { return };
         // The same scroll the painter applies when the text is longer than the box.
         let inner = r.w - self.px(16.0);
         let shift = (self.text.measure(&text[..caret]) - inner as f32 + 2.0).max(0.0);
-        let at = self.text.offset_at(&text, (x - r.x - self.px(8.0)) as f32 + shift);
+        let at = self
+            .text
+            .offset_at(&text, (x - r.x - self.px(8.0)) as f32 + shift);
         if let Some(f) = self.field_mut() {
             f.move_to(at, false);
         }
@@ -2655,8 +3385,14 @@ impl App {
     fn click_row(&mut self, row: usize) -> Option<bool> {
         let now = Instant::now();
         // Compared by key: a reload between the clicks can move rows.
-        let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
-        let double = self.last_click.as_ref().is_some_and(|(t, n)| *n == name && now.duration_since(*t) < DOUBLE_CLICK);
+        let name = self
+            .listing
+            .as_ref()
+            .map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
+        let double = self
+            .last_click
+            .as_ref()
+            .is_some_and(|(t, n)| *n == name && now.duration_since(*t) < DOUBLE_CLICK);
         let (ctrl, shift) = (self.mods_now.ctrl, self.mods_now.shift);
         if double && !ctrl && !shift {
             self.last_click = None;
@@ -2678,7 +3414,13 @@ impl App {
             self.cursor_shown = true;
             self.invalidate_list();
         } else {
-            self.move_cursor(row, Mods { shift, ..Mods::default() });
+            self.move_cursor(
+                row,
+                Mods {
+                    shift,
+                    ..Mods::default()
+                },
+            );
         }
         Some(false)
     }
@@ -2687,16 +3429,31 @@ impl App {
 
     /// Whether a position is on a row's icon or name, which is where a file drag starts.
     fn on_row_name(&mut self, row: usize, x: i32) -> bool {
-        let Some(name) = self.listing.as_ref().zip(self.rows.get(row)).map(|(l, &id)| String::from_utf8_lossy(l.name(id)).into_owned()) else { return false };
+        let Some(name) = self
+            .listing
+            .as_ref()
+            .zip(self.rows.get(row))
+            .map(|(l, &id)| String::from_utf8_lossy(l.name(id)).into_owned())
+        else {
+            return false;
+        };
         let l = self.layout();
         let name_x = l.list.x + self.px(38.0);
-        let name_max = l.list.right() - self.px(14.0) - l.col_date - l.col_size - self.px(10.0) - name_x;
+        let name_max =
+            l.list.right() - self.px(14.0) - l.col_date - l.col_size - self.px(10.0) - name_x;
         let width = (self.text.measure(&name).ceil() as i32).min(name_max);
         x >= l.list.x + self.px(10.0) && x < name_x + width + self.px(6.0)
     }
 
     fn save_selection(&self) -> SavedSelection {
-        SavedSelection { selected: self.selected.clone(), count: self.sel_count, cursor: self.cursor, anchor: self.anchor, shown: self.cursor_shown, add: self.mods_now.ctrl || self.mods_now.shift }
+        SavedSelection {
+            selected: self.selected.clone(),
+            count: self.sel_count,
+            cursor: self.cursor,
+            anchor: self.anchor,
+            shown: self.cursor_shown,
+            add: self.mods_now.ctrl || self.mods_now.shift,
+        }
     }
 
     /// The rows are about to change. A box, or a press that could become one, holds row numbers
@@ -2716,9 +3473,27 @@ impl App {
     }
 
     fn band_from_press(&mut self) {
-        let Some(FileDrag::Pressed { at, row, dir, name, band: Some((saved, start_y)), .. }) = self.file_drag.take() else { return };
+        let Some(FileDrag::Pressed {
+            at,
+            row,
+            dir,
+            name,
+            band: Some((saved, start_y)),
+            ..
+        }) = self.file_drag.take()
+        else {
+            return;
+        };
         if self.pressed_row_is_current(row, &dir, &name) {
-            self.file_drag = Some(FileDrag::Band(Band { at, active: false, start_y, saved, range: None, rect: Rect::default(), scroll_at: None }));
+            self.file_drag = Some(FileDrag::Band(Band {
+                at,
+                active: false,
+                start_y,
+                saved,
+                range: None,
+                rect: Rect::default(),
+                scroll_at: None,
+            }));
             self.band_activate();
         }
     }
@@ -2726,7 +3501,9 @@ impl App {
     fn band_activate(&mut self) {
         // Before it counts as active, which keeps the hover as it is.
         self.set_hover(Hit::None);
-        let Some(FileDrag::Band(b)) = &mut self.file_drag else { return };
+        let Some(FileDrag::Band(b)) = &mut self.file_drag else {
+            return;
+        };
         b.active = true;
         let (add, count) = (b.saved.add, b.saved.count);
         if add {
@@ -2743,7 +3520,9 @@ impl App {
 
     /// Brings the box and the selection up to date with the pointer and the scroll.
     fn band_update(&mut self) {
-        let Some(FileDrag::Band(mut b)) = self.file_drag.take() else { return };
+        let Some(FileDrag::Band(mut b)) = self.file_drag.take() else {
+            return;
+        };
         let l = self.layout();
         let (px, py) = self.pointer;
         let row_h = l.row_h.max(1) as f64;
@@ -2751,14 +3530,23 @@ impl App {
         let end = (self.list_y(py).max(0.0) / row_h) as usize;
         let last = self.rows.len().saturating_sub(1);
         // A box that's entirely below the last row touches nothing.
-        let range = (start.min(end) < self.rows.len()).then(|| (start.min(end), start.max(end).min(last)));
+        let range =
+            (start.min(end) < self.rows.len()).then(|| (start.min(end), start.max(end).min(last)));
         if range != b.range {
             let leaving = rows_outside(b.range, range);
             let joining = rows_outside(range, b.range);
-            let changed = leaving.iter().chain(&joining).map(ExactSizeIterator::len).sum::<usize>();
+            let changed = leaving
+                .iter()
+                .chain(&joining)
+                .map(ExactSizeIterator::len)
+                .sum::<usize>();
             for r in leaving.iter().cloned().flatten() {
                 let id = self.rows[r];
-                let was = b.saved.add && b.saved.selected.get(id as usize / 64).is_some_and(|w| w >> (id % 64) & 1 == 1);
+                let was = b.saved.add
+                    && b.saved
+                        .selected
+                        .get(id as usize / 64)
+                        .is_some_and(|w| w >> (id % 64) & 1 == 1);
                 self.set_selected(id, was);
             }
             for r in joining.iter().cloned().flatten() {
@@ -2792,17 +3580,31 @@ impl App {
             b.range = range;
         }
         let top = (b.start_y - self.scroll) as i32 + l.list.y;
-        let rect = Rect::new(b.at.0.min(px), top.min(py), (b.at.0 - px).abs() + 1, (top - py).abs() + 1).intersect(l.list);
+        let rect = Rect::new(
+            b.at.0.min(px),
+            top.min(py),
+            (b.at.0 - px).abs() + 1,
+            (top - py).abs() + 1,
+        )
+        .intersect(l.list);
         self.invalidate(b.rect);
         self.invalidate(rect);
         b.rect = rect;
-        let can_scroll = (py < l.list.y && self.scroll > 0.0) || (py >= l.list.bottom() && self.scroll < self.max_scroll());
-        b.scroll_at = if can_scroll { b.scroll_at.or_else(|| Some(Instant::now() + BAND_SCROLL_EVERY)) } else { None };
+        let can_scroll = (py < l.list.y && self.scroll > 0.0)
+            || (py >= l.list.bottom() && self.scroll < self.max_scroll());
+        b.scroll_at = if can_scroll {
+            b.scroll_at
+                .or_else(|| Some(Instant::now() + BAND_SCROLL_EVERY))
+        } else {
+            None
+        };
         self.file_drag = Some(FileDrag::Band(b));
     }
 
     fn band_on_timer(&mut self, now: Instant) {
-        let Some(FileDrag::Band(b)) = &mut self.file_drag else { return };
+        let Some(FileDrag::Band(b)) = &mut self.file_drag else {
+            return;
+        };
         if !b.scroll_at.is_some_and(|t| t <= now) {
             return;
         }
@@ -2810,8 +3612,15 @@ impl App {
         let l = self.layout();
         let y = self.pointer.1;
         // Faster the further past the end it is, up to a few rows at a time.
-        let past = if y < l.list.y { y - l.list.y } else { y - l.list.bottom() + 1 };
-        let step = (past as f64 / 4.0).abs().clamp(2.0, l.row_h as f64 * 3.0).copysign(past as f64);
+        let past = if y < l.list.y {
+            y - l.list.y
+        } else {
+            y - l.list.bottom() + 1
+        };
+        let step = (past as f64 / 4.0)
+            .abs()
+            .clamp(2.0, l.row_h as f64 * 3.0)
+            .copysign(past as f64);
         let old = self.scroll;
         self.scroll_to(old + step);
         // Nowhere further to go, so the scroll didn't update it, and this stops the timer.
@@ -2830,7 +3639,9 @@ impl App {
 
     /// Cancels a box, and the selection goes back to what it was before the press.
     fn band_put_back(&mut self) {
-        let Some(FileDrag::Band(b)) = self.file_drag.take() else { return };
+        let Some(FileDrag::Band(b)) = self.file_drag.take() else {
+            return;
+        };
         self.selected = b.saved.selected.clone();
         self.sel_count = b.saved.count;
         self.cursor = b.saved.cursor;
@@ -2845,11 +3656,18 @@ impl App {
 
     /// Whether a pressed row is still what's at that position in the same folder.
     fn pressed_row_is_current(&self, row: usize, dir: &Path, name: &[u8]) -> bool {
-        self.dir == dir && self.rows.get(row).zip(self.listing.as_ref()).is_some_and(|(&id, l)| *l.key(id) == *name)
+        self.dir == dir
+            && self
+                .rows
+                .get(row)
+                .zip(self.listing.as_ref())
+                .is_some_and(|(&id, l)| *l.key(id) == *name)
     }
 
     fn start_file_drag(&mut self) {
-        let Some(FileDrag::Pressed { row, dir, name, .. }) = self.file_drag.take() else { return };
+        let Some(FileDrag::Pressed { row, dir, name, .. }) = self.file_drag.take() else {
+            return;
+        };
         // Ctrl can have just unselected the pressed row, and then there's nothing to carry.
         if !self.pressed_row_is_current(row, &dir, &name) || !self.is_selected(self.rows[row]) {
             return;
@@ -2858,8 +3676,15 @@ impl App {
         if paths.is_empty() {
             return;
         }
-        let kind = self.listing.as_ref().map_or(Kind::File, |l| l.kind(self.rows[row]));
-        let ghost = DragGhost { name, kind, count: paths.len() };
+        let kind = self
+            .listing
+            .as_ref()
+            .map_or(Kind::File, |l| l.kind(self.rows[row]));
+        let ghost = DragGhost {
+            name,
+            kind,
+            count: paths.len(),
+        };
         // A drag wasn't a click, so the next press can't be the second half of a double-click.
         self.last_click = None;
         self.set_hover(Hit::None);
@@ -2869,14 +3694,41 @@ impl App {
         let hub = self.hub.clone();
         let from = dir.clone();
         // It ends with the drag, when the sender goes, unless a disk has it stuck.
-        let _ = std::thread::Builder::new().name("gannet-drag".into()).spawn(move || {
-            hub.send(Msg::DragSource { drag: id, facts: source_facts(&dir) });
-            for path in asked {
-                let device = std::fs::metadata(&path).ok().map(|m| std::os::unix::fs::MetadataExt::dev(&m));
-                hub.send(Msg::DragDevice { drag: id, path, device });
-            }
-        });
-        self.file_drag = Some(FileDrag::Active(ActiveDrag { paths, dir: from, probe, id, source: None, devices: HashMap::new(), target: None, label: Rect::default(), ghost, ghost_at: Rect::default(), wayland: false, handed_over: None, inside: false, moved_inside: false, accepting: false }));
+        let _ = std::thread::Builder::new()
+            .name("gannet-drag".into())
+            .spawn(move || {
+                hub.send(Msg::DragSource {
+                    drag: id,
+                    facts: source_facts(&dir),
+                });
+                for path in asked {
+                    let device = std::fs::metadata(&path)
+                        .ok()
+                        .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
+                    hub.send(Msg::DragDevice {
+                        drag: id,
+                        path,
+                        device,
+                    });
+                }
+            });
+        self.file_drag = Some(FileDrag::Active(ActiveDrag {
+            paths,
+            dir: from,
+            probe,
+            id,
+            source: None,
+            devices: HashMap::new(),
+            target: None,
+            label: Rect::default(),
+            ghost,
+            ghost_at: Rect::default(),
+            wayland: false,
+            handed_over: None,
+            inside: false,
+            moved_inside: false,
+            accepting: false,
+        }));
     }
 
     /// The folder a drop here would land in. Dropping on what's being dragged, on the folder
@@ -2890,7 +3742,11 @@ impl App {
                 if self.in_trash() || !l.kind(id).is_dirlike() || self.is_selected(id) {
                     return None;
                 }
-                Some(DropTarget { hit, dest: l.path(id), trash: false })
+                Some(DropTarget {
+                    hit,
+                    dest: l.path(id),
+                    trash: false,
+                })
             }
             Hit::Place(i) => {
                 let place = self.places.get(i)?;
@@ -2899,11 +3755,24 @@ impl App {
                 if place.path == self.dir || (trash && (self.in_trash() || self.mods_now.ctrl)) {
                     return None;
                 }
-                let inside_itself = place.path.strip_prefix(&self.dir).ok().and_then(|rest| rest.components().next()).is_some_and(|first| d.paths.iter().any(|p| p.file_name() == Some(first.as_os_str())));
+                let inside_itself = place
+                    .path
+                    .strip_prefix(&self.dir)
+                    .ok()
+                    .and_then(|rest| rest.components().next())
+                    .is_some_and(|first| {
+                        d.paths
+                            .iter()
+                            .any(|p| p.file_name() == Some(first.as_os_str()))
+                    });
                 if inside_itself {
                     return None;
                 }
-                Some(DropTarget { hit, dest: place.path.clone(), trash })
+                Some(DropTarget {
+                    hit,
+                    dest: place.path.clone(),
+                    trash,
+                })
             }
             _ => None,
         }
@@ -2919,8 +3788,15 @@ impl App {
             return DropAction::Copy;
         }
         let (device, can_delete) = d.source.unzip();
-        let same_disk = device.zip(d.devices.get(&t.dest).copied().flatten()).map(|(a, b)| a == b);
-        match drop_verb(self.mods_now.ctrl, self.mods_now.shift, same_disk, can_delete.unwrap_or(false)) {
+        let same_disk = device
+            .zip(d.devices.get(&t.dest).copied().flatten())
+            .map(|(a, b)| a == b);
+        match drop_verb(
+            self.mods_now.ctrl,
+            self.mods_now.shift,
+            same_disk,
+            can_delete.unwrap_or(false),
+        ) {
             DropVerb::Move => DropAction::Move,
             DropVerb::Copy => DropAction::Copy,
             DropVerb::Link => DropAction::Link,
@@ -2930,11 +3806,18 @@ impl App {
     /// What the drag is carrying, and what dropping it now would do.
     pub(crate) fn drag_label(&self, d: &ActiveDrag) -> String {
         let what = match d.paths.as_slice() {
-            [one] => format!("“{}”", one.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned())),
+            [one] => format!(
+                "“{}”",
+                one.file_name()
+                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+            ),
             many => format!("{} items", many.len()),
         };
         let Some(t) = &d.target else { return what };
-        let folder = t.dest.file_name().map_or_else(|| t.dest.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let folder = t.dest.file_name().map_or_else(
+            || t.dest.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         match self.drop_action(d, t) {
             DropAction::Move => format!("Move {what} to {folder}"),
             DropAction::Copy => format!("Copy {what} to {folder}"),
@@ -2956,7 +3839,9 @@ impl App {
     }
 
     fn label_rect_at(&mut self, label: &str, x: i32, y: i32) -> Rect {
-        let w = (self.text.measure(label).ceil() as i32 + self.px(16.0)).min(self.px(420.0)).min(self.w);
+        let w = (self.text.measure(label).ceil() as i32 + self.px(16.0))
+            .min(self.px(420.0))
+            .min(self.w);
         let h = self.px(26.0);
         Rect::new(x.min(self.w - w).max(0), y.min(self.h - h).max(0), w, h)
     }
@@ -2964,10 +3849,17 @@ impl App {
     /// The size of the row a drag carries, with room for the stack behind it if it's several.
     pub(crate) fn ghost_size(&mut self, g: &DragGhost) -> (i32, i32) {
         let name = String::from_utf8_lossy(&g.name);
-        let badge = if g.count > 1 { self.text.measure(&g.count.to_string()).ceil() as i32 + self.px(20.0) } else { 0 };
+        let badge = if g.count > 1 {
+            self.text.measure(&g.count.to_string()).ceil() as i32 + self.px(20.0)
+        } else {
+            0
+        };
         let w = self.text.measure(&name).ceil() as i32 + self.px(52.0) + badge;
         let stack = if g.count > 1 { self.px(4.0) } else { 0 };
-        (w.clamp(self.px(120.0), self.px(320.0)).min(self.w.max(1)) + stack, self.px(26.0) + stack)
+        (
+            w.clamp(self.px(120.0), self.px(320.0)).min(self.w.max(1)) + stack,
+            self.px(26.0) + stack,
+        )
     }
 
     /// Draws what the pointer carries for a drag out of this window, for the compositor to show.
@@ -2995,7 +3887,9 @@ impl App {
         if !matches!(self.file_drag, Some(FileDrag::Active(_))) {
             return;
         }
-        let Some(FileDrag::Active(mut d)) = self.file_drag.take() else { return };
+        let Some(FileDrag::Active(mut d)) = self.file_drag.take() else {
+            return;
+        };
         // The folder can go away under a drag, and what it carried isn't what's showing now.
         if d.dir != self.dir {
             // Out over other programs, the compositor still has it, and could still drop it.
@@ -3025,11 +3919,14 @@ impl App {
             d.devices.insert(t.dest.clone(), None);
             let _ = d.probe.send(t.dest.clone());
         }
-        let cursor = d.target.as_ref().map_or(Cursor::NoDrop, |t| match self.drop_action(&d, t) {
-            DropAction::Move | DropAction::Trash => Cursor::Move,
-            DropAction::Copy => Cursor::Copy,
-            DropAction::Link => Cursor::Alias,
-        });
+        let cursor = d
+            .target
+            .as_ref()
+            .map_or(Cursor::NoDrop, |t| match self.drop_action(&d, t) {
+                DropAction::Move | DropAction::Trash => Cursor::Move,
+                DropAction::Copy => Cursor::Copy,
+                DropAction::Link => Cursor::Alias,
+            });
         if d.wayland {
             // The compositor draws the cursor during its drags, and it decides by this.
             if d.accepting != d.target.is_some() {
@@ -3047,12 +3944,21 @@ impl App {
             Rect::default()
         } else {
             let (w, h) = self.ghost_size(&d.ghost);
-            Rect::new((px + self.px(14.0)).min(self.w - w).max(0), (py + self.px(10.0)).min(self.h - h).max(0), w, h)
+            Rect::new(
+                (px + self.px(14.0)).min(self.w - w).max(0),
+                (py + self.px(10.0)).min(self.h - h).max(0),
+                w,
+                h,
+            )
         };
         // Only what a drop would do needs saying: the row already shows what's being carried.
         d.label = if d.target.is_some() {
             let label = self.drag_label(&d);
-            if d.wayland { self.drag_label_rect(&label, GANNET_PICTURE) } else { self.label_rect_at(&label, d.ghost_at.x, d.ghost_at.bottom() + self.px(4.0)) }
+            if d.wayland {
+                self.drag_label_rect(&label, GANNET_PICTURE)
+            } else {
+                self.label_rect_at(&label, d.ghost_at.x, d.ghost_at.bottom() + self.px(4.0))
+            }
         } else {
             Rect::default()
         };
@@ -3097,12 +4003,15 @@ impl App {
 
     /// The pointer has left the window with the button down, so other programs can have it.
     fn start_wayland_drag(&mut self) {
-        let Some(FileDrag::Active(d)) = &mut self.file_drag else { return };
+        let Some(FileDrag::Active(d)) = &mut self.file_drag else {
+            return;
+        };
         d.wayland = true;
         d.handed_over = Some(Instant::now());
         // It's gone from this window, so nothing here is under it until it comes back.
         self.pointer = (-1, -1);
-        let (old_target, old_label) = (d.target.take().map(|t| t.hit), std::mem::take(&mut d.label));
+        let (old_target, old_label) =
+            (d.target.take().map(|t| t.hit), std::mem::take(&mut d.label));
         let old_ghost = std::mem::take(&mut d.ghost_at);
         let formats = clipboard::drag_formats(&d.paths);
         let ghost = d.ghost.clone();
@@ -3117,17 +4026,40 @@ impl App {
         // items only leave as copies, because its two folders have to stay paired, so they get
         // no marker. Nor does a drag whose folder hasn't answered yet, which then just copies.
         let move_only = self.mods_now.shift && !self.mods_now.ctrl && !self.in_trash();
-        let marker = source.filter(|_| !self.in_trash()).map(|(device, can_delete)| clipboard::DragMarker { device, can_delete, ctrl: self.mods_now.ctrl, shift: self.mods_now.shift });
+        let marker = source
+            .filter(|_| !self.in_trash())
+            .map(|(device, can_delete)| clipboard::DragMarker {
+                device,
+                can_delete,
+                ctrl: self.mods_now.ctrl,
+                shift: self.mods_now.shift,
+            });
         let icon = self.render_drag_icon(&ghost);
-        self.cmds.push(Cmd::StartDrag { formats, marker, move_only, icon });
+        self.cmds.push(Cmd::StartDrag {
+            formats,
+            marker,
+            move_only,
+            icon,
+        });
     }
 
     /// The position that comes with a drag's arrival can't be believed: Hyprland always says
     /// the middle of the window. So nothing under it lights up or gets a label, and the real
     /// position comes with the first motion, right behind it.
-    fn drag_entered(&mut self, x: f64, y: f64, files: bool, can_copy: bool, can_move: bool, marker: Option<clipboard::DragMarker>) {
+    fn drag_entered(
+        &mut self,
+        x: f64,
+        y: f64,
+        files: bool,
+        can_copy: bool,
+        can_move: bool,
+        marker: Option<clipboard::DragMarker>,
+    ) {
         // A drag arriving means the button came up without this window hearing about it.
-        if matches!(self.file_drag, Some(FileDrag::Band(_) | FileDrag::Pressed { .. })) {
+        if matches!(
+            self.file_drag,
+            Some(FileDrag::Band(_) | FileDrag::Pressed { .. })
+        ) {
             self.cancel_file_drag();
         }
         if let Some(FileDrag::Active(d)) = &mut self.file_drag
@@ -3147,15 +4079,35 @@ impl App {
             let (probe, asked) = std::sync::mpsc::channel::<PathBuf>();
             let hub = self.hub.clone();
             // It ends with the drag, when the sender goes, unless a disk has it stuck.
-            let _ = std::thread::Builder::new().name("gannet-drag".into()).spawn(move || {
-                for path in asked {
-                    let device = std::fs::metadata(&path).ok().map(|m| std::os::unix::fs::MetadataExt::dev(&m));
-                    hub.send(Msg::DragDevice { drag: id, path, device });
-                }
-            });
+            let _ = std::thread::Builder::new()
+                .name("gannet-drag".into())
+                .spawn(move || {
+                    for path in asked {
+                        let device = std::fs::metadata(&path)
+                            .ok()
+                            .map(|m| std::os::unix::fs::MetadataExt::dev(&m));
+                        hub.send(Msg::DragDevice {
+                            drag: id,
+                            path,
+                            device,
+                        });
+                    }
+                });
             probe
         });
-        self.incoming = Some(IncomingDrag { files, can_copy, can_move, marker, probe, id, devices: HashMap::new(), moved: false, target: None, label: Rect::default(), accepting: false });
+        self.incoming = Some(IncomingDrag {
+            files,
+            can_copy,
+            can_move,
+            marker,
+            probe,
+            id,
+            devices: HashMap::new(),
+            moved: false,
+            target: None,
+            label: Rect::default(),
+            accepting: false,
+        });
         self.refresh_incoming();
     }
 
@@ -3163,7 +4115,8 @@ impl App {
         if let Some(FileDrag::Active(d)) = &mut self.file_drag {
             d.inside = false;
             d.accepting = false;
-            let (old_target, old_label) = (d.target.take().map(|t| t.hit), std::mem::take(&mut d.label));
+            let (old_target, old_label) =
+                (d.target.take().map(|t| t.hit), std::mem::take(&mut d.label));
             self.invalidate(old_label);
             if let Some(hit) = old_target {
                 self.invalidate_drop_target(hit);
@@ -3188,8 +4141,15 @@ impl App {
             return None;
         }
         if !i.moved {
-            let refused = self.in_trash() || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some();
-            return (!refused).then(|| DropTarget { hit: Hit::None, dest: self.dir.clone(), trash: false });
+            let refused = self.in_trash()
+                || self.dialog.is_some()
+                || self.menu.is_some()
+                || self.preview.is_some();
+            return (!refused).then(|| DropTarget {
+                hit: Hit::None,
+                dest: self.dir.clone(),
+                trash: false,
+            });
         }
         let (x, y) = self.pointer;
         self.incoming_target_at(self.incoming_can_trash(i), x, y)
@@ -3205,11 +4165,23 @@ impl App {
                 let l = self.listing.as_ref()?;
                 let id = *self.rows.get(row)?;
                 if l.kind(id).is_dirlike() {
-                    return Some(DropTarget { hit, dest: l.path(id), trash: false });
+                    return Some(DropTarget {
+                        hit,
+                        dest: l.path(id),
+                        trash: false,
+                    });
                 }
-                Some(DropTarget { hit: Hit::ListEmpty, dest: self.dir.clone(), trash: false })
+                Some(DropTarget {
+                    hit: Hit::ListEmpty,
+                    dest: self.dir.clone(),
+                    trash: false,
+                })
             }
-            Hit::ListEmpty => Some(DropTarget { hit, dest: self.dir.clone(), trash: false }),
+            Hit::ListEmpty => Some(DropTarget {
+                hit,
+                dest: self.dir.clone(),
+                trash: false,
+            }),
             Hit::Place(i) => {
                 let place = self.places.get(i)?;
                 let trash = place.kind == PlaceKind::Trash;
@@ -3217,7 +4189,11 @@ impl App {
                 if trash && !can_trash {
                     return None;
                 }
-                Some(DropTarget { hit, dest: place.path.clone(), trash })
+                Some(DropTarget {
+                    hit,
+                    dest: place.path.clone(),
+                    trash,
+                })
             }
             _ => None,
         }
@@ -3226,7 +4202,11 @@ impl App {
     /// The keys that count for a drag from another Gannet window: the ones held now if this
     /// window can see them, and otherwise the ones held when the drag left its window.
     fn marker_keys(&self, m: &clipboard::DragMarker) -> (bool, bool) {
-        if self.has_keyboard { (self.mods_now.ctrl, self.mods_now.shift) } else { (m.ctrl, m.shift) }
+        if self.has_keyboard {
+            (self.mods_now.ctrl, self.mods_now.shift)
+        } else {
+            (m.ctrl, m.shift)
+        }
     }
 
     /// Whether a drop here can go to the Trash. Ctrl asks for a copy, and trashing the
@@ -3246,10 +4226,19 @@ impl App {
             return DropAction::Trash;
         }
         let Some(m) = &i.marker else {
-            return if verb_is_move(i.can_copy, i.can_move) { DropAction::Move } else { DropAction::Copy };
+            return if verb_is_move(i.can_copy, i.can_move) {
+                DropAction::Move
+            } else {
+                DropAction::Copy
+            };
         };
         let (ctrl, shift) = self.marker_keys(m);
-        let same_disk = i.devices.get(&t.dest).copied().flatten().map(|d| d == m.device);
+        let same_disk = i
+            .devices
+            .get(&t.dest)
+            .copied()
+            .flatten()
+            .map(|d| d == m.device);
         match drop_verb(ctrl, shift, same_disk, m.can_delete) {
             DropVerb::Move => DropAction::Move,
             DropVerb::Copy => DropAction::Copy,
@@ -3258,7 +4247,10 @@ impl App {
     }
 
     pub(crate) fn incoming_label(&self, i: &IncomingDrag, t: &DropTarget) -> String {
-        let folder = t.dest.file_name().map_or_else(|| t.dest.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let folder = t.dest.file_name().map_or_else(
+            || t.dest.to_string_lossy().into_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         match self.incoming_action(i, t) {
             DropAction::Trash => "Move to Trash".to_string(),
             DropAction::Move => format!("Move to {folder}"),
@@ -3268,7 +4260,9 @@ impl App {
     }
 
     fn refresh_incoming(&mut self) {
-        let Some(mut i) = self.incoming.take() else { return };
+        let Some(mut i) = self.incoming.take() else {
+            return;
+        };
         let target = self.incoming_target(&i);
         if target.as_ref().map(|t| t.hit) != i.target.as_ref().map(|t| t.hit) {
             for t in [i.target.as_ref(), target.as_ref()].into_iter().flatten() {
@@ -3291,7 +4285,14 @@ impl App {
         i.label = match &i.target {
             Some(t) if i.moved => {
                 let label = self.incoming_label(&i, t);
-                self.drag_label_rect(&label, if i.marker.is_some() { GANNET_PICTURE } else { OTHER_APP_PICTURE })
+                self.drag_label_rect(
+                    &label,
+                    if i.marker.is_some() {
+                        GANNET_PICTURE
+                    } else {
+                        OTHER_APP_PICTURE
+                    },
+                )
             }
             _ => Rect::default(),
         };
@@ -3326,7 +4327,11 @@ impl App {
         match self.incoming_target(&i) {
             Some(t) => {
                 let decided = i.marker.is_some().then(|| self.incoming_action(&i, &t));
-                self.cmds.push(Cmd::ReadDrop { dest: t.dest, trash: t.trash, decided });
+                self.cmds.push(Cmd::ReadDrop {
+                    dest: t.dest,
+                    trash: t.trash,
+                    decided,
+                });
             }
             None => self.cmds.push(Cmd::AbandonDrop),
         }
@@ -3345,7 +4350,9 @@ impl App {
         }
         let request = if d.trash {
             if !d.can_move && d.decided.is_none() {
-                self.notice("The other app only lets these be copied, so they can't go to the Trash".into());
+                self.notice(
+                    "The other app only lets these be copied, so they can't go to the Trash".into(),
+                );
                 self.cmds.push(Cmd::AbandonDrop);
                 return;
             }
@@ -3374,7 +4381,11 @@ impl App {
         if d.decided.is_none() && verb_is_move(d.can_copy, d.can_move) {
             self.drop_job = self.jobs.last().map(|j| (j.job.id, d.all_local));
         } else {
-            self.cmds.push(if d.all_local { Cmd::FinishDrop } else { Cmd::AbandonDrop });
+            self.cmds.push(if d.all_local {
+                Cmd::FinishDrop
+            } else {
+                Cmd::AbandonDrop
+            });
         }
     }
 
@@ -3385,13 +4396,27 @@ impl App {
             && job == o.job
         {
             self.drop_job = None;
-            self.cmds.push(if all_local && !o.cancelled && o.errors == 0 && o.skipped == 0 { Cmd::FinishDrop } else { Cmd::AbandonDrop });
+            self.cmds.push(
+                if all_local && !o.cancelled && o.errors == 0 && o.skipped == 0 {
+                    Cmd::FinishDrop
+                } else {
+                    Cmd::AbandonDrop
+                },
+            );
         }
     }
 
     fn finish_file_drag(&mut self) {
         match self.file_drag.take() {
-            Some(FileDrag::Pressed { row, dir, name, narrow: true, .. }) if self.pressed_row_is_current(row, &dir, &name) => self.move_cursor(row, Mods::default()),
+            Some(FileDrag::Pressed {
+                row,
+                dir,
+                name,
+                narrow: true,
+                ..
+            }) if self.pressed_row_is_current(row, &dir, &name) => {
+                self.move_cursor(row, Mods::default())
+            }
             Some(FileDrag::Band(b)) => self.band_ended(&b),
             // A release means the compositor never took this drag: it stops those events.
             Some(FileDrag::Active(d)) if d.wayland => {
@@ -3429,9 +4454,16 @@ fn source_facts(dir: &Path) -> Option<(u64, bool)> {
 }
 
 /// The rows in `a` that aren't in `b`, as up to two runs.
-fn rows_outside(a: Option<(usize, usize)>, b: Option<(usize, usize)>) -> [std::ops::Range<usize>; 2] {
-    let Some((a0, a1)) = a else { return [0..0, 0..0] };
-    let Some((b0, b1)) = b else { return [a0..a1 + 1, 0..0] };
+fn rows_outside(
+    a: Option<(usize, usize)>,
+    b: Option<(usize, usize)>,
+) -> [std::ops::Range<usize>; 2] {
+    let Some((a0, a1)) = a else {
+        return [0..0, 0..0];
+    };
+    let Some((b0, b1)) = b else {
+        return [a0..a1 + 1, 0..0];
+    };
     [a0..b0.min(a1 + 1), (b1 + 1).max(a0)..a1 + 1]
 }
 
@@ -3447,7 +4479,18 @@ fn verb_is_move(can_copy: bool, can_move: bool) -> bool {
 
 fn cursor_for(h: Hit) -> Cursor {
     match h {
-        Hit::Header(_) | Hit::Crumb(_) | Hit::Back | Hit::Forward | Hit::Up | Hit::EmptyTrash | Hit::Place(_) | Hit::MenuItem(_) | Hit::NoticeClose(_) | Hit::JobCancel(_) | Hit::DialogButton(_) | Hit::DialogCheck => Cursor::Pointer,
+        Hit::Header(_)
+        | Hit::Crumb(_)
+        | Hit::Back
+        | Hit::Forward
+        | Hit::Up
+        | Hit::EmptyTrash
+        | Hit::Place(_)
+        | Hit::MenuItem(_)
+        | Hit::NoticeClose(_)
+        | Hit::JobCancel(_)
+        | Hit::DialogButton(_)
+        | Hit::DialogCheck => Cursor::Pointer,
         Hit::PathBar | Hit::FilterBox => Cursor::Text,
         _ => Cursor::Default,
     }
@@ -3455,7 +4498,11 @@ fn cursor_for(h: Hit) -> Cursor {
 
 fn next_enabled(items: &[MenuItem], from: usize, step: usize) -> usize {
     let n = items.len();
-    let mut i = if from == usize::MAX { n - 1 } else { from.min(n - 1) };
+    let mut i = if from == usize::MAX {
+        n - 1
+    } else {
+        from.min(n - 1)
+    };
     if from == n {
         i = 0;
     }
@@ -3469,7 +4516,8 @@ fn next_enabled(items: &[MenuItem], from: usize, step: usize) -> usize {
 }
 
 fn title_for(dir: &Path) -> String {
-    dir.file_name().map_or_else(|| "/".to_string(), |n| n.to_string_lossy().into_owned())
+    dir.file_name()
+        .map_or_else(|| "/".to_string(), |n| n.to_string_lossy().into_owned())
 }
 
 /// `~` and `~/x`, using the home the app was given rather than the environment.
@@ -3539,17 +4587,36 @@ mod tests {
     impl Rig {
         /// An app on a fresh scratch folder, its Trash in there too.
         fn new(tag: &str) -> Self {
-            assert!(std::env::var_os("GANNET_TEST_SANDBOX").is_some(), "run tests with scripts/test.sh");
-            let root = std::env::temp_dir().join(format!("gannet-test-app-{}-{tag}", std::process::id()));
+            assert!(
+                std::env::var_os("GANNET_TEST_SANDBOX").is_some(),
+                "run tests with scripts/test.sh"
+            );
+            let root =
+                std::env::temp_dir().join(format!("gannet-test-app-{}-{tag}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(root.join("work")).unwrap();
             let (tx, rx) = channel();
-            let hub = Hub { tx, wake: Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap()) };
+            let hub = Hub {
+                tx,
+                wake: Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap()),
+            };
             let op_hub = hub.clone();
             let mut trash = TrashConfig::new(&root.join("data"), 1000);
             trash.mount_of = Arc::new(|_| None);
             let engine = Engine::new(trash, Arc::new(move |e| op_hub.send(Msg::Op(e))));
-            let mut app = App::new(hub, engine, root.join("data/Trash/files"), gannet_core::theme::builtin(false), Source::Default, Text::new(14.0, true), Vec::new(), root.join("work"), 1280, 800, 1.0);
+            let mut app = App::new(
+                hub,
+                engine,
+                root.join("data/Trash/files"),
+                gannet_core::theme::builtin(false),
+                Source::Default,
+                Text::new(14.0, true),
+                Vec::new(),
+                root.join("work"),
+                1280,
+                800,
+                1.0,
+            );
             // Tests must never find a real disk's Trash.
             app.trash_mounts = Some(Vec::new());
             Self { app, rx, root }
@@ -3572,19 +4639,31 @@ mod tests {
 
         /// Opens `dir` and waits until it's fully read.
         fn open(&mut self, dir: PathBuf) {
-            self.app.go(Stop { dir, cursor_name: None });
+            self.app.go(Stop {
+                dir,
+                cursor_name: None,
+            });
             self.pump_until("folder loaded", |a| !a.loading);
         }
 
         fn select(&mut self, name: &str) {
             let l = self.app.listing.clone().unwrap();
-            let row = self.app.rows.iter().position(|&i| l.name(i) == name.as_bytes()).unwrap();
+            let row = self
+                .app
+                .rows
+                .iter()
+                .position(|&i| l.name(i) == name.as_bytes())
+                .unwrap();
             self.app.move_cursor(row, Mods::default());
         }
 
         fn selected_names(&self) -> Vec<String> {
             let l = self.app.listing.clone().unwrap();
-            self.app.selected_ids().into_iter().map(|i| String::from_utf8_lossy(l.name(i)).into_owned()).collect()
+            self.app
+                .selected_ids()
+                .into_iter()
+                .map(|i| String::from_utf8_lossy(l.name(i)).into_owned())
+                .collect()
         }
 
         fn key(&mut self, sym: u32, utf8: &str) {
@@ -3592,7 +4671,14 @@ mod tests {
         }
 
         fn ctrl(&mut self, sym: u32) {
-            self.app.key(sym, "", Mods { ctrl: true, ..Mods::default() });
+            self.app.key(
+                sym,
+                "",
+                Mods {
+                    ctrl: true,
+                    ..Mods::default()
+                },
+            );
         }
 
         fn idle(&mut self) {
@@ -3620,11 +4706,17 @@ mod tests {
         let (there, here) = (r.root.join("there"), r.root.join("here"));
         r.open(there.clone());
         r.app.action(Action::Paste);
-        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else {
+            panic!("no read requested")
+        };
         // The user moves on before the other program answers.
         r.open(here.clone());
         let src = r.work().join("a");
-        r.app.on_msg(Msg::Clipboard(Some(uri(&src)), clipboard::GNOME.to_string(), asked));
+        r.app.on_msg(Msg::Clipboard(
+            Some(uri(&src)),
+            clipboard::GNOME.to_string(),
+            asked,
+        ));
         r.idle();
         assert!(there.join("a").exists());
         assert!(!here.join("a").exists());
@@ -3638,12 +4730,20 @@ mod tests {
         r.select("a");
         r.ctrl(k::KEY_l);
         r.ctrl(k::KEY_v);
-        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else {
+            panic!("no read requested")
+        };
         r.key(k::KEY_Escape, "");
         r.key(k::KEY_F2, "");
         assert!(matches!(r.app.edit, Edit::Rename { .. }));
-        r.app.on_msg(Msg::Clipboard(Some(b"junk".to_vec()), clipboard::TEXT.to_string(), asked));
-        let Edit::Rename { field, .. } = &r.app.edit else { panic!() };
+        r.app.on_msg(Msg::Clipboard(
+            Some(b"junk".to_vec()),
+            clipboard::TEXT.to_string(),
+            asked,
+        ));
+        let Edit::Rename { field, .. } = &r.app.edit else {
+            panic!()
+        };
         assert_eq!(field.text, "a");
     }
 
@@ -3654,7 +4754,11 @@ mod tests {
         fs::write(&dst, "old").unwrap();
         r.open(r.work());
         let dest = r.work();
-        r.app.on_msg(Msg::Clipboard(Some(uri(&src)), clipboard::GNOME.to_string(), Paste::Files { dest }));
+        r.app.on_msg(Msg::Clipboard(
+            Some(uri(&src)),
+            clipboard::GNOME.to_string(),
+            Paste::Files { dest },
+        ));
         r.pump_until("conflict shows", |a| a.dialog.is_some());
         (src, dst)
     }
@@ -3678,7 +4782,10 @@ mod tests {
         let mut r = Rig::new("conflict-guard");
         let (_, _) = clash(&mut r, "new");
         r.key(k::KEY_s, "s");
-        assert!(r.app.dialog.is_some(), "a keystroke right as it appears must not answer it");
+        assert!(
+            r.app.dialog.is_some(),
+            "a keystroke right as it appears must not answer it"
+        );
         past_guard(&mut r);
         r.key(k::KEY_s, "s");
         assert!(r.app.dialog.is_none());
@@ -3694,7 +4801,11 @@ mod tests {
         r.key(k::KEY_Left, "");
         r.key(k::KEY_Return, "\r");
         r.idle();
-        assert_eq!(fs::read_to_string(dst).unwrap(), "new", "choosing Replace on purpose works");
+        assert_eq!(
+            fs::read_to_string(dst).unwrap(),
+            "new",
+            "choosing Replace on purpose works"
+        );
     }
 
     #[test]
@@ -3723,10 +4834,18 @@ mod tests {
         r.open(r.work());
         let dest = r.work();
         let src = r.root.join("x");
-        r.app.on_msg(Msg::Clipboard(Some(uri(&src)), clipboard::GNOME.to_string(), Paste::Files { dest }));
+        r.app.on_msg(Msg::Clipboard(
+            Some(uri(&src)),
+            clipboard::GNOME.to_string(),
+            Paste::Files { dest },
+        ));
         r.select("keep");
         r.idle();
-        assert_eq!(r.selected_names(), ["keep"], "a selection made since must stay");
+        assert_eq!(
+            r.selected_names(),
+            ["keep"],
+            "a selection made since must stay"
+        );
         // Another folder: a stale wish to select `x` must not apply there.
         r.app.pending_select = vec![b"x".to_vec()];
         r.open(other);
@@ -3741,8 +4860,15 @@ mod tests {
         let dest = r.work();
         let src = r.root.join("a");
         let data = format!("cut\nfile://{}", src.display()).into_bytes();
-        r.app.on_msg(Msg::Clipboard(Some(data), clipboard::GNOME.to_string(), Paste::Files { dest }));
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::ClearClipboard)), "the clipboard must not still say cut");
+        r.app.on_msg(Msg::Clipboard(
+            Some(data),
+            clipboard::GNOME.to_string(),
+            Paste::Files { dest },
+        ));
+        assert!(
+            r.app.cmds.iter().any(|c| matches!(c, Cmd::ClearClipboard)),
+            "the clipboard must not still say cut"
+        );
         r.idle();
         assert!(r.work().join("a").exists());
     }
@@ -3753,7 +4879,14 @@ mod tests {
         r.open(r.work());
         r.ctrl(k::KEY_v);
         r.ctrl(k::KEY_v);
-        assert_eq!(r.app.cmds.iter().filter(|c| matches!(c, Cmd::ReadClipboard(_))).count(), 1);
+        assert_eq!(
+            r.app
+                .cmds
+                .iter()
+                .filter(|c| matches!(c, Cmd::ReadClipboard(_)))
+                .count(),
+            1
+        );
     }
 
     /// Puts the pointer on a row and presses, with `a` and `b` listed.
@@ -3761,15 +4894,26 @@ mod tests {
         let l = r.app.layout();
         let y = l.list.y + row as i32 * l.row_h + l.row_h / 2;
         // On the row's icon, where a drag carries the file.
-        r.app.input(Input::Move { x: (l.list.x + 20) as f64, y: y as f64 });
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.input(Input::Move {
+            x: (l.list.x + 20) as f64,
+            y: y as f64,
+        });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: true,
+        });
     }
 
     fn drag_rig(tag: &str) -> Rig {
         let mut r = Rig::new(tag);
         fs::write(r.root.join("work/a"), b"1").unwrap();
         fs::write(r.root.join("work/b"), b"2").unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the files", |a| a.rows.len() == 2);
         r
     }
@@ -3778,7 +4922,10 @@ mod tests {
     fn a_press_survives_messages_and_keys_until_it_becomes_a_drag() {
         let mut r = drag_rig("drag-survive");
         press_on_row(&mut r, 0);
-        r.app.input(Input::Mods(Mods { ctrl: true, ..Mods::default() }));
+        r.app.input(Input::Mods(Mods {
+            ctrl: true,
+            ..Mods::default()
+        }));
         r.app.input(Input::Mods(Mods::default()));
         r.app.on_msg(Msg::Notice("something finished".into()));
         assert!(matches!(r.app.file_drag, Some(FileDrag::Pressed { .. })));
@@ -3794,9 +4941,20 @@ mod tests {
         assert!(matches!(r.app.file_drag, Some(FileDrag::Active(_))));
         r.app.open_menu(800, 40);
         r.app.cmds.clear();
-        r.app.input(Input::Key { keysym: k::KEY_Escape, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_Escape,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         assert!(r.app.file_drag.is_none());
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::Cursor(Cursor::Default))), "the drag's cursor stayed");
+        assert!(
+            r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::Cursor(Cursor::Default))),
+            "the drag's cursor stayed"
+        );
     }
 
     fn dragging(tag: &str) -> Rig {
@@ -3808,7 +4966,16 @@ mod tests {
     }
 
     fn cursors(r: &App) -> Vec<Cursor> {
-        r.cmds.iter().filter_map(|c| if let Cmd::Cursor(c) = c { Some(*c) } else { None }).collect()
+        r.cmds
+            .iter()
+            .filter_map(|c| {
+                if let Cmd::Cursor(c) = c {
+                    Some(*c)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -3818,7 +4985,10 @@ mod tests {
         r.app.open_menu(800, 40);
         r.app.cmds.clear();
         r.app.on_msg(Msg::Notice("anything".into()));
-        assert!(r.app.file_drag.is_none(), "the drag ends as soon as the menu is up");
+        assert!(
+            r.app.file_drag.is_none(),
+            "the drag ends as soon as the menu is up"
+        );
         assert_eq!(cursors(&r.app), [Cursor::Default]);
         // The menu responds to the pointer now.
         let at = r.app.menu.as_ref().unwrap().at;
@@ -3826,7 +4996,10 @@ mod tests {
         let rect = r.app.menu_rect(m);
         let target = if at == 1 { 0 } else { 1 };
         let y = rect.y + r.app.px(4.0) + target as i32 * r.app.px(28.0) + r.app.px(14.0);
-        r.app.input(Input::Move { x: (rect.x + r.app.px(10.0)) as f64, y: y as f64 });
+        r.app.input(Input::Move {
+            x: (rect.x + r.app.px(10.0)) as f64,
+            y: y as f64,
+        });
         assert_eq!(r.app.menu.as_ref().unwrap().at, target);
     }
 
@@ -3839,7 +5012,10 @@ mod tests {
     }
 
     fn drags_started(a: &App) -> usize {
-        a.cmds.iter().filter(|c| matches!(c, Cmd::StartDrag { .. })).count()
+        a.cmds
+            .iter()
+            .filter(|c| matches!(c, Cmd::StartDrag { .. }))
+            .count()
     }
 
     #[test]
@@ -3868,9 +5044,23 @@ mod tests {
         r.app.cmds.clear();
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         assert_eq!(drags_started(&r.app), 1);
-        let Cmd::StartDrag { formats, move_only, .. } = r.app.cmds.iter().find(|c| matches!(c, Cmd::StartDrag { .. })).unwrap() else { unreachable!() };
+        let Cmd::StartDrag {
+            formats, move_only, ..
+        } = r
+            .app
+            .cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::StartDrag { .. }))
+            .unwrap()
+        else {
+            unreachable!()
+        };
         assert!(!move_only, "a plain drag offers a copy");
-        let list = &formats.iter().find(|(m, _)| *m == clipboard::URI_LIST).unwrap().1;
+        let list = &formats
+            .iter()
+            .find(|(m, _)| *m == clipboard::URI_LIST)
+            .unwrap()
+            .1;
         assert!(String::from_utf8_lossy(list).contains("/work/a"));
         r.app.input(Input::Move { x: -9.0, y: 200.0 });
         assert_eq!(drags_started(&r.app), 1);
@@ -3880,7 +5070,12 @@ mod tests {
     fn a_drag_out_stops_when_the_folder_changes() {
         let mut r = drag_rig("drag-out-folder");
         fs::create_dir(r.root.join("work/d")).unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the folder", |a| a.rows.len() == 3);
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
@@ -3890,14 +5085,22 @@ mod tests {
         r.app.navigate(r.root.join("work/d"), None);
         r.app.input(Input::Mods(Mods::default()));
         assert!(r.app.file_drag.is_none());
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::CancelDrag)), "the compositor would still have it");
+        assert!(
+            r.app.cmds.iter().any(|c| matches!(c, Cmd::CancelDrag)),
+            "the compositor would still have it"
+        );
     }
 
     #[test]
     fn coming_back_in_a_wayland_drag_drops_like_any_other_drag() {
         let mut r = drag_rig("drag-back");
         fs::create_dir(r.root.join("work/d")).unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the folder", |a| a.rows.len() == 3);
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
@@ -3905,9 +5108,21 @@ mod tests {
         let l = r.app.layout();
         r.app.cmds.clear();
         let y = (l.list.y + l.row_h / 2) as f64;
-        r.app.input(Input::DragEnter { x: 540.0, y, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         r.app.input(Input::DragMove { x: 540.0, y });
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::AcceptDrop(true))));
+        assert!(
+            r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::AcceptDrop(true)))
+        );
         // Until the disks have been looked at, a drop would copy.
         r.pump_until("the disk thread", |a| matches!(&a.file_drag, Some(FileDrag::Active(d)) if d.source.is_some() && d.devices.values().any(|v| v.is_some())));
         r.app.input(Input::DragDrop);
@@ -3924,7 +5139,12 @@ mod tests {
         for i in 0..n {
             fs::write(r.root.join("work").join(format!("f{i:04}")), b"x").unwrap();
         }
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the rows", |a| a.rows.len() == n && !a.loading);
         r
     }
@@ -3942,7 +5162,10 @@ mod tests {
     fn band_press(r: &mut Rig, row: usize) {
         let (x, y) = (band_x(r), band_y(r, row));
         r.app.input(Input::Move { x, y });
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: true,
+        });
     }
 
     fn band_to(r: &mut Rig, row: usize) {
@@ -3951,7 +5174,9 @@ mod tests {
     }
 
     fn selected_rows(a: &App) -> Vec<usize> {
-        (0..a.rows.len()).filter(|&i| a.is_selected(a.rows[i])).collect()
+        (0..a.rows.len())
+            .filter(|&i| a.is_selected(a.rows[i]))
+            .collect()
     }
 
     #[test]
@@ -3967,7 +5192,10 @@ mod tests {
         // Back across the start, it works upwards.
         band_to(&mut r, 0);
         assert_eq!(selected_rows(&r.app), [0, 1]);
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert!(r.app.file_drag.is_none());
         assert_eq!(selected_rows(&r.app), [0, 1]);
         assert_eq!(r.app.sel_count, 2);
@@ -3976,28 +5204,50 @@ mod tests {
     #[test]
     fn a_box_replaces_the_selection_and_escape_puts_it_back() {
         let mut r = band_rig("band-esc", 8);
-        r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_a,
+            utf8: "a".into(),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+            repeat: false,
+        });
         assert_eq!(r.app.sel_count, 8);
         // The row pressed is in the selection, and a drag from beside its name still draws a box.
         band_press(&mut r, 2);
         band_to(&mut r, 3);
         assert_eq!(selected_rows(&r.app), [2, 3]);
-        r.app.input(Input::Key { keysym: k::KEY_Escape, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_Escape,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         assert!(r.app.file_drag.is_none());
         assert_eq!(r.app.sel_count, 8, "as it was before the press");
         // The rest of the drag does nothing.
         band_to(&mut r, 5);
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert_eq!(r.app.sel_count, 8);
     }
 
     #[test]
     fn a_box_with_ctrl_adds_and_gives_back_rows_it_leaves() {
         let mut r = band_rig("band-ctrl", 8);
-        r.app.input(Input::Mods(Mods { ctrl: true, ..Mods::default() }));
+        r.app.input(Input::Mods(Mods {
+            ctrl: true,
+            ..Mods::default()
+        }));
         for row in [1, 5] {
             band_press(&mut r, row);
-            r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+            r.app.input(Input::Button {
+                button: BTN_LEFT,
+                pressed: false,
+            });
         }
         assert_eq!(selected_rows(&r.app), [1, 5]);
         std::thread::sleep(DOUBLE_CLICK);
@@ -4005,17 +5255,32 @@ mod tests {
         band_to(&mut r, 5);
         assert_eq!(selected_rows(&r.app), [1, 3, 4, 5]);
         band_to(&mut r, 4);
-        assert_eq!(selected_rows(&r.app), [1, 3, 4, 5], "row 5 was selected before");
+        assert_eq!(
+            selected_rows(&r.app),
+            [1, 3, 4, 5],
+            "row 5 was selected before"
+        );
         band_to(&mut r, 3);
         assert_eq!(selected_rows(&r.app), [1, 3, 5]);
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert_eq!(r.app.sel_count, 3);
     }
 
     #[test]
     fn a_box_from_below_the_rows_touches_nothing_until_it_reaches_one() {
         let mut r = band_rig("band-below", 3);
-        r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_a,
+            utf8: "a".into(),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+            repeat: false,
+        });
         band_press(&mut r, 6);
         assert_eq!(r.app.sel_count, 0, "a press there clears, as it always has");
         band_to(&mut r, 5);
@@ -4024,16 +5289,33 @@ mod tests {
         assert_eq!(selected_rows(&r.app), [2]);
         band_to(&mut r, 9);
         assert_eq!(r.app.sel_count, 0);
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
     }
 
     #[test]
     fn a_press_beside_a_name_that_doesnt_move_is_a_click() {
         let mut r = band_rig("band-click", 8);
-        r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_a,
+            utf8: "a".into(),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+            repeat: false,
+        });
         band_press(&mut r, 2);
-        assert_eq!(r.app.sel_count, 8, "not until the release, as it might have been a drag");
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        assert_eq!(
+            r.app.sel_count, 8,
+            "not until the release, as it might have been a drag"
+        );
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert_eq!(selected_rows(&r.app), [2]);
     }
 
@@ -4044,7 +5326,10 @@ mod tests {
         let (x, y) = (band_x(&r) + 1.0, band_y(&r, 2) + 1.0);
         r.app.input(Input::Move { x, y });
         assert!(matches!(r.app.file_drag, Some(FileDrag::Pressed { .. })));
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert_eq!(selected_rows(&r.app), [2]);
     }
 
@@ -4053,9 +5338,17 @@ mod tests {
         let mut r = band_rig("band-name", 8);
         press_on_row(&mut r, 2);
         let l = r.app.layout();
-        r.app.input(Input::Move { x: (l.list.x + 60) as f64, y: band_y(&r, 4) });
+        r.app.input(Input::Move {
+            x: (l.list.x + 60) as f64,
+            y: band_y(&r, 4),
+        });
         assert!(matches!(r.app.file_drag, Some(FileDrag::Active(_))));
-        r.app.input(Input::Key { keysym: k::KEY_Escape, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_Escape,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
     }
 
     #[test]
@@ -4064,7 +5357,10 @@ mod tests {
         band_press(&mut r, 2);
         band_to(&mut r, 4);
         let l = r.app.layout();
-        r.app.input(Input::Move { x: band_x(&r), y: (l.list.bottom() + 40) as f64 });
+        r.app.input(Input::Move {
+            x: band_x(&r),
+            y: (l.list.bottom() + 40) as f64,
+        });
         assert!(r.app.next_deadline().is_some(), "it has further to go");
         for _ in 0..60 {
             let due = r.app.next_deadline().unwrap();
@@ -4076,18 +5372,27 @@ mod tests {
         assert_eq!(rows.len(), rows[rows.len() - 1] - 1, "with nothing skipped");
         assert!(rows.len() > 30);
         // Coming back into the list stops it, so an idle window doesn't keep waking.
-        r.app.input(Input::Move { x: band_x(&r), y: (l.list.y + 100) as f64 });
+        r.app.input(Input::Move {
+            x: band_x(&r),
+            y: (l.list.y + 100) as f64,
+        });
         let (scroll, n) = (r.app.scroll, r.app.sel_count);
         r.app.on_timer(Instant::now() + Duration::from_secs(1));
         assert_eq!((r.app.scroll, r.app.sel_count), (scroll, n));
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert_eq!(r.app.sel_count, n);
         // Upwards as far as it goes, where the waking stops too.
         std::thread::sleep(DOUBLE_CLICK);
         let row = (r.app.scroll / l.row_h as f64) as usize + 3;
         band_press(&mut r, row);
         band_to(&mut r, row - 1);
-        r.app.input(Input::Move { x: band_x(&r), y: (l.list.y - 40) as f64 });
+        r.app.input(Input::Move {
+            x: band_x(&r),
+            y: (l.list.y - 40) as f64,
+        });
         let mut ticks = 0;
         while let Some(due) = r.app.next_deadline() {
             r.app.on_timer(due);
@@ -4103,7 +5408,10 @@ mod tests {
         let mut r = band_rig("band-wheel", 300);
         band_press(&mut r, 2);
         band_to(&mut r, 4);
-        r.app.input(Input::Scroll { lines: 20.0, pixels: 0.0 });
+        r.app.input(Input::Scroll {
+            lines: 20.0,
+            pixels: 0.0,
+        });
         assert!(r.app.scroll > 0.0);
         let rows = selected_rows(&r.app);
         assert_eq!(rows[0], 2);
@@ -4159,17 +5467,27 @@ mod tests {
         band_to(&mut r, 7);
         let generation = r.app.load_gen;
         let dir = r.root.join("work");
-        r.app.on_msg(Msg::Load(LoadEvent::Failed { generation, dir, error: "gone".into() }));
+        r.app.on_msg(Msg::Load(LoadEvent::Failed {
+            generation,
+            dir,
+            error: "gone".into(),
+        }));
         assert!(r.app.file_drag.is_none());
         assert!(r.app.rows.is_empty());
         band_to(&mut r, 1);
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
     }
 
     #[test]
     fn a_press_beside_a_name_doesnt_become_a_box_once_the_rows_change() {
         let mut r = band_rig("band-stale", 8);
-        r.app.input(Input::Mods(Mods { ctrl: true, ..Mods::default() }));
+        r.app.input(Input::Mods(Mods {
+            ctrl: true,
+            ..Mods::default()
+        }));
         band_press(&mut r, 3);
         // Reordered, with the pressed row where it was, so it still looks current.
         let mut moved = r.app.rows.clone();
@@ -4198,7 +5516,10 @@ mod tests {
     fn a_box_starts_on_the_row_pressed_even_if_the_list_scrolled_before_it_moved() {
         let mut r = band_rig("band-wheel-first", 300);
         band_press(&mut r, 5);
-        r.app.input(Input::Scroll { lines: 1.0, pixels: 0.0 });
+        r.app.input(Input::Scroll {
+            lines: 1.0,
+            pixels: 0.0,
+        });
         assert!(r.app.scroll > 0.0);
         band_to(&mut r, 10);
         assert_eq!(selected_rows(&r.app), [5, 6, 7, 8, 9, 10]);
@@ -4222,15 +5543,32 @@ mod tests {
         band_press(&mut r, 2);
         band_to(&mut r, 4);
         let l = r.app.layout();
-        r.app.input(Input::Move { x: band_x(&r), y: (l.list.bottom() + 40) as f64 });
+        r.app.input(Input::Move {
+            x: band_x(&r),
+            y: (l.list.bottom() + 40) as f64,
+        });
         assert!(r.app.next_deadline().is_some());
-        r.app.input(Input::DragEnter { x: 540.0, y: 200.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: 200.0,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         assert!(r.app.file_drag.is_none());
         assert_eq!(r.app.next_deadline(), None);
         r.app.input(Input::DragLeave);
         // The same goes for a press that hasn't become anything yet.
         band_press(&mut r, 2);
-        r.app.input(Input::DragEnter { x: 540.0, y: 200.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: 200.0,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         assert!(r.app.file_drag.is_none());
     }
 
@@ -4239,21 +5577,39 @@ mod tests {
         let mut r = band_rig("band-rect", 8);
         band_press(&mut r, 1);
         band_to(&mut r, 3);
-        let Some(FileDrag::Band(b)) = &r.app.file_drag else { panic!("no box") };
+        let Some(FileDrag::Band(b)) = &r.app.file_drag else {
+            panic!("no box")
+        };
         let (rect, l) = (b.rect, r.app.layout());
-        assert!(!rect.is_empty() && l.list.intersect(rect) == rect, "{rect:?}");
+        assert!(
+            !rect.is_empty() && l.list.intersect(rect) == rect,
+            "{rect:?}"
+        );
         // Past the end of the window, it stays in the list.
         r.app.input(Input::Move { x: -50.0, y: -50.0 });
-        let Some(FileDrag::Band(b)) = &r.app.file_drag else { panic!("no box") };
+        let Some(FileDrag::Band(b)) = &r.app.file_drag else {
+            panic!("no box")
+        };
         let last = b.rect;
         assert!(l.list.intersect(last) == last, "{last:?}");
         r.app.dirty = Rect::default();
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert!(r.app.dirty.intersects(last), "the box gets painted over");
     }
 
     fn dropped(r: &Rig, names: &[&str], can_copy: bool, can_move: bool) -> Dropped {
-        Dropped { paths: names.iter().map(|n| r.root.join(n)).collect(), dest: r.root.join("work"), trash: false, can_copy, can_move, decided: None, all_local: true }
+        Dropped {
+            paths: names.iter().map(|n| r.root.join(n)).collect(),
+            dest: r.root.join("work"),
+            trash: false,
+            can_copy,
+            can_move,
+            decided: None,
+            all_local: true,
+        }
     }
 
     fn outside_files(r: &Rig) {
@@ -4262,16 +5618,29 @@ mod tests {
     }
 
     fn answered(a: &App) -> (bool, bool) {
-        (a.cmds.iter().any(|c| matches!(c, Cmd::FinishDrop)), a.cmds.iter().any(|c| matches!(c, Cmd::AbandonDrop)))
+        (
+            a.cmds.iter().any(|c| matches!(c, Cmd::FinishDrop)),
+            a.cmds.iter().any(|c| matches!(c, Cmd::AbandonDrop)),
+        )
     }
 
     /// Hovering a drag from another Gannet window, with the folder's device known.
     fn marked_drag(tag: &str, marker: clipboard::DragMarker, device: Option<u64>) -> Rig {
         let mut r = drag_rig(tag);
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: false, marker: Some(marker) });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: 500.0,
+            files: true,
+            can_copy: true,
+            can_move: false,
+            marker: Some(marker),
+        });
         r.app.input(Input::DragMove { x: 540.0, y: 500.0 });
         let i = r.app.incoming.as_ref().unwrap();
-        assert!(i.devices.contains_key(&r.root.join("work")), "it asked about this folder");
+        assert!(
+            i.devices.contains_key(&r.root.join("work")),
+            "it asked about this folder"
+        );
         let (drag, path) = (i.id, r.root.join("work"));
         r.app.on_msg(Msg::DragDevice { drag, path, device });
         r
@@ -4283,19 +5652,59 @@ mod tests {
     }
 
     fn marker(can_delete: bool, ctrl: bool, shift: bool) -> clipboard::DragMarker {
-        clipboard::DragMarker { device: 7, can_delete, ctrl, shift }
+        clipboard::DragMarker {
+            device: 7,
+            can_delete,
+            ctrl,
+            shift,
+        }
     }
 
     #[test]
     fn a_drag_from_another_gannet_window_follows_the_rule_inside_a_window() {
         for (tag, m, device, want) in [
-            ("mark-same", marker(true, false, false), Some(7), DropAction::Move),
-            ("mark-other", marker(true, false, false), Some(8), DropAction::Copy),
-            ("mark-unknown", marker(true, false, false), None, DropAction::Copy),
-            ("mark-undeletable", marker(false, false, false), Some(7), DropAction::Copy),
-            ("mark-ctrl", marker(true, true, false), Some(7), DropAction::Copy),
-            ("mark-shift", marker(true, false, true), Some(8), DropAction::Move),
-            ("mark-both", marker(true, true, true), Some(7), DropAction::Link),
+            (
+                "mark-same",
+                marker(true, false, false),
+                Some(7),
+                DropAction::Move,
+            ),
+            (
+                "mark-other",
+                marker(true, false, false),
+                Some(8),
+                DropAction::Copy,
+            ),
+            (
+                "mark-unknown",
+                marker(true, false, false),
+                None,
+                DropAction::Copy,
+            ),
+            (
+                "mark-undeletable",
+                marker(false, false, false),
+                Some(7),
+                DropAction::Copy,
+            ),
+            (
+                "mark-ctrl",
+                marker(true, true, false),
+                Some(7),
+                DropAction::Copy,
+            ),
+            (
+                "mark-shift",
+                marker(true, false, true),
+                Some(8),
+                DropAction::Move,
+            ),
+            (
+                "mark-both",
+                marker(true, true, true),
+                Some(7),
+                DropAction::Link,
+            ),
         ] {
             let r = marked_drag(tag, m, device);
             assert_eq!(incoming_verb(&r), want, "{tag}");
@@ -4306,7 +5715,12 @@ mod tests {
     fn rig_with_a_folder(tag: &str) -> (Rig, f64) {
         let mut r = drag_rig(tag);
         fs::create_dir(r.root.join("work/d")).unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the folder", |a| a.rows.len() == 3);
         let l = r.app.layout();
         (r, (l.list.y + l.row_h / 2) as f64)
@@ -4317,26 +5731,59 @@ mod tests {
         // Hyprland says the middle of the window, here a folder's row, before the real position.
         let (mut r, on_folder) = rig_with_a_folder("in-first-pos");
         r.app.cmds.clear();
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: on_folder,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         let i = r.app.incoming.as_ref().unwrap();
         assert!(i.label.is_empty(), "no label yet");
-        assert_eq!(i.target.as_ref().unwrap().hit, Hit::None, "nothing lights up");
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::AcceptDrop(true))), "a drop right away still works");
+        assert_eq!(
+            i.target.as_ref().unwrap().hit,
+            Hit::None,
+            "nothing lights up"
+        );
+        assert!(
+            r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::AcceptDrop(true))),
+            "a drop right away still works"
+        );
         r.app.input(Input::DragMove { x: 540.0, y: 500.0 });
         let i = r.app.incoming.as_ref().unwrap();
         assert_eq!(i.target.as_ref().unwrap().hit, Hit::ListEmpty);
         assert!(!i.label.is_empty());
-        assert!((i.label.y - 500).abs() < r.app.px(100.0), "the label is by the pointer: {:?}", i.label);
+        assert!(
+            (i.label.y - 500).abs() < r.app.px(100.0),
+            "the label is by the pointer: {:?}",
+            i.label
+        );
     }
 
     #[test]
     fn a_drop_before_any_motion_goes_to_the_folder_showing() {
         let (mut r, on_folder) = rig_with_a_folder("in-first-drop");
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: on_folder,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         r.app.cmds.clear();
         r.app.input(Input::DragDrop);
         let want = r.root.join("work");
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadDrop { dest, trash: false, .. } if *dest == want)));
+        assert!(
+            r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::ReadDrop { dest, trash: false, .. } if *dest == want))
+        );
     }
 
     #[test]
@@ -4346,14 +5793,41 @@ mod tests {
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         r.app.input(Input::Leave);
         r.app.cmds.clear();
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
-        let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
-        assert!(d.target.is_none() && d.label.is_empty(), "nothing lights up");
-        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::AcceptDrop(true))));
-        r.app.input(Input::DragMove { x: 540.0, y: on_folder });
-        let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: on_folder,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
+        let Some(FileDrag::Active(d)) = &r.app.file_drag else {
+            panic!("no drag")
+        };
+        assert!(
+            d.target.is_none() && d.label.is_empty(),
+            "nothing lights up"
+        );
+        assert!(
+            !r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::AcceptDrop(true)))
+        );
+        r.app.input(Input::DragMove {
+            x: 540.0,
+            y: on_folder,
+        });
+        let Some(FileDrag::Active(d)) = &r.app.file_drag else {
+            panic!("no drag")
+        };
         assert!(d.target.is_some() && !d.label.is_empty());
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::AcceptDrop(true))));
+        assert!(
+            r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::AcceptDrop(true)))
+        );
     }
 
     #[test]
@@ -4362,14 +5836,25 @@ mod tests {
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         r.app.input(Input::Leave);
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: on_folder,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         r.app.input(Input::OutDragDropped);
         assert!(r.app.file_drag.is_some(), "the drop is on its way");
         r.app.cmds.clear();
         r.app.input(Input::DragDrop);
         assert!(r.app.file_drag.is_none() && r.app.jobs.is_empty());
         assert_eq!(answered(&r.app), (false, true));
-        assert_eq!(r.app.hover, Hit::None, "nothing under that first position lights up");
+        assert_eq!(
+            r.app.hover,
+            Hit::None,
+            "nothing under that first position lights up"
+        );
         assert!(r.root.join("work/a").exists() && !r.root.join("work/d/a").exists());
     }
 
@@ -4379,26 +5864,61 @@ mod tests {
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         r.app.input(Input::Leave);
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: 500.0,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         r.app.input(Input::DragMove { x: 540.0, y: 500.0 });
         r.app.input(Input::DragLeave);
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
-        let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: on_folder,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
+        let Some(FileDrag::Active(d)) = &r.app.file_drag else {
+            panic!("no drag")
+        };
         assert!(d.inside && !d.moved_inside && d.target.is_none() && d.label.is_empty());
     }
 
     #[test]
     fn a_marked_drag_uses_live_keys_only_with_the_keyboard() {
         let mut r = marked_drag("mark-keys", marker(true, true, false), Some(7));
-        assert_eq!(incoming_verb(&r), DropAction::Copy, "without the keyboard, the keys at the lift count");
+        assert_eq!(
+            incoming_verb(&r),
+            DropAction::Copy,
+            "without the keyboard, the keys at the lift count"
+        );
         r.app.input(Input::Focus(true));
-        assert_eq!(incoming_verb(&r), DropAction::Move, "with it, what's held now counts: nothing");
-        r.app.input(Input::Mods(Mods { ctrl: true, ..Mods::default() }));
+        assert_eq!(
+            incoming_verb(&r),
+            DropAction::Move,
+            "with it, what's held now counts: nothing"
+        );
+        r.app.input(Input::Mods(Mods {
+            ctrl: true,
+            ..Mods::default()
+        }));
         assert_eq!(incoming_verb(&r), DropAction::Copy);
-        r.app.input(Input::Mods(Mods { ctrl: true, shift: true, ..Mods::default() }));
+        r.app.input(Input::Mods(Mods {
+            ctrl: true,
+            shift: true,
+            ..Mods::default()
+        }));
         assert_eq!(incoming_verb(&r), DropAction::Link);
         r.app.input(Input::Focus(false));
-        assert_eq!(incoming_verb(&r), DropAction::Copy, "losing it goes back to the lift");
+        assert_eq!(
+            incoming_verb(&r),
+            DropAction::Copy,
+            "losing it goes back to the lift"
+        );
     }
 
     #[test]
@@ -4407,9 +5927,30 @@ mod tests {
             let i = r.app.incoming.as_ref().unwrap();
             r.app.incoming_label(i, i.target.as_ref().unwrap())
         };
-        assert_eq!(label(&marked_drag("mark-label-move", marker(true, false, false), Some(7))), "Move to work");
-        assert_eq!(label(&marked_drag("mark-label-copy", marker(true, false, false), Some(8))), "Copy to work");
-        assert_eq!(label(&marked_drag("mark-label-link", marker(true, true, true), Some(7))), "Link in work");
+        assert_eq!(
+            label(&marked_drag(
+                "mark-label-move",
+                marker(true, false, false),
+                Some(7)
+            )),
+            "Move to work"
+        );
+        assert_eq!(
+            label(&marked_drag(
+                "mark-label-copy",
+                marker(true, false, false),
+                Some(8)
+            )),
+            "Copy to work"
+        );
+        assert_eq!(
+            label(&marked_drag(
+                "mark-label-link",
+                marker(true, true, true),
+                Some(7)
+            )),
+            "Link in work"
+        );
     }
 
     #[test]
@@ -4417,7 +5958,13 @@ mod tests {
         let mut r = marked_drag("mark-drop", marker(true, false, false), Some(7));
         r.app.cmds.clear();
         r.app.input(Input::DragDrop);
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadDrop { decided: Some(DropAction::Move), .. })));
+        assert!(r.app.cmds.iter().any(|c| matches!(
+            c,
+            Cmd::ReadDrop {
+                decided: Some(DropAction::Move),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -4440,44 +5987,99 @@ mod tests {
         d.decided = Some(DropAction::Link);
         r.app.on_msg(Msg::Dropped(d));
         r.pump_until("the link", |a| a.jobs.is_empty() && a.rows.len() == 3);
-        assert!(fs::symlink_metadata(r.root.join("work/x")).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(r.root.join("work/x"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(r.root.join("outside/x").exists());
     }
 
     #[test]
     fn another_app_cant_cause_a_move_by_allowing_both() {
         let mut r = drag_rig("mark-foreign");
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: 500.0,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         assert_eq!(incoming_verb(&r), DropAction::Copy);
         r.app.cmds.clear();
         r.app.input(Input::DragDrop);
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadDrop { decided: None, .. })));
+        assert!(
+            r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::ReadDrop { decided: None, .. }))
+        );
     }
 
     #[test]
     fn a_drag_out_carries_the_marker_once_its_folder_has_answered() {
         let started = |tag: &str, facts: Option<(u64, bool)>, mods: Mods| {
             let mut r = dragging(tag);
-            let Some(FileDrag::Active(d)) = &mut r.app.file_drag else { panic!("no drag") };
+            let Some(FileDrag::Active(d)) = &mut r.app.file_drag else {
+                panic!("no drag")
+            };
             d.source = facts;
             r.app.input(Input::Mods(mods));
             r.app.cmds.clear();
             r.app.input(Input::Leave);
-            r.app.cmds.iter().find_map(|c| if let Cmd::StartDrag { marker, .. } = c { Some(*marker) } else { None }).unwrap()
+            r.app
+                .cmds
+                .iter()
+                .find_map(|c| {
+                    if let Cmd::StartDrag { marker, .. } = c {
+                        Some(*marker)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap()
         };
-        assert_eq!(started("out-mark", Some((7, true)), Mods::default()), Some(marker(true, false, false)));
-        assert_eq!(started("out-mark-keys", Some((7, false)), Mods { ctrl: true, shift: true, ..Mods::default() }), Some(marker(false, true, true)));
-        assert_eq!(started("out-mark-none", None, Mods::default()), None, "it just copies");
+        assert_eq!(
+            started("out-mark", Some((7, true)), Mods::default()),
+            Some(marker(true, false, false))
+        );
+        assert_eq!(
+            started(
+                "out-mark-keys",
+                Some((7, false)),
+                Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Mods::default()
+                }
+            ),
+            Some(marker(false, true, true))
+        );
+        assert_eq!(
+            started("out-mark-none", None, Mods::default()),
+            None,
+            "it just copies"
+        );
     }
 
     #[test]
     fn a_drop_from_another_app_copies_when_it_allows_that() {
         let mut r = drag_rig("in-copy");
         outside_files(&r);
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["outside/x"], true, true)));
-        assert_eq!(answered(&r.app), (true, false), "at once, as some compositors hold the pointer until then");
+        r.app
+            .on_msg(Msg::Dropped(dropped(&r, &["outside/x"], true, true)));
+        assert_eq!(
+            answered(&r.app),
+            (true, false),
+            "at once, as some compositors hold the pointer until then"
+        );
         r.pump_until("the copy", |a| a.jobs.is_empty() && a.rows.len() == 3);
-        assert!(r.root.join("work/x").exists() && r.root.join("outside/x").exists(), "the original stays");
+        assert!(
+            r.root.join("work/x").exists() && r.root.join("outside/x").exists(),
+            "the original stays"
+        );
     }
 
     #[test]
@@ -4485,9 +6087,14 @@ mod tests {
         let mut r = drag_rig("in-question");
         outside_files(&r);
         fs::write(r.root.join("work/x"), b"already").unwrap();
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["outside/x"], true, true)));
+        r.app
+            .on_msg(Msg::Dropped(dropped(&r, &["outside/x"], true, true)));
         r.pump_until("the question", |a| a.dialog.is_some());
-        assert_eq!(answered(&r.app), (true, false), "or the question couldn't be clicked");
+        assert_eq!(
+            answered(&r.app),
+            (true, false),
+            "or the question couldn't be clicked"
+        );
     }
 
     #[test]
@@ -4499,15 +6106,24 @@ mod tests {
         d.decided = Some(DropAction::Move);
         r.app.on_msg(Msg::Dropped(d));
         r.pump_until("the question", |a| a.dialog.is_some());
-        assert_eq!(answered(&r.app), (true, false), "another Gannet window deletes nothing on hearing it");
+        assert_eq!(
+            answered(&r.app),
+            (true, false),
+            "another Gannet window deletes nothing on hearing it"
+        );
     }
 
     #[test]
     fn a_move_only_source_waits_until_the_files_have_arrived() {
         let mut r = drag_rig("in-move-waits");
         outside_files(&r);
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["outside/x"], false, true)));
-        assert_eq!(answered(&r.app), (false, false), "it may delete its files on hearing it");
+        r.app
+            .on_msg(Msg::Dropped(dropped(&r, &["outside/x"], false, true)));
+        assert_eq!(
+            answered(&r.app),
+            (false, false),
+            "it may delete its files on hearing it"
+        );
         r.pump_until("the move", |a| a.jobs.is_empty());
         assert_eq!(answered(&r.app), (true, false));
     }
@@ -4517,13 +6133,30 @@ mod tests {
         let mut r = drag_rig("in-label");
         let l = r.app.layout();
         let y = l.list.y + l.row_h / 2;
-        r.app.input(Input::DragEnter { x: 540.0, y: y as f64, files: true, can_copy: true, can_move: true, marker: None });
-        r.app.input(Input::DragMove { x: 540.0, y: y as f64 });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: y as f64,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
+        r.app.input(Input::DragMove {
+            x: 540.0,
+            y: y as f64,
+        });
         let label = r.app.incoming.as_ref().unwrap().label;
-        assert!(label.y >= y + 64, "Nautilus draws 64 pixels down from the pointer: {} from {y}", label.y);
+        assert!(
+            label.y >= y + 64,
+            "Nautilus draws 64 pixels down from the pointer: {} from {y}",
+            label.y
+        );
         // With no room below, it goes above the pointer instead of being pushed under the picture.
         let y = r.app.h - 10;
-        r.app.input(Input::DragMove { x: 540.0, y: y as f64 });
+        r.app.input(Input::DragMove {
+            x: 540.0,
+            y: y as f64,
+        });
         let label = r.app.incoming.as_ref().unwrap().label;
         assert!(label.bottom() <= y, "{} from {y}", label.bottom());
     }
@@ -4532,7 +6165,8 @@ mod tests {
     fn an_app_that_only_offers_a_move_gets_a_move() {
         let mut r = drag_rig("in-move");
         outside_files(&r);
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["outside/x"], false, true)));
+        r.app
+            .on_msg(Msg::Dropped(dropped(&r, &["outside/x"], false, true)));
         r.pump_until("the move", |a| a.jobs.is_empty() && a.rows.len() == 3);
         assert!(r.root.join("work/x").exists() && !r.root.join("outside/x").exists());
         assert_eq!(answered(&r.app), (true, false));
@@ -4541,7 +6175,8 @@ mod tests {
     #[test]
     fn a_failed_drop_doesnt_tell_the_other_app_it_worked() {
         let mut r = drag_rig("in-failed");
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["outside/missing"], false, true)));
+        r.app
+            .on_msg(Msg::Dropped(dropped(&r, &["outside/missing"], false, true)));
         r.pump_until("the job", |a| a.jobs.is_empty());
         assert_eq!(answered(&r.app), (false, true), "so it keeps its files");
     }
@@ -4550,7 +6185,8 @@ mod tests {
     fn a_source_offering_neither_gets_a_copy_not_a_move() {
         let mut r = drag_rig("in-neither");
         outside_files(&r);
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["outside/x"], false, false)));
+        r.app
+            .on_msg(Msg::Dropped(dropped(&r, &["outside/x"], false, false)));
         r.pump_until("the copy", |a| a.jobs.is_empty() && a.rows.len() == 3);
         assert!(r.root.join("outside/x").exists());
     }
@@ -4560,12 +6196,22 @@ mod tests {
         let mut r = drag_rig("in-skip");
         outside_files(&r);
         fs::write(r.root.join("work/x"), b"already").unwrap();
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["outside/x"], false, true)));
+        r.app
+            .on_msg(Msg::Dropped(dropped(&r, &["outside/x"], false, true)));
         r.pump_until("the question", |a| a.dialog.is_some());
         std::thread::sleep(DIALOG_GUARD + Duration::from_millis(50));
-        r.app.input(Input::Key { keysym: k::KEY_s, utf8: "s".into(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_s,
+            utf8: "s".into(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the job", |a| a.jobs.is_empty());
-        assert_eq!(answered(&r.app), (false, true), "so a move-only source keeps its file");
+        assert_eq!(
+            answered(&r.app),
+            (false, true),
+            "so a move-only source keeps its file"
+        );
         assert!(r.root.join("outside/x").exists());
         assert_eq!(fs::read(r.root.join("work/x")).unwrap(), b"already");
     }
@@ -4580,7 +6226,11 @@ mod tests {
             r.app.cmds.clear();
             r.app.on_msg(Msg::Dropped(d));
             r.pump_until("the job", |a| a.jobs.is_empty());
-            assert_eq!(answered(&r.app), (false, true), "so the source keeps the remote entry");
+            assert_eq!(
+                answered(&r.app),
+                (false, true),
+                "so the source keeps the remote entry"
+            );
             let _ = fs::remove_file(r.root.join("work/x"));
             r.pump_until("the folder", |a| a.rows.len() == 2);
         }
@@ -4589,11 +6239,23 @@ mod tests {
     #[test]
     fn a_drop_while_another_is_handled_is_refused() {
         let mut r = drag_rig("in-busy");
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: 500.0,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         assert!(r.app.incoming.is_some());
         r.app.input(Input::DragDropBusy);
         assert!(r.app.incoming.is_none() && r.app.jobs.is_empty());
-        assert!(r.app.notices.iter().any(|n| n.contains("still being dealt")));
+        assert!(
+            r.app
+                .notices
+                .iter()
+                .any(|n| n.contains("still being dealt"))
+        );
     }
 
     #[test]
@@ -4601,7 +6263,10 @@ mod tests {
         let mut r = drag_rig("out-header");
         press_on_row(&mut r, 0);
         let l = r.app.layout();
-        r.app.input(Input::Move { x: 300.0, y: (l.header.y + l.header.h / 2) as f64 });
+        r.app.input(Input::Move {
+            x: 300.0,
+            y: (l.header.y + l.header.h / 2) as f64,
+        });
         assert!(matches!(r.app.file_drag, Some(FileDrag::Active(_))));
         r.app.input(Input::Leave);
         r.app.cmds.clear();
@@ -4614,13 +6279,25 @@ mod tests {
     fn a_drop_landing_here_isnt_ended_by_the_sources_event() {
         let mut r = drag_rig("out-order");
         fs::create_dir(r.root.join("work/d")).unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the folder", |a| a.rows.len() == 3);
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         let l = r.app.layout();
         let y = (l.list.y + l.row_h / 2) as f64;
-        r.app.input(Input::DragEnter { x: 540.0, y, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         r.app.input(Input::DragMove { x: 540.0, y });
         r.app.input(Input::OutDragDropped);
         assert!(r.app.file_drag.is_some(), "the drop is on its way");
@@ -4633,7 +6310,10 @@ mod tests {
     #[test]
     fn keys_left_over_when_focus_goes_dont_count() {
         let mut r = drag_rig("in-keys");
-        r.app.input(Input::Mods(Mods { ctrl: true, ..Mods::default() }));
+        r.app.input(Input::Mods(Mods {
+            ctrl: true,
+            ..Mods::default()
+        }));
         r.app.input(Input::Focus(false));
         assert!(!r.app.mods_now.ctrl);
     }
@@ -4641,10 +6321,15 @@ mod tests {
     #[test]
     fn dropping_files_where_they_already_are_does_nothing() {
         let mut r = drag_rig("in-same");
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["work/a"], false, true)));
+        r.app
+            .on_msg(Msg::Dropped(dropped(&r, &["work/a"], false, true)));
         assert!(r.app.jobs.is_empty() && r.app.dialog.is_none());
         assert!(r.root.join("work/a").exists());
-        assert_eq!(answered(&r.app), (false, true), "saying it worked could make a source delete them");
+        assert_eq!(
+            answered(&r.app),
+            (false, true),
+            "saying it worked could make a source delete them"
+        );
     }
 
     #[test]
@@ -4652,8 +6337,17 @@ mod tests {
         let mut r = drag_rig("in-none");
         r.app.on_msg(Msg::Dropped(dropped(&r, &[], true, true)));
         assert!(r.app.jobs.is_empty());
-        assert!(r.app.notices.iter().any(|n| n.contains("Couldn't get any files")));
-        assert_eq!(answered(&r.app), (false, true), "the other app still hears back");
+        assert!(
+            r.app
+                .notices
+                .iter()
+                .any(|n| n.contains("Couldn't get any files"))
+        );
+        assert_eq!(
+            answered(&r.app),
+            (false, true),
+            "the other app still hears back"
+        );
     }
 
     #[test]
@@ -4669,17 +6363,53 @@ mod tests {
         d.trash = true;
         r.app.on_msg(Msg::Dropped(d));
         r.pump_until("the Trash", |a| a.jobs.is_empty());
-        assert!(!r.root.join("outside/x").exists() && r.root.join("data/Trash/info/x.trashinfo").exists());
+        assert!(
+            !r.root.join("outside/x").exists()
+                && r.root.join("data/Trash/info/x.trashinfo").exists()
+        );
     }
 
     #[test]
     fn dragging_out_offers_what_the_keys_ask_for() {
-        for (tag, mods, want) in [("out-plain", Mods::default(), false), ("out-shift", Mods { shift: true, ..Mods::default() }, true), ("out-ctrl", Mods { ctrl: true, ..Mods::default() }, false), ("out-both", Mods { ctrl: true, shift: true, ..Mods::default() }, false)] {
+        for (tag, mods, want) in [
+            ("out-plain", Mods::default(), false),
+            (
+                "out-shift",
+                Mods {
+                    shift: true,
+                    ..Mods::default()
+                },
+                true,
+            ),
+            (
+                "out-ctrl",
+                Mods {
+                    ctrl: true,
+                    ..Mods::default()
+                },
+                false,
+            ),
+            (
+                "out-both",
+                Mods {
+                    ctrl: true,
+                    shift: true,
+                    ..Mods::default()
+                },
+                false,
+            ),
+        ] {
             let mut r = dragging(tag);
             r.app.input(Input::Mods(mods));
             r.app.cmds.clear();
             r.app.input(Input::Leave);
-            assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::StartDrag { move_only, .. } if *move_only == want)), "{tag}");
+            assert!(
+                r.app
+                    .cmds
+                    .iter()
+                    .any(|c| matches!(c, Cmd::StartDrag { move_only, .. } if *move_only == want)),
+                "{tag}"
+            );
         }
     }
 
@@ -4692,10 +6422,20 @@ mod tests {
         r.pump_until("the Trash", |a| a.rows.len() == 1 && !a.loading);
         press_on_row(&mut r, 0);
         r.app.input(Input::Move { x: 540.0, y: 500.0 });
-        r.app.input(Input::Mods(Mods { shift: true, ..Mods::default() }));
+        r.app.input(Input::Mods(Mods {
+            shift: true,
+            ..Mods::default()
+        }));
         r.app.cmds.clear();
         r.app.input(Input::Leave);
-        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::StartDrag { move_only: false, marker: None, .. })));
+        assert!(r.app.cmds.iter().any(|c| matches!(
+            c,
+            Cmd::StartDrag {
+                move_only: false,
+                marker: None,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -4704,7 +6444,10 @@ mod tests {
         let mut r = dragging("out-refused-release");
         r.app.input(Input::Leave);
         r.app.cmds.clear();
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert!(r.app.file_drag.is_none());
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::CancelDrag)));
         assert!(r.app.jobs.is_empty());
@@ -4725,7 +6468,10 @@ mod tests {
         r.app.cmds.clear();
         r.app.input(Input::OutDragDropped);
         assert!(r.app.file_drag.is_none());
-        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::CancelDrag)), "the other app is still reading");
+        assert!(
+            !r.app.cmds.iter().any(|c| matches!(c, Cmd::CancelDrag)),
+            "the other app is still reading"
+        );
     }
 
     #[test]
@@ -4739,8 +6485,20 @@ mod tests {
     fn something_that_isnt_files_is_refused() {
         let mut r = drag_rig("in-text");
         r.app.cmds.clear();
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: false, can_copy: true, can_move: true, marker: None });
-        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::AcceptDrop(true))));
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: 500.0,
+            files: false,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
+        assert!(
+            !r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::AcceptDrop(true)))
+        );
         r.app.input(Input::DragDrop);
         assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadDrop { .. })));
         assert_eq!(answered(&r.app), (false, true));
@@ -4750,17 +6508,47 @@ mod tests {
     fn incoming_drops_aim_at_folders_then_the_folder_showing() {
         let mut r = drag_rig("in-aim");
         fs::create_dir(r.root.join("work/d")).unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the folder", |a| a.rows.len() == 3);
         let l = r.app.layout();
         let row = |i: i32| (l.list.y + i * l.row_h + l.row_h / 2) as f64;
-        let dest = |a: &App| a.incoming.as_ref().and_then(|i| i.target.as_ref()).map(|t| t.dest.clone());
-        r.app.input(Input::DragEnter { x: 540.0, y: row(0), files: true, can_copy: true, can_move: true, marker: None });
-        r.app.input(Input::DragMove { x: 540.0, y: row(0) });
+        let dest = |a: &App| {
+            a.incoming
+                .as_ref()
+                .and_then(|i| i.target.as_ref())
+                .map(|t| t.dest.clone())
+        };
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: row(0),
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
+        r.app.input(Input::DragMove {
+            x: 540.0,
+            y: row(0),
+        });
         assert_eq!(dest(&r.app), Some(r.root.join("work/d")));
-        r.app.input(Input::DragMove { x: 540.0, y: row(1) });
-        assert_eq!(dest(&r.app), Some(r.root.join("work")), "a file means the folder it's in");
-        r.app.input(Input::DragMove { x: 540.0, y: row(9) });
+        r.app.input(Input::DragMove {
+            x: 540.0,
+            y: row(1),
+        });
+        assert_eq!(
+            dest(&r.app),
+            Some(r.root.join("work")),
+            "a file means the folder it's in"
+        );
+        r.app.input(Input::DragMove {
+            x: 540.0,
+            y: row(9),
+        });
         assert_eq!(dest(&r.app), Some(r.root.join("work")));
         r.app.input(Input::DragLeave);
         assert!(r.app.incoming.is_none());
@@ -4770,21 +6558,39 @@ mod tests {
     fn a_modal_refuses_an_incoming_drop() {
         let mut r = drag_rig("in-modal");
         r.app.dialog = Some(Dialog::ConfirmQuit { at: 0 });
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter {
+            x: 540.0,
+            y: 500.0,
+            files: true,
+            can_copy: true,
+            can_move: true,
+            marker: None,
+        });
         assert!(r.app.incoming.as_ref().is_some_and(|i| i.target.is_none()));
     }
 
     #[test]
     fn a_dialog_opening_after_a_press_keeps_the_selection() {
         let mut r = drag_rig("drag-dialog-press");
-        r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_a,
+            utf8: "a".into(),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+            repeat: false,
+        });
         assert_eq!(r.app.sel_count, 2);
         press_on_row(&mut r, 0);
         assert!(matches!(r.app.file_drag, Some(FileDrag::Pressed { .. })));
         r.app.dialog = Some(Dialog::ConfirmQuit { at: 0 });
         r.app.input(Input::Resized);
         assert!(r.app.file_drag.is_none());
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert_eq!(r.app.sel_count, 2, "nothing changes behind the dialog");
     }
 
@@ -4800,15 +6606,26 @@ mod tests {
     fn a_release_under_a_dialog_starts_nothing() {
         let mut r = drag_rig("drag-dialog-release");
         fs::create_dir(r.root.join("work/d")).unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the folder", |a| a.rows.len() == 3);
         // Folders sort first, so the folder is row 0 and the files follow.
         press_on_row(&mut r, 1);
         let l = r.app.layout();
-        r.app.input(Input::Move { x: 540.0, y: (l.list.y + l.row_h / 2) as f64 });
+        r.app.input(Input::Move {
+            x: 540.0,
+            y: (l.list.y + l.row_h / 2) as f64,
+        });
         assert!(matches!(r.app.file_drag, Some(FileDrag::Active(_))));
         r.app.dialog = Some(Dialog::ConfirmQuit { at: 0 });
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert!(r.app.jobs.is_empty(), "nothing moves under a dialog");
         assert!(r.root.join("work/a").exists());
         assert!(r.app.file_drag.is_none());
@@ -4822,7 +6639,8 @@ mod tests {
         let rect = r.app.menu_rect(m);
         let y = rect.y + r.app.px(4.0) + r.app.px(14.0);
         // Straight to the handler, so this move is what notices the menu.
-        r.app.pointer_moved((rect.x + r.app.px(10.0)) as f64, y as f64);
+        r.app
+            .pointer_moved((rect.x + r.app.px(10.0)) as f64, y as f64);
         assert!(r.app.file_drag.is_none());
         assert_eq!(r.app.menu.as_ref().unwrap().at, 0);
     }
@@ -4837,7 +6655,9 @@ mod tests {
     }
 
     fn ghost_of(a: &App) -> (Vec<u8>, usize, Rect, Rect) {
-        let Some(FileDrag::Active(d)) = &a.file_drag else { panic!("no drag") };
+        let Some(FileDrag::Active(d)) = &a.file_drag else {
+            panic!("no drag")
+        };
         (d.ghost.name.clone(), d.ghost.count, d.ghost_at, d.label)
     }
 
@@ -4845,7 +6665,12 @@ mod tests {
     fn a_drag_carries_a_row_and_only_labels_what_a_drop_would_do() {
         let mut r = drag_rig("ghost-row");
         fs::create_dir(r.root.join("work/d")).unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the folder", |a| a.rows.len() == 3);
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: 540.0, y: 500.0 });
@@ -4853,15 +6678,29 @@ mod tests {
         assert_eq!((name.as_slice(), count), (&b"a"[..], 1));
         assert!(!at.is_empty() && label.is_empty(), "no target, so no label");
         let l = r.app.layout();
-        r.app.input(Input::Move { x: 540.0, y: (l.list.y + l.row_h / 2) as f64 });
+        r.app.input(Input::Move {
+            x: 540.0,
+            y: (l.list.y + l.row_h / 2) as f64,
+        });
         let (_, _, at, label) = ghost_of(&r.app);
-        assert!(!label.is_empty() && label.y >= at.bottom(), "the label sits under the row");
+        assert!(
+            !label.is_empty() && label.y >= at.bottom(),
+            "the label sits under the row"
+        );
     }
 
     #[test]
     fn the_row_carried_is_the_one_pressed_with_a_count() {
         let mut r = drag_rig("ghost-count");
-        r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_a,
+            utf8: "a".into(),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+            repeat: false,
+        });
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: 540.0, y: 500.0 });
         let (name, count, ..) = ghost_of(&r.app);
@@ -4872,7 +6711,10 @@ mod tests {
     fn a_drag_near_the_corner_stays_in_the_window() {
         let mut r = dragging("ghost-corner");
         let (w, h) = (r.app.w as f64, r.app.h as f64);
-        r.app.input(Input::Move { x: w - 2.0, y: h - 2.0 });
+        r.app.input(Input::Move {
+            x: w - 2.0,
+            y: h - 2.0,
+        });
         let (_, _, at, _) = ghost_of(&r.app);
         assert!(at.right() <= r.app.w && at.bottom() <= r.app.h, "{at:?}");
     }
@@ -4882,9 +6724,21 @@ mod tests {
         let mut r = dragging("ghost-icon");
         r.app.cmds.clear();
         r.app.input(Input::Leave);
-        let Some(Cmd::StartDrag { icon: Some(icon), .. }) = r.app.cmds.iter().find(|c| matches!(c, Cmd::StartDrag { .. })) else { panic!("no picture") };
+        let Some(Cmd::StartDrag {
+            icon: Some(icon), ..
+        }) = r
+            .app
+            .cmds
+            .iter()
+            .find(|c| matches!(c, Cmd::StartDrag { .. }))
+        else {
+            panic!("no picture")
+        };
         assert_eq!(icon.pixels.len(), (icon.w * icon.h) as usize);
-        assert!(icon.pixels.iter().any(|&p| p != icon.pixels[0]), "something's drawn");
+        assert!(
+            icon.pixels.iter().any(|&p| p != icon.pixels[0]),
+            "something's drawn"
+        );
         assert!(ghost_of(&r.app).2.is_empty(), "the compositor draws it now");
     }
 
@@ -4895,7 +6749,12 @@ mod tests {
         r.app.input(Input::Move { x: 50.0, y: 500.0 });
         assert_eq!(r.app.hover, Hit::None);
         r.app.cmds.clear();
-        r.app.input(Input::Key { keysym: k::KEY_Escape, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_Escape,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         assert!(r.app.file_drag.is_none());
         assert_eq!(cursors(&r.app), [Cursor::Default]);
     }
@@ -4906,9 +6765,17 @@ mod tests {
         press_on_row(&mut r, 0);
         let l = r.app.layout();
         let y = l.list.y + l.row_h + l.row_h / 2;
-        r.app.input(Input::Move { x: 540.0, y: y as f64 });
+        r.app.input(Input::Move {
+            x: 540.0,
+            y: y as f64,
+        });
         assert!(matches!(r.app.file_drag, Some(FileDrag::Active(_))));
-        r.app.input(Input::Key { keysym: k::KEY_Escape, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_Escape,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         assert_eq!(r.app.hover, Hit::Row(1));
     }
 
@@ -4932,7 +6799,10 @@ mod tests {
         assert!(matches!(r.app.file_drag, Some(FileDrag::Active(_))));
         r.app.input(Input::Focus(false));
         assert!(r.app.file_drag.is_none());
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
         assert!(r.app.jobs.is_empty());
     }
 
@@ -4940,19 +6810,43 @@ mod tests {
     fn a_release_only_narrows_the_selection_if_the_row_is_still_there() {
         let mut r = drag_rig("drag-narrow");
         fs::write(r.root.join("work/c"), b"3").unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the third file", |a| a.rows.len() == 3);
-        r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_a,
+            utf8: "a".into(),
+            mods: Mods {
+                ctrl: true,
+                ..Mods::default()
+            },
+            repeat: false,
+        });
         assert_eq!(r.app.sel_count, 3);
         press_on_row(&mut r, 1);
         assert_eq!(r.app.sel_count, 3, "the press keeps the selection");
         // The pressed row goes, so another file is at that position now.
         fs::remove_file(r.root.join("work/b")).unwrap();
-        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.app.input(Input::Key {
+            keysym: k::KEY_F5,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat: false,
+        });
         r.pump_until("the reload", |a| a.rows.len() == 2);
         assert_eq!(r.app.sel_count, 2);
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
-        assert_eq!(r.app.sel_count, 2, "narrowing would have selected a file that wasn't pressed");
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
+        assert_eq!(
+            r.app.sel_count, 2,
+            "narrowing would have selected a file that wasn't pressed"
+        );
         assert!(r.app.file_drag.is_none());
     }
 
@@ -4964,13 +6858,23 @@ mod tests {
         fs::write(files.join("t"), "x").unwrap();
         r.open(files.clone());
         r.select("t");
-        for a in [Action::Rename, Action::Cut, Action::Paste, Action::NewFolder] {
+        for a in [
+            Action::Rename,
+            Action::Cut,
+            Action::Paste,
+            Action::NewFolder,
+        ] {
             r.app.notices.clear();
             r.app.action(a);
             assert!(!r.app.notices.is_empty(), "{a:?} should be refused");
             assert_eq!(r.app.edit, Edit::None);
         }
-        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadClipboard(_) | Cmd::SetClipboard(_))));
+        assert!(
+            !r.app
+                .cmds
+                .iter()
+                .any(|c| matches!(c, Cmd::ReadClipboard(_) | Cmd::SetClipboard(_)))
+        );
         // Delete asks, because there's no further Trash to go to.
         r.key(k::KEY_Delete, "");
         assert!(matches!(r.app.dialog, Some(Dialog::ConfirmDelete { .. })));
@@ -4983,11 +6887,23 @@ mod tests {
         r.open(r.work());
         r.select("a");
         r.app.cmds.clear();
-        let shift = Mods { ctrl: true, shift: true, ..Mods::default() };
+        let shift = Mods {
+            ctrl: true,
+            shift: true,
+            ..Mods::default()
+        };
         r.app.key(k::KEY_C, "", shift);
-        let Some(Cmd::SetClipboard(offers)) = r.app.cmds.pop() else { panic!("nothing copied") };
-        assert!(offers.iter().all(|(m, _)| *m != clipboard::GNOME), "text only, not a file copy");
-        r.app.undo.push(Undo::Rename { from: "/a".into(), to: "/b".into() });
+        let Some(Cmd::SetClipboard(offers)) = r.app.cmds.pop() else {
+            panic!("nothing copied")
+        };
+        assert!(
+            offers.iter().all(|(m, _)| *m != clipboard::GNOME),
+            "text only, not a file copy"
+        );
+        r.app.undo.push(Undo::Rename {
+            from: "/a".into(),
+            to: "/b".into(),
+        });
         r.app.key(k::KEY_Z, "", shift);
         r.app.key(k::KEY_z, "", shift);
         assert_eq!(r.app.undo.len(), 1, "Ctrl+Shift+Z must not undo");
@@ -5015,33 +6931,96 @@ mod tests {
         r
     }
 
+    /// The name of the file the preview window is showing, as the list knows it.
     fn previewing(r: &Rig) -> Option<String> {
-        r.app.preview.as_ref().map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
+        r.app
+            .previewer
+            .as_ref()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
     }
 
     fn with_mods(r: &mut Rig, sym: u32, utf8: &str, mods: Mods) {
-        r.app.input(Input::Key { keysym: sym, utf8: utf8.into(), mods, repeat: false });
+        r.app.input(Input::Key {
+            keysym: sym,
+            utf8: utf8.into(),
+            mods,
+            repeat: false,
+        });
+    }
+
+    /// The names the list asked a preview window to open, or to show, since the last look.
+    fn sent(r: &mut Rig) -> Vec<String> {
+        let name = |p: &PathBuf| p.file_name().unwrap().to_string_lossy().into_owned();
+        r.app
+            .cmds
+            .drain(..)
+            .filter_map(|c| match c {
+                Cmd::OpenPreview { path, .. } => Some(format!("open {}", name(&path))),
+                Cmd::PreviewShow(path) => Some(format!("show {}", name(&path))),
+                Cmd::ClosePreview => Some("close".to_string()),
+                Cmd::PreviewStepped(path) => Some(format!("stepped {}", name(&path))),
+                Cmd::Quit => Some("quit".to_string()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]
-    fn space_previews_and_closes_and_leaves_the_selection_alone() {
+    fn space_opens_the_preview_window_and_closes_it_and_leaves_the_selection_alone() {
         let mut r = preview_rig("space");
+        r.app.cmds.clear();
         r.key(k::KEY_space, " ");
+        assert_eq!(sent(&mut r), ["open a"]);
         assert_eq!(previewing(&r).as_deref(), Some("a"));
-        assert_eq!(r.selected_names(), ["a"], "showing the first row selects it, as arrows do");
+        assert_eq!(
+            r.selected_names(),
+            ["a"],
+            "showing the first row selects it, as arrows do"
+        );
         r.key(k::KEY_space, " ");
+        assert_eq!(sent(&mut r), ["close"]);
         assert_eq!(previewing(&r), None);
         assert_eq!(r.selected_names(), ["a"]);
         r.key(k::KEY_space, " ");
         r.key(k::KEY_Escape, "");
-        assert_eq!(previewing(&r), None);
-        assert_eq!(r.selected_names(), ["a"], "Escape closes the popup first, and nothing else");
+        assert_eq!(sent(&mut r), ["open a", "close"]);
+        assert_eq!(
+            r.selected_names(),
+            ["a"],
+            "Escape closes the preview first, and nothing else"
+        );
     }
 
     #[test]
-    fn ctrl_space_toggles_selection_without_a_popup() {
+    fn the_window_opens_sorted_and_filtered_as_the_list_is() {
+        let mut r = preview_rig("settings");
+        r.app.show_hidden = true;
+        r.app.sort = SortSpec {
+            key: SortKey::Size,
+            descending: true,
+        };
+        r.app.cmds.clear();
+        r.key(k::KEY_space, " ");
+        let Some(Cmd::OpenPreview { hidden, sort, .. }) = r.app.cmds.pop() else {
+            panic!("no window")
+        };
+        assert!(hidden);
+        assert_eq!(
+            sort,
+            SortSpec {
+                key: SortKey::Size,
+                descending: true
+            }
+        );
+    }
+
+    #[test]
+    fn ctrl_space_toggles_selection_without_a_preview() {
         let mut r = preview_rig("ctrl-space");
-        let ctrl = Mods { ctrl: true, ..Mods::default() };
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
         with_mods(&mut r, k::KEY_space, " ", ctrl);
         assert_eq!(previewing(&r), None);
         assert_eq!(r.selected_names(), ["a"]);
@@ -5050,15 +7029,25 @@ mod tests {
         assert_eq!(r.selected_names(), ["a", "b"]);
         with_mods(&mut r, k::KEY_space, " ", ctrl);
         assert_eq!(r.selected_names(), ["a"]);
+        assert!(sent(&mut r).is_empty());
     }
 
     #[test]
     fn holding_space_doesnt_flicker() {
         let mut r = preview_rig("repeat");
-        let space = |repeat| Input::Key { keysym: k::KEY_space, utf8: " ".into(), mods: Mods::default(), repeat };
+        let space = |repeat| Input::Key {
+            keysym: k::KEY_space,
+            utf8: " ".into(),
+            mods: Mods::default(),
+            repeat,
+        };
         r.app.input(space(false));
         r.app.input(space(true));
-        assert_eq!(previewing(&r).as_deref(), Some("a"), "a held key doesn't close it");
+        assert_eq!(
+            previewing(&r).as_deref(),
+            Some("a"),
+            "a held key doesn't close it"
+        );
         r.app.input(space(false));
         assert_eq!(previewing(&r), None);
         r.app.input(space(true));
@@ -5066,94 +7055,135 @@ mod tests {
     }
 
     #[test]
-    fn arrows_walk_the_files_and_the_ends_stay_put() {
-        let mut r = preview_rig("arrows");
+    fn moving_in_the_list_tells_the_window_once() {
+        let mut r = preview_rig("follow");
         r.key(k::KEY_space, " ");
-        r.key(k::KEY_Up, "");
-        assert_eq!(previewing(&r).as_deref(), Some("a"));
-        r.key(k::KEY_Down, "");
-        assert_eq!(previewing(&r).as_deref(), Some("b"));
-        r.key(k::KEY_Right, "");
-        assert_eq!(previewing(&r).as_deref(), Some("c"));
-        r.key(k::KEY_Down, "");
-        assert_eq!(previewing(&r).as_deref(), Some("c"));
-        r.key(k::KEY_Left, "");
-        assert_eq!(previewing(&r).as_deref(), Some("b"));
-        assert_eq!(r.selected_names(), ["b"], "the selection follows, so Enter opens what's showing");
+        r.app.cmds.clear();
+        for _ in 0..3 {
+            with_mods(&mut r, k::KEY_Down, "", Mods::default());
+        }
+        assert_eq!(
+            sent(&mut r),
+            ["show b", "show c"],
+            "the end stays put, and isn't sent again"
+        );
+        // The list can do everything else while the window is up.
+        r.key(k::KEY_F2, "");
+        assert!(matches!(r.app.edit, Edit::Rename { .. }));
     }
 
     #[test]
-    fn walking_doesnt_lose_a_selection_of_several() {
+    fn the_windows_steps_move_the_cursor() {
+        let mut r = preview_rig("stepped");
+        r.key(k::KEY_space, " ");
+        let generation = r.app.previewer_gen;
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::PreviewStepped {
+            generation,
+            path: r.work().join("c"),
+        });
+        assert_eq!(r.app.cursor, 2);
+        assert_eq!(
+            r.selected_names(),
+            ["c"],
+            "the selection follows, so Enter opens what's showing"
+        );
+        assert!(sent(&mut r).is_empty(), "and nothing is sent back");
+        // From a window that's since been replaced, or a folder the list has left.
+        r.app.on_msg(Msg::PreviewStepped {
+            generation: generation - 1,
+            path: r.work().join("a"),
+        });
+        r.app.on_msg(Msg::PreviewStepped {
+            generation,
+            path: r.root.join("elsewhere/a"),
+        });
+        assert_eq!(r.app.cursor, 2);
+    }
+
+    #[test]
+    fn stepping_doesnt_lose_a_selection_of_several() {
         let mut r = preview_rig("several");
         r.app.select_all();
         r.key(k::KEY_space, " ");
-        r.key(k::KEY_Down, "");
-        assert_eq!(previewing(&r).as_deref(), Some("b"));
+        let generation = r.app.previewer_gen;
+        r.app.on_msg(Msg::PreviewStepped {
+            generation,
+            path: r.work().join("b"),
+        });
+        assert_eq!(r.app.cursor, 1);
         assert_eq!(r.selected_names(), ["a", "b", "c"]);
     }
 
     #[test]
-    fn other_keys_dont_reach_the_list_under_the_popup() {
-        let mut r = preview_rig("keys");
+    fn a_window_that_ends_is_forgotten_and_a_crash_is_reported() {
+        let mut r = preview_rig("ended");
         r.key(k::KEY_space, " ");
-        r.key(k::KEY_c, "c");
-        r.key(k::KEY_Delete, "");
-        r.key(k::KEY_F2, "");
-        assert_eq!(r.app.cursor, 0, "typing didn't jump");
-        assert!(r.app.jobs.is_empty(), "Delete didn't trash");
-        assert!(matches!(r.app.edit, Edit::None), "F2 didn't rename");
-        assert!(r.work().join("a").exists());
+        let generation = r.app.previewer_gen;
+        r.app.on_msg(Msg::PreviewEnded {
+            generation: generation - 1,
+            crashed: true,
+        });
+        assert!(
+            r.app.previewer.is_some(),
+            "an older window's ending isn't this one's"
+        );
+        r.app.on_msg(Msg::PreviewEnded {
+            generation,
+            crashed: false,
+        });
+        assert!(r.app.previewer.is_none());
+        assert!(
+            r.app.notices.is_empty(),
+            "closing it from the window is ordinary"
+        );
+        r.key(k::KEY_space, " ");
+        r.app.on_msg(Msg::PreviewEnded {
+            generation: r.app.previewer_gen,
+            crashed: true,
+        });
+        assert!(r.app.previewer.is_none());
+        assert!(
+            r.app
+                .notices
+                .iter()
+                .any(|n| n.contains("stopped unexpectedly")),
+            "{:?}",
+            r.app.notices
+        );
+        r.app.cmds.clear();
+        r.key(k::KEY_space, " ");
+        assert_eq!(sent(&mut r), ["open a"], "and Space opens a new one");
     }
 
     #[test]
     fn nothing_to_preview_in_an_empty_folder() {
         let mut r = Rig::new("empty");
         r.open(r.work());
+        r.app.cmds.clear();
         r.key(k::KEY_space, " ");
         assert_eq!(previewing(&r), None);
-    }
-
-    #[test]
-    fn a_file_removed_underneath_moves_on_and_an_empty_folder_closes() {
-        let mut r = preview_rig("removed");
-        r.key(k::KEY_space, " ");
-        fs::remove_file(r.work().join("a")).unwrap();
-        r.app.reload();
-        r.pump_until("the next file", |a| a.preview.as_ref().is_some_and(|p| p.path.ends_with("b")));
-        for name in ["b", "c"] {
-            fs::remove_file(r.work().join(name)).unwrap();
-        }
-        r.app.reload();
-        r.pump_until("the popup to close", |a| a.preview.is_none());
-    }
-
-    #[test]
-    fn a_file_overwritten_while_showing_is_read_again() {
-        let mut r = preview_rig("overwritten");
-        r.pump_until("a size for the first row", |a| a.listing.as_ref().is_some_and(|l| matches!(l.stat(a.rows[0]), Stat::Known { .. })));
-        r.key(k::KEY_space, " ");
-        let before = r.app.preview_gen;
-        // Nothing changed: reloading leaves it alone, so a busy folder doesn't restart it.
-        r.app.reload();
-        r.pump_until("the reload", |a| !a.loading);
-        r.pump_until("the new size", |a| a.listing.as_ref().is_some_and(|l| matches!(l.stat(a.rows[0]), Stat::Known { .. })));
-        r.idle();
-        assert_eq!(r.app.preview_gen, before, "the same file isn't read twice");
-        fs::write(r.work().join("a"), "a good deal longer").unwrap();
-        r.app.reload();
-        r.pump_until("reading it again", |a| a.preview_gen > before);
-        assert_eq!(previewing(&r).as_deref(), Some("a"));
+        assert!(sent(&mut r).is_empty());
     }
 
     #[test]
     fn holding_escape_after_closing_leaves_the_selection() {
         let mut r = preview_rig("held-escape");
-        let escape = |repeat| Input::Key { keysym: k::KEY_Escape, utf8: String::new(), mods: Mods::default(), repeat };
+        let escape = |repeat| Input::Key {
+            keysym: k::KEY_Escape,
+            utf8: String::new(),
+            mods: Mods::default(),
+            repeat,
+        };
         r.key(k::KEY_space, " ");
         r.app.input(escape(false));
         assert_eq!(previewing(&r), None);
         r.app.input(escape(true));
-        assert_eq!(r.selected_names(), ["a"], "the repeats don't reach the list");
+        assert_eq!(
+            r.selected_names(),
+            ["a"],
+            "the repeats don't reach the list"
+        );
         r.app.input(escape(false));
         assert!(r.selected_names().is_empty(), "a new press does");
     }
@@ -5165,8 +7195,14 @@ mod tests {
         r.app.resized(1000, 700, 1.0);
         let l = r.app.layout();
         let (x, y) = (l.list.x + 50, l.list.y + l.row_h + l.row_h / 2);
-        r.app.input(Input::Move { x: x as f64, y: y as f64 });
-        r.app.input(Input::Button { button: BTN_RIGHT, pressed: true });
+        r.app.input(Input::Move {
+            x: x as f64,
+            y: y as f64,
+        });
+        r.app.input(Input::Button {
+            button: BTN_RIGHT,
+            pressed: true,
+        });
         assert!(r.app.menu.is_some());
         assert_eq!(r.selected_names(), ["a", "b", "c"], "the selection stays");
         r.app.close_menu();
@@ -5175,29 +7211,217 @@ mod tests {
     }
 
     #[test]
-    fn a_click_before_the_popup_appears_still_lands() {
-        let mut r = preview_rig("early-click");
-        r.app.resized(1000, 700, 1.0);
-        r.key(k::KEY_space, " ");
-        assert_eq!(r.app.preview_rect(), Rect::default(), "nothing drawn yet");
-        let l = r.app.layout();
-        r.app.input(Input::Move { x: (l.list.x + 50) as f64, y: (l.list.y + l.row_h + l.row_h / 2) as f64 });
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
-        assert_eq!(previewing(&r), None);
-        assert_eq!(r.selected_names(), ["b"], "the click selected the row it was on");
+    fn the_context_menu_previews_and_doesnt_close_an_open_window() {
+        let mut r = preview_rig("menu");
+        r.key(k::KEY_Down, "");
+        r.app.action(Action::Preview);
+        assert_eq!(previewing(&r).as_deref(), Some("a"));
+        r.key(k::KEY_Down, "");
+        r.app.cmds.clear();
+        r.app.action(Action::Preview);
+        assert_eq!(previewing(&r).as_deref(), Some("b"));
+        assert!(!sent(&mut r).contains(&"close".to_string()));
+    }
+
+    // ---- The preview window itself ----
+
+    /// The preview window on `name` in a folder of plain files, its listing read.
+    fn viewer_rig(tag: &str, name: &str) -> Rig {
+        let mut r = Rig::new(tag);
+        for name in ["a", "b", "c"] {
+            fs::write(r.work().join(name), "x").unwrap();
+        }
+        r.app.start_viewer(r.work().join(name));
+        r.pump_until("folder loaded", |a| !a.loading);
+        r
+    }
+
+    fn showing(r: &Rig) -> Option<String> {
+        r.app
+            .preview
+            .as_ref()
+            .map(|p| p.path.file_name().unwrap().to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn the_window_shows_its_file_at_once_then_walks_its_folder() {
+        let mut r = Rig::new("viewer-start");
+        for name in ["a", "b", "c"] {
+            fs::write(r.work().join(name), "x").unwrap();
+        }
+        r.app.start_viewer(r.work().join("b"));
+        assert_eq!(
+            showing(&r).as_deref(),
+            Some("b"),
+            "before the folder is read"
+        );
+        assert!(
+            matches!(r.app.cmds.last(), Some(Cmd::Title(t)) if t == "b"),
+            "named for the file"
+        );
+        r.pump_until("folder loaded", |a| !a.loading);
+        assert_eq!(showing(&r).as_deref(), Some("b"), "the cursor landed on it");
+        r.app.cmds.clear();
+        r.key(k::KEY_Down, "");
+        r.key(k::KEY_Right, "");
+        assert_eq!(showing(&r).as_deref(), Some("c"));
+        r.key(k::KEY_Up, "");
+        r.key(k::KEY_Left, "");
+        r.key(k::KEY_Left, "");
+        assert_eq!(showing(&r).as_deref(), Some("a"));
+        assert_eq!(
+            sent(&mut r),
+            ["stepped c", "stepped b", "stepped a"],
+            "each step is told to the list, and the ends stay put"
+        );
+    }
+
+    #[test]
+    fn the_window_follows_the_list_without_echoing() {
+        let mut r = viewer_rig("viewer-follow", "a");
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::PreviewShow(r.work().join("c")));
+        assert_eq!(showing(&r).as_deref(), Some("c"));
+        assert_eq!(
+            r.app.cursor, 2,
+            "its own cursor moves too, for the arrows to go on from"
+        );
+        assert!(sent(&mut r).is_empty(), "the list already knows");
+        // The list went to another folder.
+        let other = r.root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("z"), "x").unwrap();
+        r.app.on_msg(Msg::PreviewShow(other.join("z")));
+        assert_eq!(showing(&r).as_deref(), Some("z"));
+        r.pump_until("the other folder", |a| !a.loading && a.dir == other);
+        assert_eq!(showing(&r).as_deref(), Some("z"));
+        assert!(sent(&mut r).iter().all(|c| !c.starts_with("stepped")));
+    }
+
+    #[test]
+    fn a_hidden_file_is_shown_and_walked_from() {
+        let mut r = Rig::new("viewer-hidden");
+        for name in [".h", "a"] {
+            fs::write(r.work().join(name), "x").unwrap();
+        }
+        r.app.start_viewer(r.work().join(".h"));
+        r.pump_until("folder loaded", |a| !a.loading);
+        assert_eq!(
+            showing(&r).as_deref(),
+            Some(".h"),
+            "the listing didn't move it to another file"
+        );
+        r.key(k::KEY_Down, "");
+        assert_eq!(showing(&r).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn space_escape_and_the_list_going_all_close_the_window() {
+        for (tag, how) in [
+            ("viewer-space", 0),
+            ("viewer-escape", 1),
+            ("viewer-gone", 2),
+            ("viewer-ctrl-w", 3),
+        ] {
+            let mut r = viewer_rig(tag, "a");
+            r.app.cmds.clear();
+            match how {
+                0 => r.key(k::KEY_space, " "),
+                1 => r.key(k::KEY_Escape, ""),
+                2 => r.app.on_msg(Msg::ListGone),
+                _ => with_mods(
+                    &mut r,
+                    k::KEY_w,
+                    "w",
+                    Mods {
+                        ctrl: true,
+                        ..Mods::default()
+                    },
+                ),
+            }
+            assert_eq!(sent(&mut r), ["quit"], "{tag}");
+        }
+    }
+
+    #[test]
+    fn other_keys_do_nothing_in_the_window() {
+        let mut r = viewer_rig("viewer-keys", "a");
+        r.key(k::KEY_c, "c");
+        r.key(k::KEY_Delete, "");
+        r.key(k::KEY_F2, "");
+        assert_eq!(r.app.cursor, 0, "typing didn't jump");
+        assert!(r.app.jobs.is_empty(), "Delete didn't trash");
+        assert!(matches!(r.app.edit, Edit::None), "F2 didn't rename");
+        assert!(r.work().join("a").exists());
+    }
+
+    #[test]
+    fn a_file_removed_underneath_moves_on_and_an_empty_folder_closes() {
+        let mut r = viewer_rig("removed", "a");
+        fs::remove_file(r.work().join("a")).unwrap();
+        r.app.reload();
+        r.pump_until("the next file", |a| {
+            a.preview.as_ref().is_some_and(|p| p.path.ends_with("b"))
+        });
+        for name in ["b", "c"] {
+            fs::remove_file(r.work().join(name)).unwrap();
+        }
+        r.app.cmds.clear();
+        r.app.reload();
+        r.pump_until("the window to close", |a| {
+            a.cmds.iter().any(|c| matches!(c, Cmd::Quit))
+        });
+    }
+
+    #[test]
+    fn a_file_overwritten_while_showing_is_read_again() {
+        let mut r = viewer_rig("overwritten", "a");
+        r.pump_until("a size for the first row", |a| {
+            a.listing
+                .as_ref()
+                .is_some_and(|l| matches!(l.stat(a.rows[0]), Stat::Known { .. }))
+        });
+        let before = r.app.preview_gen;
+        // Nothing changed: reloading leaves it alone, so a busy folder doesn't restart it.
+        r.app.reload();
+        r.pump_until("the reload", |a| !a.loading);
+        r.pump_until("the new size", |a| {
+            a.listing
+                .as_ref()
+                .is_some_and(|l| matches!(l.stat(a.rows[0]), Stat::Known { .. }))
+        });
+        r.idle();
+        assert_eq!(r.app.preview_gen, before, "the same file isn't read twice");
+        fs::write(r.work().join("a"), "a good deal longer").unwrap();
+        r.app.reload();
+        r.pump_until("reading it again", |a| a.preview_gen > before);
+        assert_eq!(showing(&r).as_deref(), Some("a"));
     }
 
     #[test]
     fn a_report_from_before_a_key_press_doesnt_undo_it() {
         use crate::media::{PlayState, parts_for_test};
         use crate::preview::{Content, Event, Found};
-        let mut r = preview_rig("stale-report");
-        r.key(k::KEY_space, " ");
+        let mut r = viewer_rig("stale-report", "a");
         let generation = r.app.preview_gen;
         let (remote, frames) = parts_for_test();
-        r.app.on_msg(Msg::Preview(Event { generation, found: Found::VideoStarted { remote, frames } }));
-        let playing = PlayState { position: 1.0, duration: 9.0, paused: false, volume: 100.0, muted: false };
-        let report = |state| Msg::Preview(Event { generation, found: Found::VideoState(state) });
+        r.app.on_msg(Msg::Preview(Event {
+            generation,
+            found: Found::VideoStarted { remote, frames },
+        }));
+        let playing = PlayState {
+            position: 1.0,
+            duration: 9.0,
+            paused: false,
+            volume: 100.0,
+            muted: false,
+        };
+        let report = |state| {
+            Msg::Preview(Event {
+                generation,
+                found: Found::VideoState(state),
+            })
+        };
         let shown = |r: &Rig| match &r.app.preview.as_ref().unwrap().content {
             Content::Video(video) => video.state,
             _ => panic!("no video"),
@@ -5206,37 +7430,48 @@ mod tests {
         r.key(k::KEY_p, "p");
         assert!(shown(&r).paused);
         // On its way before the press landed.
-        r.app.on_msg(report(PlayState { position: 2.0, ..playing }));
+        r.app.on_msg(report(PlayState {
+            position: 2.0,
+            ..playing
+        }));
         assert!(shown(&r).paused, "the press stands");
         assert_eq!(shown(&r).position, 2.0, "and the time still moves");
         r.key(k::KEY_p, "p");
-        assert!(!shown(&r).paused, "the second press undoes the first, rather than repeating it");
+        assert!(
+            !shown(&r).paused,
+            "the second press undoes the first, rather than repeating it"
+        );
         // Once things have settled, the player is right about itself.
         std::thread::sleep(Duration::from_millis(300));
-        r.app.on_msg(report(PlayState { paused: true, ..playing }));
+        r.app.on_msg(report(PlayState {
+            paused: true,
+            ..playing
+        }));
         assert!(shown(&r).paused);
     }
 
     #[test]
-    fn the_context_menu_can_preview() {
-        let mut r = preview_rig("menu");
-        r.key(k::KEY_Down, "");
-        r.app.action(Action::Preview);
-        assert_eq!(previewing(&r).as_deref(), Some("a"));
-    }
-
-    #[test]
     fn answers_for_a_file_youve_moved_past_are_dropped() {
-        let mut r = preview_rig("stale");
-        r.key(k::KEY_space, " ");
+        let mut r = viewer_rig("stale", "a");
         let old = r.app.preview_gen;
         r.key(k::KEY_Down, "");
-        r.app.on_msg(Msg::Preview(preview::Event { generation: old, found: preview::Found::Message("old news".into()) }));
-        assert!(matches!(r.app.preview.as_ref().unwrap().content, preview::Content::Waiting));
+        r.app.on_msg(Msg::Preview(preview::Event {
+            generation: old,
+            found: preview::Found::Message("old news".into()),
+        }));
+        assert!(matches!(
+            r.app.preview.as_ref().unwrap().content,
+            preview::Content::Waiting
+        ));
     }
 
     fn item(enabled: bool) -> MenuItem {
-        MenuItem { label: "", keys: "", action: Action::Reload, enabled }
+        MenuItem {
+            label: "",
+            keys: "",
+            action: Action::Reload,
+            enabled,
+        }
     }
 
     #[test]
@@ -5274,11 +7509,18 @@ mod tests {
         trash_names(&mut r, &["a.txt", "b.txt"]);
         open_trash(&mut r);
         let l = r.app.listing.clone().unwrap();
-        let a = (0..l.len() as u32).find(|&i| l.name(i) == b"a.txt").unwrap();
-        assert_eq!(l.original(a), Some(fs::canonicalize(r.work()).unwrap().join("a.txt").as_path()));
+        let a = (0..l.len() as u32)
+            .find(|&i| l.name(i) == b"a.txt")
+            .unwrap();
+        assert_eq!(
+            l.original(a),
+            Some(fs::canonicalize(r.work()).unwrap().join("a.txt").as_path())
+        );
         r.select("a.txt");
         r.app.action(Action::Restore);
-        r.pump_until("restored and reloaded", |a| a.jobs.is_empty() && !a.loading && a.listing.as_ref().is_some_and(|l| l.len() == 1));
+        r.pump_until("restored and reloaded", |a| {
+            a.jobs.is_empty() && !a.loading && a.listing.as_ref().is_some_and(|l| l.len() == 1)
+        });
         assert_eq!(fs::read(r.work().join("a.txt")).unwrap(), b"a.txt");
         assert!(r.app.notices.is_empty(), "{:?}", r.app.notices);
     }
@@ -5294,7 +7536,14 @@ mod tests {
         r.idle();
         assert_eq!(fs::read(r.work().join("a.txt")).unwrap(), b"new");
         assert_eq!(r.app.listing.as_ref().unwrap().len(), 1);
-        assert!(r.app.notices.iter().any(|n| n.contains("stayed in the Trash")), "{:?}", r.app.notices);
+        assert!(
+            r.app
+                .notices
+                .iter()
+                .any(|n| n.contains("stayed in the Trash")),
+            "{:?}",
+            r.app.notices
+        );
     }
 
     #[test]
@@ -5307,15 +7556,31 @@ mod tests {
         open_trash(&mut r);
         assert_eq!(r.app.rows.len(), 1, "the hidden item isn't showing");
         r.app.action(Action::EmptyTrash);
-        assert!(matches!(&r.app.dialog, Some(Dialog::ConfirmDelete { empty: true, paths, .. }) if paths.len() == 2));
+        assert!(
+            matches!(&r.app.dialog, Some(Dialog::ConfirmDelete { empty: true, paths, .. }) if paths.len() == 2)
+        );
         r.key(k::KEY_Escape, "");
         assert!(r.app.dialog.is_none());
-        assert_eq!(fs::read_dir(r.root.join("data/Trash/files")).unwrap().count(), 2, "Cancel deletes nothing");
+        assert_eq!(
+            fs::read_dir(r.root.join("data/Trash/files"))
+                .unwrap()
+                .count(),
+            2,
+            "Cancel deletes nothing"
+        );
         r.app.action(Action::EmptyTrash);
         r.key(k::KEY_e, "e");
-        r.pump_until("emptied", |a| a.jobs.is_empty() && !a.loading && a.listing.as_ref().is_some_and(|l| l.is_empty()));
+        r.pump_until("emptied", |a| {
+            a.jobs.is_empty() && !a.loading && a.listing.as_ref().is_some_and(|l| l.is_empty())
+        });
         for sub in ["files", "info"] {
-            assert_eq!(fs::read_dir(r.root.join("data/Trash").join(sub)).unwrap().count(), 0, "{sub}");
+            assert_eq!(
+                fs::read_dir(r.root.join("data/Trash").join(sub))
+                    .unwrap()
+                    .count(),
+                0,
+                "{sub}"
+            );
         }
     }
 
@@ -5326,7 +7591,12 @@ mod tests {
         open_trash(&mut r);
         r.select("a.txt");
         let labels: Vec<&str> = r.app.context_items().iter().map(|m| m.label).collect();
-        for want in ["Restore", "Empty Trash", "Delete for good", "Sort by date deleted"] {
+        for want in [
+            "Restore",
+            "Empty Trash",
+            "Delete for good",
+            "Sort by date deleted",
+        ] {
             assert!(labels.contains(&want), "{want} missing from {labels:?}");
         }
         for unwanted in ["Cut", "Paste", "Rename", "Move to Trash", "New folder"] {
@@ -5348,11 +7618,18 @@ mod tests {
         r.open(d.join("inner"));
         assert_eq!(r.app.up_target().map(|s| s.dir), Some(d.clone()));
         r.open(d);
-        assert_eq!(r.app.up_target().map(|s| s.dir), Some(r.app.trash_dir.clone()));
+        assert_eq!(
+            r.app.up_target().map(|s| s.dir),
+            Some(r.app.trash_dir.clone())
+        );
         let other = r.root.join("disk/.Trash-1000/files/x");
         fs::create_dir_all(&other).unwrap();
         r.open(other);
-        assert_eq!(r.app.up_target().map(|s| s.dir), Some(r.app.trash_dir.clone()), "another disk's Trash goes up to the Trash view too");
+        assert_eq!(
+            r.app.up_target().map(|s| s.dir),
+            Some(r.app.trash_dir.clone()),
+            "another disk's Trash goes up to the Trash view too"
+        );
     }
 
     #[test]
@@ -5363,11 +7640,26 @@ mod tests {
         open_trash(&mut r);
         let b = r.app.empty_trash_rect().unwrap();
         assert_eq!(r.app.hit(b.x + b.w / 2, b.y + b.h / 2), Hit::EmptyTrash);
-        assert!(r.app.crumbs().iter().all(|(x, w, _)| x + w <= b.x), "the path stops before the button");
-        r.app.input(Input::Move { x: (b.x + 4) as f64, y: (b.y + 4) as f64 });
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
-        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
-        assert!(matches!(r.app.dialog, Some(Dialog::ConfirmDelete { empty: true, .. })));
+        assert!(
+            r.app.crumbs().iter().all(|(x, w, _)| x + w <= b.x),
+            "the path stops before the button"
+        );
+        r.app.input(Input::Move {
+            x: (b.x + 4) as f64,
+            y: (b.y + 4) as f64,
+        });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: true,
+        });
+        r.app.input(Input::Button {
+            button: BTN_LEFT,
+            pressed: false,
+        });
+        assert!(matches!(
+            r.app.dialog,
+            Some(Dialog::ConfirmDelete { empty: true, .. })
+        ));
     }
 
     #[test]
@@ -5378,14 +7670,23 @@ mod tests {
         open_trash(&mut r);
         let l = r.app.listing.clone().unwrap();
         // The lowest id is the one a lookup by name alone would lose.
-        let id = (0..l.len() as u32).find(|&i| l.name(i) == b"a.txt").unwrap();
+        let id = (0..l.len() as u32)
+            .find(|&i| l.name(i) == b"a.txt")
+            .unwrap();
         let want = l.path(id);
         let row = r.app.rows.iter().position(|&i| i == id).unwrap();
         r.app.move_cursor(row, Mods::default());
         r.app.reload();
-        r.pump_until("reloaded", |a| !a.loading && !a.listing.as_ref().is_some_and(|n| Arc::ptr_eq(n, &l)));
+        r.pump_until("reloaded", |a| {
+            !a.loading && !a.listing.as_ref().is_some_and(|n| Arc::ptr_eq(n, &l))
+        });
         let l = r.app.listing.clone().unwrap();
-        let picked: Vec<PathBuf> = r.app.selected_ids().into_iter().map(|i| l.path(i)).collect();
+        let picked: Vec<PathBuf> = r
+            .app
+            .selected_ids()
+            .into_iter()
+            .map(|i| l.path(i))
+            .collect();
         assert_eq!(picked, std::slice::from_ref(&want));
         assert_eq!(l.path(r.app.rows[r.app.cursor]), want);
     }
@@ -5416,7 +7717,12 @@ mod tests {
         r.app.loading = true;
         let b = r.app.empty_trash_rect().unwrap();
         assert_eq!(r.app.hit(b.x + b.w / 2, b.y + b.h / 2), Hit::None);
-        assert!(!r.app.context_items().iter().any(|m| m.label == "Empty Trash" && m.enabled));
+        assert!(
+            !r.app
+                .context_items()
+                .iter()
+                .any(|m| m.label == "Empty Trash" && m.enabled)
+        );
         r.app.action(Action::EmptyTrash);
         assert!(r.app.dialog.is_none());
     }
@@ -5428,7 +7734,14 @@ mod tests {
         fs::create_dir_all(&inner).unwrap();
         r.open(inner.clone());
         let crumbs: Vec<PathBuf> = r.app.crumbs().into_iter().map(|(_, _, p)| p).collect();
-        assert_eq!(crumbs, [r.app.trash_dir.clone(), r.root.join("disk/.Trash-1000/files/d"), inner]);
+        assert_eq!(
+            crumbs,
+            [
+                r.app.trash_dir.clone(),
+                r.root.join("disk/.Trash-1000/files/d"),
+                inner
+            ]
+        );
     }
 
     #[test]
@@ -5455,14 +7768,19 @@ mod tests {
         for n in ["a", "b", ".h"] {
             fs::write(r.work().join(n), b"").unwrap();
         }
-        r.app.open_selecting(r.work(), vec![b"b".to_vec(), b".h".to_vec()]);
+        r.app
+            .open_selecting(r.work(), vec![b"b".to_vec(), b".h".to_vec()]);
         r.pump_until("loaded", |a| !a.loading);
         let mut got = r.selected_names();
         got.sort();
         assert_eq!(got, [".h", "b"]);
         assert!(r.app.show_hidden);
         let l = r.app.listing.clone().unwrap();
-        assert_eq!(l.name(r.app.rows[r.app.cursor]), b"b", "the cursor is on the first");
+        assert_eq!(
+            l.name(r.app.rows[r.app.cursor]),
+            b"b",
+            "the cursor is on the first"
+        );
     }
 
     #[test]

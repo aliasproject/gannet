@@ -51,7 +51,9 @@ pub fn to_file_uri(path: &Path) -> String {
 
 /// The local path in a `file:` URI. Other schemes and other hosts give `None`.
 pub fn from_file_uri(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://").or_else(|| uri.strip_prefix("file:"))?;
+    let rest = uri
+        .strip_prefix("file://")
+        .or_else(|| uri.strip_prefix("file:"))?;
     if let Some(path) = rest.strip_prefix('/') {
         return Some(decode_path(&format!("/{path}")));
     }

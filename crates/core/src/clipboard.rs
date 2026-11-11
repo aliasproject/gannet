@@ -22,7 +22,11 @@ pub fn encode(paths: &[PathBuf], cut: bool) -> Vec<(&'static str, Vec<u8>)> {
     let uris: Vec<String> = paths.iter().map(|p| to_file_uri(p)).collect();
     let gnome = format!("{}\n{}", if cut { "cut" } else { "copy" }, uris.join("\n"));
     let list = format!("{}\r\n", uris.join("\r\n"));
-    let text = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("\n");
+    let text = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
     vec![
         (GNOME, gnome.into_bytes()),
         (URI_LIST, list.into_bytes()),
@@ -36,14 +40,21 @@ pub fn encode(paths: &[PathBuf], cut: bool) -> Vec<(&'static str, Vec<u8>)> {
 /// The formats to offer other programs in a drag. Whether it's a move is agreed separately,
 /// so the clipboard's cut markers don't belong here.
 pub fn drag_formats(paths: &[PathBuf]) -> Vec<(&'static str, Vec<u8>)> {
-    encode(paths, false).into_iter().filter(|(m, _)| *m != GNOME && *m != KDE_CUT).collect()
+    encode(paths, false)
+        .into_iter()
+        .filter(|(m, _)| *m != GNOME && *m != KDE_CUT)
+        .collect()
 }
 
 /// Whether every entry in a dropped uri-list is one of these local paths. If not, the drop
 /// can't be called a complete success, whatever happens to the local ones.
 pub fn uri_list_is_all_local(data: &[u8], paths: &[PathBuf]) -> bool {
     let text = String::from_utf8_lossy(data);
-    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).count() == paths.len()
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .count()
+        == paths.len()
 }
 
 /// Says a drag comes from another Gannet window, and what that window knows that a receiver
@@ -65,7 +76,13 @@ const DRAG_MARKER: &str = "application/x-gannet-drag";
 
 impl DragMarker {
     pub fn mime(&self) -> String {
-        format!("{DRAG_MARKER};device={};delete={};ctrl={};shift={}", self.device, u8::from(self.can_delete), u8::from(self.ctrl), u8::from(self.shift))
+        format!(
+            "{DRAG_MARKER};device={};delete={};ctrl={};shift={}",
+            self.device,
+            u8::from(self.can_delete),
+            u8::from(self.ctrl),
+            u8::from(self.shift)
+        )
     }
 
     /// Reads a format name. Anything other than exactly what `mime` writes isn't a marker.
@@ -81,18 +98,27 @@ impl DragMarker {
         let can_delete = flag(parts.next()?.strip_prefix("delete=")?)?;
         let ctrl = flag(parts.next()?.strip_prefix("ctrl=")?)?;
         let shift = flag(parts.next()?.strip_prefix("shift=")?)?;
-        parts.next().is_none().then_some(Self { device, can_delete, ctrl, shift })
+        parts.next().is_none().then_some(Self {
+            device,
+            can_delete,
+            ctrl,
+            shift,
+        })
     }
 }
 
 /// Which offered format to ask for when pasting files.
 pub fn preferred_file_mime(offered: &[String]) -> Option<&'static str> {
-    [GNOME, URI_LIST].into_iter().find(|m| offered.iter().any(|o| o == m))
+    [GNOME, URI_LIST]
+        .into_iter()
+        .find(|m| offered.iter().any(|o| o == m))
 }
 
 /// Which offered format to ask for when pasting into a text field.
 pub fn preferred_text_mime(offered: &[String]) -> Option<&'static str> {
-    [TEXT, UTF8_STRING, TEXT_PLAIN].into_iter().find(|m| offered.iter().any(|o| o == m))
+    [TEXT, UTF8_STRING, TEXT_PLAIN]
+        .into_iter()
+        .find(|m| offered.iter().any(|o| o == m))
 }
 
 /// Reads a clipboard pipe, refusing anything over `max` rather than acting on a cut-off
@@ -117,7 +143,11 @@ pub fn parse(mime: &str, data: &[u8]) -> (Vec<PathBuf>, bool) {
         }
     }
     // `#` starts a comment in a uri-list.
-    let paths = lines.filter(|l| !l.starts_with('#')).filter_map(from_file_uri).filter(|p| Path::is_absolute(p)).collect();
+    let paths = lines
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(from_file_uri)
+        .filter(|p| Path::is_absolute(p))
+        .collect();
     (paths, cut)
 }
 
@@ -173,7 +203,13 @@ mod tests {
     #[test]
     fn junk_and_remote_uris_are_left_out() {
         assert_eq!(parse(GNOME, b"not a verb\nfile:///a"), (vec![], false));
-        assert_eq!(parse(URI_LIST, b"# comment\nhttps://x/y\nfile:///a\nfile://host/b\nrelative\n"), (vec![PathBuf::from("/a")], false));
+        assert_eq!(
+            parse(
+                URI_LIST,
+                b"# comment\nhttps://x/y\nfile:///a\nfile://host/b\nrelative\n"
+            ),
+            (vec![PathBuf::from("/a")], false)
+        );
         assert_eq!(parse(URI_LIST, b"\xff\xfe"), (vec![], false));
         assert_eq!(parse(GNOME, b""), (vec![], false));
     }
@@ -182,7 +218,10 @@ mod tests {
     fn kde_programs_can_read_and_write_a_cut() {
         assert_eq!(get(&encode(&["/d".into()], true), KDE_CUT), b"1");
         assert_eq!(get(&encode(&["/d".into()], false), KDE_CUT), b"0");
-        assert_eq!(parse(URI_LIST_CUT, b"file:///a\r\n"), (vec![PathBuf::from("/a")], true));
+        assert_eq!(
+            parse(URI_LIST_CUT, b"file:///a\r\n"),
+            (vec![PathBuf::from("/a")], true)
+        );
     }
 
     #[test]
@@ -197,13 +236,27 @@ mod tests {
         assert_eq!(preferred_file_mime(&o(&[URI_LIST, GNOME])), Some(GNOME));
         assert_eq!(preferred_file_mime(&o(&[URI_LIST])), Some(URI_LIST));
         assert_eq!(preferred_file_mime(&o(&["text/plain"])), None);
-        assert_eq!(preferred_text_mime(&o(&["UTF8_STRING", "text/plain"])), Some("UTF8_STRING"));
+        assert_eq!(
+            preferred_text_mime(&o(&["UTF8_STRING", "text/plain"])),
+            Some("UTF8_STRING")
+        );
     }
 
     #[test]
     fn a_drag_marker_survives_its_format_name() {
-        for (can_delete, ctrl, shift) in [(false, false, false), (true, false, false), (false, true, false), (false, false, true), (true, true, true)] {
-            let m = DragMarker { device: u64::MAX, can_delete, ctrl, shift };
+        for (can_delete, ctrl, shift) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let m = DragMarker {
+                device: u64::MAX,
+                can_delete,
+                ctrl,
+                shift,
+            };
             assert_eq!(DragMarker::parse(&m.mime()), Some(m));
         }
     }

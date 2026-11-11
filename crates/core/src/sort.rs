@@ -67,7 +67,10 @@ fn decode(s: &[u8]) -> (char, usize) {
     {
         return (c, len);
     }
-    (char::from_u32(0xE000 + s[0] as u32).unwrap_or('\u{FFFD}'), 1)
+    (
+        char::from_u32(0xE000 + s[0] as u32).unwrap_or('\u{FFFD}'),
+        1,
+    )
 }
 
 fn fold(c: char) -> char {
@@ -81,7 +84,9 @@ where
     F: Fn(&T, &T) -> Ordering + Sync,
 {
     const PARALLEL_FROM: usize = 16 * 1024;
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(8);
     if v.len() < PARALLEL_FROM || threads < 2 {
         v.sort_unstable_by(&cmp);
         return;
@@ -140,15 +145,24 @@ mod tests {
 
     #[test]
     fn digit_runs_compare_as_numbers() {
-        assert_eq!(sorted(vec!["a10", "a9", "a100", "a1"]), ["a1", "a9", "a10", "a100"]);
+        assert_eq!(
+            sorted(vec!["a10", "a9", "a100", "a1"]),
+            ["a1", "a9", "a10", "a100"]
+        );
         assert_eq!(sorted(vec!["x007", "x7", "x06"]), ["x06", "x007", "x7"]);
     }
 
     #[test]
     fn case_is_ignored_then_bytes_break_ties() {
         assert_eq!(sorted(vec!["b", "A", "a", "B"]), ["A", "a", "B", "b"]);
-        assert_eq!(sorted(vec!["École", "eagle", "zebra"]), ["eagle", "zebra", "École"]);
-        assert_eq!(natural_cmp("É".as_bytes(), "é".as_bytes()), "É".as_bytes().cmp("é".as_bytes()));
+        assert_eq!(
+            sorted(vec!["École", "eagle", "zebra"]),
+            ["eagle", "zebra", "École"]
+        );
+        assert_eq!(
+            natural_cmp("É".as_bytes(), "é".as_bytes()),
+            "É".as_bytes().cmp("é".as_bytes())
+        );
     }
 
     #[test]

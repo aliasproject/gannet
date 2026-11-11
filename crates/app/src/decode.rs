@@ -59,21 +59,33 @@ pub fn helper_main() -> ! {
 fn lock_down() -> bool {
     // Never a raise, which isn't allowed: a stricter limit from whatever started the app stands.
     let limit = |resource, value: u64| {
-        let mut l = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let mut l = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
         // SAFETY: `l` is a valid rlimit that outlives both calls.
         unsafe {
             if libc::getrlimit(resource, &mut l) != 0 {
                 return false;
             }
             let value = value.min(l.rlim_cur).min(l.rlim_max);
-            l = libc::rlimit { rlim_cur: value, rlim_max: value };
+            l = libc::rlimit {
+                rlim_cur: value,
+                rlim_max: value,
+            };
             libc::setrlimit(resource, &l) == 0
         }
     };
     // SAFETY: these calls take plain integers and touch nothing of ours but descriptors we
     // don't use.
     let closed = unsafe {
-        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0);
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        );
         libc::close_range(3, libc::c_uint::MAX, 0) == 0
     };
     closed
@@ -107,12 +119,36 @@ pub fn attempt_as_player(what: &str) -> i32 {
         return if exists(path) { 1 } else { REFUSED };
     }
     match what {
-        "see-etc" => if exists("/etc/passwd") { 1 } else { REFUSED },
-        "write-usr" => if std::fs::File::create("/usr/gannet-was-here").is_ok() { 1 } else { REFUSED },
+        "see-etc" => {
+            if exists("/etc/passwd") {
+                1
+            } else {
+                REFUSED
+            }
+        }
+        "write-usr" => {
+            if std::fs::File::create("/usr/gannet-was-here").is_ok() {
+                1
+            } else {
+                REFUSED
+            }
+        }
         // SAFETY: only ever run in a process that's about to exit. The call has no pointers.
-        "network" => if unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) } < 0 { REFUSED } else { 1 },
+        "network" => {
+            if unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) } < 0 {
+                REFUSED
+            } else {
+                1
+            }
+        }
         "thread" => match std::thread::Builder::new().spawn(|| {}) {
-            Ok(thread) => if thread.join().is_ok() { REACHED_THE_END } else { 1 },
+            Ok(thread) => {
+                if thread.join().is_ok() {
+                    REACHED_THE_END
+                } else {
+                    1
+                }
+            }
             Err(_) => 1,
         },
         other => attempt(other),
@@ -129,7 +165,9 @@ const REACHED_THE_END: i32 = 41;
 /// by the checks. The dangerous ones touch nothing even if they get through.
 #[cfg(any(test, feature = "bench"))]
 fn attempt(what: &str) -> i32 {
-    let refused = |result: libc::c_long| result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS);
+    let refused = |result: libc::c_long| {
+        result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS)
+    };
     let code = |result: libc::c_long| if refused(result) { REFUSED } else { 1 };
     let path = c"/etc/passwd".as_ptr();
     // SAFETY: as above. Each call either fails or, as is the point, gets the process killed.
@@ -137,11 +175,28 @@ fn attempt(what: &str) -> i32 {
         match what {
             "nothing" => REACHED_THE_END,
             "open" => code(libc::openat(libc::AT_FDCWD, path, libc::O_RDONLY) as libc::c_long),
-            "stat-path" => code(libc::syscall(libc::SYS_newfstatat, libc::AT_FDCWD, path, std::ptr::null_mut::<libc::stat>(), 0)),
-            "statx-path" => code(libc::syscall(libc::SYS_statx, libc::AT_FDCWD, path, 0, 0, std::ptr::null_mut::<libc::c_void>())),
+            "stat-path" => code(libc::syscall(
+                libc::SYS_newfstatat,
+                libc::AT_FDCWD,
+                path,
+                std::ptr::null_mut::<libc::stat>(),
+                0,
+            )),
+            "statx-path" => code(libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                path,
+                0,
+                0,
+                std::ptr::null_mut::<libc::c_void>(),
+            )),
             "fstat-is-fine" => {
                 let mut st: libc::stat = std::mem::zeroed();
-                if libc::fstat(0, &mut st) == 0 { REACHED_THE_END } else { 1 }
+                if libc::fstat(0, &mut st) == 0 {
+                    REACHED_THE_END
+                } else {
+                    1
+                }
             }
             "socket" => {
                 libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
@@ -161,11 +216,25 @@ fn attempt(what: &str) -> i32 {
                 REACHED_THE_END
             }
             "exec-memory" => {
-                libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ | libc::PROT_EXEC, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
                 REACHED_THE_END
             }
             "make-executable" => {
-                let page = libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+                let page = libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
                 libc::mprotect(page, 4096, libc::PROT_READ | libc::PROT_EXEC);
                 REACHED_THE_END
             }
@@ -227,9 +296,20 @@ pub(crate) mod sandbox {
     /// reason, and looking up says whether a file exists, its size and when it changed. `ENOSYS`
     /// makes Rust's standard library fall back to `fstat`, which only takes a descriptor.
     #[cfg(target_arch = "x86_64")]
-    const BY_PATH: &[libc::c_long] = &[libc::SYS_open, libc::SYS_openat, libc::SYS_openat2, libc::SYS_newfstatat, libc::SYS_statx];
+    const BY_PATH: &[libc::c_long] = &[
+        libc::SYS_open,
+        libc::SYS_openat,
+        libc::SYS_openat2,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+    ];
     #[cfg(not(target_arch = "x86_64"))]
-    const BY_PATH: &[libc::c_long] = &[libc::SYS_openat, libc::SYS_openat2, libc::SYS_newfstatat, libc::SYS_statx];
+    const BY_PATH: &[libc::c_long] = &[
+        libc::SYS_openat,
+        libc::SYS_openat2,
+        libc::SYS_newfstatat,
+        libc::SYS_statx,
+    ];
 
     const LD_ABS_W: u16 = 0x20; // BPF_LD | BPF_W | BPF_ABS
     const JEQ_K: u16 = 0x15; // BPF_JMP | BPF_JEQ | BPF_K
@@ -300,7 +380,12 @@ pub(crate) mod sandbox {
     const X32_BIT: u32 = 0x4000_0000;
 
     #[cfg(target_arch = "x86_64")]
-    const FORBIDDEN_HERE: &[libc::c_long] = &[libc::SYS_fork, libc::SYS_vfork, libc::SYS_iopl, libc::SYS_ioperm];
+    const FORBIDDEN_HERE: &[libc::c_long] = &[
+        libc::SYS_fork,
+        libc::SYS_vfork,
+        libc::SYS_iopl,
+        libc::SYS_ioperm,
+    ];
     #[cfg(not(target_arch = "x86_64"))]
     const FORBIDDEN_HERE: &[libc::c_long] = &[];
 
@@ -385,15 +470,25 @@ pub(crate) mod sandbox {
     }
 
     fn install(program: &[libc::sock_filter]) -> bool {
-        let Ok(len) = u16::try_from(program.len()) else { return false };
-        let fprog = libc::sock_fprog { len, filter: program.as_ptr() as *mut libc::sock_filter };
+        let Ok(len) = u16::try_from(program.len()) else {
+            return false;
+        };
+        let fprog = libc::sock_fprog {
+            len,
+            filter: program.as_ptr() as *mut libc::sock_filter,
+        };
         // The player has threads by the time this goes on, and all of them need it.
         const SECCOMP_FILTER_FLAG_TSYNC: libc::c_ulong = 1;
         // SAFETY: `fprog` points at a valid program that outlives the call, and the kernel copies
         // it. The other arguments are plain integers.
         unsafe {
             libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) == 0
-                && libc::syscall(libc::SYS_seccomp, 1 as libc::c_ulong, SECCOMP_FILTER_FLAG_TSYNC, &fprog as *const libc::sock_fprog) == 0
+                && libc::syscall(
+                    libc::SYS_seccomp,
+                    1 as libc::c_ulong,
+                    SECCOMP_FILTER_FLAG_TSYNC,
+                    &fprog as *const libc::sock_fprog,
+                ) == 0
         }
     }
 }
@@ -408,7 +503,9 @@ fn classify(e: ImageError) -> Failure {
 
 /// Decodes any image `input` holds, upright, and writes it out as straight RGBA.
 pub fn decode(input: impl Read + Seek, mut output: impl Write) -> Result<(), Failure> {
-    let mut reader = ImageReader::new(BufReader::new(input)).with_guessed_format().map_err(|_| Failure::Damaged)?;
+    let mut reader = ImageReader::new(BufReader::new(input))
+        .with_guessed_format()
+        .map_err(|_| Failure::Damaged)?;
     if reader.format().is_none() {
         return Err(Failure::Unsupported);
     }
@@ -431,7 +528,9 @@ pub fn decode(input: impl Read + Seek, mut output: impl Write) -> Result<(), Fai
     header.extend_from_slice(&rgba.width().to_ne_bytes());
     header.extend_from_slice(&rgba.height().to_ne_bytes());
     output.write_all(&header).map_err(|_| Failure::TooLarge)?;
-    output.write_all(rgba.as_raw()).map_err(|_| Failure::TooLarge)?;
+    output
+        .write_all(rgba.as_raw())
+        .map_err(|_| Failure::TooLarge)?;
     Ok(())
 }
 
@@ -471,8 +570,15 @@ mod tests {
 
     #[test]
     fn decodes_the_other_common_formats() {
-        for format in [image::ImageFormat::Gif, image::ImageFormat::WebP, image::ImageFormat::Bmp, image::ImageFormat::Tiff, image::ImageFormat::Ico] {
-            let (w, h, _) = run(&encoded(&two_by_one(), format)).unwrap_or_else(|e| panic!("{format:?}: {e:?}"));
+        for format in [
+            image::ImageFormat::Gif,
+            image::ImageFormat::WebP,
+            image::ImageFormat::Bmp,
+            image::ImageFormat::Tiff,
+            image::ImageFormat::Ico,
+        ] {
+            let (w, h, _) = run(&encoded(&two_by_one(), format))
+                .unwrap_or_else(|e| panic!("{format:?}: {e:?}"));
             assert_eq!((w, h), (2, 1), "{format:?}");
         }
     }
@@ -481,7 +587,9 @@ mod tests {
     fn sideways_jpeg() -> Vec<u8> {
         let mut plain = Vec::new();
         let image = RgbImage::from_pixel(4, 2, image::Rgb([200, 10, 10]));
-        JpegEncoder::new(&mut plain).write_image(image.as_raw(), 4, 2, image::ExtendedColorType::Rgb8).unwrap();
+        JpegEncoder::new(&mut plain)
+            .write_image(image.as_raw(), 4, 2, image::ExtendedColorType::Rgb8)
+            .unwrap();
         let mut exif = b"Exif\0\0".to_vec();
         exif.extend_from_slice(b"MM\0\x2a\0\0\0\x08\0\x01"); // Big-endian TIFF, one tag.
         exif.extend_from_slice(b"\x01\x12\0\x03\0\0\0\x01\0\x06\0\0\0\0\0\0"); // Orientation = 6.
@@ -501,7 +609,10 @@ mod tests {
 
     #[test]
     fn something_that_isnt_an_image_is_unsupported() {
-        assert_eq!(run(b"just some words, nothing to see here").unwrap_err(), Failure::Unsupported);
+        assert_eq!(
+            run(b"just some words, nothing to see here").unwrap_err(),
+            Failure::Unsupported
+        );
         assert_eq!(run(b"").unwrap_err(), Failure::Unsupported);
     }
 
@@ -509,14 +620,22 @@ mod tests {
     fn a_damaged_image_says_so() {
         let png = encoded(&two_by_one(), image::ImageFormat::Png);
         assert_eq!(run(&png[..png.len() / 2]).unwrap_err(), Failure::Damaged);
-        assert_eq!(run(b"\x89PNG\r\n\x1a\ngarbage").unwrap_err(), Failure::Damaged);
+        assert_eq!(
+            run(b"\x89PNG\r\n\x1a\ngarbage").unwrap_err(),
+            Failure::Damaged
+        );
     }
 
     #[test]
     fn a_huge_claim_is_refused_before_any_memory_is_spent() {
         // A valid PNG saying 60,000 x 60,000, with hardly any data behind it.
         let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
-        let body = [&60_000u32.to_be_bytes()[..], &60_000u32.to_be_bytes()[..], &[8, 6, 0, 0, 0]].concat();
+        let body = [
+            &60_000u32.to_be_bytes()[..],
+            &60_000u32.to_be_bytes()[..],
+            &[8, 6, 0, 0, 0],
+        ]
+        .concat();
         let mut crc_input = b"IHDR".to_vec();
         crc_input.extend_from_slice(&body);
         png.extend_from_slice(&body);
@@ -531,7 +650,12 @@ mod tests {
     /// the real decoder.
     fn try_in_sandbox(what: &str) -> std::process::ExitStatus {
         std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "decode::tests::sandboxed_child", "--nocapture", "--test-threads=1"])
+            .args([
+                "--exact",
+                "decode::tests::sandboxed_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
             .env("GANNET_SANDBOX_TRY", what)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -542,11 +666,24 @@ mod tests {
     /// Not a test by itself: does nothing unless `try_in_sandbox` started it.
     #[test]
     fn sandboxed_child() {
-        let Ok(what) = std::env::var("GANNET_SANDBOX_TRY") else { return };
+        let Ok(what) = std::env::var("GANNET_SANDBOX_TRY") else {
+            return;
+        };
         let png = encoded(&two_by_one(), image::ImageFormat::Png);
         let jpeg = sideways_jpeg();
-        let others: Vec<Vec<u8>> = [image::ImageFormat::Gif, image::ImageFormat::WebP, image::ImageFormat::Bmp, image::ImageFormat::Tiff, image::ImageFormat::Ico].map(|f| encoded(&two_by_one(), f)).into();
-        let big = encoded(&RgbaImage::from_raw(4000, 4000, vec![9u8; 4000 * 4000 * 4]).unwrap(), image::ImageFormat::Png);
+        let others: Vec<Vec<u8>> = [
+            image::ImageFormat::Gif,
+            image::ImageFormat::WebP,
+            image::ImageFormat::Bmp,
+            image::ImageFormat::Tiff,
+            image::ImageFormat::Ico,
+        ]
+        .map(|f| encoded(&two_by_one(), f))
+        .into();
+        let big = encoded(
+            &RgbaImage::from_raw(4000, 4000, vec![9u8; 4000 * 4000 * 4]).unwrap(),
+            image::ImageFormat::Png,
+        );
         assert!(sandbox::enter());
         if what == "decode" {
             run(&png).unwrap();
@@ -563,16 +700,31 @@ mod tests {
     fn a_locked_down_process_can_still_decode() {
         assert_eq!(try_in_sandbox("nothing").code(), Some(REACHED_THE_END));
         assert_eq!(try_in_sandbox("decode").code(), Some(REACHED_THE_END));
-        assert_eq!(try_in_sandbox("fstat-is-fine").code(), Some(REACHED_THE_END));
+        assert_eq!(
+            try_in_sandbox("fstat-is-fine").code(),
+            Some(REACHED_THE_END)
+        );
     }
 
     #[test]
     fn the_sandbox_stops_everything_a_takeover_would_want() {
         use std::os::unix::process::ExitStatusExt;
         for what in ["open", "stat-path", "statx-path"] {
-            assert_eq!(try_in_sandbox(what).code(), Some(REFUSED), "{what}: refused, and the process lives on");
+            assert_eq!(
+                try_in_sandbox(what).code(),
+                Some(REFUSED),
+                "{what}: refused, and the process lives on"
+            );
         }
-        for what in ["socket", "exec", "fork", "thread", "exec-memory", "make-executable", "signal-another"] {
+        for what in [
+            "socket",
+            "exec",
+            "fork",
+            "thread",
+            "exec-memory",
+            "make-executable",
+            "signal-another",
+        ] {
             assert_eq!(try_in_sandbox(what).signal(), Some(libc::SIGSYS), "{what}");
         }
     }
@@ -580,7 +732,10 @@ mod tests {
     #[test]
     fn running_out_of_memory_still_says_so() {
         use std::os::unix::process::ExitStatusExt;
-        assert_eq!(try_in_sandbox("out-of-memory").signal(), Some(libc::SIGABRT));
+        assert_eq!(
+            try_in_sandbox("out-of-memory").signal(),
+            Some(libc::SIGABRT)
+        );
     }
 
     fn crc32(data: &[u8]) -> u32 {
@@ -588,7 +743,11 @@ mod tests {
         for &b in data {
             crc ^= b as u32;
             for _ in 0..8 {
-                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xedb8_8320
+                } else {
+                    crc >> 1
+                };
             }
         }
         !crc

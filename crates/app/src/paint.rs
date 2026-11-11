@@ -16,6 +16,9 @@ use crate::icons::Icon;
 
 impl App {
     pub fn paint(&mut self, c: &mut Canvas) {
+        if self.viewer {
+            return self.paint_preview(c);
+        }
         let l = self.layout();
         let clip = c.clip();
         if clip.intersects(l.list) {
@@ -46,9 +49,6 @@ impl App {
         if self.menu.is_some() {
             self.paint_menu(c);
         }
-        if self.preview.is_some() {
-            self.paint_preview(c);
-        }
         if self.dialog.is_some() {
             self.paint_dialog(c);
         }
@@ -57,7 +57,12 @@ impl App {
 
     /// The target a drag is over, if it's this row or place.
     fn is_drop_target(&self, hit: Hit) -> bool {
-        matches!(&self.file_drag, Some(FileDrag::Active(ActiveDrag { target: Some(t), .. })) if t.hit == hit) || self.incoming.as_ref().and_then(|i| i.target.as_ref()).is_some_and(|t| t.hit == hit)
+        matches!(&self.file_drag, Some(FileDrag::Active(ActiveDrag { target: Some(t), .. })) if t.hit == hit)
+            || self
+                .incoming
+                .as_ref()
+                .and_then(|i| i.target.as_ref())
+                .is_some_and(|t| t.hit == hit)
     }
 
     /// What a drag carries: its row, as it looks in the list, with a stack and a count if
@@ -73,22 +78,64 @@ impl App {
         }
         c.rrect(row, radius, co.accent);
         let inset = self.px(1.0);
-        c.rrect(Rect::new(row.x + inset, row.y + inset, row.w - inset * 2, row.h - inset * 2), radius, co.selection);
+        c.rrect(
+            Rect::new(
+                row.x + inset,
+                row.y + inset,
+                row.w - inset * 2,
+                row.h - inset * 2,
+            ),
+            radius,
+            co.selection,
+        );
         let icon = self.px(16.0);
-        let tint = if g.kind.is_dirlike() { co.on_selection } else { blend(co.on_selection, co.selection, 0.25) };
-        self.icons.draw(c, icon_for(g.kind, &g.name), row.x + self.px(10.0), row.y + (row.h - icon) / 2, icon, tint);
+        let tint = if g.kind.is_dirlike() {
+            co.on_selection
+        } else {
+            blend(co.on_selection, co.selection, 0.25)
+        };
+        self.icons.draw(
+            c,
+            icon_for(g.kind, &g.name),
+            row.x + self.px(10.0),
+            row.y + (row.h - icon) / 2,
+            icon,
+            tint,
+        );
         let badge = g.count.to_string();
-        let badge_w = if g.count > 1 { self.text.measure(&badge).ceil() as i32 + self.px(12.0) } else { 0 };
+        let badge_w = if g.count > 1 {
+            self.text.measure(&badge).ceil() as i32 + self.px(12.0)
+        } else {
+            0
+        };
         let tx = (row.x + self.px(34.0)) as f32;
-        let right = row.right() - self.px(8.0) - if badge_w > 0 { badge_w + self.px(6.0) } else { 0 };
+        let right = row.right()
+            - self.px(8.0)
+            - if badge_w > 0 {
+                badge_w + self.px(6.0)
+            } else {
+                0
+            };
         let by = self.baseline(row.y, row.h);
         let name = String::from_utf8_lossy(&g.name).into_owned();
-        self.text.draw_fitted(c, &name, tx, by, right as f32 - tx, co.on_selection);
+        self.text
+            .draw_fitted(c, &name, tx, by, right as f32 - tx, co.on_selection);
         if badge_w > 0 {
             let h = self.px(18.0);
-            let pill = Rect::new(row.right() - self.px(6.0) - badge_w, row.y + (row.h - h) / 2, badge_w, h);
+            let pill = Rect::new(
+                row.right() - self.px(6.0) - badge_w,
+                row.y + (row.h - h) / 2,
+                badge_w,
+                h,
+            );
             c.rrect(pill, h / 2, co.accent);
-            self.text.draw_str(c, &badge, (pill.x + self.px(6.0)) as f32, self.baseline(pill.y, pill.h), co.on_accent);
+            self.text.draw_str(
+                c,
+                &badge,
+                (pill.x + self.px(6.0)) as f32,
+                self.baseline(pill.y, pill.h),
+                co.on_accent,
+            );
         }
     }
 
@@ -114,7 +161,11 @@ impl App {
         let co = self.colors;
         let radius = self.px(5.0);
         c.rrect(r, radius, co.accent);
-        let (x, by, max) = ((r.x + self.px(8.0)) as f32, self.baseline(r.y, r.h), (r.w - self.px(16.0)) as f32);
+        let (x, by, max) = (
+            (r.x + self.px(8.0)) as f32,
+            self.baseline(r.y, r.h),
+            (r.w - self.px(16.0)) as f32,
+        );
         self.text.draw_fitted(c, &label, x, by, max, co.on_accent);
     }
 
@@ -136,15 +187,33 @@ impl App {
         let l = self.layout();
         let co = self.colors;
         c.fill(l.toolbar, co.surface);
-        c.fill(Rect::new(0, l.toolbar.bottom() - 1, l.toolbar.w, 1), co.border);
+        c.fill(
+            Rect::new(0, l.toolbar.bottom() - 1, l.toolbar.w, 1),
+            co.border,
+        );
         let (b, pad, icon) = (self.px(36.0), self.px(6.0), self.px(18.0));
-        let buttons = [(Hit::Back, Icon::Back, self.history.can_go_back()), (Hit::Forward, Icon::Forward, self.history.can_go_forward()), (Hit::Up, Icon::Up, self.up_target().is_some())];
+        let buttons = [
+            (Hit::Back, Icon::Back, self.history.can_go_back()),
+            (Hit::Forward, Icon::Forward, self.history.can_go_forward()),
+            (Hit::Up, Icon::Up, self.up_target().is_some()),
+        ];
         for (i, (hit, ic, on)) in buttons.into_iter().enumerate() {
             let x = pad + i as i32 * b;
             if on && self.hover == hit {
-                c.rrect(Rect::new(x + 2, self.px(6.0), b - 4, l.toolbar.h - self.px(12.0)), self.px(5.0), co.hover);
+                c.rrect(
+                    Rect::new(x + 2, self.px(6.0), b - 4, l.toolbar.h - self.px(12.0)),
+                    self.px(5.0),
+                    co.hover,
+                );
             }
-            self.icons.draw(c, ic, x + (b - icon) / 2, (l.toolbar.h - icon) / 2, icon, if on { co.foreground } else { co.border });
+            self.icons.draw(
+                c,
+                ic,
+                x + (b - icon) / 2,
+                (l.toolbar.h - icon) / 2,
+                icon,
+                if on { co.foreground } else { co.border },
+            );
         }
         let y = self.baseline(0, l.toolbar.h);
         if let Edit::Path(f) = &self.edit {
@@ -157,12 +226,29 @@ impl App {
             let gap = self.px(14.0);
             for (i, (x, w, path)) in crumbs.into_iter().enumerate() {
                 if self.hover == Hit::Crumb(i) {
-                    c.rrect(Rect::new(x, self.px(8.0), w, l.toolbar.h - self.px(16.0)), self.px(5.0), co.hover);
+                    c.rrect(
+                        Rect::new(x, self.px(8.0), w, l.toolbar.h - self.px(16.0)),
+                        self.px(5.0),
+                        co.hover,
+                    );
                 }
                 let label = self.crumb_label(&path);
-                self.text.draw_str(c, &label, (x + self.px(6.0)) as f32, y, if i == last { co.foreground } else { co.muted });
+                self.text.draw_str(
+                    c,
+                    &label,
+                    (x + self.px(6.0)) as f32,
+                    y,
+                    if i == last { co.foreground } else { co.muted },
+                );
                 if i != last {
-                    self.icons.draw(c, Icon::Forward, x + w + (gap - self.px(10.0)) / 2, (l.toolbar.h - self.px(10.0)) / 2, self.px(10.0), co.muted);
+                    self.icons.draw(
+                        c,
+                        Icon::Forward,
+                        x + w + (gap - self.px(10.0)) / 2,
+                        (l.toolbar.h - self.px(10.0)) / 2,
+                        self.px(10.0),
+                        co.muted,
+                    );
                 }
             }
         }
@@ -174,7 +260,13 @@ impl App {
             c.frame(r, 1, co.border);
             let w = self.text.measure("Empty Trash");
             let by = self.baseline(r.y, r.h);
-            self.text.draw_str(c, "Empty Trash", r.x as f32 + (r.w as f32 - w) / 2.0, by, if on { co.danger } else { co.muted });
+            self.text.draw_str(
+                c,
+                "Empty Trash",
+                r.x as f32 + (r.w as f32 - w) / 2.0,
+                by,
+                if on { co.danger } else { co.muted },
+            );
         }
         if let Some(r) = self.filter_rect() {
             let focused = matches!(self.edit, Edit::Filter(_));
@@ -197,17 +289,26 @@ impl App {
         let shift = (caret_x - inner.w as f32 + 2.0).max(0.0);
         let x0 = inner.x as f32 - shift;
         let (a, b) = f.selection();
-        let (sa, sb) = (self.text.measure(&f.text[..a]), self.text.measure(&f.text[..b]));
+        let (sa, sb) = (
+            self.text.measure(&f.text[..a]),
+            self.text.measure(&f.text[..b]),
+        );
         let line = self.text.line_height() as i32;
         let line_y = r.y + (r.h - line) / 2;
         let text = &mut self.text;
         Self::with_clip(c, inner, |c| {
             if focused && a != b {
-                c.fill(Rect::new((x0 + sa) as i32, line_y, (sb - sa) as i32, line), co.selection);
+                c.fill(
+                    Rect::new((x0 + sa) as i32, line_y, (sb - sa) as i32, line),
+                    co.selection,
+                );
             }
             text.draw_str(c, &f.text, x0, y, co.foreground);
             if focused {
-                c.fill(Rect::new((x0 + caret_x) as i32, line_y, 1, line), co.foreground);
+                c.fill(
+                    Rect::new((x0 + caret_x) as i32, line_y, 1, line),
+                    co.foreground,
+                );
             }
         });
     }
@@ -216,14 +317,22 @@ impl App {
         let l = self.layout();
         let co = self.colors;
         c.fill(l.sidebar, co.surface);
-        c.fill(Rect::new(l.sidebar.right() - 1, l.sidebar.y, 1, l.sidebar.h), co.border);
+        c.fill(
+            Rect::new(l.sidebar.right() - 1, l.sidebar.y, 1, l.sidebar.h),
+            co.border,
+        );
         let row = self.px(30.0);
         let icon = self.px(16.0);
         let top = l.sidebar.y + self.px(8.0);
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {
             let y = top + i as i32 * row;
-            let r = Rect::new(l.sidebar.x + self.px(6.0), y, l.sidebar.w - self.px(13.0), row);
+            let r = Rect::new(
+                l.sidebar.x + self.px(6.0),
+                y,
+                l.sidebar.w - self.px(13.0),
+                row,
+            );
             let here = p.path == self.dir;
             if self.is_drop_target(Hit::Place(i)) {
                 c.rrect(r, self.px(5.0), blend(co.accent, co.surface, 0.45));
@@ -243,7 +352,14 @@ impl App {
                 PlaceKind::Pictures => Icon::Image,
                 PlaceKind::Videos => Icon::Video,
             };
-            self.icons.draw(c, ic, r.x + self.px(8.0), y + (row - icon) / 2, icon, if here { co.on_selection } else { co.muted });
+            self.icons.draw(
+                c,
+                ic,
+                r.x + self.px(8.0),
+                y + (row - icon) / 2,
+                icon,
+                if here { co.on_selection } else { co.muted },
+            );
             let tx = (r.x + self.px(32.0)) as f32;
             let color = if here { co.on_selection } else { co.foreground };
             let max = (r.right() - self.px(6.0)) as f32 - tx;
@@ -257,7 +373,10 @@ impl App {
         let l = self.layout();
         let co = self.colors;
         c.fill(l.header, co.base);
-        c.fill(Rect::new(l.header.x, l.header.bottom() - 1, l.header.w, 1), co.border);
+        c.fill(
+            Rect::new(l.header.x, l.header.bottom() - 1, l.header.w, 1),
+            co.border,
+        );
         let date_x = l.header.right() - self.px(14.0) - l.col_date;
         let size_x = date_x - l.col_size;
         let name_x = l.header.x + self.px(14.0);
@@ -265,19 +384,47 @@ impl App {
         let arrow = self.px(14.0);
         let trash = self.listing.as_ref().is_some_and(|l| l.is_trash());
         if let Some((ox, _)) = self.origin_column(l.header, size_x).filter(|_| trash) {
-            self.text.draw_str(c, "Original location", ox as f32, y, co.muted);
+            self.text
+                .draw_str(c, "Original location", ox as f32, y, co.muted);
         }
-        let cols = [(SortKey::Name, "Name", name_x), (SortKey::Size, "Size", size_x), (SortKey::Modified, if trash { "Deleted" } else { "Modified" }, date_x)];
+        let cols = [
+            (SortKey::Name, "Name", name_x),
+            (SortKey::Size, "Size", size_x),
+            (
+                SortKey::Modified,
+                if trash { "Deleted" } else { "Modified" },
+                date_x,
+            ),
+        ];
         for (key, label, x) in cols {
             let on = self.sort.key == key;
-            let color = if on || self.hover == Hit::Header(key) { co.foreground } else { co.muted };
+            let color = if on || self.hover == Hit::Header(key) {
+                co.foreground
+            } else {
+                co.muted
+            };
             // Size figures sit to the right of their column, so its label does too.
             let w = self.text.measure(label) as i32;
-            let x = if key == SortKey::Size { date_x - self.px(16.0) - w - if on { arrow } else { 0 } } else { x };
+            let x = if key == SortKey::Size {
+                date_x - self.px(16.0) - w - if on { arrow } else { 0 }
+            } else {
+                x
+            };
             self.text.draw_str(c, label, x as f32, y, color);
             if on {
-                let ic = if self.sort.descending { Icon::ArrowDown } else { Icon::ArrowUp };
-                self.icons.draw(c, ic, x + w + self.px(3.0), l.header.y + (l.header.h - arrow) / 2, arrow, co.muted);
+                let ic = if self.sort.descending {
+                    Icon::ArrowDown
+                } else {
+                    Icon::ArrowUp
+                };
+                self.icons.draw(
+                    c,
+                    ic,
+                    x + w + self.px(3.0),
+                    l.header.y + (l.header.h - arrow) / 2,
+                    arrow,
+                    co.muted,
+                );
             }
         }
     }
@@ -290,7 +437,12 @@ impl App {
         if let (Edit::NewFolder(f), true) = (&self.edit, self.rows.is_empty()) {
             let f = f.clone();
             let name_x = area.x + self.px(38.0);
-            let r = Rect::new(name_x - self.px(4.0), area.y + 1, self.px(300.0), l.row_h - self.px(2.0));
+            let r = Rect::new(
+                name_x - self.px(4.0),
+                area.y + 1,
+                self.px(300.0),
+                l.row_h - self.px(2.0),
+            );
             self.paint_field(c, r, &f, true);
             return;
         }
@@ -320,13 +472,23 @@ impl App {
         let date_x = area.right() - self.px(14.0) - l.col_date;
         let size_x = date_x - l.col_size;
         let name_x = area.x + self.px(38.0);
-        let origin = self.origin_column(area, size_x).filter(|_| listing.is_trash());
+        let origin = self
+            .origin_column(area, size_x)
+            .filter(|_| listing.is_trash());
         let name_max = (origin.map_or(size_x, |(ox, _)| ox) - self.px(10.0) - name_x) as f32;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let icon = self.px(16.0);
         let now = time::now();
-        let hover_row = if let Hit::Row(r) = self.hover { Some(r) } else { None };
-        let thumb_room = if self.scrollbar_visible() { self.px(12.0) } else { 0 };
+        let hover_row = if let Hit::Row(r) = self.hover {
+            Some(r)
+        } else {
+            None
+        };
+        let thumb_room = if self.scrollbar_visible() {
+            self.px(12.0)
+        } else {
+            0
+        };
         Self::with_clip(c, area, |c| {
             let visible = (area.h + offset) / row_h.max(1) + 1;
             for vis in 0..visible as usize {
@@ -348,23 +510,68 @@ impl App {
                 if self.cursor_shown && row == self.cursor {
                     c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.accent);
                 }
-                let fg = if selected { co.on_selection } else { co.foreground };
-                let dim = if selected { blend(co.on_selection, co.selection, 0.25) } else { co.muted };
+                let fg = if selected {
+                    co.on_selection
+                } else {
+                    co.foreground
+                };
+                let dim = if selected {
+                    blend(co.on_selection, co.selection, 0.25)
+                } else {
+                    co.muted
+                };
                 let name = listing.name(id);
                 let kind = listing.kind(id);
-                let tint = if kind.is_dirlike() { if selected { co.on_selection } else { co.accent } } else { dim };
-                self.icons.draw(c, icon_for(kind, name), area.x + self.px(14.0), y + (row_h - icon) / 2, icon, tint);
+                let tint = if kind.is_dirlike() {
+                    if selected { co.on_selection } else { co.accent }
+                } else {
+                    dim
+                };
+                self.icons.draw(
+                    c,
+                    icon_for(kind, name),
+                    area.x + self.px(14.0),
+                    y + (row_h - icon) / 2,
+                    icon,
+                    tint,
+                );
                 let shown = String::from_utf8_lossy(name);
-                let by = y + ((row_h as f32 + self.text.ascent - self.text.descent) / 2.0).round() as i32;
-                let is_cut = !self.cut_paths.is_empty() && self.cut_paths.iter().any(|p| p.parent() == Some(listing.dir.as_path()) && p.file_name() == Some(listing.os_name(id)));
-                if let Edit::Rename { name: editing, field, .. } = &self.edit
+                let by = y
+                    + ((row_h as f32 + self.text.ascent - self.text.descent) / 2.0).round() as i32;
+                let is_cut = !self.cut_paths.is_empty()
+                    && self.cut_paths.iter().any(|p| {
+                        p.parent() == Some(listing.dir.as_path())
+                            && p.file_name() == Some(listing.os_name(id))
+                    });
+                if let Edit::Rename {
+                    name: editing,
+                    field,
+                    ..
+                } = &self.edit
                     && editing.as_slice() == name
                 {
                     let f = field.clone();
                     let box_h = (row_h - self.px(2.0)).max(1);
-                    self.paint_field(c, Rect::new(name_x - self.px(4.0), y + 1, name_max as i32 + self.px(8.0), box_h), &f, true);
+                    self.paint_field(
+                        c,
+                        Rect::new(
+                            name_x - self.px(4.0),
+                            y + 1,
+                            name_max as i32 + self.px(8.0),
+                            box_h,
+                        ),
+                        &f,
+                        true,
+                    );
                 } else {
-                    self.text.draw_fitted(c, &shown, name_x as f32, by, name_max, if is_cut { dim } else { fg });
+                    self.text.draw_fitted(
+                        c,
+                        &shown,
+                        name_x as f32,
+                        by,
+                        name_max,
+                        if is_cut { dim } else { fg },
+                    );
                 }
                 if let Some((ox, ow)) = origin
                     && let Some(folder) = listing.original(id).and_then(Path::parent)
@@ -374,14 +581,16 @@ impl App {
                         Some(rest) => format!("~/{}", rest.display()),
                         None => folder.display().to_string(),
                     };
-                    self.text.draw_fitted(c, &shown, ox as f32, by, ow as f32, dim);
+                    self.text
+                        .draw_fitted(c, &shown, ox as f32, by, ow as f32, dim);
                 }
                 match listing.stat(id) {
                     Stat::Known { size, mtime } => {
                         if !matches!(kind, Kind::Dir | Kind::LinkDir) {
                             let s = format::size(size);
                             let w = self.text.measure(&s);
-                            self.text.draw_str(c, &s, (date_x - self.px(16.0)) as f32 - w, by, dim);
+                            self.text
+                                .draw_str(c, &s, (date_x - self.px(16.0)) as f32 - w, by, dim);
                         }
                         let d = format::date(mtime, now);
                         self.text.draw_str(c, &d, date_x as f32, by, dim);
@@ -394,14 +603,39 @@ impl App {
                 let f = f.clone();
                 let r = Rect::new(area.x, area.y, area.w, row_h);
                 c.fill(r, co.hover);
-                self.icons.draw(c, crate::icons::Icon::Folder, area.x + self.px(14.0), area.y + (row_h - icon) / 2, icon, co.accent);
-                self.paint_field(c, Rect::new(name_x - self.px(4.0), area.y + 1, name_max as i32 + self.px(8.0), row_h - self.px(2.0)), &f, true);
+                self.icons.draw(
+                    c,
+                    crate::icons::Icon::Folder,
+                    area.x + self.px(14.0),
+                    area.y + (row_h - icon) / 2,
+                    icon,
+                    co.accent,
+                );
+                self.paint_field(
+                    c,
+                    Rect::new(
+                        name_x - self.px(4.0),
+                        area.y + 1,
+                        name_max as i32 + self.px(8.0),
+                        row_h - self.px(2.0),
+                    ),
+                    &f,
+                    true,
+                );
             }
             if thumb_room > 0 {
                 let (ty, th) = self.scrollbar_thumb();
                 let w = self.px(5.0);
-                let color = if self.hover == Hit::Scrollbar { co.muted } else { co.border };
-                c.rrect(Rect::new(area.right() - w - self.px(3.0), area.y + ty, w, th), w / 2, color);
+                let color = if self.hover == Hit::Scrollbar {
+                    co.muted
+                } else {
+                    co.border
+                };
+                c.rrect(
+                    Rect::new(area.right() - w - self.px(3.0), area.y + ty, w, th),
+                    w / 2,
+                    color,
+                );
             }
         });
     }
@@ -418,25 +652,53 @@ impl App {
         let w = self.text.measure(msg);
         let x = area.x as f32 + ((area.w as f32 - w) / 2.0).max(self.px(12.0) as f32);
         let y = self.baseline(area.y + area.h / 3, self.px(30.0));
-        self.text.draw_fitted(c, msg, x, y, (area.w - self.px(24.0)) as f32, color);
+        self.text
+            .draw_fitted(c, msg, x, y, (area.w - self.px(24.0)) as f32, color);
     }
 
     fn paint_notices(&mut self, c: &mut Canvas) {
         let l = self.layout();
         let co = self.colors;
         let row = self.px(30.0);
-        let shown_jobs: Vec<_> = self.visible_jobs().take(4).map(|j| (j.job.label.clone(), j.job.progress.clone(), j.job.is_cancelled())).collect();
+        let shown_jobs: Vec<_> = self
+            .visible_jobs()
+            .take(4)
+            .map(|j| {
+                (
+                    j.job.label.clone(),
+                    j.job.progress.clone(),
+                    j.job.is_cancelled(),
+                )
+            })
+            .collect();
         let job_rows = shown_jobs.len();
         for (i, (label, p, stopping)) in shown_jobs.into_iter().enumerate() {
             let y = l.notices.y + i as i32 * row;
             let r = Rect::new(l.notices.x, y, l.notices.w, row);
             c.fill(r, co.surface);
             c.fill(Rect::new(r.x, r.y, r.w, 1), co.border);
-            let (total, done) = (p.total_bytes.load(Ordering::Relaxed), p.done_bytes.load(Ordering::Relaxed));
-            let (items, done_items) = (p.total_items.load(Ordering::Relaxed), p.done_items.load(Ordering::Relaxed));
+            let (total, done) = (
+                p.total_bytes.load(Ordering::Relaxed),
+                p.done_bytes.load(Ordering::Relaxed),
+            );
+            let (items, done_items) = (
+                p.total_items.load(Ordering::Relaxed),
+                p.done_items.load(Ordering::Relaxed),
+            );
             let scanning = p.scanning.load(Ordering::Relaxed);
-            let fraction = if total > 0 { done as f32 / total as f32 } else if items > 0 { done_items as f32 / items as f32 } else { 0.0 };
-            let bar = Rect::new(r.right() - self.px(240.0), y + (row - self.px(6.0)) / 2, self.px(200.0), self.px(6.0));
+            let fraction = if total > 0 {
+                done as f32 / total as f32
+            } else if items > 0 {
+                done_items as f32 / items as f32
+            } else {
+                0.0
+            };
+            let bar = Rect::new(
+                r.right() - self.px(240.0),
+                y + (row - self.px(6.0)) / 2,
+                self.px(200.0),
+                self.px(6.0),
+            );
             let text_max = (bar.x - self.px(12.0) - r.x - self.px(14.0)) as f32;
             let detail = if stopping {
                 format!("{label}: stopping…")
@@ -448,13 +710,35 @@ impl App {
                 label
             };
             let by = self.baseline(y, row);
-            self.text.draw_fitted(c, &detail, (r.x + self.px(14.0)) as f32, by, text_max, co.foreground);
+            self.text.draw_fitted(
+                c,
+                &detail,
+                (r.x + self.px(14.0)) as f32,
+                by,
+                text_max,
+                co.foreground,
+            );
             c.rrect(bar, bar.h / 2, co.hover);
-            let fill = ((bar.w as f32 * fraction.clamp(0.0, 1.0)) as i32).max(if scanning { 0 } else { bar.h });
+            let fill = ((bar.w as f32 * fraction.clamp(0.0, 1.0)) as i32).max(if scanning {
+                0
+            } else {
+                bar.h
+            });
             c.rrect(Rect::new(bar.x, bar.y, fill, bar.h), bar.h / 2, co.accent);
             let s = self.px(12.0);
-            let color = if self.hover == Hit::JobCancel(i) { co.foreground } else { co.muted };
-            self.icons.draw(c, Icon::Close, r.right() - self.px(22.0), y + (row - s) / 2, s, color);
+            let color = if self.hover == Hit::JobCancel(i) {
+                co.foreground
+            } else {
+                co.muted
+            };
+            self.icons.draw(
+                c,
+                Icon::Close,
+                r.right() - self.px(22.0),
+                y + (row - s) / 2,
+                s,
+                color,
+            );
         }
         let count = self.notices.len().min(4);
         let shown: Vec<String> = self.notices.iter().take(count).cloned().collect();
@@ -465,11 +749,33 @@ impl App {
             c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.danger);
             let by = self.baseline(y, row);
             let more = self.notices.len() - count;
-            let line = if more > 0 && i + 1 == count { format!("{msg} (and {more} more)") } else { msg.clone() };
-            self.text.draw_fitted(c, &line, (r.x + self.px(14.0)) as f32, by, (r.w - self.px(52.0)) as f32, co.foreground);
+            let line = if more > 0 && i + 1 == count {
+                format!("{msg} (and {more} more)")
+            } else {
+                msg.clone()
+            };
+            self.text.draw_fitted(
+                c,
+                &line,
+                (r.x + self.px(14.0)) as f32,
+                by,
+                (r.w - self.px(52.0)) as f32,
+                co.foreground,
+            );
             let s = self.px(12.0);
-            let color = if self.hover == Hit::NoticeClose(i) { co.foreground } else { co.muted };
-            self.icons.draw(c, Icon::Close, r.right() - self.px(22.0), y + (row - s) / 2, s, color);
+            let color = if self.hover == Hit::NoticeClose(i) {
+                co.foreground
+            } else {
+                co.muted
+            };
+            self.icons.draw(
+                c,
+                Icon::Close,
+                r.right() - self.px(22.0),
+                y + (row - s) / 2,
+                s,
+                color,
+            );
         }
     }
 
@@ -479,10 +785,22 @@ impl App {
         let r = self.dialog_rect();
         c.rrect(r, self.px(8.0), co.surface);
         c.frame(r, 1, co.border);
-        let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let name = |p: &std::path::Path| {
+            p.file_name().map_or_else(
+                || p.to_string_lossy().into_owned(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        };
         let (title, line2, at) = match &d {
             Dialog::Conflict { conflict, at, .. } => {
-                let t = if conflict.both_folders { format!("A folder named “{}” is already here", name(&conflict.target)) } else { format!("“{}” is already here", name(&conflict.target)) };
+                let t = if conflict.both_folders {
+                    format!(
+                        "A folder named “{}” is already here",
+                        name(&conflict.target)
+                    )
+                } else {
+                    format!("“{}” is already here", name(&conflict.target))
+                };
                 let body = if conflict.both_folders {
                     "Merge puts the contents together and asks about any clashes."
                 } else if conflict.can_replace {
@@ -492,23 +810,38 @@ impl App {
                 };
                 (t, body.to_string(), *at)
             }
-            Dialog::ConfirmDelete { paths, at, empty: true } => {
+            Dialog::ConfirmDelete {
+                paths,
+                at,
+                empty: true,
+            } => {
                 let t = match paths.len() {
                     1 => "Delete the one item in the Trash for good?".to_string(),
                     n => format!("Delete all {n} items in the Trash for good?"),
                 };
                 // A disk that didn't answer keeps its items, and the question shouldn't hide that.
-                let more = if self.load_error.is_some() { " A disk that couldn't be read keeps its items." } else { "" };
+                let more = if self.load_error.is_some() {
+                    " A disk that couldn't be read keeps its items."
+                } else {
+                    ""
+                };
                 (t, format!("This can't be undone.{more}"), *at)
             }
             Dialog::ConfirmDelete { paths, at, .. } => {
                 let t = match paths.as_slice() {
                     [one] => format!("Delete “{}” for good?", name(one)),
-                    many => format!("Delete {} for good?", format::count(many.len(), "item", "items")),
+                    many => format!(
+                        "Delete {} for good?",
+                        format::count(many.len(), "item", "items")
+                    ),
                 };
                 (t, "This can't be undone.".to_string(), *at)
             }
-            Dialog::ConfirmQuit { at } => ("Operations are still running".to_string(), "Closing stops them. Whatever's finished stays finished.".to_string(), *at),
+            Dialog::ConfirmQuit { at } => (
+                "Operations are still running".to_string(),
+                "Closing stops them. Whatever's finished stays finished.".to_string(),
+                *at,
+            ),
         };
         let x = (r.x + self.px(16.0)) as f32;
         let max = (r.w - self.px(32.0)) as f32;
@@ -526,18 +859,35 @@ impl App {
             }
             c.frame(bx, 1, if *apply_to_all { co.accent } else { co.muted });
             let by = self.baseline(cr.y, cr.h);
-            self.text.draw_str(c, "Do the same for the rest (A)", (cr.x + s + self.px(8.0)) as f32, by, co.foreground);
+            self.text.draw_str(
+                c,
+                "Do the same for the rest (A)",
+                (cr.x + s + self.px(8.0)) as f32,
+                by,
+                co.foreground,
+            );
         }
         let buttons = App::dialog_buttons(&d);
         let rects = self.dialog_button_rects(&d);
         for (i, (b, br)) in buttons.iter().zip(&rects).enumerate() {
             let focused = i == at;
-            let bg = if focused { if b.danger { co.danger } else { co.accent } } else { co.hover };
+            let bg = if focused {
+                if b.danger { co.danger } else { co.accent }
+            } else {
+                co.hover
+            };
             c.rrect(*br, self.px(5.0), bg);
-            let fg = if focused { co.on_accent } else if b.danger { co.danger } else { co.foreground };
+            let fg = if focused {
+                co.on_accent
+            } else if b.danger {
+                co.danger
+            } else {
+                co.foreground
+            };
             let w = self.text.measure(b.label);
             let by = self.baseline(br.y, br.h);
-            self.text.draw_str(c, b.label, br.x as f32 + (br.w as f32 - w) / 2.0, by, fg);
+            self.text
+                .draw_str(c, b.label, br.x as f32 + (br.w as f32 - w) / 2.0, by, fg);
         }
         self.dialog = Some(d);
     }
@@ -549,7 +899,14 @@ impl App {
         c.fill(Rect::new(0, l.status.y, l.status.w, 1), co.border);
         let msg = self.status_text();
         let y = self.baseline(l.status.y, l.status.h);
-        self.text.draw_fitted(c, &msg, self.px(12.0) as f32, y, (l.status.w - self.px(24.0)) as f32, co.muted);
+        self.text.draw_fitted(
+            c,
+            &msg,
+            self.px(12.0) as f32,
+            y,
+            (l.status.w - self.px(24.0)) as f32,
+            co.muted,
+        );
     }
 
     fn status_text(&mut self) -> String {
@@ -562,7 +919,12 @@ impl App {
             s.push_str(" matching the filter");
         }
         if self.sel_count > 0 {
-            s.push_str(&format!(" · {} selected", format::count(self.sel_count, "item", "items").replace(" items", "").replace(" item", "")));
+            s.push_str(&format!(
+                " · {} selected",
+                format::count(self.sel_count, "item", "items")
+                    .replace(" items", "")
+                    .replace(" item", "")
+            ));
             if let Some(l) = &self.listing
                 && self.sel_count <= 2000
             {
@@ -598,7 +960,11 @@ impl App {
         for (i, item) in m.items.iter().enumerate() {
             let y = top + i as i32 * row;
             if i == m.at && item.enabled {
-                c.rrect(Rect::new(r.x + self.px(4.0), y, r.w - self.px(8.0), row), self.px(4.0), co.selection);
+                c.rrect(
+                    Rect::new(r.x + self.px(4.0), y, r.w - self.px(8.0), row),
+                    self.px(4.0),
+                    co.selection,
+                );
             }
             let fg = if !item.enabled {
                 co.border
@@ -608,11 +974,17 @@ impl App {
                 co.foreground
             };
             let by = self.baseline(y, row);
-            self.text.draw_str(c, item.label, (r.x + self.px(12.0)) as f32, by, fg);
+            self.text
+                .draw_str(c, item.label, (r.x + self.px(12.0)) as f32, by, fg);
             let w = self.text.measure(item.keys);
-            self.text.draw_str(c, item.keys, (r.right() - self.px(12.0)) as f32 - w, by, if item.enabled { co.muted } else { co.border });
+            self.text.draw_str(
+                c,
+                item.keys,
+                (r.right() - self.px(12.0)) as f32 - w,
+                by,
+                if item.enabled { co.muted } else { co.border },
+            );
         }
         self.menu = Some(m);
     }
 }
-

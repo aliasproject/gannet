@@ -45,6 +45,8 @@ Gannet also has a set of performance budgets, which `bench/run.py` checks:
 | Painting while scrolling, 99th percentile, 3840x2160 | 8.3 ms | 3.9 ms |
 | Longest UI stall, slow folder | 16 ms | 3.3 ms |
 | Moving 5,000 files to Trash | 1,000 ms | 216 ms |
+| Space to the preview window | 25 ms | 6.5 ms |
+| Space to a 1600x1200 photo in the preview | 100 ms | 11.1 ms |
 | Idle wakeups | 1 per second | 0 |
 
 To run them yourself, see [bench/README.md](bench/README.md).
@@ -160,16 +162,28 @@ after a few seconds, and the status bar says so.
 
 ## Preview
 
-Space shows the file under the cursor in a popup, and Space or Escape closes it. Arrows go to
-the next or previous file. Plus and minus zoom, 0 fits, and Shift+arrows or dragging moves a
-zoomed image around.
+Space opens the file under the cursor in a preview window, and Space or Escape closes it, in
+either window. Arrows, or the mouse's back and forward buttons, go to the next or previous
+file, and the list's cursor follows; moving the cursor in the list changes the preview too.
+Enter opens the file in its app. Plus and minus zoom, 0 fits, and Shift+arrows or dragging
+moves a zoomed image around.
+
+The preview runs as a program of its own, `gannet --preview FILE`, so a file that crashes it
+closes only the preview, and the list says so. Its app ID is `com.aliasproject.Gannet.Preview`,
+for window rules: on aliasOS it floats over the list. Elsewhere, add a rule to float it if you
+like; without one, it opens beside the list like any other window.
 
 Images are PNG, JPEG, WebP, GIF (its first frame), BMP, TIFF and ICO. If another program has
 already made a thumbnail, it shows until the full image is ready.
 
-Videos play in the popup with sound, using libmpv. P or Enter pauses, Shift+Left and Shift+Right
-seek, Shift+Up and Shift+Down set the volume, and M mutes. Clicking the picture pauses, and the
+Videos play with sound, using libmpv. P or Enter pauses, Shift+Left and Shift+Right seek,
+Shift+Up and Shift+Down set the volume, and M mutes. Clicking the picture pauses, and the
 footer has the same controls for the mouse.
+
+Anything else shows what it is, from the system's file type database (shared-mime-info): its
+icon, or a thumbnail another program made, its type ("PDF document"), size and date, and an
+Open button. The type comes from the file's name, or from its first few kilobytes when the
+name doesn't say.
 
 ### Sandboxing
 
@@ -191,9 +205,11 @@ microphone.
 
 ## Theme
 
-Gannet uses the light or dark preference from your GTK settings or `gsettings`, with a built-in
-palette, and asks `gsettings` again whenever its window regains focus. With no preference set,
-it's light.
+On aliasOS, Gannet uses the theme's own colors, from
+`~/.local/state/aliasos/current/theme/colors.toml`, and changes with the theme while it's open.
+Elsewhere, it uses the light or dark preference from your GTK settings or `gsettings`, with a
+built-in palette, and asks `gsettings` again whenever its window regains focus. With no
+preference set, it's light.
 
 ## Known gaps
 

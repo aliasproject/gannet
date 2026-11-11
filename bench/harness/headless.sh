@@ -17,6 +17,8 @@ output HEADLESS-1 resolution $SIZE scale 1
 default_border none
 default_floating_border none
 font pango:monospace 1
+# Gannet's preview window floats over the list, as aliasOS's window rules float it.
+for_window [app_id="com.aliasproject.Gannet.Preview"] floating enable, resize set 960 720, move position center
 CONF
 exec env -i PATH=/usr/bin HOME="$ROOT/home" XDG_CACHE_HOME="$ROOT/cache" XDG_CONFIG_HOME="$ROOT/config" \
   XDG_STATE_HOME="$ROOT/state" XDG_DATA_HOME="$ROOT/data" XDG_RUNTIME_DIR="$ROOT/runtime" \

@@ -23,7 +23,11 @@ pub fn blend(a: Rgb, b: Rgb, t: f32) -> Rgb {
 pub fn luminance(c: Rgb) -> f32 {
     let lin = |shift: u32| {
         let v = ((c >> shift) & 255) as f32 / 255.0;
-        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
     };
     0.2126 * lin(16) + 0.7152 * lin(8) + 0.0722 * lin(0)
 }
@@ -34,7 +38,11 @@ fn contrast(a: Rgb, b: Rgb) -> f32 {
 }
 
 fn readable_on(bg: Rgb) -> Rgb {
-    if contrast(bg, 0xffffff) >= contrast(bg, 0x000000) { 0xffffff } else { 0x000000 }
+    if contrast(bg, 0xffffff) >= contrast(bg, 0x000000) {
+        0xffffff
+    } else {
+        0x000000
+    }
 }
 
 /// Every color the UI draws with, all derived from a theme's palette so any theme
@@ -77,9 +85,20 @@ pub fn parse_colors(text: &str) -> Option<Colors> {
     };
     let bg = get("background")?;
     let fg = get("foreground")?;
-    let accent = get("accent").or_else(|| get("color4")).or_else(|| get("blue")).unwrap_or_else(|| blend(fg, bg, 0.3));
-    let selection = get("selection_background").or_else(|| get("selection")).unwrap_or_else(|| blend(bg, accent, 0.35));
-    let on_selection = get("selection_foreground").unwrap_or_else(|| if contrast(selection, fg) >= 3.0 { fg } else { readable_on(selection) });
+    let accent = get("accent")
+        .or_else(|| get("color4"))
+        .or_else(|| get("blue"))
+        .unwrap_or_else(|| blend(fg, bg, 0.3));
+    let selection = get("selection_background")
+        .or_else(|| get("selection"))
+        .unwrap_or_else(|| blend(bg, accent, 0.35));
+    let on_selection = get("selection_foreground").unwrap_or_else(|| {
+        if contrast(selection, fg) >= 3.0 {
+            fg
+        } else {
+            readable_on(selection)
+        }
+    });
     let mode = text.lines().find_map(|l| {
         let (k, v) = l.split_once('=')?;
         (k.trim() == "mode").then(|| v.trim().trim_matches('"').to_string())
@@ -101,8 +120,20 @@ pub fn parse_colors(text: &str) -> Option<Colors> {
         on_accent: readable_on(accent),
         selection,
         on_selection,
-        danger: get("color1").or_else(|| get("red")).unwrap_or(if luminance(bg) < 0.4 { 0xe06c75 } else { 0xc0392b }),
-        warning: get("color3").or_else(|| get("yellow")).unwrap_or(if luminance(bg) < 0.4 { 0xe5c07b } else { 0xb7791f }),
+        danger: get("color1")
+            .or_else(|| get("red"))
+            .unwrap_or(if luminance(bg) < 0.4 {
+                0xe06c75
+            } else {
+                0xc0392b
+            }),
+        warning: get("color3")
+            .or_else(|| get("yellow"))
+            .unwrap_or(if luminance(bg) < 0.4 {
+                0xe5c07b
+            } else {
+                0xb7791f
+            }),
     })
 }
 
@@ -129,7 +160,10 @@ pub struct ThemePaths {
 
 impl ThemePaths {
     pub fn for_home(home: &Path, config_home: &Path) -> Self {
-        Self { state_home: home.join(".local/state"), config_home: config_home.to_path_buf() }
+        Self {
+            state_home: home.join(".local/state"),
+            config_home: config_home.to_path_buf(),
+        }
     }
 
     fn current(&self) -> PathBuf {
@@ -182,7 +216,12 @@ pub fn load(paths: &ThemePaths) -> (Colors, Source) {
 fn read_aliasos(paths: &ThemePaths) -> Option<Colors> {
     let mut colors = parse_colors(&std::fs::read_to_string(paths.colors_file()).ok()?)?;
     // aliasOS marks light themes with this file too.
-    if paths.current().join("theme/light.mode").symlink_metadata().is_ok() {
+    if paths
+        .current()
+        .join("theme/light.mode")
+        .symlink_metadata()
+        .is_ok()
+    {
         colors.dark = false;
     }
     Some(colors)
@@ -201,7 +240,9 @@ pub fn reload(paths: &ThemePaths) -> Option<Colors> {
 /// but means starting a process, so the app asks that after the first frame.
 fn gtk_settings_dark(config_home: &Path) -> Option<bool> {
     for file in ["gtk-4.0/settings.ini", "gtk-3.0/settings.ini"] {
-        let Ok(text) = std::fs::read_to_string(config_home.join(file)) else { continue };
+        let Ok(text) = std::fs::read_to_string(config_home.join(file)) else {
+            continue;
+        };
         let value = |key: &str| {
             text.lines().find_map(|l| {
                 let (k, v) = l.split_once('=')?;
@@ -222,7 +263,10 @@ fn gtk_settings_dark(config_home: &Path) -> Option<bool> {
 /// The answer from `gsettings`, if it's around. Blocks on a process, so call this off
 /// the UI thread.
 pub fn query_gsettings_dark() -> Option<bool> {
-    let out = std::process::Command::new("gsettings").args(["get", "org.gnome.desktop.interface", "color-scheme"]).output().ok()?;
+    let out = std::process::Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.interface", "color-scheme"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -247,7 +291,10 @@ pub struct ThemeWatch {
 
 impl ThemeWatch {
     pub fn new(paths: ThemePaths) -> rustix::io::Result<Self> {
-        let w = Self { watch: Watch::new()?, paths };
+        let w = Self {
+            watch: Watch::new()?,
+            paths,
+        };
         w.rearm();
         Ok(w)
     }
@@ -283,7 +330,10 @@ mod tests {
     const SAMPLE: &str = "# comment with = \"#000000\"\naccent = \"#5E92C6\"\nforeground = \"#C5CED6\"\nbackground = \"#0B111A\"\nselection_foreground = \"#E3EAF0\"\nselection_background = \"#1E3047\"\ncolor1 = \"#C25F54\"\ncolor3 = \"#D19A4E\"\n";
 
     fn paths(s: &Scratch) -> ThemePaths {
-        ThemePaths { state_home: s.path().join("state"), config_home: s.path().join("config") }
+        ThemePaths {
+            state_home: s.path().join("state"),
+            config_home: s.path().join("config"),
+        }
     }
 
     fn write_theme(s: &Scratch, text: &str) {
@@ -320,7 +370,15 @@ mod tests {
 
     #[test]
     fn malformed_themes_are_rejected_without_panicking() {
-        for bad in ["", "background = \"#xyz\"\nforeground = \"#000000\"", "background = \"#12345\"\nforeground = \"#000000\"", "background = #000000\nforeground = \"#000000\"", "background = \"#ééé\"\nforeground = \"#000000\"", "background = \"#000000", "=\n=\"\n\""] {
+        for bad in [
+            "",
+            "background = \"#xyz\"\nforeground = \"#000000\"",
+            "background = \"#12345\"\nforeground = \"#000000\"",
+            "background = #000000\nforeground = \"#000000\"",
+            "background = \"#ééé\"\nforeground = \"#000000\"",
+            "background = \"#000000",
+            "=\n=\"\n\"",
+        ] {
             assert!(parse_colors(bad).is_none(), "{bad:?}");
         }
     }
@@ -335,7 +393,10 @@ mod tests {
     fn aliasos_theme_wins_when_present() {
         let s = Scratch::new();
         write_theme(&s, SAMPLE);
-        s.file("config/gtk-4.0/settings.ini", b"[Settings]\ngtk-application-prefer-dark-theme=0\n");
+        s.file(
+            "config/gtk-4.0/settings.ini",
+            b"[Settings]\ngtk-application-prefer-dark-theme=0\n",
+        );
         let (c, src) = load(&paths(&s));
         assert_eq!(src, Source::AliasOs);
         assert_eq!(c.base, 0x0B111A);
@@ -353,15 +414,24 @@ mod tests {
     #[test]
     fn gtk_settings_pick_light_or_dark() {
         let s = Scratch::new();
-        s.file("config/gtk-4.0/settings.ini", b"[Settings]\ngtk-application-prefer-dark-theme=1\n");
+        s.file(
+            "config/gtk-4.0/settings.ini",
+            b"[Settings]\ngtk-application-prefer-dark-theme=1\n",
+        );
         let (c, src) = load(&paths(&s));
         assert_eq!(src, Source::Desktop);
         assert!(c.dark);
         let s = Scratch::new();
-        s.file("config/gtk-3.0/settings.ini", b"[Settings]\ngtk-theme-name=Adwaita-dark\n");
+        s.file(
+            "config/gtk-3.0/settings.ini",
+            b"[Settings]\ngtk-theme-name=Adwaita-dark\n",
+        );
         assert!(load(&paths(&s)).0.dark);
         let s = Scratch::new();
-        s.file("config/gtk-3.0/settings.ini", b"[Settings]\ngtk-icon-theme-name=Adwaita\n");
+        s.file(
+            "config/gtk-3.0/settings.ini",
+            b"[Settings]\ngtk-icon-theme-name=Adwaita\n",
+        );
         assert_eq!(load(&paths(&s)).1, Source::Default);
     }
 
@@ -465,12 +535,21 @@ mod tests {
     #[test]
     fn the_dark_preference_wins_over_an_earlier_theme_name() {
         let s = Scratch::new();
-        s.file("config/gtk-4.0/settings.ini", b"[Settings]\ngtk-theme-name=Adwaita\ngtk-application-prefer-dark-theme=1\n");
+        s.file(
+            "config/gtk-4.0/settings.ini",
+            b"[Settings]\ngtk-theme-name=Adwaita\ngtk-application-prefer-dark-theme=1\n",
+        );
         assert!(load(&paths(&s)).0.dark);
         // A plain theme name says nothing, so the older settings file still gets a say.
         let s = Scratch::new();
-        s.file("config/gtk-4.0/settings.ini", b"[Settings]\ngtk-theme-name=Adwaita\n");
-        s.file("config/gtk-3.0/settings.ini", b"[Settings]\ngtk-application-prefer-dark-theme=1\n");
+        s.file(
+            "config/gtk-4.0/settings.ini",
+            b"[Settings]\ngtk-theme-name=Adwaita\n",
+        );
+        s.file(
+            "config/gtk-3.0/settings.ini",
+            b"[Settings]\ngtk-application-prefer-dark-theme=1\n",
+        );
         assert!(load(&paths(&s)).0.dark);
     }
 
@@ -489,7 +568,10 @@ mod tests {
     #[test]
     fn the_aliasos_path_ignores_xdg_state_home() {
         let p = ThemePaths::for_home(Path::new("/h"), Path::new("/c"));
-        assert_eq!(p.colors_file(), Path::new("/h/.local/state/aliasos/current/theme/colors.toml"));
+        assert_eq!(
+            p.colors_file(),
+            Path::new("/h/.local/state/aliasos/current/theme/colors.toml")
+        );
     }
 
     #[test]
@@ -500,8 +582,16 @@ mod tests {
     #[test]
     fn the_theme_can_say_light_or_dark_outright() {
         let mid = "background = \"#8a8a8a\"\nforeground = \"#000000\"\n";
-        assert!(!parse_colors(&format!("{mid}mode = \"light\"\n")).unwrap().dark);
-        assert!(parse_colors(&format!("{mid}mode = \"dark\"\n")).unwrap().dark);
+        assert!(
+            !parse_colors(&format!("{mid}mode = \"light\"\n"))
+                .unwrap()
+                .dark
+        );
+        assert!(
+            parse_colors(&format!("{mid}mode = \"dark\"\n"))
+                .unwrap()
+                .dark
+        );
         let s = Scratch::new();
         write_theme(&s, "background = \"#222222\"\nforeground = \"#eeeeee\"\n");
         s.file("state/aliasos/current/theme/light.mode", b"");

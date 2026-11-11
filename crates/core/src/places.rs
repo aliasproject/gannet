@@ -32,8 +32,16 @@ pub fn parse_user_dirs(text: &str, home: &Path) -> Vec<(String, PathBuf)> {
         if line.starts_with('#') {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else { continue };
-        let Some(name) = key.trim().strip_prefix("XDG_").and_then(|k| k.strip_suffix("_DIR")) else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(name) = key
+            .trim()
+            .strip_prefix("XDG_")
+            .and_then(|k| k.strip_suffix("_DIR"))
+        else {
+            continue;
+        };
         let value = value.trim().trim_matches('"');
         let path = match value.strip_prefix("$HOME") {
             Some(rest) => home.join(rest.trim_start_matches('/')),
@@ -48,18 +56,44 @@ pub fn parse_user_dirs(text: &str, home: &Path) -> Vec<(String, PathBuf)> {
 /// The standard places, skipping folders that don't exist or just point back at home,
 /// as aliasOS does for Desktop and Templates.
 pub fn standard_places(home: &Path, config_home: &Path, data_home: &Path) -> Vec<Place> {
-    let mut places = vec![Place { label: "Home".into(), path: home.to_path_buf(), kind: PlaceKind::Home }];
+    let mut places = vec![Place {
+        label: "Home".into(),
+        path: home.to_path_buf(),
+        kind: PlaceKind::Home,
+    }];
     let text = std::fs::read_to_string(config_home.join("user-dirs.dirs")).unwrap_or_default();
     let dirs = parse_user_dirs(&text, home);
-    let wanted = [("DOCUMENTS", "Documents", PlaceKind::Documents), ("DOWNLOAD", "Downloads", PlaceKind::Downloads), ("MUSIC", "Music", PlaceKind::Music), ("PICTURES", "Pictures", PlaceKind::Pictures), ("VIDEOS", "Videos", PlaceKind::Videos)];
+    let wanted = [
+        ("DOCUMENTS", "Documents", PlaceKind::Documents),
+        ("DOWNLOAD", "Downloads", PlaceKind::Downloads),
+        ("MUSIC", "Music", PlaceKind::Music),
+        ("PICTURES", "Pictures", PlaceKind::Pictures),
+        ("VIDEOS", "Videos", PlaceKind::Videos),
+    ];
     for (key, label, kind) in wanted {
-        let path = dirs.iter().find(|(k, _)| k == key).map(|(_, p)| p.clone()).unwrap_or_else(|| home.join(label));
+        let path = dirs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| home.join(label));
         if path != home && path.is_dir() {
-            places.push(Place { label: label.into(), path, kind });
+            places.push(Place {
+                label: label.into(),
+                path,
+                kind,
+            });
         }
     }
-    places.push(Place { label: "Trash".into(), path: data_home.join("Trash/files"), kind: PlaceKind::Trash });
-    places.push(Place { label: "Computer".into(), path: PathBuf::from("/"), kind: PlaceKind::Root });
+    places.push(Place {
+        label: "Trash".into(),
+        path: data_home.join("Trash/files"),
+        kind: PlaceKind::Trash,
+    });
+    places.push(Place {
+        label: "Computer".into(),
+        path: PathBuf::from("/"),
+        kind: PlaceKind::Root,
+    });
     places
 }
 
@@ -71,8 +105,26 @@ pub fn disk_places(mounts: &[Mount]) -> Vec<Place> {
     let mut out = Vec::new();
     for m in mounts {
         let point = m.point.to_string_lossy();
-        let real = m.source.starts_with("/dev/") || NETWORK_FS.contains(&m.fs_type.as_str()) || m.fs_type.starts_with("fuse.");
-        let internal = ["/", "/home", "/usr", "/var", "/nix", "/etc", "/opt", "/srv", "/root"].contains(&point.as_ref()) || ["/boot", "/efi", "/proc", "/sys", "/dev", "/run/user", "/var/", "/snap", "/tmp"].iter().any(|p| point.starts_with(p));
+        let real = m.source.starts_with("/dev/")
+            || NETWORK_FS.contains(&m.fs_type.as_str())
+            || m.fs_type.starts_with("fuse.");
+        let internal = [
+            "/", "/home", "/usr", "/var", "/nix", "/etc", "/opt", "/srv", "/root",
+        ]
+        .contains(&point.as_ref())
+            || [
+                "/boot",
+                "/efi",
+                "/proc",
+                "/sys",
+                "/dev",
+                "/run/user",
+                "/var/",
+                "/snap",
+                "/tmp",
+            ]
+            .iter()
+            .any(|p| point.starts_with(p));
         // A bind mount or a btrfs subvolume repeats its device, so any device already seen,
         // including a system one, doesn't count again.
         let repeat = seen.contains(&m.source.as_str());
@@ -80,8 +132,15 @@ pub fn disk_places(mounts: &[Mount]) -> Vec<Place> {
         if !real || internal || repeat {
             continue;
         }
-        let label = m.point.file_name().map_or_else(|| point.to_string(), |n| n.to_string_lossy().into_owned());
-        out.push(Place { label, path: m.point.clone(), kind: PlaceKind::Disk });
+        let label = m
+            .point
+            .file_name()
+            .map_or_else(|| point.to_string(), |n| n.to_string_lossy().into_owned());
+        out.push(Place {
+            label,
+            path: m.point.clone(),
+            kind: PlaceKind::Disk,
+        });
     }
     out
 }
@@ -94,8 +153,18 @@ mod tests {
 
     #[test]
     fn user_dirs_parse() {
-        let d = parse_user_dirs("# c\nXDG_MUSIC_DIR=\"$HOME/Tunes\"\nXDG_DESKTOP_DIR=\"$HOME/\"\nXDG_X_DIR=\"/abs\"\nnoise\nXDG_BAD_DIR=\"relative\"\n", Path::new("/h"));
-        assert_eq!(d, vec![("MUSIC".into(), "/h/Tunes".into()), ("DESKTOP".into(), "/h/".into()), ("X".into(), "/abs".into())]);
+        let d = parse_user_dirs(
+            "# c\nXDG_MUSIC_DIR=\"$HOME/Tunes\"\nXDG_DESKTOP_DIR=\"$HOME/\"\nXDG_X_DIR=\"/abs\"\nnoise\nXDG_BAD_DIR=\"relative\"\n",
+            Path::new("/h"),
+        );
+        assert_eq!(
+            d,
+            vec![
+                ("MUSIC".into(), "/h/Tunes".into()),
+                ("DESKTOP".into(), "/h/".into()),
+                ("X".into(), "/abs".into())
+            ]
+        );
     }
 
     #[test]

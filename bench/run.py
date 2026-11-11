@@ -8,7 +8,7 @@ files on the project's own disk (btrfs on Mike's desktop). Times are warm page c
 medians. Everything renders in software in sway's pixman backend, with no GPU; the time
 a real compositor spends uploading the buffer isn't included.
 """
-import argparse, os, re, shutil, subprocess, sys, time
+import argparse, json, os, re, shutil, struct, subprocess, sys, time, zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -35,6 +35,8 @@ BUDGETS = [
     ("theme change to new frame", 100, "ms"),
     ("copy 1 GiB across disks, vs cp", 1.10, "x cp"),
     ("move 5,000 files to Trash", 1000, "ms"),
+    ("Space to the preview window", 25, "ms"),
+    ("Space to a 1600x1200 photo in the preview", 100, "ms"),
 ]
 
 
@@ -245,6 +247,49 @@ def measure_theme(h, results, runs):
     stop(p)
 
 
+def png(w, h):
+    """A plain RGB PNG with some variety in it, so it isn't trivially small to decode."""
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    rows = b"".join(b"\0" + bytes((x * 7 + y * 3) % 256 for x in range(w * 3)) for y in range(h))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b"")
+
+
+def measure_preview(h, results, runs):
+    """Space on a 1600x1200 photo: until the preview window is mapped, and until the photo is in it."""
+    folder = DATA / "fixture-preview"
+    folder.mkdir(parents=True, exist_ok=True)
+    photo = folder / "photo.png"
+    if not photo.exists():
+        photo.write_bytes(png(1600, 1200))
+    state = Path("/tmp/gnbench-client/preview-state.json")
+    shown = Path(str(state) + ".preview")
+    log, env = log_env(h, "preview", {"GANNET_STATE": str(state)})
+    window, image = [], []
+    for _ in range(runs):
+        shown.unlink(missing_ok=True)
+        p = subprocess.Popen([str(BENCH), str(folder)], env=env, stderr=subprocess.DEVNULL)
+        h.wait_window(30)
+        wait_log(log, "rows")
+        time.sleep(0.2)
+        t0 = time.monotonic()
+        key(env, "space")
+        window.append((h.wait_window(30) - t0) * 1000)
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            try:
+                if (json.loads(shown.read_text()).get("preview") or {}).get("state") == "image":
+                    break
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.001)
+        image.append((time.monotonic() - t0) * 1000)
+        stop(p)
+        time.sleep(0.3)
+    results["Space to the preview window"] = median(window)
+    results["Space to a 1600x1200 photo in the preview"] = median(image)
+
+
 def measure_copy(results):
     src = DATA / "copy-1g.bin"
     if not src.exists() or src.stat().st_size != 1 << 30:
@@ -346,6 +391,7 @@ def main():
         results["paint scrolling 100k p99, 1280x800"] = p99(scroll_paints(h, "scroll"))
         measure_stall(h, results)
         measure_theme(h, results, a.runs)
+        measure_preview(h, results, a.runs)
     finally:
         h.stop()
     h = Headless("/tmp/gnbench-h", "3840x2160")

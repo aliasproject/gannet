@@ -9,6 +9,7 @@ mod icons;
 mod media;
 mod paint;
 mod preview;
+mod preview_window;
 mod service;
 mod text;
 mod wl;
@@ -37,20 +38,64 @@ struct Dirs {
     config: PathBuf,
     cache: PathBuf,
     data: PathBuf,
+    /// The shared-mime-info folders, first wins.
+    mime: Vec<PathBuf>,
 }
 
 /// The one place Gannet reads where things live. Everything else gets paths as arguments.
 fn dirs() -> Dirs {
-    let home = std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| "/".into());
-    let var = |name: &str, default: &str| std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(default));
-    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data: var("XDG_DATA_HOME", ".local/share"), home }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| "/".into());
+    let var = |name: &str, default: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| home.join(default))
+    };
+    let data = var("XDG_DATA_HOME", ".local/share");
+    let data_dirs = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".into());
+    let mut mime = vec![data.join("mime")];
+    mime.extend(
+        std::env::split_paths(&data_dirs)
+            .filter(|p| p.is_absolute())
+            .map(|p| p.join("mime")),
+    );
+    Dirs {
+        config: var("XDG_CONFIG_HOME", ".config"),
+        cache: var("XDG_CACHE_HOME", ".cache"),
+        data,
+        home,
+        mime,
+    }
+}
+
+/// The language messages are in, as the C library would choose it.
+fn language() -> Option<String> {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .iter()
+        .find_map(|v| std::env::var(v).ok().filter(|l| !l.is_empty()))
 }
 
 /// What to show: the folder, and an entry to put the cursor on if a file was named.
 fn start_location(arg: Option<OsString>, home: &Path) -> PathBuf {
-    let Some(arg) = arg else { return home.to_path_buf() };
-    let path = arg.to_str().and_then(from_file_uri).unwrap_or_else(|| PathBuf::from(arg));
-    let abs = if path.is_absolute() { path } else { std::env::current_dir().unwrap_or_else(|_| "/".into()).join(path) };
+    let Some(arg) = arg else {
+        return home.to_path_buf();
+    };
+    let path = arg
+        .to_str()
+        .and_then(from_file_uri)
+        .unwrap_or_else(|| PathBuf::from(arg));
+    let abs = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| "/".into())
+            .join(path)
+    };
     app::clean(&abs)
 }
 
@@ -85,7 +130,13 @@ fn main() {
             service::claim_main(a == service::RELEASE_ARG);
         }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       gannet {} | {}\n       gannet {}", service::CLAIM_ARG, service::RELEASE_ARG, service::ARG);
+            println!(
+                "usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       gannet {} | {}\n       gannet {}",
+                preview_window::USAGE,
+                service::CLAIM_ARG,
+                service::RELEASE_ARG,
+                service::ARG
+            );
             return;
         }
         if a == "--version" {
@@ -94,18 +145,50 @@ fn main() {
         }
     }
     let d = dirs();
+    // `--preview FILE`: the preview window, on its own.
+    let viewing = match arg.as_deref().is_some_and(|a| a == preview_window::ARG) {
+        false => None,
+        true => match preview_window::parse(std::env::args_os().skip(2)) {
+            Some(mut v) => {
+                let abs = start_location(Some(v.path.into_os_string()), &d.home);
+                v.path = abs;
+                Some(v)
+            }
+            None => {
+                eprintln!("usage: {}", preview_window::USAGE);
+                std::process::exit(2);
+            }
+        },
+    };
     // `--select PATH...`: the first path's folder, with the paths in it selected.
     let selecting = arg.as_deref().is_some_and(|a| a == service::SELECT_ARG);
-    let picks: Vec<PathBuf> = if selecting { std::env::args_os().skip(2).map(|a| start_location(Some(a), &d.home)).collect() } else { Vec::new() };
-    let start_dir = match picks.first() {
-        Some(first) => first.parent().map_or_else(|| first.clone(), Path::to_path_buf),
-        None if selecting => d.home.clone(),
-        None => start_location(arg, &d.home),
+    let picks: Vec<PathBuf> = if selecting {
+        std::env::args_os()
+            .skip(2)
+            .map(|a| start_location(Some(a), &d.home))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let start_dir = match (picks.first(), &viewing) {
+        (_, Some(v)) => v
+            .path
+            .parent()
+            .map_or_else(|| v.path.clone(), Path::to_path_buf),
+        (Some(first), _) => first
+            .parent()
+            .map_or_else(|| first.clone(), Path::to_path_buf),
+        (None, _) if selecting => d.home.clone(),
+        (None, _) => start_location(arg, &d.home),
     };
     let theme_paths = ThemePaths::for_home(&d.home, &d.config);
     let (colors, source) = theme::load(&theme_paths);
 
-    let mut wl = match wl::Wl::connect("Gannet", "com.aliasproject.Gannet", 1100, 700) {
+    let window = match &viewing {
+        Some(_) => wl::Wl::connect("Preview", preview_window::APP_ID, 960, 720),
+        None => wl::Wl::connect("Gannet", "com.aliasproject.Gannet", 1100, 700),
+    };
+    let mut wl = match window {
         Ok(w) => w,
         Err(e) => {
             eprintln!("gannet: {e}");
@@ -123,9 +206,13 @@ fn main() {
         None => eprintln!("gannet: no font found; is fontconfig installed?"),
     }
 
-    let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).expect("eventfd"));
+    let wake =
+        Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).expect("eventfd"));
     let (tx, rx) = channel();
-    let hub = Hub { tx, wake: wake.clone() };
+    let hub = Hub {
+        tx,
+        wake: wake.clone(),
+    };
 
     let mut places = standard_places(&d.home, &d.config, &d.data);
     places.extend(disk_places(&read_mounts()));
@@ -134,26 +221,63 @@ fn main() {
     let op_hub = hub.clone();
     let trash = TrashConfig::new(&d.data, rustix::process::geteuid().as_raw());
     let engine = Engine::new(trash, Arc::new(move |e| op_hub.send(Msg::Op(e))));
-    let mut app = App::new(hub.clone(), engine, d.data.join("Trash/files"), colors, source, text, places, start_dir.clone(), w, h, wl.scale());
+    let mut app = App::new(
+        hub.clone(),
+        engine,
+        d.data.join("Trash/files"),
+        colors,
+        source,
+        text,
+        places,
+        start_dir.clone(),
+        w,
+        h,
+        wl.scale(),
+    );
     let dir_watch = Watch::new().ok().map(Arc::new);
     app.watch = dir_watch.clone();
     app.cache_home = Some(d.cache.clone());
+    app.kinds = Arc::new(preview::Kinds::new(d.mime.clone(), language()));
     let mut theme_watch = ThemeWatch::new(theme_paths.clone()).ok();
     let mut theme_due: Option<Instant> = None;
     #[cfg(feature = "bench")]
     {
-        app.slow_read = std::env::var("GANNET_SLOW_READ_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
-        app.slow_preview = std::env::var("GANNET_SLOW_PREVIEW_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
+        app.slow_read = std::env::var("GANNET_SLOW_READ_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(std::time::Duration::from_millis);
+        app.slow_preview = std::env::var("GANNET_SLOW_PREVIEW_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(std::time::Duration::from_millis);
     }
-    let names: Vec<Vec<u8>> = picks.iter().filter(|p| p.parent() == Some(start_dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_encoded_bytes().to_vec()).collect();
-    if names.is_empty() {
-        app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None });
+    let names: Vec<Vec<u8>> = picks
+        .iter()
+        .filter(|p| p.parent() == Some(start_dir.as_path()))
+        .filter_map(|p| p.file_name())
+        .map(|n| n.as_encoded_bytes().to_vec())
+        .collect();
+    // The list's preview window, while one is open.
+    let mut previewer: Option<preview_window::Child> = None;
+    let following = viewing.as_ref().is_some_and(|v| v.follow);
+    if let Some(v) = viewing {
+        app.show_hidden = v.hidden;
+        app.sort = v.sort;
+        app.start_viewer(v.path);
+        if v.follow {
+            preview_window::listen_to_the_list(hub.clone());
+        }
+    } else if names.is_empty() {
+        app.go(gannet_core::history::Stop {
+            dir: start_dir,
+            cursor_name: None,
+        });
     } else {
         app.open_selecting(start_dir, names);
     }
     let mut first_frame = true;
     #[cfg(feature = "bench")]
-    let mut bench = bench::Bench::new();
+    let mut bench = bench::Bench::new(app.viewer);
 
     loop {
         #[cfg(feature = "bench")]
@@ -186,25 +310,77 @@ fn main() {
                 Cmd::Title(t) => wl.set_title(&t),
                 Cmd::Cursor(c) => wl.set_cursor(c),
                 Cmd::SetClipboard(offers) => {
-                    wl.set_clipboard(wl::Offer { mimes: offers.into_iter().map(|(m, d)| (m.to_string(), Arc::new(d))).collect() });
+                    wl.set_clipboard(wl::Offer {
+                        mimes: offers
+                            .into_iter()
+                            .map(|(m, d)| (m.to_string(), Arc::new(d)))
+                            .collect(),
+                    });
                 }
                 Cmd::ClearClipboard => wl.clear_clipboard(),
                 Cmd::ReadClipboard(purpose) => read_clipboard(&wl, &hub, purpose),
-                Cmd::StartDrag { formats, marker, move_only, icon } => {
-                    let mut mimes: Vec<_> = formats.into_iter().map(|(m, d)| (m.to_string(), Arc::new(d))).collect();
+                Cmd::StartDrag {
+                    formats,
+                    marker,
+                    move_only,
+                    icon,
+                } => {
+                    let mut mimes: Vec<_> = formats
+                        .into_iter()
+                        .map(|(m, d)| (m.to_string(), Arc::new(d)))
+                        .collect();
                     mimes.extend(marker.map(|m| (m.mime(), Arc::new(Vec::new()))));
                     wl.start_drag(wl::Offer { mimes }, move_only, icon);
                 }
                 Cmd::CancelDrag => wl.cancel_drag(),
                 Cmd::AcceptDrop(accept) => wl.accept_drop(accept),
-                Cmd::ReadDrop { dest, trash, decided } => read_drop(&wl, &hub, dest, trash, decided),
+                Cmd::ReadDrop {
+                    dest,
+                    trash,
+                    decided,
+                } => read_drop(&wl, &hub, dest, trash, decided),
                 Cmd::FinishDrop => wl.finish_drop(),
                 Cmd::AbandonDrop => wl.abandon_drop(),
+                Cmd::OpenPreview {
+                    generation,
+                    path,
+                    hidden,
+                    sort,
+                } => {
+                    // Replacing one closes it.
+                    previewer = None;
+                    match preview_window::Child::start(&hub, generation, &path, hidden, sort) {
+                        Ok(child) => previewer = Some(child),
+                        Err(e) => {
+                            hub.send(Msg::Notice(format!("Couldn't open the preview: {e}")));
+                            hub.send(Msg::PreviewEnded {
+                                generation,
+                                crashed: false,
+                            });
+                        }
+                    }
+                }
+                Cmd::ClosePreview => previewer = None,
+                Cmd::PreviewShow(path) => {
+                    if let Some(p) = previewer.as_mut() {
+                        p.show(&path);
+                    }
+                }
+                Cmd::PreviewStepped(path) => {
+                    if following {
+                        preview_window::tell_the_list(&path);
+                    }
+                }
                 Cmd::Quit => return,
             }
         }
-        if wl.must_paint() || (!app.dirty.is_empty() && wl.can_paint() && app.hold_paint.is_none()) {
-            let damage = if wl.must_paint() { canvas::Rect::new(0, 0, i32::MAX / 2, i32::MAX / 2) } else { std::mem::take(&mut app.dirty) };
+        if wl.must_paint() || (!app.dirty.is_empty() && wl.can_paint() && app.hold_paint.is_none())
+        {
+            let damage = if wl.must_paint() {
+                canvas::Rect::new(0, 0, i32::MAX / 2, i32::MAX / 2)
+            } else {
+                std::mem::take(&mut app.dirty)
+            };
             app.dirty = canvas::Rect::default();
             #[cfg(feature = "bench")]
             let t0 = Instant::now();
@@ -238,13 +414,28 @@ fn main() {
         };
 
         // Sleep until something happens. With nothing due, this is an endless wait.
-        let Some(guard) = wl.queue.prepare_read() else { continue };
+        let Some(guard) = wl.queue.prepare_read() else {
+            continue;
+        };
         let deadline = [app.next_deadline(), theme_due].into_iter().flatten().min();
         let timeout = deadline.map(|t| {
             let d = t.saturating_duration_since(Instant::now());
-            Timespec { tv_sec: d.as_secs() as _, tv_nsec: d.subsec_nanos() as _ }
+            Timespec {
+                tv_sec: d.as_secs() as _,
+                tv_nsec: d.subsec_nanos() as _,
+            }
         });
-        let mut fds = vec![PollFd::from_borrowed_fd(wl.fd(), if flush_blocked { PollFlags::IN | PollFlags::OUT } else { PollFlags::IN }), PollFd::new(&*wake, PollFlags::IN)];
+        let mut fds = vec![
+            PollFd::from_borrowed_fd(
+                wl.fd(),
+                if flush_blocked {
+                    PollFlags::IN | PollFlags::OUT
+                } else {
+                    PollFlags::IN
+                },
+            ),
+            PollFd::new(&*wake, PollFlags::IN),
+        ];
         let repeat = wl.repeat_fd();
         let repeat_at = repeat.map(|f| {
             fds.push(PollFd::from_borrowed_fd(f, PollFlags::IN));
@@ -259,20 +450,30 @@ fn main() {
             fds.len() - 1
         });
         let _ = poll(&mut fds, timeout.as_ref());
-        let ready = |i: usize| fds[i].revents().intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP);
+        let ready = |i: usize| {
+            fds[i]
+                .revents()
+                .intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP)
+        };
         let (wl_ready, wake_ready) = (ready(0), ready(1));
         let wl_hup = fds[0].revents().intersects(PollFlags::HUP | PollFlags::ERR);
         let repeat_ready = repeat_at.is_some_and(ready);
         let dir_ready = dir_at.is_some_and(ready);
         let theme_ready = theme_at.is_some_and(ready);
         drop(fds);
-        let read_error = if wl_ready { guard.read().err().filter(read_is_fatal) } else { None };
+        let read_error = if wl_ready {
+            guard.read().err().filter(read_is_fatal)
+        } else {
+            None
+        };
         if read_error.is_some() || wl_hup {
             // The compositor went away, or it disconnected this program, in which case it may have
             // said why. A hang-up with nothing wrong is just the session ending.
             let (w, h) = wl.physical_size();
             match &read_error {
-                Some(e) => eprintln!("gannet: reading from the compositor failed: {e} (window {w}x{h})"),
+                Some(e) => {
+                    eprintln!("gannet: reading from the compositor failed: {e} (window {w}x{h})")
+                }
                 None => eprintln!("gannet: the compositor hung up (window {w}x{h})"),
             }
             if say_why_the_connection_ended(&wl) || read_error.is_some() {
@@ -307,9 +508,14 @@ fn read_is_fatal(error: &WaylandError) -> bool {
 /// A compositor that disconnects a client for breaking the protocol leaves the reason here. Returns
 /// whether it did.
 fn say_why_the_connection_ended(wl: &wl::Wl) -> bool {
-    let Some(error) = wl.conn.protocol_error() else { return false };
+    let Some(error) = wl.conn.protocol_error() else {
+        return false;
+    };
     let (w, h) = wl.physical_size();
-    eprintln!("gannet: the compositor closed the connection: {}@{} error {}: {} (window {w}x{h})", error.object_interface, error.object_id, error.code, error.message);
+    eprintln!(
+        "gannet: the compositor closed the connection: {}@{} error {}: {} (window {w}x{h})",
+        error.object_interface, error.object_id, error.code, error.message
+    );
     true
 }
 
@@ -329,69 +535,116 @@ fn read_clipboard(wl: &wl::Wl, hub: &Hub, purpose: app::Paste) {
         return;
     };
     // KDE programs flag a cut in a format of its own.
-    let kde = (mime == clipboard::URI_LIST && offered.iter().any(|o| o == clipboard::KDE_CUT)).then(|| wl.read_clipboard(clipboard::KDE_CUT)).flatten();
+    let kde = (mime == clipboard::URI_LIST && offered.iter().any(|o| o == clipboard::KDE_CUT))
+        .then(|| wl.read_clipboard(clipboard::KDE_CUT))
+        .flatten();
     let hub = hub.clone();
-    let _ = std::thread::Builder::new().name("gannet-paste".into()).spawn(move || {
-        let data = clipboard::read_limited(std::fs::File::from(fd), MAX);
-        let is_cut = kde.and_then(|k| clipboard::read_limited(std::fs::File::from(k), 16)).is_some_and(|d| d.first() == Some(&b'1'));
-        let mime = if is_cut { clipboard::URI_LIST_CUT } else { mime };
-        hub.send(Msg::Clipboard(data, mime.to_string(), purpose));
-    });
+    let _ = std::thread::Builder::new()
+        .name("gannet-paste".into())
+        .spawn(move || {
+            let data = clipboard::read_limited(std::fs::File::from(fd), MAX);
+            let is_cut = kde
+                .and_then(|k| clipboard::read_limited(std::fs::File::from(k), 16))
+                .is_some_and(|d| d.first() == Some(&b'1'));
+            let mime = if is_cut {
+                clipboard::URI_LIST_CUT
+            } else {
+                mime
+            };
+            hub.send(Msg::Clipboard(data, mime.to_string(), purpose));
+        });
 }
 
 /// Reads a dropped file list off the main thread, since the other program can stall.
 fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option<app::DropAction>) {
     const MAX: u64 = 64 * 1024 * 1024;
     let Some((fd, can_copy, can_move)) = wl.read_drop() else {
-        hub.send(Msg::Dropped(app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false }));
+        hub.send(Msg::Dropped(app::Dropped {
+            paths: Vec::new(),
+            dest,
+            trash,
+            can_copy: false,
+            can_move: false,
+            decided,
+            all_local: false,
+        }));
         return;
     };
     // The other program can stall forever, and an unanswered drop would refuse every later one.
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
     let (answer, answered) = std::sync::mpsc::channel();
     // If this can't start, the sender goes with it, and the waiter below answers right away.
-    let _ = std::thread::Builder::new().name("gannet-drop".into()).spawn(move || {
-        let _ = answer.send(clipboard::read_limited(std::fs::File::from(fd), MAX));
-    });
+    let _ = std::thread::Builder::new()
+        .name("gannet-drop".into())
+        .spawn(move || {
+            let _ = answer.send(clipboard::read_limited(std::fs::File::from(fd), MAX));
+        });
     let waiter = hub.clone();
     let (wait_dest, wait_trash) = (dest.clone(), trash);
-    let waiting = std::thread::Builder::new().name("gannet-drop-wait".into()).spawn(move || {
-        let data = answered.recv_timeout(PATIENCE).ok().flatten().unwrap_or_default();
-        let (paths, _) = clipboard::parse(clipboard::URI_LIST, &data);
-        let all_local = clipboard::uri_list_is_all_local(&data, &paths);
-        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local }));
-    });
+    let waiting = std::thread::Builder::new()
+        .name("gannet-drop-wait".into())
+        .spawn(move || {
+            let data = answered
+                .recv_timeout(PATIENCE)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let (paths, _) = clipboard::parse(clipboard::URI_LIST, &data);
+            let all_local = clipboard::uri_list_is_all_local(&data, &paths);
+            waiter.send(Msg::Dropped(app::Dropped {
+                paths,
+                dest: wait_dest,
+                trash: wait_trash,
+                can_copy,
+                can_move,
+                decided,
+                all_local,
+            }));
+        });
     if waiting.is_err() {
-        hub.send(Msg::Dropped(app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false }));
+        hub.send(Msg::Dropped(app::Dropped {
+            paths: Vec::new(),
+            dest,
+            trash,
+            can_copy: false,
+            can_move: false,
+            decided,
+            all_local: false,
+        }));
     }
 }
 
 /// Work that mustn't delay the first frame: confirm the font the cache file named.
 fn after_first_frame(hub: &Hub, cache: &Path, primary: Option<(PathBuf, u32)>) {
     let (hub, cache) = (hub.clone(), cache.to_path_buf());
-    let _ = std::thread::Builder::new().name("gannet-fonts".into()).spawn(move || {
-        if let Some(found) = text::fc_match("sans")
-            && Some(&found) != primary.as_ref()
-        {
-            text::store_primary_font(&cache, &found);
-            hub.send(Msg::PrimaryFont(found.0, found.1));
-        }
-    });
+    let _ = std::thread::Builder::new()
+        .name("gannet-fonts".into())
+        .spawn(move || {
+            if let Some(found) = text::fc_match("sans")
+                && Some(&found) != primary.as_ref()
+            {
+                text::store_primary_font(&cache, &found);
+                hub.send(Msg::PrimaryFont(found.0, found.1));
+            }
+        });
 }
 
 fn find_fallback_fonts(hub: &Hub, chars: Vec<char>) {
     let hub = hub.clone();
-    let _ = std::thread::Builder::new().name("gannet-fonts".into()).spawn(move || {
-        let mut found: Vec<PathBuf> = Vec::new();
-        for ch in chars {
-            if let Some((path, index)) = text::fc_match(&format!("sans:charset={:x}", ch as u32))
-                && !found.contains(&path)
-            {
-                found.push(path.clone());
-                hub.send(Msg::Font(path, index));
+    let _ = std::thread::Builder::new()
+        .name("gannet-fonts".into())
+        .spawn(move || {
+            let mut found: Vec<PathBuf> = Vec::new();
+            for ch in chars {
+                if let Some((path, index)) =
+                    text::fc_match(&format!("sans:charset={:x}", ch as u32))
+                    && !found.contains(&path)
+                {
+                    found.push(path.clone());
+                    hub.send(Msg::Font(path, index));
+                }
             }
-        }
-    });
+        });
 }
 
 #[cfg(test)]
@@ -401,13 +654,19 @@ mod tests {
 
     #[test]
     fn nothing_to_read_isnt_a_lost_connection() {
-        assert!(!read_is_fatal(&WaylandError::Io(Error::from(ErrorKind::WouldBlock))));
+        assert!(!read_is_fatal(&WaylandError::Io(Error::from(
+            ErrorKind::WouldBlock
+        ))));
     }
 
     #[test]
     fn a_really_broken_connection_is() {
-        assert!(read_is_fatal(&WaylandError::Io(Error::from(ErrorKind::BrokenPipe))));
-        assert!(read_is_fatal(&WaylandError::Io(Error::from(ErrorKind::ConnectionReset))));
+        assert!(read_is_fatal(&WaylandError::Io(Error::from(
+            ErrorKind::BrokenPipe
+        ))));
+        assert!(read_is_fatal(&WaylandError::Io(Error::from(
+            ErrorKind::ConnectionReset
+        ))));
     }
 }
 
@@ -435,10 +694,16 @@ mod bench {
     }
 
     impl Bench {
-        pub fn new() -> Self {
+        /// The preview window writes beside the list, as both see the same environment.
+        pub fn new(viewer: bool) -> Self {
+            let suffix = if viewer { ".preview" } else { "" };
             Self {
-                log: std::env::var("GANNET_BENCH_LOG").ok().and_then(|p| std::fs::File::create(p).ok()),
-                state_path: std::env::var("GANNET_STATE").ok(),
+                log: std::env::var("GANNET_BENCH_LOG")
+                    .ok()
+                    .and_then(|p| std::fs::File::create(format!("{p}{suffix}")).ok()),
+                state_path: std::env::var("GANNET_STATE")
+                    .ok()
+                    .map(|p| format!("{p}{suffix}")),
                 last_state: String::new(),
                 rows_stamped: None,
             }
@@ -451,11 +716,18 @@ mod bench {
         }
 
         pub fn painted(&mut self, took: Duration, app: &App) {
-            let ready = app.listing.as_ref().is_some_and(|l| l.complete) && !app.loading && !app.rows.is_empty();
+            let ready = app.listing.as_ref().is_some_and(|l| l.complete)
+                && !app.loading
+                && !app.rows.is_empty();
             self.stamp(format!("paint {} {:.1}", took.as_micros(), mono_ms()));
             if ready && self.rows_stamped.as_ref() != Some(&app.dir) {
                 self.rows_stamped = Some(app.dir.clone());
-                self.stamp(format!("rows {} {:.1} {:.1}", app.rows.len(), mono_ms(), app.load_elapsed().as_secs_f64() * 1000.0));
+                self.stamp(format!(
+                    "rows {} {:.1} {:.1}",
+                    app.rows.len(),
+                    mono_ms(),
+                    app.load_elapsed().as_secs_f64() * 1000.0
+                ));
             }
             if !ready {
                 self.rows_stamped = None;
@@ -471,7 +743,9 @@ mod bench {
 
         /// Writes the visible state when it changes, for checks to wait on.
         pub fn idle(&mut self, app: &App) {
-            let Some(path) = self.state_path.clone() else { return };
+            let Some(path) = self.state_path.clone() else {
+                return;
+            };
             let state = dump(app);
             if state != self.last_state {
                 let tmp = format!("{path}.tmp");
@@ -503,7 +777,11 @@ mod bench {
     }
 
     pub fn dump(a: &App) -> String {
-        let name = |i: u32| a.listing.as_ref().map_or_else(String::new, |l| String::from_utf8_lossy(l.name(i)).into_owned());
+        let name = |i: u32| {
+            a.listing.as_ref().map_or_else(String::new, |l| {
+                String::from_utf8_lossy(l.name(i)).into_owned()
+            })
+        };
         let edit = match &a.edit {
             Edit::None => "none".to_string(),
             Edit::Path(f) => format!("path:{}", f.text),
@@ -512,7 +790,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"drag\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -528,7 +806,9 @@ mod bench {
             a.scroll,
             list(a.notices.iter().cloned()),
             a.menu.is_some(),
-            a.load_error.as_ref().map_or_else(|| "null".to_string(), |e| esc(e)),
+            a.load_error
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |e| esc(e)),
             a.colors.base,
             a.history.can_go_back(),
             a.history.can_go_forward(),
@@ -544,6 +824,10 @@ mod bench {
             a.undo.len(),
             a.panel_rows(),
             preview(a),
+            a.previewer
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map_or_else(|| "null".to_string(), |n| esc(&n.to_string_lossy())),
             esc(&drag(a)),
         )
     }
@@ -553,34 +837,74 @@ mod bench {
             Some(crate::app::FileDrag::Active(d)) if d.is_out() => "out".to_string(),
             Some(crate::app::FileDrag::Active(d)) => a.drag_label(d),
             Some(crate::app::FileDrag::Pressed { .. }) => "pressed".to_string(),
-            Some(crate::app::FileDrag::Band(b)) => if b.active { "band" } else { "pressed" }.to_string(),
-            None => a.incoming.as_ref().filter(|i| !i.label.is_empty()).and_then(|i| i.target.as_ref().map(|t| a.incoming_label(i, t))).unwrap_or_default(),
+            Some(crate::app::FileDrag::Band(b)) => {
+                if b.active { "band" } else { "pressed" }.to_string()
+            }
+            None => a
+                .incoming
+                .as_ref()
+                .filter(|i| !i.label.is_empty())
+                .and_then(|i| i.target.as_ref().map(|t| a.incoming_label(i, t)))
+                .unwrap_or_default(),
         }
     }
 
     fn preview(a: &App) -> String {
         use crate::preview::Content;
-        let Some(p) = &a.preview else { return "null".to_string() };
-        let name = p.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        let Some(p) = &a.preview else {
+            return "null".to_string();
+        };
+        let name = p
+            .path
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let (state, w, h, message) = match &p.content {
             Content::Waiting if p.loading_shown => ("loading", 0, 0, ""),
             Content::Waiting => ("waiting", 0, 0, ""),
-            Content::Image { image, thumbnail: true } => ("thumbnail", image.w, image.h, ""),
-            Content::Image { image, thumbnail: false } => ("image", image.w, image.h, ""),
-            Content::Video(video) => ("video", video.frame.map_or(0, |f| f.1), video.frame.map_or(0, |f| f.2), ""),
+            Content::Image {
+                image,
+                thumbnail: true,
+            } => ("thumbnail", image.w, image.h, ""),
+            Content::Image {
+                image,
+                thumbnail: false,
+            } => ("image", image.w, image.h, ""),
+            Content::Video(video) => (
+                "video",
+                video.frame.map_or(0, |f| f.1),
+                video.frame.map_or(0, |f| f.2),
+                "",
+            ),
             Content::Message(m) => ("message", 0, 0, m.as_str()),
+            Content::Info(i) => (
+                "info",
+                i.thumbnail.as_ref().map_or(0, |t| t.w),
+                i.thumbnail.as_ref().map_or(0, |t| t.h),
+                i.description.as_str(),
+            ),
+        };
+        let kind = match &p.content {
+            Content::Info(i) => esc(&i.mime),
+            _ => "null".to_string(),
         };
         let rect = a.preview_rect();
         let video = match &p.content {
             Content::Video(v) => format!(
                 "{{\"shown\":{},\"position\":{:.3},\"duration\":{:.3},\"paused\":{},\"volume\":{:.0},\"muted\":{}}}",
-                v.frames_shown, v.state.position, v.state.duration, v.state.paused, v.state.volume, v.state.muted
+                v.frames_shown,
+                v.state.position,
+                v.state.duration,
+                v.state.paused,
+                v.state.volume,
+                v.state.muted
             ),
             _ => "null".to_string(),
         };
-        let zoom = p.zoom.map_or_else(|| "null".to_string(), |z| format!("{z:.3}"));
+        let zoom = p
+            .zoom
+            .map_or_else(|| "null".to_string(), |z| format!("{z:.3}"));
         format!(
-            "{{\"name\":{},\"state\":{},\"w\":{w},\"h\":{h},\"message\":{},\"zoom\":{zoom},\"pan\":[{:.0},{:.0}],\"scaled\":{},\"size\":{},\"rect\":[{},{},{},{}],\"video\":{video}}}",
+            "{{\"name\":{},\"state\":{},\"kind\":{kind},\"w\":{w},\"h\":{h},\"message\":{},\"zoom\":{zoom},\"pan\":[{:.0},{:.0}],\"scaled\":{},\"size\":{},\"rect\":[{},{},{},{}],\"video\":{video}}}",
             esc(&name),
             esc(state),
             esc(message),

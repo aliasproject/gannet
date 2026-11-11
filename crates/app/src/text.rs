@@ -28,7 +28,11 @@ struct Face {
 
 impl Face {
     fn font(&self) -> FontRef<'static> {
-        FontRef { data: self.data, offset: self.offset, key: self.key }
+        FontRef {
+            data: self.data,
+            offset: self.offset,
+            key: self.key,
+        }
     }
 }
 
@@ -122,13 +126,28 @@ impl Text {
 
     /// Maps a font file. `false` if it can't be read or isn't a font.
     pub fn add_font(&mut self, path: &Path, index: u32) -> bool {
-        if self.faces.len() >= u8::MAX as usize || self.faces.iter().any(|f| f.path == path && f.index == index) {
+        if self.faces.len() >= u8::MAX as usize
+            || self
+                .faces
+                .iter()
+                .any(|f| f.path == path && f.index == index)
+        {
             return false;
         }
-        let Some(data) = map_file(path) else { return false };
-        let Some(font) = FontRef::from_index(data, index as usize) else { return false };
+        let Some(data) = map_file(path) else {
+            return false;
+        };
+        let Some(font) = FontRef::from_index(data, index as usize) else {
+            return false;
+        };
         let first = self.faces.is_empty();
-        self.faces.push(Face { data, offset: font.offset, key: font.key, path: path.to_path_buf(), index });
+        self.faces.push(Face {
+            data,
+            offset: font.offset,
+            key: font.key,
+            path: path.to_path_buf(),
+            index,
+        });
         if first {
             self.update_metrics();
         }
@@ -139,9 +158,19 @@ impl Text {
 
     /// Replaces the primary font, as when the system's choice changed.
     pub fn set_primary(&mut self, path: &Path, index: u32) -> bool {
-        let Some(data) = map_file(path) else { return false };
-        let Some(font) = FontRef::from_index(data, index as usize) else { return false };
-        let face = Face { data, offset: font.offset, key: font.key, path: path.to_path_buf(), index };
+        let Some(data) = map_file(path) else {
+            return false;
+        };
+        let Some(font) = FontRef::from_index(data, index as usize) else {
+            return false;
+        };
+        let face = Face {
+            data,
+            offset: font.offset,
+            key: font.key,
+            path: path.to_path_buf(),
+            index,
+        };
         if self.faces.is_empty() {
             self.faces.push(face);
         } else {
@@ -235,7 +264,9 @@ impl Text {
             match &mut seg {
                 None => seg = Some((face, script)),
                 Some((f, sc)) => {
-                    let script_differs = !generic && *sc != script && !matches!(*sc, Script::Common | Script::Inherited | Script::Unknown);
+                    let script_differs = !generic
+                        && *sc != script
+                        && !matches!(*sc, Script::Common | Script::Inherited | Script::Unknown);
                     if *f != face || script_differs {
                         segments.push((start, i, *f, *sc));
                         start = i;
@@ -251,12 +282,23 @@ impl Text {
         }
         for (a, b, face, script) in segments {
             let font = self.faces[face as usize].font();
-            let mut shaper = self.shape_ctx.builder(font).script(script).direction(Direction::LeftToRight).size(self.px).build();
+            let mut shaper = self
+                .shape_ctx
+                .builder(font)
+                .script(script)
+                .direction(Direction::LeftToRight)
+                .size(self.px)
+                .build();
             shaper.add_str(&s[a..b]);
             let hinted = self.hinted;
             shaper.shape_with(|c| {
                 for g in c.glyphs {
-                    glyphs.push(Glyph { face, id: g.id, x: x + g.x, y: g.y });
+                    glyphs.push(Glyph {
+                        face,
+                        id: g.id,
+                        x: x + g.x,
+                        y: g.y,
+                    });
                     x += if hinted { g.advance.round() } else { g.advance };
                 }
             });
@@ -277,7 +319,12 @@ impl Text {
             self.arena.clear();
         }
         let font = self.faces.get(key.face as usize)?.font();
-        let mut scaler = self.scale_ctx.builder(font).size(self.px).hint(self.hinted).build();
+        let mut scaler = self
+            .scale_ctx
+            .builder(font)
+            .size(self.px)
+            .hint(self.hinted)
+            .build();
         // No ColorOutline: it gives premultiplied pixels, and color bitmaps are what's
         // installed here. Such fonts fall back to their plain outlines.
         let image = Render::new(&[Source::ColorBitmap(StrikeWith::BestFit), Source::Outline])
@@ -290,9 +337,17 @@ impl Text {
             self.arena.extend_from_slice(&image.data);
         } else {
             let gamma = &self.gamma;
-            self.arena.extend(image.data.iter().map(|&a| gamma[a as usize]));
+            self.arena
+                .extend(image.data.iter().map(|&a| gamma[a as usize]));
         }
-        let c = Cached { left: image.placement.left, top: image.placement.top, w: image.placement.width as i32, h: image.placement.height as i32, off, color };
+        let c = Cached {
+            left: image.placement.left,
+            top: image.placement.top,
+            w: image.placement.width as i32,
+            h: image.placement.height as i32,
+            off,
+            color,
+        };
         self.glyphs.insert(key, c);
         Some(c)
     }
@@ -311,7 +366,13 @@ impl Text {
                 let fl = gx.floor();
                 (fl as i32, (((gx - fl) * 4.0) as u8).min(3))
             };
-            let Some(c) = self.glyph(GlyphKey { face: g.face, id: g.id, sub_x }) else { continue };
+            let Some(c) = self.glyph(GlyphKey {
+                face: g.face,
+                id: g.id,
+                sub_x,
+            }) else {
+                continue;
+            };
             if c.w == 0 || c.h == 0 {
                 continue;
             }
@@ -333,7 +394,15 @@ impl Text {
 
     /// Draws text that must fit in `max_w`, cutting from the middle so the end of a
     /// file name (usually the extension or a number) stays visible.
-    pub fn draw_fitted(&mut self, canvas: &mut Canvas, s: &str, x: f32, y: i32, max_w: f32, color: u32) {
+    pub fn draw_fitted(
+        &mut self,
+        canvas: &mut Canvas,
+        s: &str,
+        x: f32,
+        y: i32,
+        max_w: f32,
+        color: u32,
+    ) {
         let run = self.shape(s);
         if run.width <= max_w {
             self.draw(canvas, &run, x, y, color);
@@ -348,7 +417,10 @@ impl Text {
         let ell = self.shape("…");
         // Too narrow even for the ellipsis: drawing nothing beats running into the next column.
         if max_w < ell.width {
-            return Run { glyphs: Vec::new(), width: 0.0 };
+            return Run {
+                glyphs: Vec::new(),
+                width: 0.0,
+            };
         }
         let keep = (max_w - ell.width).max(0.0);
         let tail_w = (keep * 0.33).min(keep);
@@ -367,9 +439,15 @@ impl Text {
         {
             glyphs.pop();
         }
-        let head_end = glyphs.len().checked_sub(1).map_or(0.0, |i| self.next_x(run, i));
+        let head_end = glyphs
+            .len()
+            .checked_sub(1)
+            .map_or(0.0, |i| self.next_x(run, i));
         for g in &ell.glyphs {
-            glyphs.push(Glyph { x: g.x + head_end, ..*g });
+            glyphs.push(Glyph {
+                x: g.x + head_end,
+                ..*g
+            });
         }
         let after_ell = head_end + ell.width;
         let tail_from = run.width - tail_w;
@@ -380,7 +458,10 @@ impl Text {
                 glyphs.push(Glyph { x: g.x + s, ..*g });
             }
         }
-        Run { glyphs, width: max_w.min(run.width) }
+        Run {
+            glyphs,
+            width: max_w.min(run.width),
+        }
     }
 
     fn next_x(&self, run: &Run, i: usize) -> f32 {
@@ -391,7 +472,11 @@ impl Text {
     pub fn offset_at(&mut self, s: &str, x: f32) -> usize {
         let mut best = (0usize, f32::MAX);
         // Not before a mark or joiner: that would split a character from its accent.
-        let mut ends: Vec<usize> = s.char_indices().filter(|&(_, c)| !joins_previous(c)).map(|(i, _)| i).collect();
+        let mut ends: Vec<usize> = s
+            .char_indices()
+            .filter(|&(_, c)| !joins_previous(c))
+            .map(|(i, _)| i)
+            .collect();
         ends.push(s.len());
         for i in ends {
             let w = self.measure(&s[..i]);
@@ -421,7 +506,15 @@ fn map_file(path: &Path) -> Option<&'static [u8]> {
     // for 'static. Fonts being replaced in place is the one risk, the same as for every
     // program that maps fonts.
     unsafe {
-        let p = mmap(std::ptr::null_mut(), len, ProtFlags::READ, MapFlags::PRIVATE, &file, 0).ok()?;
+        let p = mmap(
+            std::ptr::null_mut(),
+            len,
+            ProtFlags::READ,
+            MapFlags::PRIVATE,
+            &file,
+            0,
+        )
+        .ok()?;
         Some(std::slice::from_raw_parts(p as *const u8, len))
     }
 }
@@ -429,7 +522,10 @@ fn map_file(path: &Path) -> Option<&'static [u8]> {
 /// Asks fontconfig for a font, through `fc-match` so startup doesn't pay to load it
 /// as a library. `pattern` is like `sans` or `sans:charset=4e00`.
 pub fn fc_match(pattern: &str) -> Option<(PathBuf, u32)> {
-    let out = std::process::Command::new("fc-match").args(["-f", "%{file}\t%{index}", pattern]).output().ok()?;
+    let out = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}\t%{index}", pattern])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -461,7 +557,10 @@ pub fn primary_font(cache_home: &Path) -> Option<(PathBuf, u32)> {
 pub fn store_primary_font(cache_home: &Path, found: &(PathBuf, u32)) {
     let dir = cache_home.join("gannet");
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("font"), format!("{}\t{}", found.0.display(), found.1));
+    let _ = std::fs::write(
+        dir.join("font"),
+        format!("{}\t{}", found.0.display(), found.1),
+    );
 }
 
 #[cfg(test)]
@@ -530,7 +629,14 @@ mod tests {
     fn empty_and_odd_strings_shape() {
         let Some(mut t) = text() else { return };
         assert_eq!(t.measure(""), 0.0);
-        for s in ["\u{200d}", "e\u{301}", "\u{1F600}", "a\u{0}b", "\u{FFFD}\u{FFFD}", "日本語 mixed"] {
+        for s in [
+            "\u{200d}",
+            "e\u{301}",
+            "\u{1F600}",
+            "a\u{0}b",
+            "\u{FFFD}\u{FFFD}",
+            "日本語 mixed",
+        ] {
             t.measure(s);
         }
     }
@@ -559,7 +665,11 @@ mod tests {
         let s = "cafe\u{301}";
         assert_eq!(t.offset_at(s, 10_000.0), s.len());
         let x = t.measure("cafe");
-        assert_ne!(t.offset_at(s, x), "cafe".len(), "never between a letter and its accent");
+        assert_ne!(
+            t.offset_at(s, x),
+            "cafe".len(),
+            "never between a letter and its accent"
+        );
     }
 
     #[test]

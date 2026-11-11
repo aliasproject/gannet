@@ -10,16 +10,25 @@ use gannet_core::trash::TrashConfig;
 
 fn main() {
     let mut a = std::env::args().skip(1);
-    let (src, dest) = (PathBuf::from(a.next().expect("source")), PathBuf::from(a.next().expect("destination folder")));
+    let (src, dest) = (
+        PathBuf::from(a.next().expect("source")),
+        PathBuf::from(a.next().expect("destination folder")),
+    );
     let (tx, rx) = mpsc::channel();
     let tx = Mutex::new(tx);
     let mut trash = TrashConfig::new(&dest, 0);
     trash.mount_of = Arc::new(|_| None);
-    let e = Engine::new(trash, Arc::new(move |ev| {
-        let _ = tx.lock().unwrap().send(ev);
-    }));
+    let e = Engine::new(
+        trash,
+        Arc::new(move |ev| {
+            let _ = tx.lock().unwrap().send(ev);
+        }),
+    );
     let t = Instant::now();
-    e.start(Request::Copy { sources: vec![src], dest });
+    e.start(Request::Copy {
+        sources: vec![src],
+        dest,
+    });
     loop {
         match rx.recv().unwrap() {
             Event::Finished(o) => {
