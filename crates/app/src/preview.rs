@@ -290,20 +290,23 @@ struct Place<'a> {
 /// Gets one file on screen. Returns its final answer, or `None` if it's been cancelled.
 fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Found)) -> Option<Found> {
     let path = at.path;
-    // Non-blocking so a FIFO can't hang this on open. It's turned away just below.
+    // Folders, pipes, sockets and devices are only described, never opened: a socket can't be,
+    // and a device may not be yours to read.
+    if let Ok(meta) = std::fs::metadata(path)
+        && !meta.is_file()
+    {
+        return Some(describe(at, &meta, None, None, cancel));
+    }
+    // Non-blocking so a FIFO swapped in since can't hang this on open. It's turned away just below.
     let file = match File::options().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return message("You don't have permission to read this file");
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return message("This file is no longer here");
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return message("You don't have permission to read this file"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return message("This file is no longer here"),
         Err(_) => return message("This file can't be read"),
     };
     let Ok(meta) = file.metadata() else { return message("This file can't be read") };
     if !meta.is_file() {
-        return Some(describe(at, &meta, None, cancel));
+        return Some(describe(at, &meta, None, None, cancel));
     }
     // Read where it is rather than with `read`, which would move the decoder's starting point.
     let mut head = vec![0u8; mime::HEAD];
@@ -313,12 +316,14 @@ fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &Ow
         Err(_) => return message("The previewer couldn't start"),
     };
     let mut waited = helper.wait(cancel, THUMBNAIL_AFTER);
+    // The thumbnail, once it's been looked for: `Some(None)` when there isn't one.
+    let mut looked: Option<Option<Arc<ImageBuf>>> = None;
     if slow.is_some() || matches!(waited, Waited::TimedOut) {
-        if let Some(cache_home) = at.cache_home
-            && let Some(image) = thumbnail(cache_home, path, meta.mtime(), cancel)
-        {
-            send(Found::Thumbnail(Arc::new(image)));
+        let found = at.cache_home.and_then(|cache_home| thumbnail(cache_home, path, meta.mtime(), cancel)).map(Arc::new);
+        if let Some(image) = &found {
+            send(Found::Thumbnail(image.clone()));
         }
+        looked = Some(found);
         if let Some(slow) = slow
             && cancelled_within(cancel, slow)
         {
@@ -326,17 +331,18 @@ fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &Ow
         }
         waited = helper.wait(cancel, DECODE_LIMIT);
     }
-    let unsupported = || Some(describe(at, &meta, head.as_deref(), cancel));
+    let unsupported = || Some(describe(at, &meta, head.as_deref(), looked.clone(), cancel));
     match waited {
         Waited::Cancelled => None,
         Waited::TimedOut => message("This file is taking too long to read"),
-        Waited::Exited(status) if status.code() == Some(decode::EXIT_UNSUPPORTED) && head.as_deref().is_some_and(media::looks_like_video) => play_video(path, video_size, cancel, send, &|| describe(at, &meta, head.as_deref(), cancel)),
+        Waited::Exited(status) if status.code() == Some(decode::EXIT_UNSUPPORTED) && head.as_deref().is_some_and(media::looks_like_video) => play_video(path, video_size, cancel, send, &|| describe(at, &meta, head.as_deref(), looked.clone(), cancel)),
         Waited::Exited(status) => answer(status, &helper.output, meta.len()).or_else(unsupported),
     }
 }
 
 /// The type, name, size and date of anything, and a picture of it if another program made one.
-fn describe(at: &Place, meta: &std::fs::Metadata, head: Option<&[u8]>, cancel: &OwnedFd) -> Found {
+/// `looked` is the thumbnail if it's already been looked for.
+fn describe(at: &Place, meta: &std::fs::Metadata, head: Option<&[u8]>, looked: Option<Option<Arc<ImageBuf>>>, cancel: &OwnedFd) -> Found {
     let name = at.path.file_name().map_or(&b""[..], |n| n.as_encoded_bytes());
     let kind = meta.file_type();
     let db = at.kinds.db();
@@ -355,8 +361,9 @@ fn describe(at: &Place, meta: &std::fs::Metadata, head: Option<&[u8]>, cancel: &
     };
     let description = db.describe(mime, at.kinds.lang.as_deref()).unwrap_or_else(|| fallback_description(mime));
     let icon = icon_for(mime, &db.generic_icon(mime), name);
-    let thumbnail = match at.cache_home {
-        Some(cache_home) if kind.is_file() => thumbnail(cache_home, at.path, meta.mtime(), cancel).map(Arc::new),
+    let thumbnail = match (looked, at.cache_home) {
+        (Some(looked), _) => looked,
+        (None, Some(cache_home)) if kind.is_file() => thumbnail(cache_home, at.path, meta.mtime(), cancel).map(Arc::new),
         _ => None,
     };
     let size = kind.is_file().then_some(meta.len());
@@ -718,14 +725,15 @@ impl App {
         // Replacing the old one stops its decoder and frees its image.
         self.preview = Some(Preview {
             generation: self.preview_gen,
-            path,
+            path: path.clone(),
             content: Content::Waiting,
             size: None,
             zoom: None,
             pan: (0.0, 0.0),
             loading_shown: false,
             continuing: old.is_some(),
-            seen: self.stat_at_cursor(),
+            // Only the cursor's row is this file, and only once the listing has caught up.
+            seen: if self.path_at_cursor().as_ref() == Some(&path) { self.stat_at_cursor() } else { None },
             scaled: None,
             scale_gen: 0,
             scale_wanted: (0, 0),
@@ -777,7 +785,8 @@ impl App {
         }
         self.previewer_gen += 1;
         self.cmds.push(Cmd::OpenPreview { generation: self.previewer_gen, path: path.clone(), hidden: self.show_hidden, sort: self.sort });
-        self.previewer = Some(path);
+        self.previewer = Some(path.clone());
+        self.previewer_cursor = Some(path);
     }
 
     /// The preview window closes: from the list, by telling it to; in it, by quitting.
@@ -1410,9 +1419,12 @@ impl App {
             return;
         }
         let Some(path) = self.path_at_cursor() else { return };
-        if self.previewer.as_ref() != Some(&path) {
-            self.previewer = Some(path.clone());
-            self.cmds.push(Cmd::PreviewShow(path));
+        if self.previewer_cursor.as_ref() != Some(&path) {
+            self.previewer_cursor = Some(path.clone());
+            if self.previewer.as_ref() != Some(&path) {
+                self.previewer = Some(path.clone());
+                self.cmds.push(Cmd::PreviewShow(path));
+            }
         }
     }
 
@@ -1427,10 +1439,12 @@ impl App {
             return;
         }
         let Some(name) = path.file_name().map(|n| n.as_encoded_bytes()) else { return };
+        // A file the list doesn't show (its filter hides it, say) leaves the cursor where it is.
         let Some(row) = self.listing.as_ref().and_then(|l| self.rows.iter().position(|&i| *l.key(i) == *name)) else { return };
         if row != self.cursor || !self.cursor_shown {
             self.move_cursor(row, Mods { ctrl: self.sel_count > 1, ..Mods::default() });
         }
+        self.previewer_cursor = Some(path);
     }
 
     /// The preview window has gone. Said so if it wasn't asked to.
@@ -1543,6 +1557,27 @@ mod tests {
         assert!(!worth_smoothing(&view(12_000, 9_000, false, Some(0.9), (0.0, 0.0))));
         // Not shrinking at all.
         assert!(!worth_smoothing(&view(100, 50, false, Some(2.0), (0.0, 0.0))));
+    }
+
+    #[test]
+    fn sockets_and_folders_are_described_without_being_opened() {
+        assert!(std::env::var_os("GANNET_TEST_SANDBOX").is_some(), "run tests with scripts/test.sh");
+        let dir = std::env::temp_dir().join(format!("gannet-test-describe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(dir.join("socket")).unwrap();
+        let kinds = Kinds::default();
+        let cancel = event();
+        for (name, mime) in [("socket", "inode/socket"), ("folder", mime::FOLDER)] {
+            let path = dir.join(name);
+            let at = Place { path: &path, kinds: &kinds, cache_home: None };
+            match fetch(&at, None, (100, 100), &cancel, &|_| {}) {
+                Some(Found::Info(info)) => assert_eq!(info.mime, mime),
+                Some(Found::Message(m)) => panic!("{name}: {m}"),
+                _ => panic!("{name}: no answer"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn sleeper(script: &str) -> Helper {

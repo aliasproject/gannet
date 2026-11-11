@@ -481,6 +481,10 @@ pub struct App {
     /// The file the other side last heard about. In the list, `Some` while a preview window is
     /// open.
     pub previewer: Option<PathBuf>,
+    /// In the list: where its cursor was when it last told the window, or followed it. Only
+    /// the cursor moving from there is news; the window showing something the list doesn't
+    /// have, like a file its filter hides, isn't.
+    pub(crate) previewer_cursor: Option<PathBuf>,
     pub(crate) previewer_gen: u64,
     /// The file-type database, for saying what any file is.
     pub kinds: Arc<preview::Kinds>,
@@ -583,6 +587,7 @@ impl App {
             preview_gen: 0,
             viewer: false,
             previewer: None,
+            previewer_cursor: None,
             previewer_gen: 0,
             kinds: Arc::new(preview::Kinds::default()),
             cache_home: None,
@@ -5172,6 +5177,28 @@ mod tests {
     }
 
     #[test]
+    fn a_step_to_a_file_the_list_hides_isnt_undone() {
+        let mut r = preview_rig("filtered");
+        fs::write(r.work().join("ab"), "x").unwrap();
+        r.app.reload();
+        r.pump_until("the new file", |a| !a.loading && a.rows.len() == 4);
+        r.app.filter = "a".into();
+        r.app.rederive(false);
+        r.pump_until("filtered", |a| a.rows.len() == 2);
+        r.key(k::KEY_space, " ");
+        let generation = r.app.previewer_gen;
+        r.app.cmds.clear();
+        // The window walks on to "b", which the filter hides from the list.
+        r.app.on_msg(Msg::PreviewStepped { generation, path: r.work().join("b") });
+        assert_eq!(r.app.cursor, 0, "the list's cursor stays");
+        assert!(sent(&mut r).is_empty(), "and doesn't pull the window back");
+        assert_eq!(previewing(&r).as_deref(), Some("b"));
+        // Moving in the list is still news.
+        with_mods(&mut r, k::KEY_Down, "", Mods::default());
+        assert_eq!(sent(&mut r), ["show ab"]);
+    }
+
+    #[test]
     fn stepping_doesnt_lose_a_selection_of_several() {
         let mut r = preview_rig("several");
         r.app.select_all();
@@ -5306,8 +5333,12 @@ mod tests {
         fs::write(other.join("z"), "x").unwrap();
         r.app.on_msg(Msg::PreviewShow(other.join("z")));
         assert_eq!(showing(&r).as_deref(), Some("z"));
+        let generation = r.app.preview_gen;
         r.pump_until("the other folder", |a| !a.loading && a.dir == other);
+        r.pump_until("its size", |a| a.listing.as_ref().is_some_and(|l| a.rows.first().is_some_and(|&i| matches!(l.stat(i), Stat::Known { .. }))));
+        r.idle();
         assert_eq!(showing(&r).as_deref(), Some("z"));
+        assert_eq!(r.app.preview_gen, generation, "the folder arriving doesn't make it read the file again");
         assert!(sent(&mut r).iter().all(|c| !c.starts_with("stepped")));
     }
 

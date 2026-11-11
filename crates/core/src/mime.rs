@@ -54,12 +54,16 @@ pub struct MimeDb {
 }
 
 impl MimeDb {
-    /// Reads `globs2`, `magic` and `generic-icons` from each `mime` folder (`$XDG_DATA_HOME/mime`,
-    /// then each of `$XDG_DATA_DIRS`), the first folder's entries winning. Folders that don't
-    /// exist or don't parse are left out, so this always gives a database, if an empty one.
+    /// Reads `globs2`, `magic` and `generic-icons` from each `mime` folder, given most important
+    /// first (`$XDG_DATA_HOME/mime`, then each of `$XDG_DATA_DIRS`). Patterns and magic from all
+    /// of them count together, ranked by their own weights and priorities, except that a
+    /// folder's `__NOGLOBS__` for a type drops the patterns less important folders gave it. A
+    /// type's generic icon comes from the first folder that names one. Folders that don't exist
+    /// or don't parse are left out, so this always gives a database, if an empty one.
     pub fn load(dirs: &[PathBuf]) -> Self {
         let mut db = MimeDb { dirs: dirs.to_vec(), ..Default::default() };
-        for dir in dirs {
+        // Least important first, so a later folder's `__NOGLOBS__` can clear what came before.
+        for dir in dirs.iter().rev() {
             if let Some(text) = read_capped(&dir.join("globs2"), MAX_DB_FILE) {
                 db.add_globs(&text);
             }
@@ -69,11 +73,12 @@ impl MimeDb {
             if let Some(text) = read_capped(&dir.join("generic-icons"), MAX_DB_FILE) {
                 for line in String::from_utf8_lossy(&text).lines() {
                     if let Some((mime, icon)) = line.split_once(':') {
-                        db.generic_icons.entry(mime.to_string()).or_insert_with(|| icon.to_string());
+                        db.generic_icons.insert(mime.to_string(), icon.to_string());
                     }
                 }
             }
         }
+        db.index_globs();
         // Highest priority first, keeping the files' own order otherwise.
         db.magic.sort_by_key(|s| std::cmp::Reverse(s.priority));
         db
@@ -83,7 +88,10 @@ impl MimeDb {
         self.globs.is_empty() && self.magic.is_empty()
     }
 
+    /// One folder's `globs2`. Call [`Self::index_globs`] once they're all in.
     fn add_globs(&mut self, text: &[u8]) {
+        let mut cleared: Vec<&str> = Vec::new();
+        let mut added = Vec::new();
         for line in text.split(|&b| b == b'\n') {
             if line.is_empty() || line[0] == b'#' {
                 continue;
@@ -92,14 +100,27 @@ impl MimeDb {
             let (Some(weight), Some(mime), Some(pattern)) = (parts.next(), parts.next(), parts.next()) else { continue };
             let Some(weight) = std::str::from_utf8(weight).ok().and_then(|w| w.parse().ok()) else { continue };
             let (Ok(mime), false) = (std::str::from_utf8(mime), pattern.is_empty()) else { continue };
+            if pattern == b"__NOGLOBS__" {
+                cleared.push(mime);
+                continue;
+            }
             let case_sensitive = parts.next().is_some_and(|flags| flags.split(|&b| b == b',').any(|f| f == b"cs"));
             let pattern = if case_sensitive { pattern.to_vec() } else { pattern.to_ascii_lowercase() };
-            let index = self.globs.len();
-            match pattern.strip_prefix(b"*.") {
-                Some(ext) if !case_sensitive && !ext.iter().any(|b| b"*?[".contains(b)) => self.by_ext.entry(ext.to_vec()).or_default().push(index),
+            added.push(Glob { weight, mime: mime.to_string(), pattern, case_sensitive });
+        }
+        self.globs.retain(|g| !cleared.contains(&g.mime.as_str()));
+        self.globs.extend(added);
+    }
+
+    /// Sorts the patterns into the `*.ext` ones, looked up by extension, and the rest.
+    fn index_globs(&mut self) {
+        self.by_ext.clear();
+        self.other.clear();
+        for (index, g) in self.globs.iter().enumerate() {
+            match g.pattern.strip_prefix(b"*.") {
+                Some(ext) if !g.case_sensitive && !ext.iter().any(|b| b"*?[".contains(b)) => self.by_ext.entry(ext.to_vec()).or_default().push(index),
                 _ => self.other.push(index),
             }
-            self.globs.push(Glob { weight, mime: mime.to_string(), pattern, case_sensitive });
         }
     }
 
@@ -238,14 +259,15 @@ fn read_capped(path: &Path, max: u64) -> Option<Vec<u8>> {
     (out.len() as u64 <= max).then_some(out)
 }
 
-/// Text when nothing in it is a control character other than the usual whitespace, and the
-/// part that's there is UTF-8, allowing for a character cut off at the end.
+/// Text when nothing in it is a control character other than whitespace, and the part that's
+/// there is UTF-8, allowing for a character cut off at the end. That's GLib's test, so a file
+/// reads as text here when it does in GTK apps.
 pub fn looks_like_text(head: &[u8]) -> bool {
     let valid = match std::str::from_utf8(head) {
         Ok(_) => true,
         Err(e) => e.error_len().is_none(),
     };
-    valid && !head.iter().any(|&b| b < 0x20 && !b"\t\n\r\x0c\x1b".contains(&b) || b == 0x7f)
+    valid && !head.iter().any(|&b| b < 0x20 && !b"\t\n\x0b\x0c\r".contains(&b) || b == 0x7f)
 }
 
 /// `[indent]>start=LLvalue[&mask][~size][+range]\n`, numbers in decimal, `LL` big-endian.
@@ -312,7 +334,8 @@ fn test_matches(t: &Test, head: &[u8]) -> bool {
     if len == 0 {
         return false;
     }
-    (t.start..t.start.saturating_add(t.range)).any(|at| {
+    // Starts past the end of what was read can't match, however wide the range.
+    (t.start..t.start.saturating_add(t.range).min(head.len())).any(|at| {
         let Some(bytes) = head.get(at..at + len) else { return false };
         match &t.mask {
             None => bytes == t.value.as_slice(),
@@ -458,6 +481,7 @@ mod tests {
     fn db(globs: &str, magic: &[u8]) -> MimeDb {
         let mut db = MimeDb::default();
         db.add_globs(globs.as_bytes());
+        db.index_globs();
         db.add_magic(magic);
         db.magic.sort_by_key(|s| std::cmp::Reverse(s.priority));
         db
@@ -520,6 +544,8 @@ mod tests {
         let d = db(GLOBS, &magic());
         assert_eq!(d.guess(b"notes", Some(b"just words\n")), PLAIN_TEXT);
         assert_eq!(d.guess(b"notes", Some("naïve".as_bytes())), PLAIN_TEXT);
+        assert_eq!(d.guess(b"notes", Some(b"columns\x0bwith a vertical tab")), PLAIN_TEXT, "whitespace, as GLib counts it");
+        assert_eq!(d.guess(b"notes", Some(b"\x1b[31mred\x1b[0m")), OCTET_STREAM, "escapes aren't whitespace");
         assert_eq!(d.guess(b"blob", Some(b"\x00\x01\x02")), OCTET_STREAM);
         assert_eq!(d.guess(b"blob", None), OCTET_STREAM);
         assert_eq!(d.guess(b"empty", Some(b"")), EMPTY);
@@ -577,6 +603,20 @@ mod tests {
         assert_eq!(d.describe("application/missing", None), None);
         assert_eq!(d.describe("../etc/passwd", None), None);
         assert_eq!(d.describe("application/../pdf", None), None);
+    }
+
+    #[test]
+    fn a_more_important_folder_can_clear_a_types_patterns() {
+        let s = crate::testutil::Scratch::new();
+        s.file("user/globs2", b"50:text/x-mine:*.zz\n50:application/x-old:__NOGLOBS__\n");
+        s.file("user/generic-icons", b"text/x-mine:mine-icon\n");
+        s.file("system/globs2", b"50:application/x-old:*.old\n50:application/x-kept:*.kept\n");
+        s.file("system/generic-icons", b"text/x-mine:system-icon\n");
+        let d = MimeDb::load(&[s.path().join("user"), s.path().join("system")]);
+        assert_eq!(d.guess(b"a.zz", None), "text/x-mine");
+        assert_eq!(d.guess(b"a.kept", None), "application/x-kept");
+        assert_eq!(d.guess(b"a.old", None), OCTET_STREAM, "the user's folder dropped it");
+        assert_eq!(d.generic_icon("text/x-mine"), "mine-icon", "the first folder's icon");
     }
 
     #[test]
