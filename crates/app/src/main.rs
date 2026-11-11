@@ -457,11 +457,20 @@ fn find_fallback_fonts(hub: &Hub, chars: Vec<char>) {
     let hub = hub.clone();
     let _ = std::thread::Builder::new().name("gannet-fonts".into()).spawn(move || {
         let mut found: Vec<PathBuf> = Vec::new();
+        // A long document can need thousands of characters, and one font found for the first
+        // usually has the rest, so it's asked before fontconfig is.
+        let mut have: Vec<(Vec<u8>, u32)> = Vec::new();
         for ch in chars {
+            if have.iter().any(|(bytes, index)| text::font_has(bytes, *index, ch)) {
+                continue;
+            }
             if let Some((path, index)) = text::fc_match(&format!("sans:charset={:x}", ch as u32))
                 && !found.contains(&path)
             {
                 found.push(path.clone());
+                if let Ok(bytes) = std::fs::read(&path) {
+                    have.push((bytes, index));
+                }
                 hub.send(Msg::Font(path, index));
             }
         }

@@ -58,6 +58,7 @@ const FOOT_H: f64 = 32.0;
 
 const DAMAGED: &str = "This image can't be read. It may be damaged.";
 const DAMAGED_TEXT: &str = "This file can't be read as text";
+const TEXT_TOO_LARGE: &str = "This file took too much work to show as text";
 const TOO_LARGE: &str = "This image is too large to preview";
 const NO_BUBBLEWRAP: &str = "Playing video and sound needs bubblewrap, which isn't installed";
 const NO_MPV: &str = "Playing video and sound needs mpv, which isn't installed";
@@ -383,7 +384,7 @@ fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &Ow
     let mut head = vec![0u8; mime::HEAD];
     let head = file.read_at(&mut head, 0).ok().map(|n| head[..n].to_vec());
     // Text goes to the decoder as text: no image starts out looking like it.
-    let mode = head.as_deref().filter(|h| !h.is_empty() && mime::looks_like_text(h)).map(|h| if is_markdown(at, h) { decode::MARKDOWN_ARG } else { decode::TEXT_ARG });
+    let mode = head.as_deref().filter(|h| is_text(at, h)).map(|h| if is_markdown(at, h) { decode::MARKDOWN_ARG } else { decode::TEXT_ARG });
     let mut helper = match Helper::spawn(file, mode) {
         Ok(h) => h,
         Err(_) => return message("The previewer couldn't start"),
@@ -414,9 +415,8 @@ fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &Ow
                 Found::Info(info) => Some(Found::Doc { doc, info }),
                 other => Some(other),
             },
-            (Some(0), None) => message(DAMAGED_TEXT),
             (Some(decode::EXIT_UNSUPPORTED), _) => unsupported(),
-            _ => answer(status, &helper.output, meta.len()).or_else(unsupported),
+            _ => text_answer(status),
         };
     }
     match waited {
@@ -487,6 +487,32 @@ fn icon_for(mime: &str, generic: &str, name: &[u8]) -> Icon {
             Icon::File if mime.starts_with("text/") => Icon::Document,
             other => other,
         },
+    }
+}
+
+/// Text, as far as the start of it shows: no zero byte, and either it reads as text, or the
+/// database says it is, as for a Latin-1 file or a log with colour codes in it.
+fn is_text(at: &Place, head: &[u8]) -> bool {
+    if head.is_empty() || head.contains(&0) {
+        return false;
+    }
+    if mime::looks_like_text(head) {
+        return true;
+    }
+    let name = at.path.file_name().map_or(&b""[..], |n| n.as_encoded_bytes());
+    at.kinds.db().guess(name, Some(head)).starts_with("text/")
+}
+
+/// What a decoder reading text ending other than with a document or "not text" means.
+fn text_answer(status: ExitStatus) -> Option<Found> {
+    match (status.code(), status.signal()) {
+        (Some(decode::EXIT_NO_SANDBOX), _) => message(NO_SANDBOX),
+        (_, Some(libc::SIGSYS)) => {
+            eprintln!("gannet: the sandbox stopped a preview decoder");
+            message(SANDBOX_STOPPED)
+        }
+        (_, Some(libc::SIGABRT | libc::SIGKILL | libc::SIGXFSZ)) | (Some(decode::EXIT_TOO_LARGE), _) => message(TEXT_TOO_LARGE),
+        _ => message(DAMAGED_TEXT),
     }
 }
 
@@ -1504,9 +1530,12 @@ impl App {
         let Some(fonts) = self.doc_fonts.as_mut() else { return };
         if !p.doc_layout.as_ref().is_some_and(|l| l.fits(area.w, fonts)) {
             // Keeps the same part of it in view, as near as can be.
-            let along = p.doc_layout.as_ref().map_or(0.0, |l| p.scroll / l.height.max(1) as f64);
+            // A scroll from before the first layout stands, and is cut to fit below.
+            let along = p.doc_layout.as_ref().map(|l| p.scroll / l.height.max(1) as f64);
             let layout = docview::lay_out(doc, area.w, fonts);
-            p.scroll = along * layout.height as f64;
+            if let Some(along) = along {
+                p.scroll = along * layout.height as f64;
+            }
             p.doc_layout = Some(layout);
         }
         let Some(layout) = &p.doc_layout else { return };
@@ -1964,6 +1993,34 @@ mod tests {
         assert!(ImageBuf::from_memfd(&memfd_with(&animation(1, 1, &[0; 8], &[10, 10], decode::MAX_FRAMES + 1))).is_none());
         assert!(ImageBuf::from_memfd(&memfd_with(&animation(u32::MAX, u32::MAX, &[0; 8], &[10, 10], 2))).is_none());
         assert!(ImageBuf::from_memfd(&memfd_with(&decode::ANIMATION_MAGIC[..].repeat(3))).is_none());
+    }
+
+    #[test]
+    fn text_is_known_by_a_zero_byte_or_by_its_type() {
+        let kinds = Kinds::new(vec![PathBuf::from("/usr/share/mime")], None);
+        let at = |name: &str| PathBuf::from("/nowhere").join(name);
+        let is = |name: &str, head: &[u8]| is_text(&Place { path: &at(name), kinds: &kinds, cache_home: None }, head);
+        assert!(is("notes", b"plain words\n"));
+        // Not GLib's idea of text, but text all the same.
+        assert!(is("build.log", b"\x1b[31merror\x1b[0m: it broke\n"), "colour codes in a log");
+        assert!(is("cafe.txt", b"caf\xe9 au lait\n"), "Latin-1");
+        assert!(!is("data.bin", b"\x89\xfe\x01\x02 no zero byte here"), "bytes the database doesn't call text");
+        assert!(!is("notes.txt", b"text\0then a zero"));
+        assert!(!is("empty.txt", b""));
+    }
+
+    #[test]
+    fn a_text_decoder_ending_badly_says_so_in_words_about_text() {
+        let said = |raw: i32| match text_answer(ExitStatus::from_raw(raw)) {
+            Some(Found::Message(m)) => m,
+            _ => panic!("no message for {raw}"),
+        };
+        assert_eq!(said(libc::SIGKILL), TEXT_TOO_LARGE, "a limit");
+        assert_eq!(said(decode::EXIT_TOO_LARGE << 8), TEXT_TOO_LARGE);
+        assert_eq!(said(libc::SIGSYS), SANDBOX_STOPPED);
+        assert_eq!(said(decode::EXIT_NO_SANDBOX << 8), NO_SANDBOX);
+        assert_eq!(said(decode::EXIT_DAMAGED << 8), DAMAGED_TEXT);
+        assert!(!said(libc::SIGKILL).contains("image"));
     }
 
     #[test]

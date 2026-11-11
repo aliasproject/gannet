@@ -131,8 +131,18 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => out.open(item.take().map_or(Kind::Paragraph, Kind::Item), quote, indent(&lists)),
-                Tag::Heading { level, .. } => out.open(Kind::Heading(level as u8), quote, indent(&lists)),
-                Tag::CodeBlock(_) => out.open(Kind::Code, quote, indent(&lists)),
+                Tag::Heading { .. } | Tag::CodeBlock(_) => {
+                    // An item that starts with one of these has its bullet on a line of its own.
+                    if let Some(marker) = item.take() {
+                        out.open(Kind::Item(marker), quote, indent(&lists));
+                        out.close();
+                    }
+                    let kind = match tag {
+                        Tag::Heading { level, .. } => Kind::Heading(level as u8),
+                        _ => Kind::Code,
+                    };
+                    out.open(kind, quote, indent(&lists));
+                }
                 Tag::BlockQuote(_) => {
                     out.close();
                     quote = quote.saturating_add(1);
@@ -447,6 +457,15 @@ mod tests {
                 (item("4."), 0, 1, "four".into()),
             ]
         );
+    }
+
+    #[test]
+    fn an_item_can_start_with_code_or_a_heading() {
+        let doc = markdown("- ```\n  code\n  ```\n- # Title\n", false);
+        let kinds: Vec<(Kind, u8)> = doc.blocks.iter().map(|b| (b.kind.clone(), b.indent)).collect();
+        let bullet = Kind::Item("•".into());
+        assert_eq!(kinds, [(bullet.clone(), 1), (Kind::Code, 1), (bullet, 1), (Kind::Heading(1), 1)]);
+        assert_eq!(doc.blocks[1].spans, [span(CODE, "code")]);
     }
 
     #[test]

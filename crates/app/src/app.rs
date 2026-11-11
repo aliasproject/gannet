@@ -1063,10 +1063,8 @@ impl App {
                 }
             }
             Msg::Font(path, index) => {
-                if let Some(fonts) = self.doc_fonts.as_mut() {
-                    fonts.add_fallback(&path, index);
-                }
-                if self.text.add_font(&path, index) || self.doc_fonts.is_some() {
+                let for_documents = self.doc_fonts.as_mut().is_some_and(|f| f.add_fallback(&path, index));
+                if self.text.add_font(&path, index) | for_documents {
                     self.invalidate_all();
                 }
             }
@@ -5502,6 +5500,26 @@ mod tests {
         assert_eq!(frame(&r), 1);
         assert_eq!(r.app.next_deadline(), Some(late + Duration::from_millis(300)));
         assert!(matches!(r.app.preview.as_ref().unwrap().content, Content::Image { .. }));
+    }
+
+    #[test]
+    fn a_scroll_before_the_first_layout_isnt_lost() {
+        use crate::preview::{Event, Found, Info};
+        let mut r = viewer_rig("early-scroll", "a");
+        let generation = r.app.preview_gen;
+        let text = (0..2000).map(|i| format!("line {i}\n")).collect::<String>();
+        let info = Info { mime: "text/plain".into(), description: String::new(), icon: crate::icons::Icon::Document, size: None, modified: None, thumbnail: None, folder: None };
+        r.app.on_msg(Msg::Preview(Event { generation, found: Found::Doc { doc: crate::doc::plain(text, false), info } }));
+        r.key(k::KEY_End, "");
+        let (w, h) = (r.app.w, r.app.h);
+        let mut pixels = vec![0u32; (w * h) as usize];
+        let mut canvas = crate::canvas::Canvas::new(&mut pixels, w, h);
+        canvas.set_clip(Rect::new(0, 0, w, h));
+        r.app.paint(&mut canvas);
+        let p = r.app.preview.as_ref().unwrap();
+        let height = p.doc_layout.as_ref().unwrap().height;
+        assert!(height > h, "longer than the window");
+        assert!(p.scroll > (height - h) as f64 - 1.0, "at the end: {} of {height}", p.scroll);
     }
 
     #[test]

@@ -118,10 +118,9 @@ impl Fonts {
     }
 
     /// A font for characters none of the others have.
-    pub fn add_fallback(&mut self, path: &Path, index: u32) {
-        for t in self.all() {
-            t.add_font(path, index);
-        }
+    /// Returns whether any of them didn't have it already.
+    pub fn add_fallback(&mut self, path: &Path, index: u32) -> bool {
+        self.all().fold(false, |added, t| t.add_font(path, index) | added)
     }
 
     pub fn take_missing(&mut self) -> Vec<char> {
@@ -397,22 +396,25 @@ fn flow(block: &Block, left: i32, right: i32, mut y: i32, fonts: &mut Fonts, lin
                 finish(&mut line, &mut y, fonts, &mut marker, lines);
                 x = left as f32;
             }
-            // A word longer than the whole line is broken wherever it has to be.
+            // A word longer than the whole line is broken wherever it has to be. Characters are
+            // measured one at a time, as measuring each longer start of a long word would take
+            // as long as the square of its length.
             if ink > (right - left) as f32 {
-                let mut part = String::new();
+                let (mut part, mut part_w) = (String::new(), 0.0);
+                let mut buf = [0u8; 4];
                 for c in word.chars() {
-                    part.push(c);
-                    if fonts.get(face).measure(&part) > (right as f32 - x) && part.chars().count() > 1 {
-                        part.pop();
+                    let cw = fonts.get(face).measure(c.encode_utf8(&mut buf));
+                    if x + part_w + cw > right as f32 && !part.is_empty() {
                         line.push(Piece { x, face, style: span.style, text: std::mem::take(&mut part) });
                         finish(&mut line, &mut y, fonts, &mut marker, lines);
                         x = left as f32;
-                        part.push(c);
+                        part_w = 0.0;
                     }
+                    part.push(c);
+                    part_w += cw;
                 }
-                let w = fonts.get(face).measure(&part);
                 line.push(Piece { x, face, style: span.style, text: part });
-                x += w;
+                x += part_w;
                 continue;
             }
             // Joined to the piece before when it looks the same, so a line is drawn in a few goes.
@@ -504,6 +506,29 @@ mod tests {
         assert_eq!(wrap_columns("日本語", 4), ["日本", "語"], "two columns each");
         assert_eq!(wrap_columns("e\u{301}x", 2), ["e\u{301}x"], "a mark takes no room of its own");
         assert_eq!(wrap_columns("ab", 0), ["a", "b"], "a window too narrow still shows something");
+    }
+
+    fn fonts() -> Option<Fonts> {
+        let (path, index) = text::fc_match("sans")?;
+        let mut ui = Text::new(14.0, true);
+        ui.add_font(&path, index);
+        Some(Fonts::new(&ui, 1.0, false, None))
+    }
+
+    #[test]
+    fn a_word_longer_than_the_line_is_broken_to_fit() {
+        let Some(mut fonts) = fonts() else { return };
+        let doc = doc::markdown(&format!("{}\n", "a".repeat(5000)), false);
+        let width = 400;
+        let layout = lay_out(&doc, width, &mut fonts);
+        assert!(layout.lines.len() > 5, "broken over lines");
+        let text: String = layout.lines.iter().flat_map(|l| l.pieces.iter().map(|p| p.text.as_str())).collect();
+        assert_eq!(text.len(), 5000, "nothing lost");
+        for line in &layout.lines {
+            for p in &line.pieces {
+                assert!(p.x + fonts.get(p.face).measure(&p.text) <= (width - fonts.px(20.0)) as f32 + 1.0, "inside the line");
+            }
+        }
     }
 
     #[test]

@@ -449,6 +449,11 @@ fn parse_fc_match(text: &str) -> Option<(PathBuf, u32)> {
     Some((PathBuf::from(file), index.trim().parse().unwrap_or(0)))
 }
 
+/// Whether the font in `bytes` has a glyph for `ch`.
+pub fn font_has(bytes: &[u8], index: u32, ch: char) -> bool {
+    FontRef::from_index(bytes, index as usize).is_some_and(|f| f.charmap().map(ch) != 0)
+}
+
 /// The font to use, from a small cache file so the first frame needn't start a process.
 pub fn primary_font(cache_home: &Path) -> Option<(PathBuf, u32)> {
     if let Some(found) = cached_font(cache_home, "font") {

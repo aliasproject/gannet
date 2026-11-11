@@ -30,7 +30,8 @@ const CHECK_EVERY: u32 = 256;
 /// if `stop` said to stop.
 pub fn measure(dir: &Path, stop: &dyn Fn() -> bool, report: &mut dyn FnMut(Tally)) -> Option<Tally> {
     let mut tally = Tally::default();
-    let Ok(top) = std::fs::symlink_metadata(dir) else {
+    // What's counted is the folder a link to one leads to, so its disk is the one to stay on.
+    let Ok(top) = std::fs::metadata(dir) else {
         tally.incomplete = true;
         tally.done = true;
         return Some(tally);
@@ -123,6 +124,21 @@ mod tests {
         let t = count(&s.path().join("top"));
         assert_eq!((t.items, t.bytes), (3, 10));
         assert!(big.exists());
+    }
+
+    #[test]
+    fn a_link_to_a_folder_on_another_disk_is_counted_all_the_way_down() {
+        let s = Scratch::new();
+        // A tmpfs of its own in the test sandbox, so another disk from the scratch folder.
+        let other = Path::new("/run/gannet-tree/mnt").join(format!("foldersize-{}", std::process::id()));
+        std::fs::create_dir_all(other.join("inner")).unwrap();
+        std::fs::write(other.join("inner/b"), [0; 300]).unwrap();
+        std::fs::write(other.join("a"), [0; 20]).unwrap();
+        let link = s.path().join("link");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        let t = count(&link);
+        std::fs::remove_dir_all(&other).unwrap();
+        assert_eq!((t.items, t.bytes), (2, 320));
     }
 
     #[test]
