@@ -5199,6 +5199,20 @@ mod tests {
     }
 
     #[test]
+    fn the_menus_preview_brings_the_window_back_to_the_cursor() {
+        let mut r = preview_rig("menu-back");
+        r.key(k::KEY_space, " ");
+        let generation = r.app.previewer_gen;
+        // The window walked off to something the list doesn't follow.
+        r.app.on_msg(Msg::PreviewStepped { generation, path: r.root.join("elsewhere/x") });
+        r.app.cmds.clear();
+        r.app.action(Action::Preview);
+        assert_eq!(sent(&mut r), ["show a"]);
+        r.app.action(Action::Preview);
+        assert!(sent(&mut r).is_empty(), "and only once");
+    }
+
+    #[test]
     fn stepping_doesnt_lose_a_selection_of_several() {
         let mut r = preview_rig("several");
         r.app.select_all();

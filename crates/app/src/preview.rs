@@ -589,8 +589,6 @@ pub struct Preview {
     pub zoom: Option<f64>,
     pub pan: (f64, f64),
     pub loading_shown: bool,
-    /// Whether a popup was already up, so there's no gap in it while the next file loads.
-    continuing: bool,
     /// The size and time the listing has for this file, to notice it being overwritten.
     seen: Option<(u64, i64)>,
     scaled: Option<Scaled>,
@@ -731,7 +729,6 @@ impl App {
             zoom: None,
             pan: (0.0, 0.0),
             loading_shown: false,
-            continuing: old.is_some(),
             // Only the cursor's row is this file, and only once the listing has caught up.
             seen: if self.path_at_cursor().as_ref() == Some(&path) { self.stat_at_cursor() } else { None },
             scaled: None,
@@ -781,7 +778,14 @@ impl App {
         }
         let Some(path) = self.path_at_cursor() else { return };
         if self.previewer.is_some() {
-            return self.preview_follow();
+            // Asked for by name, so it's shown even if the cursor hasn't moved: the window may
+            // have walked off somewhere the list doesn't follow.
+            self.previewer_cursor = Some(path.clone());
+            if self.previewer.as_ref() != Some(&path) {
+                self.previewer = Some(path.clone());
+                self.cmds.push(Cmd::PreviewShow(path));
+            }
+            return;
         }
         self.previewer_gen += 1;
         self.cmds.push(Cmd::OpenPreview { generation: self.previewer_gen, path: path.clone(), hidden: self.show_hidden, sort: self.sort });
@@ -862,7 +866,6 @@ impl App {
                 if matches!(p.content, Content::Waiting) {
                     p.content = Content::Image { image, thumbnail: true };
                     p.loading_at = None;
-                    p.continuing = true;
                 }
             }
             Found::Full { image, size } => {

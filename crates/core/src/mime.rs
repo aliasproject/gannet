@@ -19,6 +19,8 @@ pub const EMPTY: &str = "application/x-zerosize";
 pub const FOLDER: &str = "inode/directory";
 
 struct Glob {
+    /// Which folder it came from: 0 is the most important.
+    rank: usize,
     weight: u32,
     mime: String,
     pattern: Vec<u8>,
@@ -35,6 +37,7 @@ struct Test {
 }
 
 struct Section {
+    rank: usize,
     priority: u32,
     mime: String,
     tests: Vec<Test>,
@@ -63,12 +66,12 @@ impl MimeDb {
     pub fn load(dirs: &[PathBuf]) -> Self {
         let mut db = MimeDb { dirs: dirs.to_vec(), ..Default::default() };
         // Least important first, so a later folder's `__NOGLOBS__` can clear what came before.
-        for dir in dirs.iter().rev() {
+        for (rank, dir) in dirs.iter().enumerate().rev() {
             if let Some(text) = read_capped(&dir.join("globs2"), MAX_DB_FILE) {
-                db.add_globs(&text);
+                db.add_globs(&text, rank);
             }
             if let Some(bytes) = read_capped(&dir.join("magic"), MAX_DB_FILE) {
-                db.add_magic(&bytes);
+                db.add_magic(&bytes, rank);
             }
             if let Some(text) = read_capped(&dir.join("generic-icons"), MAX_DB_FILE) {
                 for line in String::from_utf8_lossy(&text).lines() {
@@ -79,8 +82,8 @@ impl MimeDb {
             }
         }
         db.index_globs();
-        // Highest priority first, keeping the files' own order otherwise.
-        db.magic.sort_by_key(|s| std::cmp::Reverse(s.priority));
+        // Highest priority first, then the more important folder, keeping each file's own order.
+        db.magic.sort_by_key(|s| (std::cmp::Reverse(s.priority), s.rank));
         db
     }
 
@@ -89,7 +92,7 @@ impl MimeDb {
     }
 
     /// One folder's `globs2`. Call [`Self::index_globs`] once they're all in.
-    fn add_globs(&mut self, text: &[u8]) {
+    fn add_globs(&mut self, text: &[u8], rank: usize) {
         let mut cleared: Vec<&str> = Vec::new();
         let mut added = Vec::new();
         for line in text.split(|&b| b == b'\n') {
@@ -106,7 +109,7 @@ impl MimeDb {
             }
             let case_sensitive = parts.next().is_some_and(|flags| flags.split(|&b| b == b',').any(|f| f == b"cs"));
             let pattern = if case_sensitive { pattern.to_vec() } else { pattern.to_ascii_lowercase() };
-            added.push(Glob { weight, mime: mime.to_string(), pattern, case_sensitive });
+            added.push(Glob { rank, weight, mime: mime.to_string(), pattern, case_sensitive });
         }
         self.globs.retain(|g| !cleared.contains(&g.mime.as_str()));
         self.globs.extend(added);
@@ -124,7 +127,7 @@ impl MimeDb {
         }
     }
 
-    fn add_magic(&mut self, bytes: &[u8]) {
+    fn add_magic(&mut self, bytes: &[u8], rank: usize) {
         let Some(mut rest) = bytes.strip_prefix(b"MIME-Magic\0\n") else { return };
         let mut current: Option<Section> = None;
         while !rest.is_empty() {
@@ -137,7 +140,7 @@ impl MimeDb {
                 }
                 let header = header.strip_suffix(b"]").unwrap_or(header);
                 let Some((priority, mime)) = std::str::from_utf8(header).ok().and_then(|h| h.split_once(':')) else { continue };
-                current = priority.parse().ok().map(|priority| Section { priority, mime: mime.to_string(), tests: Vec::new() });
+                current = priority.parse().ok().map(|priority| Section { rank, priority, mime: mime.to_string(), tests: Vec::new() });
                 continue;
             }
             match parse_test(rest) {
@@ -188,7 +191,7 @@ impl MimeDb {
     fn by_name<'a>(&'a self, name: &[u8]) -> Vec<&'a str> {
         let lower = name.to_ascii_lowercase();
         let mut best: Option<(u32, usize, bool)> = None;
-        let mut found: Vec<&'a str> = Vec::new();
+        let mut found: Vec<(usize, &'a str)> = Vec::new();
         let mut consider = |g: &'a Glob| {
             let subject = if g.case_sensitive { name } else { &lower };
             if !glob_match(&g.pattern, subject) {
@@ -200,8 +203,8 @@ impl MimeDb {
                 best = Some(rank);
                 found.clear();
             }
-            if best == Some(rank) && !found.contains(&g.mime.as_str()) {
-                found.push(&g.mime);
+            if best == Some(rank) {
+                found.push((g.rank, &g.mime));
             }
         };
         // Every `*.ext` a name could end in, so `x.tar.gz` finds `*.tar.gz` as well as `*.gz`.
@@ -215,7 +218,15 @@ impl MimeDb {
         for &i in &self.other {
             consider(&self.globs[i]);
         }
-        found
+        // The more important folder's answer first, each type once.
+        found.sort_by_key(|&(rank, _)| rank);
+        let mut types: Vec<&str> = Vec::new();
+        for (_, mime) in found {
+            if !types.contains(&mime) {
+                types.push(mime);
+            }
+        }
+        types
     }
 
     /// The highest-priority magic section that matches, from among `only` if given.
@@ -480,9 +491,9 @@ mod tests {
 
     fn db(globs: &str, magic: &[u8]) -> MimeDb {
         let mut db = MimeDb::default();
-        db.add_globs(globs.as_bytes());
+        db.add_globs(globs.as_bytes(), 0);
         db.index_globs();
-        db.add_magic(magic);
+        db.add_magic(magic, 0);
         db.magic.sort_by_key(|s| std::cmp::Reverse(s.priority));
         db
     }
@@ -617,6 +628,18 @@ mod tests {
         assert_eq!(d.guess(b"a.kept", None), "application/x-kept");
         assert_eq!(d.guess(b"a.old", None), OCTET_STREAM, "the user's folder dropped it");
         assert_eq!(d.generic_icon("text/x-mine"), "mine-icon", "the first folder's icon");
+        // Equally good answers from both folders: the user's wins.
+        s.file("user/globs2", b"50:text/x-mine:*.zz\n50:application/x-users:*.tie\n");
+        s.file("system/globs2", b"50:application/x-systems:*.tie\n");
+        let mut magic = b"MIME-Magic\0\n[50:application/x-users]\n".to_vec();
+        magic.extend(magic_line(0, 0, b"TIE", b""));
+        s.file("user/magic", &magic);
+        let mut magic = b"MIME-Magic\0\n[50:application/x-systems]\n".to_vec();
+        magic.extend(magic_line(0, 0, b"TIE", b""));
+        s.file("system/magic", &magic);
+        let d = MimeDb::load(&[s.path().join("user"), s.path().join("system")]);
+        assert_eq!(d.guess(b"a.tie", None), "application/x-users");
+        assert_eq!(d.guess(b"untitled", Some(b"TIE")), "application/x-users");
     }
 
     #[test]

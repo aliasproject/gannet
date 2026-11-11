@@ -53,17 +53,15 @@ fn dirs() -> Dirs {
     Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data, home, mime }
 }
 
-/// The language messages are in, as gettext would choose it: the locale's, unless `LANGUAGE`
-/// lists others first, which it only can when the locale isn't plain C.
+/// The language messages are in, as GLib chooses it for GTK apps: the first of `LANGUAGE`, then
+/// the locale.
 fn language() -> Option<String> {
     language_from(|v| std::env::var(v).ok())
 }
 
 fn language_from(var: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let locale = ["LC_ALL", "LC_MESSAGES", "LANG"].iter().find_map(|v| var(v).filter(|l| !l.is_empty()));
-    let plain = locale.as_deref().is_none_or(|l| l == "C" || l == "POSIX" || l.starts_with("C."));
     let preferred = var("LANGUAGE").and_then(|l| l.split(':').find(|l| !l.is_empty()).map(str::to_string));
-    if plain { locale } else { preferred.or(locale) }
+    preferred.or_else(|| ["LC_ALL", "LC_MESSAGES", "LANG"].iter().find_map(|v| var(v).filter(|l| !l.is_empty())))
 }
 
 /// What to show: the folder, and an entry to put the cursor on if a file was named.
@@ -478,13 +476,12 @@ mod tests {
     }
 
     #[test]
-    fn the_language_is_gettexts() {
+    fn the_language_is_glibs() {
         let env = |pairs: &'static [(&'static str, &'static str)]| move |v: &str| pairs.iter().find(|(k, _)| *k == v).map(|(_, x)| x.to_string());
         assert_eq!(language_from(env(&[("LANG", "en_US.UTF-8"), ("LANGUAGE", "de:fr")])).as_deref(), Some("de"));
         assert_eq!(language_from(env(&[("LANG", "en_US.UTF-8")])).as_deref(), Some("en_US.UTF-8"));
         assert_eq!(language_from(env(&[("LANG", "en_US.UTF-8"), ("LC_ALL", "pt_BR.UTF-8")])).as_deref(), Some("pt_BR.UTF-8"));
-        // In the C locale, gettext doesn't look at LANGUAGE.
-        assert_eq!(language_from(env(&[("LANG", "C.UTF-8"), ("LANGUAGE", "de")])).as_deref(), Some("C.UTF-8"));
+        assert_eq!(language_from(env(&[("LANG", "C.UTF-8"), ("LANGUAGE", ":de")])).as_deref(), Some("de"), "as GLib reads it, in any locale");
         assert_eq!(language_from(env(&[])), None);
     }
 
