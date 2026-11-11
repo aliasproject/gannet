@@ -4,6 +4,7 @@
 
 pub mod bus;
 pub mod clipboard;
+pub mod foldersize;
 pub mod history;
 pub mod listing;
 pub mod mime;

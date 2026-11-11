@@ -3,6 +3,8 @@
 mod app;
 mod canvas;
 mod decode;
+mod doc;
+mod docview;
 mod field;
 mod format;
 mod icons;
@@ -77,7 +79,7 @@ fn main() {
     let arg = std::env::args_os().nth(1);
     if let Some(a) = arg.as_deref().and_then(|a| a.to_str()) {
         if a == decode::ARG {
-            decode::helper_main();
+            decode::helper_main(std::env::args().nth(2).as_deref());
         }
         if a == media::ARG {
             media::helper_main(&std::env::args().skip(2).collect::<Vec<_>>());
@@ -287,7 +289,8 @@ fn main() {
                 after_first_frame(&hub, &d.cache, primary.clone());
                 app.ask_desktop_theme();
             }
-            let missing = app.text.take_missing();
+            let mut missing = app.text.take_missing();
+            missing.extend(app.doc_fonts.as_mut().map(|f| f.take_missing()).unwrap_or_default());
             if !missing.is_empty() {
                 find_fallback_fonts(&hub, missing);
             }
@@ -450,15 +453,34 @@ fn after_first_frame(hub: &Hub, cache: &Path, primary: Option<(PathBuf, u32)>) {
     });
 }
 
+/// Lookups for one batch of missing characters. Characters left over show blank.
+const MAX_FONT_LOOKUPS: usize = 64;
+
 fn find_fallback_fonts(hub: &Hub, chars: Vec<char>) {
     let hub = hub.clone();
     let _ = std::thread::Builder::new().name("gannet-fonts".into()).spawn(move || {
         let mut found: Vec<PathBuf> = Vec::new();
+        // A long document can need thousands of characters, and one font found for the first
+        // usually has the rest, so it's asked before fontconfig is.
+        let mut have: Vec<(Vec<u8>, u32)> = Vec::new();
+        // fontconfig always answers with something, even for a character no font has, so a file
+        // full of those would still be a process each without a limit.
+        let mut asked = 0;
         for ch in chars {
+            if asked >= MAX_FONT_LOOKUPS {
+                break;
+            }
+            if have.iter().any(|(bytes, index)| text::font_has(bytes, *index, ch)) {
+                continue;
+            }
+            asked += 1;
             if let Some((path, index)) = text::fc_match(&format!("sans:charset={:x}", ch as u32))
                 && !found.contains(&path)
             {
                 found.push(path.clone());
+                if let Ok(bytes) = std::fs::read(&path) {
+                    have.push((bytes, index));
+                }
                 hub.send(Msg::Font(path, index));
             }
         }
@@ -643,7 +665,7 @@ mod bench {
     }
 
     fn preview(a: &App) -> String {
-        use crate::preview::Content;
+        use crate::preview::{Content, Video};
         let Some(p) = &a.preview else { return "null".to_string() };
         let name = p.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
         let (state, w, h, message) = match &p.content {
@@ -651,12 +673,15 @@ mod bench {
             Content::Waiting => ("waiting", 0, 0, ""),
             Content::Image { image, thumbnail: true } => ("thumbnail", image.w, image.h, ""),
             Content::Image { image, thumbnail: false } => ("image", image.w, image.h, ""),
+            Content::Video(Video { sound: Some(info), .. }) => ("sound", 0, 0, info.description.as_str()),
             Content::Video(video) => ("video", video.frame.map_or(0, |f| f.1), video.frame.map_or(0, |f| f.2), ""),
             Content::Message(m) => ("message", 0, 0, m.as_str()),
+            Content::Doc { doc, info } if doc.lines() > 0 => ("text", 0, 0, info.description.as_str()),
+            Content::Doc { info, .. } => ("markdown", 0, 0, info.description.as_str()),
             Content::Info(i) => ("info", i.thumbnail.as_ref().map_or(0, |t| t.w), i.thumbnail.as_ref().map_or(0, |t| t.h), i.description.as_str()),
         };
         let kind = match &p.content {
-            Content::Info(i) => esc(&i.mime),
+            Content::Info(i) | Content::Video(Video { sound: Some(i), .. }) | Content::Doc { info: i, .. } => esc(&i.mime),
             _ => "null".to_string(),
         };
         let rect = a.preview_rect();
@@ -667,11 +692,32 @@ mod bench {
             ),
             _ => "null".to_string(),
         };
+        let frames = match &p.content {
+            Content::Image { image, .. } => image.frames(),
+            _ => 0,
+        };
+        let doc = match (&p.content, &p.doc_layout) {
+            (Content::Doc { doc, .. }, layout) => format!(
+                "{{\"blocks\":{},\"cut\":{},\"lines\":{},\"scroll\":{:.0},\"height\":{},\"text\":{}}}",
+                doc.blocks.len(),
+                doc.cut,
+                layout.as_ref().map_or(0, |l| l.lines.len()),
+                p.scroll,
+                layout.as_ref().map_or(0, |l| l.height),
+                esc(&doc.blocks.iter().take(3).flat_map(|b| b.spans.iter().map(|s| s.text.as_str())).collect::<String>().chars().take(200).collect::<String>()),
+            ),
+            _ => "null".to_string(),
+        };
+        let folder = match &p.content {
+            Content::Info(crate::preview::Info { folder: Some(t), .. }) => format!("{{\"items\":{},\"bytes\":{},\"done\":{},\"incomplete\":{}}}", t.items, t.bytes, t.done, t.incomplete),
+            _ => "null".to_string(),
+        };
         let zoom = p.zoom.map_or_else(|| "null".to_string(), |z| format!("{z:.3}"));
         format!(
-            "{{\"name\":{},\"state\":{},\"kind\":{kind},\"w\":{w},\"h\":{h},\"message\":{},\"zoom\":{zoom},\"pan\":[{:.0},{:.0}],\"scaled\":{},\"size\":{},\"rect\":[{},{},{},{}],\"video\":{video}}}",
+            "{{\"name\":{},\"state\":{},\"kind\":{kind},\"w\":{w},\"h\":{h},\"frame\":{},\"frames\":{frames},\"message\":{},\"zoom\":{zoom},\"pan\":[{:.0},{:.0}],\"scaled\":{},\"size\":{},\"rect\":[{},{},{},{}],\"video\":{video},\"doc\":{doc},\"folder\":{folder}}}",
             esc(&name),
             esc(state),
+            p.frame,
             esc(message),
             p.pan.0,
             p.pan.1,

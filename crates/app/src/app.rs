@@ -65,6 +65,8 @@ pub enum Msg {
     Derived { generation: u64, listing: Arc<Listing>, sorted: Arc<Vec<u32>>, rows: Vec<u32>, sort: SortSpec },
     Font(PathBuf, u32),
     PrimaryFont(PathBuf, u32),
+    /// What fontconfig chose for one of the preview's document fonts.
+    DocFont(crate::docview::Role, PathBuf, u32),
     DesktopDark(bool),
     Notice(String),
     Op(ops::Event),
@@ -488,6 +490,8 @@ pub struct App {
     pub(crate) previewer_gen: u64,
     /// The file-type database, for saying what any file is.
     pub kinds: Arc<preview::Kinds>,
+    /// The fonts text and Markdown are set in, once the preview has shown some.
+    pub doc_fonts: Option<crate::docview::Fonts>,
     /// Where other programs keep thumbnails.
     pub cache_home: Option<PathBuf>,
     pub slow_preview: Option<Duration>,
@@ -590,6 +594,7 @@ impl App {
             previewer_cursor: None,
             previewer_gen: 0,
             kinds: Arc::new(preview::Kinds::default()),
+            doc_fonts: None,
             cache_home: None,
             slow_preview: None,
             key_is_repeat: false,
@@ -617,6 +622,9 @@ impl App {
         }
         self.scale = scale;
         self.text.set_size(14.0 * scale as f32, scale < 1.5);
+        if let Some(fonts) = self.doc_fonts.as_mut() {
+            fonts.set_scale(scale);
+        }
         self.clamp_scroll();
         self.stats_range = (0, 0);
         self.request_stats();
@@ -1055,7 +1063,13 @@ impl App {
                 }
             }
             Msg::Font(path, index) => {
-                if self.text.add_font(&path, index) {
+                let for_documents = self.doc_fonts.as_mut().is_some_and(|f| f.add_fallback(&path, index));
+                if self.text.add_font(&path, index) | for_documents {
+                    self.invalidate_all();
+                }
+            }
+            Msg::DocFont(role, path, index) => {
+                if self.doc_fonts.as_mut().is_some_and(|f| f.set_role(role, &path, index)) {
                     self.invalidate_all();
                 }
             }
@@ -1111,6 +1125,9 @@ impl App {
         if c != self.colors {
             self.colors = c;
             self.text.set_contrast(c.dark);
+            if let Some(fonts) = self.doc_fonts.as_mut() {
+                fonts.set_contrast(c.dark);
+            }
             self.invalidate_all();
         }
     }
@@ -1915,7 +1932,9 @@ impl App {
             }
             Input::Button { button, pressed } => self.button(button, pressed),
             Input::Scroll { lines, pixels } => {
-                if self.menu.is_none() && self.preview.is_none() {
+                if self.preview.is_some() {
+                    self.preview_scroll(lines, pixels);
+                } else if self.menu.is_none() {
                     let row = self.layout().row_h as f64;
                     self.scroll_to(self.scroll + lines * 3.0 * row + pixels * self.scale);
                     self.refresh_file_drag();
@@ -5454,6 +5473,53 @@ mod tests {
         std::thread::sleep(Duration::from_millis(300));
         r.app.on_msg(report(PlayState { paused: true, ..playing }));
         assert!(shown(&r).paused);
+    }
+
+    #[test]
+    fn an_animation_steps_through_its_frames_in_time_and_round_again() {
+        use crate::preview::{Content, Event, Found, ImageBuf};
+        let mut r = viewer_rig("animation", "a");
+        let generation = r.app.preview_gen;
+        let image = Arc::new(ImageBuf::animation_for_test(&[100, 300]));
+        let start = Instant::now();
+        r.app.on_msg(Msg::Preview(Event { generation, found: Found::Full { image, size: 1 } }));
+        let frame = |r: &Rig| r.app.preview.as_ref().unwrap().frame;
+        assert_eq!(frame(&r), 0);
+        let due = r.app.next_deadline().unwrap();
+        assert!(due >= start + Duration::from_millis(100) && due <= Instant::now() + Duration::from_millis(100), "the first frame's time");
+        r.app.on_timer(due - Duration::from_millis(1));
+        assert_eq!(frame(&r), 0, "not yet");
+        r.app.on_timer(due);
+        assert_eq!(frame(&r), 1);
+        assert_eq!(r.app.next_deadline(), Some(due + Duration::from_millis(300)), "timed from when it was due, so it doesn't drift");
+        r.app.on_timer(due + Duration::from_millis(300));
+        assert_eq!(frame(&r), 0, "round again");
+        // Asleep for a minute: it carries on from now, rather than racing to catch up.
+        let late = due + Duration::from_secs(60);
+        r.app.on_timer(late);
+        assert_eq!(frame(&r), 1);
+        assert_eq!(r.app.next_deadline(), Some(late + Duration::from_millis(300)));
+        assert!(matches!(r.app.preview.as_ref().unwrap().content, Content::Image { .. }));
+    }
+
+    #[test]
+    fn a_scroll_before_the_first_layout_isnt_lost() {
+        use crate::preview::{Event, Found, Info};
+        let mut r = viewer_rig("early-scroll", "a");
+        let generation = r.app.preview_gen;
+        let text = (0..2000).map(|i| format!("line {i}\n")).collect::<String>();
+        let info = Info { mime: "text/plain".into(), description: String::new(), icon: crate::icons::Icon::Document, size: None, modified: None, thumbnail: None, folder: None };
+        r.app.on_msg(Msg::Preview(Event { generation, found: Found::Doc { doc: crate::doc::plain(text, false), info } }));
+        r.key(k::KEY_End, "");
+        let (w, h) = (r.app.w, r.app.h);
+        let mut pixels = vec![0u32; (w * h) as usize];
+        let mut canvas = crate::canvas::Canvas::new(&mut pixels, w, h);
+        canvas.set_clip(Rect::new(0, 0, w, h));
+        r.app.paint(&mut canvas);
+        let p = r.app.preview.as_ref().unwrap();
+        let height = p.doc_layout.as_ref().unwrap().height;
+        assert!(height > h, "longer than the window");
+        assert!(p.scroll > (height - h) as f64 - 1.0, "at the end: {} of {height}", p.scroll);
     }
 
     #[test]

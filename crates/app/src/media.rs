@@ -33,6 +33,8 @@ use crate::decode;
 pub const ARG: &str = "--video-helper";
 pub const EXIT_NO_MPV: i32 = 7;
 pub const EXIT_CANT_PLAY: i32 = 8;
+/// After the size: a file with no picture plays as sound.
+const SOUND_ARG: &str = "sound";
 
 /// The largest frame the player draws. A bigger popup scales it up.
 pub const MAX_W: u32 = 3840;
@@ -64,6 +66,8 @@ pub enum Said {
     Frame { index: usize, w: u32, h: u32 },
     State(PlayState),
     NoVideo,
+    /// It has no picture, and it's playing as sound, as it was told it could.
+    Sound,
     CantPlay,
 }
 
@@ -82,6 +86,7 @@ pub fn parse_said(line: &str) -> Option<Said> {
     let said = match words.next()? {
         "hello" => Said::Hello,
         "novideo" => Said::NoVideo,
+        "sound" => Said::Sound,
         "cantplay" => Said::CantPlay,
         "frame" => {
             let index: usize = words.next()?.parse().ok()?;
@@ -247,7 +252,8 @@ pub struct Started {
 }
 
 /// Starts `words` after the jail's own, with the video and frame memory on their descriptors.
-pub fn start_jailed(video: File, size: (i32, i32), words: &[&str]) -> Result<Started, StartError> {
+/// With `sound`, a file with no picture plays rather than stopping at `Said::NoVideo`.
+pub fn start_jailed(video: File, size: (i32, i32), words: &[&str], sound: bool) -> Result<Started, StartError> {
     let shared = memfd_create("gannet-video", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).map_err(|_| StartError::Other)?;
     rustix::fs::ftruncate(&shared, SHARED_BYTES as u64).map_err(|_| StartError::Other)?;
     // Without this, a player shrinking it would fault the app when it read a frame.
@@ -268,6 +274,9 @@ pub fn start_jailed(video: File, size: (i32, i32), words: &[&str]) -> Result<Sta
     let mut command = Command::new("bwrap");
     command.args(jail_arguments(&executable, sound_socket().as_deref())).args(words);
     command.arg(size.0.to_string()).arg(size.1.to_string());
+    if sound {
+        command.arg(SOUND_ARG);
+    }
     command.stdin(Stdio::from(their_commands)).stdout(Stdio::from(their_said)).stderr(Stdio::null());
     // SAFETY: only async-signal-safe calls. Bubblewrap passes on all it inherits.
     unsafe {
@@ -293,6 +302,7 @@ pub fn start_jailed(video: File, size: (i32, i32), words: &[&str]) -> Result<Sta
 struct Inbox {
     hello: bool,
     no_video: bool,
+    sound: bool,
     cant_play: bool,
     frame: Option<Said>,
     state: Option<Said>,
@@ -303,6 +313,7 @@ impl Inbox {
         match said {
             Said::Hello => self.hello = true,
             Said::NoVideo => self.no_video = true,
+            Said::Sound => self.sound = true,
             Said::CantPlay => self.cant_play = true,
             Said::Frame { .. } => self.frame = Some(said),
             Said::State(_) => self.state = Some(said),
@@ -311,7 +322,7 @@ impl Inbox {
 
     fn deliver(&mut self, on_said: &mut impl FnMut(Said)) -> bool {
         let inbox = std::mem::take(self);
-        let singles = [(inbox.hello, Said::Hello), (inbox.no_video, Said::NoVideo), (inbox.cant_play, Said::CantPlay)];
+        let singles = [(inbox.hello, Said::Hello), (inbox.no_video, Said::NoVideo), (inbox.sound, Said::Sound), (inbox.cant_play, Said::CantPlay)];
         let mut any = false;
         for said in singles.into_iter().filter(|s| s.0).map(|s| s.1).chain(inbox.state).chain(inbox.frame) {
             on_said(said);
@@ -616,6 +627,7 @@ unsafe extern "C" fn wake_up(data: *mut c_void) {
 pub fn helper_main(args: &[String]) -> ! {
     let parse = |i: usize| args.get(i).and_then(|a| a.parse::<u32>().ok());
     let (Some(w), Some(h)) = (parse(0), parse(1)) else { std::process::exit(decode::EXIT_NO_SANDBOX) };
+    let sound_only_plays = args.get(2).is_some_and(|a| a == SOUND_ARG);
     // SAFETY: plain integers. `exit` runs nothing that matters here.
     unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) };
     let Some(mpv) = Mpv::load() else { std::process::exit(EXIT_NO_MPV) };
@@ -687,6 +699,9 @@ pub fn helper_main(args: &[String]) -> ! {
                     EVENT_FILE_LOADED => {
                         have_video = handles.get(c"vid").is_some_and(|v| v != "no");
                         if have_video {
+                            start.loaded(&handles);
+                        } else if sound_only_plays {
+                            said("sound");
                             start.loaded(&handles);
                         } else {
                             said("novideo");
@@ -906,8 +921,10 @@ pub const BENCH_RUN_ARG: &str = "--video-jail-run";
 #[cfg(feature = "bench")]
 pub fn bench_run(path: &str, commands: &[String]) -> ! {
     let video = File::open(path).expect("the video");
-    let Ok(mut started) = start_jailed(video, (640, 360), &[ARG]) else { std::process::exit(99) };
-    for command in commands {
+    // `sound` first lets a file with no picture play.
+    let sound = commands.first().is_some_and(|c| c == SOUND_ARG);
+    let Ok(mut started) = start_jailed(video, (640, 360), &[ARG], sound) else { std::process::exit(99) };
+    for command in commands.iter().skip(usize::from(sound)) {
         started.remote.say(command);
     }
     let cancel = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC).expect("eventfd");
@@ -958,6 +975,7 @@ mod tests {
         assert_eq!(parse_said("frame 1 640 360"), Some(Said::Frame { index: 1, w: 640, h: 360 }));
         assert_eq!(parse_said("state 1.5 10 1 50 0"), Some(Said::State(PlayState { position: 1.5, duration: 10.0, paused: true, volume: 50.0, muted: false })));
         assert_eq!(parse_said("novideo"), Some(Said::NoVideo));
+        assert_eq!(parse_said("sound"), Some(Said::Sound));
     }
 
     #[test]

@@ -137,6 +137,11 @@ impl Text {
         true
     }
 
+    /// The fonts this has, the primary one first, for text in another size or style to start from.
+    pub fn fonts(&self) -> Vec<(PathBuf, u32)> {
+        self.faces.iter().map(|f| (f.path.clone(), f.index)).collect()
+    }
+
     /// Replaces the primary font, as when the system's choice changed.
     pub fn set_primary(&mut self, path: &Path, index: u32) -> bool {
         let Some(data) = map_file(path) else { return false };
@@ -444,14 +449,15 @@ fn parse_fc_match(text: &str) -> Option<(PathBuf, u32)> {
     Some((PathBuf::from(file), index.trim().parse().unwrap_or(0)))
 }
 
+/// Whether the font in `bytes` has a glyph for `ch`.
+pub fn font_has(bytes: &[u8], index: u32, ch: char) -> bool {
+    FontRef::from_index(bytes, index as usize).is_some_and(|f| f.charmap().map(ch) != 0)
+}
+
 /// The font to use, from a small cache file so the first frame needn't start a process.
 pub fn primary_font(cache_home: &Path) -> Option<(PathBuf, u32)> {
-    let cache = cache_home.join("gannet/font");
-    if let Ok(text) = std::fs::read_to_string(&cache)
-        && let Some((path, index)) = parse_fc_match(&text)
-        && path.is_file()
-    {
-        return Some((path, index));
+    if let Some(found) = cached_font(cache_home, "font") {
+        return Some(found);
     }
     let found = fc_match("sans")?;
     store_primary_font(cache_home, &found);
@@ -459,9 +465,19 @@ pub fn primary_font(cache_home: &Path) -> Option<(PathBuf, u32)> {
 }
 
 pub fn store_primary_font(cache_home: &Path, found: &(PathBuf, u32)) {
+    store_font(cache_home, "font", found);
+}
+
+/// A font fontconfig chose last time, kept in the cache folder under `name`.
+pub fn cached_font(cache_home: &Path, name: &str) -> Option<(PathBuf, u32)> {
+    let text = std::fs::read_to_string(cache_home.join("gannet").join(name)).ok()?;
+    parse_fc_match(&text).filter(|(path, _)| path.is_file())
+}
+
+pub fn store_font(cache_home: &Path, name: &str, found: &(PathBuf, u32)) {
     let dir = cache_home.join("gannet");
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join("font"), format!("{}\t{}", found.0.display(), found.1));
+    let _ = std::fs::write(dir.join(name), format!("{}\t{}", found.0.display(), found.1));
 }
 
 #[cfg(test)]
