@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "gannet"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "gannet-core",
  "image",
@@ -211,11 +211,12 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "xkbcommon",
+ "zbus",
 ]
 
 [[package]]
 name = "gannet-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "futures-core",
  "libc",

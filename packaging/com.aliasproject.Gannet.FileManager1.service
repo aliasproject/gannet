@@ -1,0 +1,9 @@
+# Lets other programs' "Show in folder" open Gannet. D-Bus starts the service on the
+# first request, and it exits again when idle. It's named for Gannet, as Dolphin's, Thunar's
+# and Nemo's are, because Nautilus installs the plain org.freedesktop.FileManager1 name.
+# Packages install it into /usr/share/dbus-1/services, as other file managers do theirs.
+# With several installed, which one D-Bus uses depends on the bus, so
+# `gannet --claim-show-in-folder` settles it for one user.
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+Exec=/usr/bin/gannet --file-manager-service
