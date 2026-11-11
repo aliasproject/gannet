@@ -22,7 +22,8 @@ pub struct Thumbnailer {
 
 #[derive(Debug, Default)]
 pub struct Thumbnailers {
-    by_mime: HashMap<String, usize>,
+    /// Every entry for each type, most important first.
+    by_mime: HashMap<String, Vec<usize>>,
     list: Vec<Thumbnailer>,
 }
 
@@ -51,20 +52,21 @@ impl Thumbnailers {
     pub fn add(&mut self, text: &str) {
         let Some((thumbnailer, mimes)) = parse(text) else { return };
         let index = self.list.len();
-        let mut used = false;
         for mime in mimes {
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.by_mime.entry(mime) {
-                slot.insert(index);
-                used = true;
-            }
+            self.by_mime.entry(mime).or_default().push(index);
         }
-        if used {
-            self.list.push(thumbnailer);
-        }
+        self.list.push(thumbnailer);
     }
 
+    /// The most important entry for a type.
     pub fn find(&self, mime: &str) -> Option<&Thumbnailer> {
-        self.list.get(*self.by_mime.get(mime)?)
+        self.find_all(mime).next()
+    }
+
+    /// Every entry for a type, most important first, for when the first one's program isn't
+    /// installed.
+    pub fn find_all(&self, mime: &str) -> impl Iterator<Item = &Thumbnailer> {
+        self.by_mime.get(mime).into_iter().flatten().filter_map(|&i| self.list.get(i))
     }
 }
 
@@ -201,6 +203,8 @@ mod tests {
         s.file("sys/thumbnailers/notes.txt", b"[Thumbnailer Entry]\nExec=nope\nMimeType=image/png;\n");
         let t = Thumbnailers::load(&[s.path().join("user/thumbnailers"), s.path().join("missing"), s.path().join("sys/thumbnailers")]);
         assert_eq!(t.find("image/svg+xml").unwrap().exec[0], "my-thumbs", "the user's own comes first");
+        let all: Vec<&str> = t.find_all("image/svg+xml").map(|t| t.exec[0].as_str()).collect();
+        assert_eq!(all, ["my-thumbs", "glycin"], "and the system's after it");
         assert_eq!(t.find("image/jxl").unwrap().exec[0], "glycin");
         assert_eq!(t.find("application/msword").unwrap().try_exec.as_deref(), Some("gsf-office-thumbnailer"));
         assert!(t.find("text/x-nothing").is_none(), "no command");

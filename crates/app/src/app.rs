@@ -5523,6 +5523,31 @@ mod tests {
     }
 
     #[test]
+    fn a_pdf_keeps_its_place_and_its_pages_through_a_resize() {
+        use crate::preview::{Content, Event, Found, Info};
+        use crate::tools::Page;
+        let mut r = viewer_rig("pdf-resize", "a");
+        let generation = r.app.preview_gen;
+        let info = Info { mime: "application/pdf".into(), description: String::new(), icon: crate::icons::Icon::Document, size: None, modified: None, thumbnail: None, folder: None };
+        let pages = vec![Page { w: 612.0, h: 792.0, turned: false }; 20];
+        r.app.on_msg(Msg::Preview(Event { generation, found: Found::Pdf { pages, info } }));
+        let pdf = |r: &Rig| match &r.app.preview.as_ref().unwrap().content {
+            Content::Pdf(pdf) => (pdf.drawing_page(), r.app.preview.as_ref().unwrap().scroll),
+            _ => panic!("not a PDF"),
+        };
+        assert_eq!(pdf(&r).0, Some(0), "the first page is drawn first");
+        r.key(k::KEY_End, "");
+        let (drawing, at_end) = pdf(&r);
+        assert_eq!(drawing, Some(19), "then the last, once it's scrolled to");
+        // Half as wide: the pages are half as tall, so the old scroll is past the new end.
+        let (w, h) = (r.app.w, r.app.h);
+        r.app.resized(w / 2, h, 1.0);
+        let (drawing, scroll) = pdf(&r);
+        assert!(scroll < at_end * 0.6 && scroll > at_end * 0.4, "the same place, at the new size: {scroll} from {at_end}");
+        assert_eq!(drawing, Some(19), "still drawing what's in view, at the new width");
+    }
+
+    #[test]
     fn answers_for_a_file_youve_moved_past_are_dropped() {
         let mut r = viewer_rig("stale", "a");
         let old = r.app.preview_gen;

@@ -1452,6 +1452,22 @@ def make_pdf(path, pages, password=None):
     ps.unlink()
 
 
+def plain_pdf(path, rotate=0):
+    """A one-page PDF written by hand, all in plain ASCII, as some programs write them."""
+    content = b"BT /F1 24 Tf 72 700 Td (Hello) Tj ET"
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /CropBox [0 0 300 400] /Rotate %d /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>" % rotate,
+            b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream", b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"]
+    out, offsets = b"%PDF-1.4\n", []
+    for i, o in enumerate(objs):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % (i + 1) + o + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objs) + 1) + b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objs) + 1, xref)
+    path.write_bytes(out)
+
+
 def pdf_of(s):
     return preview_of(s).get("pdf") or {}
 
@@ -1469,8 +1485,10 @@ def pdfs_draw_their_pages_as_they_scroll(h):
     make_pdf(fs / "c-broken.pdf", 3)
     data = (fs / "c-broken.pdf").read_bytes()
     (fs / "c-broken.pdf").write_bytes(data[: len(data) // 3])
+    plain_pdf(fs / "d-plain.pdf")
+    plain_pdf(fs / "e-turned.pdf", rotate=90)
     a = App(h, fs, extra_env={"LANG": "C.UTF-8"})
-    a.wait(lambda s: s["count"] == 3, "listing")
+    a.wait(lambda s: s["count"] == 5, "listing")
     a.key("space")
     s = a.wait(lambda s: preview_of(s).get("state") == "pdf" and drawn(s).get(0), "the first page", timeout=10)
     assert pdf_of(s)["pages"] == 12, s["preview"]
@@ -1487,6 +1505,12 @@ def pdfs_draw_their_pages_as_they_scroll(h):
     a.key("Down")
     s = a.wait(lambda s: preview_of(s).get("name") == "c-broken.pdf" and preview_of(s)["state"] == "message", "broken", timeout=10)
     assert "can't be read" in preview_of(s)["message"], s["preview"]
+    # All plain words, and cropped: still a PDF, not text.
+    for name in ("d-plain.pdf", "e-turned.pdf"):
+        a.key("Down")
+        s = a.wait(lambda s: preview_of(s).get("name") == name and drawn(s).get(0), name, timeout=10)
+        assert preview_of(s)["state"] == "pdf", s["preview"]
+    a.shot("preview-pdf-turned")
     assert a.alive()
     a.close()
 

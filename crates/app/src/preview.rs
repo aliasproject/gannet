@@ -238,7 +238,7 @@ pub enum Found {
     /// Text, or Markdown, ready to lay out.
     Doc { doc: Doc, info: Info },
     /// A PDF's page sizes, each to be drawn when it's scrolled to.
-    Pdf { pages: Vec<(f32, f32)>, info: Info },
+    Pdf { pages: Vec<tools::Page>, info: Info },
     /// One page of a PDF drawn this wide, or `None` if it couldn't be.
     PdfPage { index: usize, width: i32, image: Option<Arc<ImageBuf>> },
     /// A picture of the file that one of the system's thumbnailers made, and which one.
@@ -533,7 +533,8 @@ fn icon_for(mime: &str, generic: &str, name: &[u8]) -> Icon {
 /// Text, as far as the start of it shows: no zero byte, and either it reads as text, or the
 /// database says it is, as for a Latin-1 file or a log with colour codes in it.
 fn is_text(at: &Place, head: &[u8]) -> bool {
-    if head.is_empty() || head.contains(&0) {
+    // A PDF can start out all plain words, but it's still a PDF.
+    if head.is_empty() || head.contains(&0) || head.starts_with(b"%PDF-") {
         return false;
     }
     if mime::looks_like_text(head) {
@@ -608,8 +609,8 @@ fn decode_output(output: &OwnedFd, cancel: &OwnedFd) -> Option<ImageBuf> {
 /// A picture of the file made by the system's thumbnailer for its type, the biggest that makes
 /// sense for a window this size. `None` if there's no thumbnailer for it or it didn't work.
 fn picture(at: &Place, mime: &str, area: (i32, i32), cancel: &OwnedFd) -> Option<Found> {
-    let thumbnailer = at.kinds.thumbnailers().find(mime)?;
-    let program = thumbnailer.program(&[PathBuf::from(tools::PROGRAMS)])?;
+    // The first one for the type that's actually installed where the jail can see it.
+    let (thumbnailer, program) = at.kinds.thumbnailers().find_all(mime).find_map(|t| Some((t, t.program(&[PathBuf::from(tools::PROGRAMS)])?)))?;
     let ext = tools::extension(at.path);
     let size = area.0.max(area.1).clamp(256, 2048) as u32;
     let argv = tools::thumbnailer(|input, output| thumbnailer.command(&program, input, output, size), &ext)?;
@@ -633,7 +634,7 @@ fn open_pdf(at: &Place, cancel: &OwnedFd, describe: &dyn Fn() -> Found) -> Optio
     if !Path::new(tools::PROGRAMS).join("pdfinfo").is_file() || !Path::new(tools::PROGRAMS).join("pdftoppm").is_file() {
         return None;
     }
-    let (status, out) = match run_tool(&tools::pdfinfo(), reopen(at.path)?, None, cancel) {
+    let (status, out) = match run_tool(&tools::pdfinfo(), reopen(at.path)?, Some(tools::PDF_EXT), cancel) {
         Ok(ran) => ran,
         Err(NotRun::NoBubblewrap) => return message(PDF_NO_BUBBLEWRAP),
         Err(NotRun::Stopped) => return (!cancelled_within(cancel, Duration::ZERO)).then(|| Found::Message(DAMAGED_PDF.to_string())),
@@ -664,10 +665,10 @@ fn read_capped(output: &OwnedFd) -> Vec<u8> {
 }
 
 /// Draws one page of a PDF `width` pixels across.
-fn pdf_page(path: &Path, index: usize, width: i32, cancel: &OwnedFd) -> Option<Found> {
+fn pdf_page(path: &Path, index: usize, width: i32, turned: bool, cancel: &OwnedFd) -> Option<Found> {
     let failed = Some(Found::PdfPage { index, width, image: None });
     let Some(file) = reopen(path) else { return failed };
-    let output = match run_tool(&tools::pdftoppm(index, width), file, None, cancel) {
+    let output = match run_tool(&tools::pdftoppm(index, width, turned), file, Some(tools::PDF_EXT), cancel) {
         Ok((status, output)) if status.success() => output,
         _ if cancelled_within(cancel, Duration::ZERO) => return None,
         _ => return failed,
@@ -858,11 +859,21 @@ pub enum Content {
 
 /// A PDF being shown: its pages' sizes, and the ones drawn so far, at the width they were drawn.
 pub struct Pdf {
-    pub pages: Vec<(f32, f32)>,
+    pub pages: Vec<tools::Page>,
     pub info: Info,
+    /// The width and height it was last laid out at, to keep the same part in view at another.
+    laid_out: Option<(i32, i32)>,
     pub drawn: HashMap<usize, (i32, Option<Arc<ImageBuf>>)>,
     /// The page being drawn now, at what width.
     drawing: Option<(usize, i32, Job)>,
+}
+
+#[cfg(test)]
+impl Pdf {
+    /// The page being drawn now, if one is.
+    pub fn drawing_page(&self) -> Option<usize> {
+        self.drawing.as_ref().map(|d| d.0)
+    }
 }
 
 /// Where a PDF's pages go, for a window this wide.
@@ -874,12 +885,12 @@ struct PdfLayout {
     height: i32,
 }
 
-fn pdf_layout(sizes: &[(f32, f32)], area_w: i32, pad: i32, gap: i32) -> PdfLayout {
+fn pdf_layout(sizes: &[tools::Page], area_w: i32, pad: i32, gap: i32) -> PdfLayout {
     let width = (area_w - pad * 2).max(1);
     let mut y = pad;
     let pages = sizes
         .iter()
-        .map(|&(w, h)| {
+        .map(|&tools::Page { w, h, .. }| {
             let height = ((width as f32 * h / w).round() as i32).clamp(1, width.saturating_mul(50));
             let slot = (y, height);
             y += height + gap;
@@ -1291,7 +1302,7 @@ impl App {
                 self.preview_rescale();
             }
             Found::Pdf { pages, info } => {
-                p.content = Content::Pdf(Pdf { pages, info, drawn: HashMap::new(), drawing: None });
+                p.content = Content::Pdf(Pdf { pages, info, laid_out: None, drawn: HashMap::new(), drawing: None });
                 p.loading_at = None;
                 p.job = None;
                 self.pdf_draw_next();
@@ -1811,6 +1822,16 @@ impl App {
         let area = self.preview_geometry().area;
         let hub = self.hub.clone();
         let Some(p) = self.preview.as_mut() else { return };
+        let Content::Pdf(pdf) = &mut p.content else { return };
+        // At a new width the same part stays in view, and the scroll is cut to fit before it's
+        // used, or a window that grew would find nothing in view and let every page go.
+        if let Some((width, height)) = pdf.laid_out
+            && width != layout.width
+        {
+            p.scroll *= layout.height as f64 / height.max(1) as f64;
+        }
+        pdf.laid_out = Some((layout.width, layout.height));
+        p.scroll = p.scroll.clamp(0.0, (layout.height - area.h).max(0) as f64);
         let (generation, path, scroll) = (p.generation, p.path.clone(), p.scroll as i32);
         let Content::Pdf(pdf) = &mut p.content else { return };
         let in_view = |(top, h): (i32, i32), reach: i32| top + h > scroll - reach && top < scroll + area.h + reach;
@@ -1825,8 +1846,8 @@ impl App {
             // What's being drawn is still wanted, just not first: let it finish.
             (Some(d), _) if d.1 == layout.width && keep(d.0) && wanted.is_none_or(|i| !visible.contains(&i) || visible.contains(&d.0)) => {}
             (_, Some(i)) => {
-                let width = layout.width;
-                pdf.drawing = Job::run(hub, generation, move |cancel, _| pdf_page(&path, i, width, cancel)).map(|job| (i, width, job));
+                let (width, turned) = (layout.width, pdf.pages[i].turned);
+                pdf.drawing = Job::run(hub, generation, move |cancel, _| pdf_page(&path, i, width, turned, cancel)).map(|job| (i, width, job));
             }
             (_, None) => pdf.drawing = None,
         }
@@ -2312,6 +2333,7 @@ mod tests {
         assert!(is("cafe.txt", b"caf\xe9 au lait\n"), "Latin-1");
         assert!(!is("data.bin", b"\x89\xfe\x01\x02 no zero byte here"), "bytes the database doesn't call text");
         assert!(!is("notes.txt", b"text\0then a zero"));
+        assert!(!is("plain.pdf", b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n"), "a PDF written all in plain words");
         assert!(!is("empty.txt", b""));
     }
 

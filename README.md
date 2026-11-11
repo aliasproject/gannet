@@ -194,7 +194,8 @@ PDFs show their pages one under another, each drawn by poppler's `pdftoppm` as i
 view, and scroll like text. A locked or damaged PDF says so.
 
 HEIC and JPEG XL photos, SVG drawings, office documents and anything else the system has a
-thumbnailer for (the `.thumbnailer` files under `/usr/share/thumbnailers`) show the biggest
+thumbnailer for (the `.thumbnailer` files in `~/.local/share/thumbnailers` and
+`/usr/share/thumbnailers`) show the biggest
 picture the thumbnailer makes for the window's size.
 
 Folders show how many items they hold and their total size, counted in the background. Like
