@@ -1809,9 +1809,15 @@ impl App {
         };
         let most = height.saturating_sub(area.h).max(0) as f64;
         let next = (p.scroll + pixels).clamp(0.0, most);
+        let pdf = matches!(p.content, Content::Pdf(_));
         if next != p.scroll {
             p.scroll = next;
             self.invalidate(area);
+            // A PDF's footer says which page is in view, so it changes as it scrolls too.
+            if pdf {
+                let frame = self.preview_geometry();
+                self.invalidate(Rect::new(frame.rect.x, area.bottom(), frame.rect.w, frame.rect.bottom() - area.bottom()));
+            }
             self.pdf_draw_next();
         }
     }

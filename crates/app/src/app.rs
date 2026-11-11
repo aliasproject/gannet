@@ -5548,6 +5548,19 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_a_pdf_repaints_the_page_number_below_it() {
+        use crate::preview::{Event, Found, Info};
+        use crate::tools::Page;
+        let mut r = viewer_rig("pdf-footer", "a");
+        let generation = r.app.preview_gen;
+        let info = Info { mime: "application/pdf".into(), description: String::new(), icon: crate::icons::Icon::Document, size: None, modified: None, thumbnail: None, folder: None };
+        r.app.on_msg(Msg::Preview(Event { generation, found: Found::Pdf { pages: vec![Page { w: 612.0, h: 792.0, turned: false }; 10], info } }));
+        r.app.dirty = Rect::default();
+        r.key(k::KEY_Page_Down, "");
+        assert!(r.app.dirty.bottom() >= r.app.h, "the footer, at the bottom of the window, is repainted: {:?}", r.app.dirty);
+    }
+
+    #[test]
     fn answers_for_a_file_youve_moved_past_are_dropped() {
         let mut r = viewer_rig("stale", "a");
         let old = r.app.preview_gen;
