@@ -31,12 +31,7 @@ impl Rect {
 
     pub fn intersect(&self, o: Rect) -> Rect {
         let (x, y) = (self.x.max(o.x), self.y.max(o.y));
-        Rect {
-            x,
-            y,
-            w: (self.right().min(o.right()) - x).max(0),
-            h: (self.bottom().min(o.bottom()) - y).max(0),
-        }
+        Rect { x, y, w: (self.right().min(o.right()) - x).max(0), h: (self.bottom().min(o.bottom()) - y).max(0) }
     }
 
     pub fn union(&self, o: Rect) -> Rect {
@@ -47,12 +42,7 @@ impl Rect {
             return *self;
         }
         let (x, y) = (self.x.min(o.x), self.y.min(o.y));
-        Rect {
-            x,
-            y,
-            w: self.right().max(o.right()) - x,
-            h: self.bottom().max(o.bottom()) - y,
-        }
+        Rect { x, y, w: self.right().max(o.right()) - x, h: self.bottom().max(o.bottom()) - y }
     }
 
     pub fn intersects(&self, o: Rect) -> bool {
@@ -70,12 +60,7 @@ pub struct Canvas<'a> {
 impl<'a> Canvas<'a> {
     pub fn new(px: &'a mut [u32], w: i32, h: i32) -> Self {
         debug_assert!(px.len() >= (w * h) as usize);
-        Self {
-            px,
-            w,
-            h,
-            clip: Rect::new(0, 0, w, h),
-        }
+        Self { px, w, h, clip: Rect::new(0, 0, w, h) }
     }
 
     pub fn clip(&self) -> Rect {
@@ -200,17 +185,12 @@ impl<'a> Canvas<'a> {
             for row in area.y..area.bottom() {
                 let from = (row - dest.y) as usize * stride + (area.x - dest.x) as usize;
                 let to = (row * self.w + area.x) as usize;
-                self.px[to..to + area.w as usize]
-                    .copy_from_slice(&data[from..from + area.w as usize]);
+                self.px[to..to + area.w as usize].copy_from_slice(&data[from..from + area.w as usize]);
             }
             return;
         }
-        let sample = |at: i32, from: i32, to: i32| {
-            ((at as i64 * 2 + 1) * from as i64 / (to as i64 * 2)) as usize
-        };
-        let columns: Vec<usize> = (area.x..area.right())
-            .map(|x| sample(x - dest.x, sw, dest.w))
-            .collect();
+        let sample = |at: i32, from: i32, to: i32| ((at as i64 * 2 + 1) * from as i64 / (to as i64 * 2)) as usize;
+        let columns: Vec<usize> = (area.x..area.right()).map(|x| sample(x - dest.x, sw, dest.w)).collect();
         for row in area.y..area.bottom() {
             let line = &data[sample(row - dest.y, sh, dest.h) * stride..][..stride];
             let to = (row * self.w + area.x) as usize;
@@ -227,23 +207,14 @@ impl<'a> Canvas<'a> {
         if area.is_empty() || sw <= 0 || sh <= 0 || data.len() < sw as usize * sh as usize * 4 {
             return;
         }
-        let sample = |at: i32, from: i32, to: i32| {
-            ((at as i64 * 2 + 1) * from as i64 / (to as i64 * 2)) as usize
-        };
-        let columns: Vec<usize> = (area.x..area.right())
-            .map(|x| sample(x - dest.x, sw, dest.w) * 4)
-            .collect();
+        let sample = |at: i32, from: i32, to: i32| ((at as i64 * 2 + 1) * from as i64 / (to as i64 * 2)) as usize;
+        let columns: Vec<usize> = (area.x..area.right()).map(|x| sample(x - dest.x, sw, dest.w) * 4).collect();
         let stride = sw as usize * 4;
         for row in area.y..area.bottom() {
             let line = &data[sample(row - dest.y, sh, dest.h) * stride..][..stride];
             let d = (row * self.w + area.x) as usize;
             for (p, &column) in self.px[d..d + area.w as usize].iter_mut().zip(&columns) {
-                let [r, g, b, a] = [
-                    line[column],
-                    line[column + 1],
-                    line[column + 2],
-                    line[column + 3],
-                ];
+                let [r, g, b, a] = [line[column], line[column + 1], line[column + 2], line[column + 3]];
                 let color = (r as u32) << 16 | (g as u32) << 8 | b as u32;
                 match a {
                     255 => *p = color,

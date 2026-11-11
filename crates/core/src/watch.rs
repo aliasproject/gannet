@@ -16,10 +16,7 @@ pub struct Watch {
 
 impl Watch {
     pub fn new() -> rustix::io::Result<Self> {
-        Ok(Self {
-            fd: inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?,
-            current: Mutex::new(Vec::new()),
-        })
+        Ok(Self { fd: inotify::init(CreateFlags::CLOEXEC | CreateFlags::NONBLOCK)?, current: Mutex::new(Vec::new()) })
     }
 
     /// Watches these folders for entries changing. Folders already watched keep their
@@ -51,9 +48,7 @@ impl Watch {
                 next.push((d.to_path_buf(), wd));
             }
         }
-        let Ok(mut current) = self.current.lock() else {
-            return;
-        };
+        let Ok(mut current) = self.current.lock() else { return };
         if stale() {
             // A newer request owns the list now. Anything only this one added has to go.
             for (_, wd) in &next {
@@ -124,10 +119,7 @@ mod tests {
         let before = w.current.lock().unwrap()[0].1;
         w.set_dirs(&[a.path(), b.path()]);
         let current = w.current.lock().unwrap();
-        assert_eq!(
-            current.iter().find(|(p, _)| p == a.path()).unwrap().1,
-            before
-        );
+        assert_eq!(current.iter().find(|(p, _)| p == a.path()).unwrap().1, before);
         assert_eq!(current.len(), 2);
     }
 

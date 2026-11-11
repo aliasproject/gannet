@@ -13,10 +13,7 @@ impl Scratch {
     pub fn new() -> Self {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         // scripts/sandbox-run.sh sets this, inside bubblewrap with the real home hidden.
-        assert!(
-            std::env::var_os("GANNET_TEST_SANDBOX").is_some(),
-            "run tests with scripts/test.sh, not plain cargo test"
-        );
+        assert!(std::env::var_os("GANNET_TEST_SANDBOX").is_some(), "run tests with scripts/test.sh, not plain cargo test");
         let base = std::env::temp_dir();
         assert!(base.is_absolute(), "temp dir must be absolute: {base:?}");
         let dir = base.join(format!("gannet-test-{}-{n}", std::process::id()));

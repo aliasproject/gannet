@@ -41,12 +41,7 @@ pub fn session_address(env: Option<&str>, runtime_dir: Option<&Path>) -> Option<
         return Some(a.to_string());
     }
     let socket = runtime_dir?.join("bus");
-    socket.exists().then(|| {
-        format!(
-            "unix:path={}",
-            escape(socket.as_os_str().as_encoded_bytes())
-        )
-    })
+    socket.exists().then(|| format!("unix:path={}", escape(socket.as_os_str().as_encoded_bytes())))
 }
 
 /// Escapes a value for a D-Bus address, where `,`, `;`, `=` and the like mean something.
@@ -65,9 +60,7 @@ fn escape(bytes: &[u8]) -> String {
 /// Where the system bus is: `DBUS_SYSTEM_BUS_ADDRESS` if it's set, or else the standard
 /// socket.
 pub fn system_address(env: Option<&str>) -> String {
-    env.filter(|a| !a.is_empty())
-        .unwrap_or("unix:path=/run/dbus/system_bus_socket")
-        .to_string()
+    env.filter(|a| !a.is_empty()).unwrap_or("unix:path=/run/dbus/system_bus_socket").to_string()
 }
 
 fn timed_out() -> zbus::Error {
@@ -103,11 +96,7 @@ fn block_on_for<T>(f: impl Future<Output = zbus::Result<T>>, limit: Duration) ->
         }
         // Stored before the check, so a timer firing in between still wakes this.
         *waker.lock().unwrap() = Some(cx.waker().clone());
-        if fired.load(Ordering::SeqCst) {
-            Poll::Ready(Err(timed_out()))
-        } else {
-            Poll::Pending
-        }
+        if fired.load(Ordering::SeqCst) { Poll::Ready(Err(timed_out())) } else { Poll::Pending }
     }));
     drop(done_tx);
     out
@@ -128,12 +117,7 @@ impl Bus {
 
     /// As `connect`, giving up on connecting, and later on each method call, after `limit`.
     pub fn connect_with_limit(address: &str, limit: Duration) -> zbus::Result<Self> {
-        let conn = block_on_for(
-            zbus::conn::Builder::address(address)
-                .method_timeout(limit)
-                .build(),
-            limit,
-        )?;
+        let conn = block_on_for(zbus::conn::Builder::address(address).method_timeout(limit).build(), limit)?;
         Ok(Self { conn, limit })
     }
 
@@ -146,15 +130,8 @@ impl Bus {
     /// that already owns it keeps it: the request neither waits in line nor replaces it.
     /// Serve the objects first: a program can call them as soon as the name is ours.
     pub fn own_name(&self, name: &str) -> zbus::Result<bool> {
-        match block_on_for(
-            self.conn
-                .request_name_with_flags(name, RequestNameFlags::DO_NOT_QUEUE),
-            self.limit,
-        ) {
-            Ok(reply) => Ok(matches!(
-                reply,
-                RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner
-            )),
+        match block_on_for(self.conn.request_name_with_flags(name, RequestNameFlags::DO_NOT_QUEUE), self.limit) {
+            Ok(reply) => Ok(matches!(reply, RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner)),
             // zbus reports a name someone else has as an error, but it's an ordinary answer.
             Err(zbus::Error::NameTaken) => Ok(false),
             Err(e) => Err(e),
@@ -175,25 +152,12 @@ impl Bus {
 
     /// Calls a method on another program and waits for its reply, up to the connection's
     /// time limit.
-    pub fn call<B, R>(
-        &self,
-        destination: &str,
-        path: &str,
-        interface: &str,
-        method: &str,
-        body: &B,
-    ) -> zbus::Result<R>
+    pub fn call<B, R>(&self, destination: &str, path: &str, interface: &str, method: &str, body: &B) -> zbus::Result<R>
     where
         B: serde::Serialize + DynamicType,
         R: for<'d> DynamicDeserialize<'d>,
     {
-        let reply = block_on(self.conn.call_method(
-            Some(destination),
-            path,
-            Some(interface),
-            method,
-            body,
-        ))?;
+        let reply = block_on(self.conn.call_method(Some(destination), path, Some(interface), method, body))?;
         reply.body().deserialize()
     }
 
@@ -206,11 +170,7 @@ impl Bus {
     /// let a connection go. A panic in `on` ends following, and so does nothing else: keep
     /// `on` from panicking. zbus queues up to 64 messages for it, and drops the oldest
     /// past that, so `on` should hand work on rather than do it.
-    pub fn follow(
-        &self,
-        rule: MatchRule<'static>,
-        mut on: impl FnMut(zbus::Result<Message>) -> bool + Send + 'static,
-    ) -> zbus::Result<Following> {
+    pub fn follow(&self, rule: MatchRule<'static>, mut on: impl FnMut(zbus::Result<Message>) -> bool + Send + 'static) -> zbus::Result<Following> {
         let mut stream = block_on(MessageStream::for_match_rule(rule, &self.conn, None))?;
         let stop: Arc<StopFlag> = Arc::default();
         let stop2 = stop.clone();
@@ -263,8 +223,8 @@ mod tests {
     use crate::testutil::Scratch;
     use std::io::{BufRead, BufReader};
     use std::process::{Child, Command, Stdio};
-    use std::sync::Mutex;
     use std::sync::mpsc::{Sender, channel};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     /// A bus of our own, so tests never touch the real session bus.
@@ -297,25 +257,15 @@ mod tests {
             ))
             .unwrap();
             let daemon = Command::new("dbus-daemon")
-                .args([
-                    "--nofork",
-                    "--print-address=1",
-                    &format!("--config-file={}", config.display()),
-                ])
+                .args(["--nofork", "--print-address=1", &format!("--config-file={}", config.display())])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("dbus-daemon must be installed to run the D-Bus tests");
             // Owned before anything can fail, so the daemon is always stopped.
-            let mut bus = Self {
-                daemon,
-                address: String::new(),
-                _dir: dir,
-            };
+            let mut bus = Self { daemon, address: String::new(), _dir: dir };
             let mut line = String::new();
-            BufReader::new(bus.daemon.stdout.take().unwrap())
-                .read_line(&mut line)
-                .unwrap();
+            BufReader::new(bus.daemon.stdout.take().unwrap()).read_line(&mut line).unwrap();
             assert!(!line.trim().is_empty(), "dbus-daemon printed no address");
             bus.address = line.trim().to_string();
             bus
@@ -350,12 +300,7 @@ mod tests {
 
     fn echo() -> (Echo, std::sync::mpsc::Receiver<String>) {
         let (tx, rx) = channel();
-        (
-            Echo {
-                told: Mutex::new(tx),
-            },
-            rx,
-        )
+        (Echo { told: Mutex::new(tx) }, rx)
     }
 
     const NAME: &str = "com.aliasproject.Gannet.Test";
@@ -395,10 +340,7 @@ mod tests {
         let (e, _rx) = echo();
         first.serve(PATH, e).unwrap();
         assert!(first.own_name(NAME).unwrap());
-        assert!(
-            first.own_name(NAME).unwrap(),
-            "asking again for a name it has is fine"
-        );
+        assert!(first.own_name(NAME).unwrap(), "asking again for a name it has is fine");
         assert!(!second.own_name(NAME).unwrap());
         // The first keeps answering under it.
         let reply: String = second.call(NAME, PATH, IFACE, "Echo", &("x",)).unwrap();
@@ -419,12 +361,7 @@ mod tests {
         let gannet = Bus::connect(&bus.address).unwrap();
         let other = Bus::connect(&bus.address).unwrap();
         let (tx, rx) = channel();
-        let rule = MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .interface(IFACE)
-            .member("Changed")
-            .build()
-            .unwrap();
+        let rule = MatchRule::builder().msg_type(zbus::message::Type::Signal).interface(IFACE).member("Changed").build().unwrap();
         let _following = gannet
             .follow(rule, move |m| {
                 let n: u32 = m.unwrap().body().deserialize().unwrap();
@@ -433,34 +370,18 @@ mod tests {
             })
             .unwrap();
         for n in 1..=3u32 {
-            zbus::block_on(other.connection().emit_signal(
-                None::<&str>,
-                PATH,
-                IFACE,
-                "Changed",
-                &(n,),
-            ))
-            .unwrap();
+            zbus::block_on(other.connection().emit_signal(None::<&str>, PATH, IFACE, "Changed", &(n,))).unwrap();
         }
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
-        assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "it stopped after saying so"
-        );
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "it stopped after saying so");
     }
 
     #[test]
     fn a_call_to_nobody_fails_rather_than_hanging() {
         let bus = PrivateBus::start();
         let gannet = Bus::connect(&bus.address).unwrap();
-        let r: zbus::Result<String> = gannet.call(
-            "com.example.Nobody",
-            "/",
-            "com.example.Nobody",
-            "Hello",
-            &(),
-        );
+        let r: zbus::Result<String> = gannet.call("com.example.Nobody", "/", "com.example.Nobody", "Hello", &());
         assert!(r.is_err());
     }
 
@@ -473,25 +394,12 @@ mod tests {
     #[test]
     fn addresses_come_from_the_environment_or_the_usual_places() {
         let dir = Scratch::new();
-        assert_eq!(
-            session_address(Some("unix:path=/x"), Some(dir.path())),
-            Some("unix:path=/x".into())
-        );
-        assert_eq!(
-            session_address(None, Some(dir.path())),
-            None,
-            "no socket there"
-        );
+        assert_eq!(session_address(Some("unix:path=/x"), Some(dir.path())), Some("unix:path=/x".into()));
+        assert_eq!(session_address(None, Some(dir.path())), None, "no socket there");
         std::fs::write(dir.path().join("bus"), b"").unwrap();
-        assert_eq!(
-            session_address(Some(""), Some(dir.path())),
-            Some(format!("unix:path={}", dir.path().join("bus").display()))
-        );
+        assert_eq!(session_address(Some(""), Some(dir.path())), Some(format!("unix:path={}", dir.path().join("bus").display())));
         assert_eq!(session_address(None, None), None);
-        assert_eq!(
-            system_address(None),
-            "unix:path=/run/dbus/system_bus_socket"
-        );
+        assert_eq!(system_address(None), "unix:path=/run/dbus/system_bus_socket");
         assert_eq!(system_address(Some("unix:path=/y")), "unix:path=/y");
         let odd = dir.path().join("a,b;c=d e");
         std::fs::create_dir(&odd).unwrap();
@@ -520,28 +428,9 @@ mod tests {
         gannet.serve(PATH, e).unwrap();
         gannet.own_name(NAME).unwrap();
         // busctl is a separate program, and this thread only waits for it to exit.
-        let out = Command::new("busctl")
-            .args([
-                &format!("--address={}", bus.address),
-                "call",
-                NAME,
-                PATH,
-                IFACE,
-                "Echo",
-                "s",
-                "hello",
-            ])
-            .output()
-            .expect("busctl must be installed to run the D-Bus tests");
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            r#"s "echo: hello""#
-        );
+        let out = Command::new("busctl").args([&format!("--address={}", bus.address), "call", NAME, PATH, IFACE, "Echo", "s", "hello"]).output().expect("busctl must be installed to run the D-Bus tests");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), r#"s "echo: hello""#);
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "hello");
     }
 
@@ -565,13 +454,7 @@ mod tests {
         // Accepts connections, then says nothing.
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let started = std::time::Instant::now();
-        assert!(
-            Bus::connect_with_limit(
-                &format!("unix:path={}", path.display()),
-                Duration::from_millis(300)
-            )
-            .is_err()
-        );
+        assert!(Bus::connect_with_limit(&format!("unix:path={}", path.display()), Duration::from_millis(300)).is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
@@ -580,11 +463,7 @@ mod tests {
         let bus = PrivateBus::start();
         let gannet = Bus::connect(&bus.address).unwrap();
         let (tx, rx) = channel::<()>();
-        let rule = MatchRule::builder()
-            .msg_type(zbus::message::Type::Signal)
-            .interface(IFACE)
-            .build()
-            .unwrap();
+        let rule = MatchRule::builder().msg_type(zbus::message::Type::Signal).interface(IFACE).build().unwrap();
         let following = gannet
             .follow(rule, move |_| {
                 let _ = &tx;
@@ -593,9 +472,6 @@ mod tests {
             .unwrap();
         drop(following);
         // The thread let go of `on`, and with it the only sender.
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(5)),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
-        );
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Err(std::sync::mpsc::RecvTimeoutError::Disconnected));
     }
 }

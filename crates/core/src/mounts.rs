@@ -12,9 +12,7 @@ pub struct Mount {
 }
 
 pub fn read_mounts() -> Vec<Mount> {
-    std::fs::read("/proc/self/mountinfo")
-        .map(|b| parse_mountinfo(&b))
-        .unwrap_or_default()
+    std::fs::read("/proc/self/mountinfo").map(|b| parse_mountinfo(&b)).unwrap_or_default()
 }
 
 /// Lines look like: `36 35 98:0 /root /mnt rw,noatime master:1 - ext3 /dev/root rw`.
@@ -22,9 +20,7 @@ pub fn parse_mountinfo(text: &[u8]) -> Vec<Mount> {
     let mut out = Vec::new();
     for line in text.split(|&b| b == b'\n') {
         let fields: Vec<&[u8]> = line.split(|&b| b == b' ').collect();
-        let Some(sep) = fields.iter().position(|f| *f == b"-") else {
-            continue;
-        };
+        let Some(sep) = fields.iter().position(|f| *f == b"-") else { continue };
         if fields.len() < 5 || sep + 2 >= fields.len() {
             continue;
         }
@@ -43,13 +39,7 @@ fn unescape(s: &[u8]) -> Vec<u8> {
     let mut rest = s;
     loop {
         match rest {
-            [
-                b'\\',
-                a @ b'0'..=b'7',
-                b @ b'0'..=b'7',
-                c @ b'0'..=b'7',
-                after @ ..,
-            ] => {
+            [b'\\', a @ b'0'..=b'7', b @ b'0'..=b'7', c @ b'0'..=b'7', after @ ..] => {
                 out.push(((a - b'0') << 6) | ((b - b'0') << 3) | (c - b'0'));
                 rest = after;
             }
@@ -64,11 +54,7 @@ fn unescape(s: &[u8]) -> Vec<u8> {
 
 /// The mount point holding `path`, which should already be canonical.
 pub fn mount_point_of(mounts: &[Mount], path: &Path) -> Option<PathBuf> {
-    mounts
-        .iter()
-        .filter(|m| path.starts_with(&m.point))
-        .max_by_key(|m| m.point.as_os_str().len())
-        .map(|m| m.point.clone())
+    mounts.iter().filter(|m| path.starts_with(&m.point)).max_by_key(|m| m.point.as_os_str().len()).map(|m| m.point.clone())
 }
 
 #[cfg(test)]
@@ -102,13 +88,7 @@ garbage line\n";
     #[test]
     fn finds_the_longest_matching_mount() {
         let m = parse_mountinfo(SAMPLE);
-        assert_eq!(
-            mount_point_of(&m, Path::new("/home/me/x")).unwrap(),
-            Path::new("/home")
-        );
-        assert_eq!(
-            mount_point_of(&m, Path::new("/homework")).unwrap(),
-            Path::new("/")
-        );
+        assert_eq!(mount_point_of(&m, Path::new("/home/me/x")).unwrap(), Path::new("/home"));
+        assert_eq!(mount_point_of(&m, Path::new("/homework")).unwrap(), Path::new("/"));
     }
 }

@@ -8,9 +8,7 @@ use std::process::{Command, Stdio};
 /// start or reports failure, with a reason for the user.
 pub fn open_with_default(path: &Path, on_fail: impl FnOnce(PathBuf, String) + Send + 'static) {
     let path = path.to_path_buf();
-    spawn_detached(Command::new("xdg-open").arg(&path), move |reason| {
-        on_fail(path, reason)
-    });
+    spawn_detached(Command::new("xdg-open").arg(&path), move |reason| on_fail(path, reason));
 }
 
 /// Starts another program, on its own, with its output discarded.
@@ -38,19 +36,17 @@ fn run_detached(cmd: &mut Command, opener: bool, on_fail: impl FnOnce(String) + 
     }
     match cmd.spawn() {
         Ok(mut child) => {
-            let _ = std::thread::Builder::new()
-                .name("gannet-wait".into())
-                .spawn(move || match child.wait() {
-                    Ok(s) if s.success() => {}
-                    Ok(s) => on_fail(match s.code() {
-                        Some(3) if opener => "No app is set up for this type of file".to_string(),
-                        Some(c) if opener => format!("The opener reported an error (code {c})"),
-                        None if opener => "The opener was stopped".to_string(),
-                        Some(c) => format!("it exited with code {c}"),
-                        None => "it was stopped by a signal".to_string(),
-                    }),
-                    Err(e) => on_fail(crate::listing::describe(&e)),
-                });
+            let _ = std::thread::Builder::new().name("gannet-wait".into()).spawn(move || match child.wait() {
+                Ok(s) if s.success() => {}
+                Ok(s) => on_fail(match s.code() {
+                    Some(3) if opener => "No app is set up for this type of file".to_string(),
+                    Some(c) if opener => format!("The opener reported an error (code {c})"),
+                    None if opener => "The opener was stopped".to_string(),
+                    Some(c) => format!("it exited with code {c}"),
+                    None => "it was stopped by a signal".to_string(),
+                }),
+                Err(e) => on_fail(crate::listing::describe(&e)),
+            });
         }
         Err(e) => on_fail(crate::listing::describe(&e)),
     }

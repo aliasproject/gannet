@@ -49,10 +49,7 @@ impl History {
 pub fn parent_stop(dir: &Path) -> Option<Stop> {
     use std::os::unix::ffi::OsStrExt;
     let parent = dir.parent()?;
-    Some(Stop {
-        dir: parent.to_path_buf(),
-        cursor_name: dir.file_name().map(|n| n.as_bytes().to_vec()),
-    })
+    Some(Stop { dir: parent.to_path_buf(), cursor_name: dir.file_name().map(|n| n.as_bytes().to_vec()) })
 }
 
 #[cfg(test)]
@@ -60,10 +57,7 @@ mod tests {
     use super::*;
 
     fn stop(p: &str) -> Stop {
-        Stop {
-            dir: p.into(),
-            cursor_name: None,
-        }
+        Stop { dir: p.into(), cursor_name: None }
     }
 
     #[test]

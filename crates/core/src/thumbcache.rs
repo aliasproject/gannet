@@ -27,10 +27,7 @@ pub fn thumbnail_uri(path: &Path) -> String {
 /// Where a thumbnail of this file could be, in the order to try them.
 pub fn candidates(cache_home: &Path, path: &Path) -> Vec<PathBuf> {
     let name = format!("{:x}.png", md5::compute(thumbnail_uri(path).as_bytes()));
-    SIZES
-        .iter()
-        .map(|size| cache_home.join("thumbnails").join(size).join(&name))
-        .collect()
+    SIZES.iter().map(|size| cache_home.join("thumbnails").join(size).join(&name)).collect()
 }
 
 /// The modified time a thumbnail says it was made from, if it says. A thumbnail that doesn't
@@ -76,10 +73,7 @@ mod tests {
 
     #[test]
     fn uris_match_what_glib_writes() {
-        assert_eq!(
-            thumbnail_uri(Path::new("/a b/it's (1)+@,_-~.png")),
-            "file:///a%20b/it's%20(1)+@,_-~.png"
-        );
+        assert_eq!(thumbnail_uri(Path::new("/a b/it's (1)+@,_-~.png")), "file:///a%20b/it's%20(1)+@,_-~.png");
         assert_eq!(thumbnail_uri(Path::new("/x#y%z?")), "file:///x%23y%25z%3F");
         assert_eq!(thumbnail_uri(Path::new("/é")), "file:///%C3%A9");
     }
@@ -88,21 +82,13 @@ mod tests {
     fn the_name_is_the_hash_of_the_uri() {
         // From the freedesktop spec's example, checked with md5sum.
         let found = candidates(Path::new("/c"), Path::new("/home/jens/photos/me.png"));
-        assert_eq!(
-            found[3],
-            Path::new("/c/thumbnails/normal/c6ee772d9e49320e97ec29a7eb5b1697.png")
-        );
+        assert_eq!(found[3], Path::new("/c/thumbnails/normal/c6ee772d9e49320e97ec29a7eb5b1697.png"));
         assert!(found[0].starts_with("/c/thumbnails/xx-large"));
     }
 
     #[test]
     fn reads_the_recorded_time() {
-        let p = png(&[
-            chunk(b"IHDR", &[0; 13]),
-            chunk(b"tEXt", b"Software\0x"),
-            chunk(b"tEXt", b"Thumb::MTime\x001234"),
-            chunk(b"IEND", b""),
-        ]);
+        let p = png(&[chunk(b"IHDR", &[0; 13]), chunk(b"tEXt", b"Software\0x"), chunk(b"tEXt", b"Thumb::MTime\x001234"), chunk(b"IEND", b"")]);
         assert_eq!(recorded_mtime(&p), Some(1234));
     }
 
@@ -110,10 +96,7 @@ mod tests {
     fn bad_or_missing_times_are_none() {
         assert_eq!(recorded_mtime(b"not a png"), None);
         assert_eq!(recorded_mtime(&png(&[chunk(b"IEND", b"")])), None);
-        assert_eq!(
-            recorded_mtime(&png(&[chunk(b"tEXt", b"Thumb::MTime\0soon")])),
-            None
-        );
+        assert_eq!(recorded_mtime(&png(&[chunk(b"tEXt", b"Thumb::MTime\0soon")])), None);
         // A length that runs off the end, and one big enough to overflow.
         let mut cut = png(&[chunk(b"tEXt", b"Thumb::MTime\x001234")]);
         cut.truncate(cut.len() - 8);

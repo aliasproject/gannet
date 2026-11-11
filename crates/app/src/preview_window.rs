@@ -31,17 +31,11 @@ pub struct Args {
     pub follow: bool,
 }
 
-pub const USAGE: &str =
-    "gannet --preview [--hidden] [--sort name|size|modified] [--descending] [--follow] FILE";
+pub const USAGE: &str = "gannet --preview [--hidden] [--sort name|size|modified] [--descending] [--follow] FILE";
 
 /// The arguments after `--preview`. `None` if they don't make sense.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Option<Args> {
-    let mut out = Args {
-        path: PathBuf::new(),
-        hidden: false,
-        sort: SortSpec::default(),
-        follow: false,
-    };
+    let mut out = Args { path: PathBuf::new(), hidden: false, sort: SortSpec::default(), follow: false };
     let mut args = args.into_iter();
     let mut path = None;
     while let Some(a) = args.next() {
@@ -100,19 +94,9 @@ pub struct Child {
 
 impl Child {
     /// Starts the window. Its answers, and its ending, come back through `hub`.
-    pub fn start(
-        hub: &Hub,
-        generation: u64,
-        path: &Path,
-        hidden: bool,
-        sort: SortSpec,
-    ) -> std::io::Result<Self> {
+    pub fn start(hub: &Hub, generation: u64, path: &Path, hidden: bool, sort: SortSpec) -> std::io::Result<Self> {
         // `/proc/self/exe` rather than a path: this binary, even if it's been upgraded since.
-        let mut child = Command::new("/proc/self/exe")
-            .args(command_line(path, hidden, sort))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
+        let mut child = Command::new("/proc/self/exe").args(command_line(path, hidden, sort)).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();
@@ -121,19 +105,12 @@ impl Child {
         // A window that stops reading mustn't be able to stop the list.
         rustix::fs::fcntl_setfl(stdin.as_fd(), rustix::fs::OFlags::NONBLOCK)?;
         let hub = hub.clone();
-        std::thread::Builder::new()
-            .name("gannet-previewer".into())
-            .spawn(move || {
-                read_paths(stdout, |path| {
-                    hub.send(Msg::PreviewStepped { generation, path })
-                });
-                // Its stdout has ended, which it only does by exiting.
-                let crashed = !child.wait().is_ok_and(|s| s.success());
-                hub.send(Msg::PreviewEnded {
-                    generation,
-                    crashed,
-                });
-            })?;
+        std::thread::Builder::new().name("gannet-previewer".into()).spawn(move || {
+            read_paths(stdout, |path| hub.send(Msg::PreviewStepped { generation, path }));
+            // Its stdout has ended, which it only does by exiting.
+            let crashed = !child.wait().is_ok_and(|s| s.success());
+            hub.send(Msg::PreviewEnded { generation, crashed });
+        })?;
         Ok(Self { stdin })
     }
 
@@ -160,14 +137,10 @@ pub fn tell_the_list(path: &Path) {
 /// In the preview window: listens to the list until it goes.
 pub fn listen_to_the_list(hub: Hub) {
     let them = hub.clone();
-    let started = std::thread::Builder::new()
-        .name("gannet-list".into())
-        .spawn(move || {
-            read_paths(std::io::stdin().lock(), |path| {
-                them.send(Msg::PreviewShow(path))
-            });
-            them.send(Msg::ListGone);
-        });
+    let started = std::thread::Builder::new().name("gannet-list".into()).spawn(move || {
+        read_paths(std::io::stdin().lock(), |path| them.send(Msg::PreviewShow(path)));
+        them.send(Msg::ListGone);
+    });
     if started.is_err() {
         hub.send(Msg::ListGone);
     }
@@ -190,8 +163,7 @@ fn read_paths(mut from: impl Read, mut each: impl FnMut(PathBuf)) {
         pending.extend_from_slice(&buf[..n]);
         while let Some(end) = pending.iter().position(|&b| b == 0) {
             let message: Vec<u8> = pending.drain(..=end).take(end).collect();
-            if !std::mem::take(&mut skipping) && !message.is_empty() && message.len() < MAX_MESSAGE
-            {
+            if !std::mem::take(&mut skipping) && !message.is_empty() && message.len() < MAX_MESSAGE {
                 each(PathBuf::from(OsString::from_vec(message)));
             }
         }
@@ -212,32 +184,18 @@ mod tests {
 
     #[test]
     fn arguments_round_trip() {
-        let sort = SortSpec {
-            key: SortKey::Modified,
-            descending: true,
-        };
+        let sort = SortSpec { key: SortKey::Modified, descending: true };
         let line = command_line(Path::new("/a/--odd name"), true, sort);
         assert_eq!(line[0], ARG);
         let back = parse(line.into_iter().skip(1)).unwrap();
-        assert_eq!(
-            back,
-            Args {
-                path: "/a/--odd name".into(),
-                hidden: true,
-                sort,
-                follow: true
-            }
-        );
+        assert_eq!(back, Args { path: "/a/--odd name".into(), hidden: true, sort, follow: true });
     }
 
     #[test]
     fn plain_and_odd_arguments() {
         assert_eq!(args(&["x.png"]).unwrap().path, PathBuf::from("x.png"));
         assert!(!args(&["x.png"]).unwrap().follow);
-        assert_eq!(
-            args(&["--", "--hidden"]).unwrap().path,
-            PathBuf::from("--hidden")
-        );
+        assert_eq!(args(&["--", "--hidden"]).unwrap().path, PathBuf::from("--hidden"));
         assert!(args(&[]).is_none());
         assert!(args(&["--sort", "colour", "x"]).is_none());
         assert!(args(&["--what", "x"]).is_none());
@@ -260,17 +218,7 @@ mod tests {
         stream.extend(std::iter::repeat_n(b'x', MAX_MESSAGE + 10));
         stream.extend_from_slice(b"\0/e\0");
         let mut got = Vec::new();
-        read_paths(Dribble(stream, 0), |p| {
-            got.push(p.into_os_string().into_vec())
-        });
-        assert_eq!(
-            got,
-            [
-                b"/a/b".to_vec(),
-                b"/c/new\nline".to_vec(),
-                b"/d/\xff".to_vec(),
-                b"/e".to_vec()
-            ]
-        );
+        read_paths(Dribble(stream, 0), |p| got.push(p.into_os_string().into_vec()));
+        assert_eq!(got, [b"/a/b".to_vec(), b"/c/new\nline".to_vec(), b"/d/\xff".to_vec(), b"/e".to_vec()]);
     }
 }

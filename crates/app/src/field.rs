@@ -10,11 +10,7 @@ pub struct Field {
 
 impl Field {
     pub fn new(text: &str) -> Self {
-        Self {
-            text: text.to_string(),
-            caret: text.len(),
-            anchor: text.len(),
-        }
+        Self { text: text.to_string(), caret: text.len(), anchor: text.len() }
     }
 
     pub fn has_selection(&self) -> bool {
@@ -56,17 +52,11 @@ impl Field {
     }
 
     fn prev(&self, i: usize) -> usize {
-        self.text[..i]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(p, _)| p)
+        self.text[..i].char_indices().next_back().map_or(0, |(p, _)| p)
     }
 
     fn next(&self, i: usize) -> usize {
-        self.text[i..]
-            .chars()
-            .next()
-            .map_or(i, |c| i + c.len_utf8())
+        self.text[i..].chars().next().map_or(i, |c| i + c.len_utf8())
     }
 
     fn word_left(&self, mut i: usize) -> usize {
@@ -93,22 +83,14 @@ impl Field {
 
     pub fn backspace(&mut self, word: bool) {
         if !self.has_selection() {
-            self.anchor = if word {
-                self.word_left(self.caret)
-            } else {
-                self.prev(self.caret)
-            };
+            self.anchor = if word { self.word_left(self.caret) } else { self.prev(self.caret) };
         }
         self.delete_selection();
     }
 
     pub fn delete(&mut self, word: bool) {
         if !self.has_selection() {
-            self.anchor = if word {
-                self.word_right(self.caret)
-            } else {
-                self.next(self.caret)
-            };
+            self.anchor = if word { self.word_right(self.caret) } else { self.next(self.caret) };
         }
         self.delete_selection();
     }

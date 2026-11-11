@@ -10,22 +10,13 @@ use gannet_core::trash::TrashConfig;
 
 fn main() {
     let mut a = std::env::args().skip(1);
-    let (folder, data_home) = (
-        PathBuf::from(a.next().expect("folder")),
-        PathBuf::from(a.next().expect("data home")),
-    );
-    let paths: Vec<PathBuf> = std::fs::read_dir(&folder)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
+    let (folder, data_home) = (PathBuf::from(a.next().expect("folder")), PathBuf::from(a.next().expect("data home")));
+    let paths: Vec<PathBuf> = std::fs::read_dir(&folder).unwrap().map(|e| e.unwrap().path()).collect();
     let (tx, rx) = mpsc::channel();
     let tx = Mutex::new(tx);
-    let e = Engine::new(
-        TrashConfig::new(&data_home, 0),
-        Arc::new(move |ev| {
-            let _ = tx.lock().unwrap().send(ev);
-        }),
-    );
+    let e = Engine::new(TrashConfig::new(&data_home, 0), Arc::new(move |ev| {
+        let _ = tx.lock().unwrap().send(ev);
+    }));
     let t = Instant::now();
     e.start(Request::Trash { paths });
     loop {

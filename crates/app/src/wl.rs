@@ -7,31 +7,17 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gannet_core::clipboard;
 use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
-use rustix::time::{
-    Itimerspec, TimerfdClockId, TimerfdFlags, TimerfdTimerFlags, Timespec, timerfd_create,
-    timerfd_settime,
-};
+use rustix::time::{Itimerspec, TimerfdClockId, TimerfdFlags, TimerfdTimerFlags, Timespec, timerfd_create, timerfd_settime};
+use gannet_core::clipboard;
 use wayland_client::protocol::wl_data_device_manager::DndAction;
-use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
-};
-use wayland_client::{
-    Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, event_created_child,
-};
-use wayland_protocols::wp::cursor_shape::v1::client::{
-    wp_cursor_shape_device_v1 as cursor_dev, wp_cursor_shape_manager_v1 as cursor_mgr,
-};
-use wayland_protocols::wp::fractional_scale::v1::client::{
-    wp_fractional_scale_manager_v1 as frac_mgr, wp_fractional_scale_v1 as frac,
-};
+use wayland_client::protocol::{wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, event_created_child};
+use wayland_protocols::wp::cursor_shape::v1::client::{wp_cursor_shape_device_v1 as cursor_dev, wp_cursor_shape_manager_v1 as cursor_mgr};
+use wayland_protocols::wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1 as frac_mgr, wp_fractional_scale_v1 as frac};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
-use wayland_protocols::xdg::decoration::zv1::client::{
-    zxdg_decoration_manager_v1 as deco_mgr, zxdg_toplevel_decoration_v1 as deco,
-};
+use wayland_protocols::xdg::decoration::zv1::client::{zxdg_decoration_manager_v1 as deco_mgr, zxdg_toplevel_decoration_v1 as deco};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use xkbcommon::xkb;
 
@@ -64,45 +50,21 @@ pub enum Cursor {
 pub enum Input {
     Mods(Mods),
     /// `repeat` if this comes from the key being held rather than pressed.
-    Key {
-        keysym: u32,
-        utf8: String,
-        mods: Mods,
-        repeat: bool,
-    },
-    Move {
-        x: f64,
-        y: f64,
-    },
+    Key { keysym: u32, utf8: String, mods: Mods, repeat: bool },
+    Move { x: f64, y: f64 },
     Leave,
     /// Linux button code, like BTN_LEFT.
-    Button {
-        button: u32,
-        pressed: bool,
-    },
+    Button { button: u32, pressed: bool },
     /// Positive scrolls down. `lines` for a wheel, `pixels` for a touchpad, in logical units.
-    Scroll {
-        lines: f64,
-        pixels: f64,
-    },
+    Scroll { lines: f64, pixels: f64 },
     Resized,
     Close,
     Focus(bool),
     /// Another program took over the clipboard from us.
     ClipboardLost,
     /// A Wayland drag over this window, from any program, this one included.
-    DragEnter {
-        x: f64,
-        y: f64,
-        files: bool,
-        can_copy: bool,
-        can_move: bool,
-        marker: Option<clipboard::DragMarker>,
-    },
-    DragMove {
-        x: f64,
-        y: f64,
-    },
+    DragEnter { x: f64, y: f64, files: bool, can_copy: bool, can_move: bool, marker: Option<clipboard::DragMarker> },
+    DragMove { x: f64, y: f64 },
     DragLeave,
     DragDrop,
     /// The Wayland drag this window started was dropped. The receiver may still be reading.
@@ -227,11 +189,7 @@ pub struct State {
     /// A dropped drag's source, kept until the receiver has read it. It's held apart so that
     /// a new drag can't destroy it, and its last events can't end a new drag.
     finishing_source: Option<(wl_data_source::WlDataSource, Arc<Offer>)>,
-    dnd_icon: Option<(
-        wl_surface::WlSurface,
-        Buffer,
-        Option<wp_viewport::WpViewport>,
-    )>,
+    dnd_icon: Option<(wl_surface::WlSurface, Buffer, Option<wp_viewport::WpViewport>)>,
     source: Option<wl_data_source::WlDataSource>,
     offer: Option<Arc<Offer>>,
     cursor_now: Cursor,
@@ -247,8 +205,7 @@ pub struct Wl {
 impl Wl {
     /// Connects and opens the window. `Err` has a message for the terminal.
     pub fn connect(title: &str, app_id: &str, w: i32, h: i32) -> Result<Self, String> {
-        let conn = Connection::connect_to_env()
-            .map_err(|e| format!("can't connect to a Wayland compositor: {e}"))?;
+        let conn = Connection::connect_to_env().map_err(|e| format!("can't connect to a Wayland compositor: {e}"))?;
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
         let _registry = conn.display().get_registry(&qh, ());
@@ -288,11 +245,7 @@ impl Wl {
             repeat_delay: 400,
             repeat_rate: 30,
             repeat_key: None,
-            repeat_timer: timerfd_create(
-                TimerfdClockId::Monotonic,
-                TimerfdFlags::CLOEXEC | TimerfdFlags::NONBLOCK,
-            )
-            .ok(),
+            repeat_timer: timerfd_create(TimerfdClockId::Monotonic, TimerfdFlags::CLOEXEC | TimerfdFlags::NONBLOCK).ok(),
             pointer_serial: 0,
             input_serial: 0,
             axis_lines: 0.0,
@@ -313,17 +266,9 @@ impl Wl {
             offer: None,
             cursor_now: Cursor::Default,
         };
-        queue
-            .roundtrip(&mut state)
-            .map_err(|e| format!("Wayland: {e}"))?;
-        let compositor = state
-            .compositor
-            .clone()
-            .ok_or("the compositor lacks wl_compositor")?;
-        let wm_base = state
-            .wm_base
-            .clone()
-            .ok_or("the compositor lacks xdg_wm_base")?;
+        queue.roundtrip(&mut state).map_err(|e| format!("Wayland: {e}"))?;
+        let compositor = state.compositor.clone().ok_or("the compositor lacks wl_compositor")?;
+        let wm_base = state.wm_base.clone().ok_or("the compositor lacks xdg_wm_base")?;
         state.shm.as_ref().ok_or("the compositor lacks wl_shm")?;
         let surface = compositor.create_surface(&qh, ());
         let xs = wm_base.get_xdg_surface(&surface, &qh, ());
@@ -332,8 +277,7 @@ impl Wl {
         top.set_app_id(app_id.to_string());
         top.set_min_size(MIN_SIZE.0, MIN_SIZE.1);
         if let Some(m) = &state.deco_manager {
-            m.get_toplevel_decoration(&top, &qh, ())
-                .set_mode(deco::Mode::ServerSide);
+            m.get_toplevel_decoration(&top, &qh, ()).set_mode(deco::Mode::ServerSide);
         }
         if let (Some(v), Some(f)) = (&state.viewporter, &state.frac_manager) {
             state.viewport = Some(v.get_viewport(&surface, &qh, ()));
@@ -344,12 +288,7 @@ impl Wl {
         state.xdg_surface = Some(xs);
         state.toplevel = Some(top);
         conn.flush().map_err(|e| format!("Wayland: {e}"))?;
-        Ok(Self {
-            conn,
-            queue,
-            qh,
-            state,
-        })
+        Ok(Self { conn, queue, qh, state })
     }
 
     pub fn set_title(&self, title: &str) {
@@ -391,11 +330,7 @@ impl Wl {
 
     /// Physical pixels per logical pixel.
     pub fn scale(&self) -> f64 {
-        if self.state.viewport.is_some() {
-            self.state.scale120 as f64 / 120.0
-        } else {
-            self.state.integer_scale as f64
-        }
+        if self.state.viewport.is_some() { self.state.scale120 as f64 / 120.0 } else { self.state.integer_scale as f64 }
     }
 
     /// True if a paint now would reach the screen soon. A pending frame means wait.
@@ -426,11 +361,7 @@ impl Wl {
         for b in self.state.buffers.iter_mut() {
             b.stale = b.stale.union(damage);
         }
-        let surface = self
-            .state
-            .surface
-            .clone()
-            .expect("surface exists once connected");
+        let surface = self.state.surface.clone().expect("surface exists once connected");
         let b = &mut self.state.buffers[i];
         let clip = b.stale.intersect(full);
         // SAFETY: ptr maps w*h u32s for this buffer's lifetime, and the compositor doesn't
@@ -472,9 +403,7 @@ impl Wl {
 
     /// Puts data on the clipboard. Needs a recent input serial, which it has after a key press.
     pub fn set_clipboard(&mut self, offer: Offer) {
-        let (Some(m), Some(d)) = (&self.state.data_manager, &self.state.data_device) else {
-            return;
-        };
+        let (Some(m), Some(d)) = (&self.state.data_manager, &self.state.data_device) else { return };
         let source = m.create_data_source(&self.qh, ());
         for (mime, _) in &offer.mimes {
             source.offer(mime.clone());
@@ -495,12 +424,7 @@ impl Wl {
 
     /// MIME types on the clipboard now.
     pub fn clipboard_mimes(&self) -> Vec<String> {
-        self.state
-            .selection
-            .as_ref()
-            .and_then(|o| o.data::<OfferData>())
-            .map(|d| d.mimes.lock().map(|m| m.clone()).unwrap_or_default())
-            .unwrap_or_default()
+        self.state.selection.as_ref().and_then(|o| o.data::<OfferData>()).map(|d| d.mimes.lock().map(|m| m.clone()).unwrap_or_default()).unwrap_or_default()
     }
 
     /// Asks for clipboard contents; the read end gets them, from a thread that's the
@@ -520,35 +444,19 @@ impl Wl {
     /// It offers one action, so whatever receives it does what the keys asked for.
     pub fn start_drag(&mut self, offer: Offer, move_only: bool, icon: Option<DragIcon>) {
         self.cancel_drag();
-        let (Some(m), Some(d), Some(surface)) = (
-            &self.state.data_manager,
-            &self.state.data_device,
-            &self.state.surface,
-        ) else {
+        let (Some(m), Some(d), Some(surface)) = (&self.state.data_manager, &self.state.data_device, &self.state.surface) else {
             self.state.inputs.push_back(Input::OutDragEnded);
             return;
         };
-        let icon_surface = icon
-            .as_ref()
-            .and_then(|_| self.state.compositor.as_ref())
-            .map(|c| c.create_surface(&self.qh, ()));
+        let icon_surface = icon.as_ref().and_then(|_| self.state.compositor.as_ref()).map(|c| c.create_surface(&self.qh, ()));
         let source = m.create_data_source(&self.qh, ());
         for (mime, _) in &offer.mimes {
             source.offer(mime.clone());
         }
         if source.version() >= 3 {
-            source.set_actions(if move_only {
-                DndAction::Move
-            } else {
-                DndAction::Copy
-            });
+            source.set_actions(if move_only { DndAction::Move } else { DndAction::Copy });
         }
-        d.start_drag(
-            Some(&source),
-            surface,
-            icon_surface.as_ref(),
-            self.state.press_serial,
-        );
+        d.start_drag(Some(&source), surface, icon_surface.as_ref(), self.state.press_serial);
         self.state.dnd_source = Some(source);
         self.state.dnd_payload = Some(Arc::new(offer));
         if let (Some(surface), Some(icon)) = (icon_surface, icon) {
@@ -558,19 +466,10 @@ impl Wl {
 
     fn show_drag_icon(&mut self, surface: wl_surface::WlSurface, icon: DragIcon) {
         let qh = self.qh.clone();
-        let viewport = self
-            .state
-            .viewporter
-            .as_ref()
-            .filter(|_| self.state.viewport.is_some())
-            .map(|v| v.get_viewport(&surface, &qh, ()));
+        let viewport = self.state.viewporter.as_ref().filter(|_| self.state.viewport.is_some()).map(|v| v.get_viewport(&surface, &qh, ()));
         // With a buffer scale, a buffer has to be a multiple of it, or the compositor closes
         // the connection. Whatever that adds is filled like the edge of the picture.
-        let multiple = if viewport.is_some() {
-            1
-        } else {
-            self.state.integer_scale.max(1)
-        };
+        let multiple = if viewport.is_some() { 1 } else { self.state.integer_scale.max(1) };
         let (bw, bh) = (round_up(icon.w, multiple), round_up(icon.h, multiple));
         let Some(buffer) = self.state.new_buffer(bw, bh, &qh) else {
             if let Some(v) = viewport {
@@ -584,10 +483,7 @@ impl Wl {
         copy_into_larger(&icon, px, bw);
         let scale = self.scale();
         match &viewport {
-            Some(v) => v.set_destination(
-                (bw as f64 / scale).ceil() as i32,
-                (bh as f64 / scale).ceil() as i32,
-            ),
+            Some(v) => v.set_destination((bw as f64 / scale).ceil() as i32, (bh as f64 / scale).ceil() as i32),
             None => surface.set_buffer_scale(multiple),
         }
         // Beside the pointer and just below it, in logical pixels. From version 5, a non-zero
@@ -616,10 +512,7 @@ impl Wl {
     pub fn accept_drop(&mut self, accept: bool) {
         self.state.drag_accepting = accept;
         if let Some(offer) = &self.state.drag_offer {
-            offer.accept(
-                self.state.drag_serial,
-                accept.then(|| clipboard::URI_LIST.to_string()),
-            );
+            offer.accept(self.state.drag_serial, accept.then(|| clipboard::URI_LIST.to_string()));
         }
     }
 
@@ -638,10 +531,7 @@ impl Wl {
     /// then delete its side, so that's only safe to say once the files have arrived.
     pub fn finish_drop(&mut self) {
         if let Some(offer) = self.state.dropped_offer.take() {
-            let action = offer
-                .data::<OfferData>()
-                .and_then(|d| d.action.lock().ok().map(|a| *a))
-                .unwrap_or(0);
+            let action = offer.data::<OfferData>().and_then(|d| d.action.lock().ok().map(|a| *a)).unwrap_or(0);
             if self.state.dropped_accepted && action != 0 && offer.version() >= 3 {
                 offer.finish();
             }
@@ -672,22 +562,12 @@ fn copy_into_larger(icon: &DragIcon, px: &mut [u32], bw: i32) {
 
 /// What this window will agree to for a drop. Move stays out unless it's all that's on offer.
 fn allowed_actions(can_copy: bool) -> DndAction {
-    if can_copy {
-        DndAction::Copy
-    } else {
-        DndAction::Copy | DndAction::Move
-    }
+    if can_copy { DndAction::Copy } else { DndAction::Copy | DndAction::Move }
 }
 
 fn offer_allows(offer: &wl_data_offer::WlDataOffer) -> (bool, bool) {
-    let bits = offer
-        .data::<OfferData>()
-        .and_then(|d| d.source_actions.lock().ok().map(|a| *a))
-        .unwrap_or(0);
-    (
-        bits & DndAction::Copy.bits() != 0,
-        bits & DndAction::Move.bits() != 0,
-    )
+    let bits = offer.data::<OfferData>().and_then(|d| d.source_actions.lock().ok().map(|a| *a)).unwrap_or(0);
+    (bits & DndAction::Copy.bits() != 0, bits & DndAction::Move.bits() != 0)
 }
 
 fn shape_of(c: Cursor) -> cursor_dev::Shape {
@@ -745,43 +625,18 @@ impl State {
         let fd = memfd_create("gannet-buffer", MemfdFlags::CLOEXEC).ok()?;
         ftruncate(&fd, size as u64).ok()?;
         // SAFETY: fd is a new memfd of `size` bytes, mapped shared and unmapped only by Buffer::free.
-        let ptr = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                size,
-                ProtFlags::READ | ProtFlags::WRITE,
-                MapFlags::SHARED,
-                &fd,
-                0,
-            )
-            .ok()?
-        } as *mut u32;
-        let pool = self
-            .shm
-            .as_ref()?
-            .create_pool(fd.as_fd(), size as i32, qh, ());
+        let ptr = unsafe { mmap(std::ptr::null_mut(), size, ProtFlags::READ | ProtFlags::WRITE, MapFlags::SHARED, &fd, 0).ok()? } as *mut u32;
+        let pool = self.shm.as_ref()?.create_pool(fd.as_fd(), size as i32, qh, ());
         let id = self.next_buffer_id;
         self.next_buffer_id = id.wrapping_add(1);
         let wl = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Xrgb8888, qh, id);
         pool.destroy();
-        Some(Buffer {
-            wl,
-            ptr,
-            size,
-            w,
-            h,
-            busy: false,
-            stale: Rect::new(0, 0, w, h),
-            retired: false,
-            id,
-        })
+        Some(Buffer { wl, ptr, size, w, h, busy: false, stale: Rect::new(0, 0, w, h), retired: false, id })
     }
 
     /// After a quiet spell, frees buffers kept only for smooth scrolling.
     fn trim_spare_buffers(&mut self) {
-        let quiet = self
-            .last_frame
-            .is_none_or(|t| t.elapsed() > Duration::from_millis(500));
+        let quiet = self.last_frame.is_none_or(|t| t.elapsed() > Duration::from_millis(500));
         if !quiet {
             return;
         }
@@ -796,16 +651,9 @@ impl State {
     }
 
     fn mods(&self) -> Mods {
-        let Some(s) = &self.xkb_state else {
-            return Mods::default();
-        };
+        let Some(s) = &self.xkb_state else { return Mods::default() };
         let on = |name: &str| s.mod_name_is_active(name, xkb::STATE_MODS_EFFECTIVE);
-        Mods {
-            ctrl: on(xkb::MOD_NAME_CTRL),
-            shift: on(xkb::MOD_NAME_SHIFT),
-            alt: on(xkb::MOD_NAME_ALT),
-            logo: on(xkb::MOD_NAME_LOGO),
-        }
+        Mods { ctrl: on(xkb::MOD_NAME_CTRL), shift: on(xkb::MOD_NAME_SHIFT), alt: on(xkb::MOD_NAME_ALT), logo: on(xkb::MOD_NAME_LOGO) }
     }
 
     /// Emits a key press for a Wayland key code.
@@ -815,36 +663,14 @@ impl State {
         let keysym = s.key_get_one_sym(kc).raw();
         let utf8 = s.key_get_utf8(kc);
         let mods = self.mods();
-        self.inputs.push_back(Input::Key {
-            keysym,
-            utf8,
-            mods,
-            repeat,
-        });
+        self.inputs.push_back(Input::Key { keysym, utf8, mods, repeat });
     }
 
     fn arm_repeat(&self, on: bool) {
         let Some(fd) = &self.repeat_timer else { return };
-        let (first, every) = if on && self.repeat_rate > 0 {
-            (
-                (self.repeat_delay as i64).max(1) * 1_000_000,
-                1_000_000_000 / self.repeat_rate as i64,
-            )
-        } else {
-            (0, 0)
-        };
-        let split = |ns: i64| Timespec {
-            tv_sec: ns / 1_000_000_000,
-            tv_nsec: ns % 1_000_000_000,
-        };
-        let _ = timerfd_settime(
-            fd,
-            TimerfdTimerFlags::empty(),
-            &Itimerspec {
-                it_interval: split(every),
-                it_value: split(first),
-            },
-        );
+        let (first, every) = if on && self.repeat_rate > 0 { ((self.repeat_delay as i64).max(1) * 1_000_000, 1_000_000_000 / self.repeat_rate as i64) } else { (0, 0) };
+        let split = |ns: i64| Timespec { tv_sec: ns / 1_000_000_000, tv_nsec: ns % 1_000_000_000 };
+        let _ = timerfd_settime(fd, TimerfdTimerFlags::empty(), &Itimerspec { it_interval: split(every), it_value: split(first) });
     }
 
     fn apply_size(&mut self) {
@@ -861,22 +687,8 @@ impl State {
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
-    fn event(
-        s: &mut State,
-        r: &wl_registry::WlRegistry,
-        e: wl_registry::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<State>,
-    ) {
-        let wl_registry::Event::Global {
-            name,
-            interface,
-            version,
-        } = e
-        else {
-            return;
-        };
+    fn event(s: &mut State, r: &wl_registry::WlRegistry, e: wl_registry::Event, _: &(), _: &Connection, qh: &QueueHandle<State>) {
+        let wl_registry::Event::Global { name, interface, version } = e else { return };
         match interface.as_str() {
             "wl_compositor" => s.compositor = Some(r.bind(name, version.min(6), qh, ())),
             "wl_shm" => s.shm = Some(r.bind(name, 1, qh, ())),
@@ -886,8 +698,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             "wp_fractional_scale_manager_v1" => s.frac_manager = Some(r.bind(name, 1, qh, ())),
             "wp_cursor_shape_manager_v1" => s.cursor_manager = Some(r.bind(name, 1, qh, ())),
             "wl_data_device_manager" => {
-                let m: wl_data_device_manager::WlDataDeviceManager =
-                    r.bind(name, version.min(3), qh, ());
+                let m: wl_data_device_manager::WlDataDeviceManager = r.bind(name, version.min(3), qh, ());
                 s.data_manager = Some(m);
             }
             "zxdg_decoration_manager_v1" => s.deco_manager = Some(r.bind(name, 1, qh, ())),
@@ -922,14 +733,7 @@ ignore_events!(
 );
 
 impl Dispatch<wl_surface::WlSurface, ()> for State {
-    fn event(
-        s: &mut State,
-        surface: &wl_surface::WlSurface,
-        e: wl_surface::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, surface: &wl_surface::WlSurface, e: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         // A drag's picture is a surface too, but this is about the window.
         if let wl_surface::Event::PreferredBufferScale { factor } = e
             && s.surface.as_ref() == Some(surface)
@@ -943,14 +747,7 @@ impl Dispatch<wl_surface::WlSurface, ()> for State {
 }
 
 impl Dispatch<frac::WpFractionalScaleV1, ()> for State {
-    fn event(
-        s: &mut State,
-        _: &frac::WpFractionalScaleV1,
-        e: frac::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, _: &frac::WpFractionalScaleV1, e: frac::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         if let frac::Event::PreferredScale { scale } = e
             && scale != s.scale120
         {
@@ -961,14 +758,7 @@ impl Dispatch<frac::WpFractionalScaleV1, ()> for State {
 }
 
 impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
-    fn event(
-        _: &mut State,
-        b: &xdg_wm_base::XdgWmBase,
-        e: xdg_wm_base::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(_: &mut State, b: &xdg_wm_base::XdgWmBase, e: xdg_wm_base::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         if let xdg_wm_base::Event::Ping { serial } = e {
             b.pong(serial);
         }
@@ -976,14 +766,7 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for State {
 }
 
 impl Dispatch<xdg_surface::XdgSurface, ()> for State {
-    fn event(
-        s: &mut State,
-        x: &xdg_surface::XdgSurface,
-        e: xdg_surface::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, x: &xdg_surface::XdgSurface, e: xdg_surface::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         if let xdg_surface::Event::Configure { serial } = e {
             x.ack_configure(serial);
             s.apply_size();
@@ -994,14 +777,7 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for State {
 }
 
 impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
-    fn event(
-        s: &mut State,
-        _: &xdg_toplevel::XdgToplevel,
-        e: xdg_toplevel::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, _: &xdg_toplevel::XdgToplevel, e: xdg_toplevel::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         match e {
             xdg_toplevel::Event::Configure { width, height, .. } => {
                 if width > 0 && height > 0 {
@@ -1015,14 +791,7 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for State {
 }
 
 impl Dispatch<wl_callback::WlCallback, ()> for State {
-    fn event(
-        s: &mut State,
-        _: &wl_callback::WlCallback,
-        e: wl_callback::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, _: &wl_callback::WlCallback, e: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         if let wl_callback::Event::Done { .. } = e {
             s.frame_pending = false;
         }
@@ -1030,14 +799,7 @@ impl Dispatch<wl_callback::WlCallback, ()> for State {
 }
 
 impl Dispatch<wl_buffer::WlBuffer, u32> for State {
-    fn event(
-        s: &mut State,
-        _: &wl_buffer::WlBuffer,
-        e: wl_buffer::Event,
-        id: &u32,
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, _: &wl_buffer::WlBuffer, e: wl_buffer::Event, id: &u32, _: &Connection, _: &QueueHandle<State>) {
         if let wl_buffer::Event::Release = e
             && let Some(i) = s.buffers.iter().position(|b| b.id == *id)
         {
@@ -1051,18 +813,8 @@ impl Dispatch<wl_buffer::WlBuffer, u32> for State {
 }
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
-    fn event(
-        s: &mut State,
-        seat: &wl_seat::WlSeat,
-        e: wl_seat::Event,
-        _: &(),
-        _: &Connection,
-        qh: &QueueHandle<State>,
-    ) {
-        if let wl_seat::Event::Capabilities {
-            capabilities: WEnum::Value(c),
-        } = e
-        {
+    fn event(s: &mut State, seat: &wl_seat::WlSeat, e: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<State>) {
+        if let wl_seat::Event::Capabilities { capabilities: WEnum::Value(c) } = e {
             // Devices come and go, say with a KVM switch or an unplugged keyboard. The old
             // objects stop working when they do, so each return needs fresh ones.
             if c.contains(wl_seat::Capability::Keyboard) {
@@ -1093,43 +845,19 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
 }
 
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
-    fn event(
-        s: &mut State,
-        _: &wl_keyboard::WlKeyboard,
-        e: wl_keyboard::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, _: &wl_keyboard::WlKeyboard, e: wl_keyboard::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         match e {
-            wl_keyboard::Event::Keymap {
-                format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
-                fd,
-                size,
-            } => {
+            wl_keyboard::Event::Keymap { format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1), fd, size } => {
                 // Read by position: the fd's shared offset isn't ours to move.
                 let mut bytes = vec![0u8; size as usize];
-                if std::os::unix::fs::FileExt::read_exact_at(
-                    &std::fs::File::from(fd),
-                    &mut bytes,
-                    0,
-                )
-                .is_err()
-                {
+                if std::os::unix::fs::FileExt::read_exact_at(&std::fs::File::from(fd), &mut bytes, 0).is_err() {
                     return;
                 }
                 while bytes.last() == Some(&0) {
                     bytes.pop();
                 }
-                let Ok(text) = String::from_utf8(bytes) else {
-                    return;
-                };
-                if let Some(map) = xkb::Keymap::new_from_string(
-                    &s.xkb_ctx,
-                    text,
-                    xkb::KEYMAP_FORMAT_TEXT_V1,
-                    xkb::KEYMAP_COMPILE_NO_FLAGS,
-                ) {
+                let Ok(text) = String::from_utf8(bytes) else { return };
+                if let Some(map) = xkb::Keymap::new_from_string(&s.xkb_ctx, text, xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS) {
                     s.xkb_state = Some(xkb::State::new(&map));
                 }
             }
@@ -1142,13 +870,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 s.arm_repeat(false);
                 s.inputs.push_back(Input::Focus(false));
             }
-            wl_keyboard::Event::Modifiers {
-                serial,
-                mods_depressed,
-                mods_latched,
-                mods_locked,
-                group,
-            } => {
+            wl_keyboard::Event::Modifiers { serial, mods_depressed, mods_latched, mods_locked, group } => {
                 s.input_serial = serial;
                 if let Some(st) = &mut s.xkb_state {
                     st.update_mask(mods_depressed, mods_latched, mods_locked, 0, 0, group);
@@ -1160,19 +882,12 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
                 s.repeat_rate = rate;
                 s.repeat_delay = delay;
             }
-            wl_keyboard::Event::Key {
-                serial,
-                key,
-                state: WEnum::Value(st),
-                ..
-            } => {
+            wl_keyboard::Event::Key { serial, key, state: WEnum::Value(st), .. } => {
                 s.input_serial = serial;
                 match st {
                     wl_keyboard::KeyState::Pressed => {
                         s.key_event(key, false);
-                        let repeats = s.xkb_state.as_ref().is_some_and(|x| {
-                            x.get_keymap().key_repeats(xkb::Keycode::new(key + 8))
-                        });
+                        let repeats = s.xkb_state.as_ref().is_some_and(|x| x.get_keymap().key_repeats(xkb::Keycode::new(key + 8)));
                         if repeats {
                             s.repeat_key = Some(key);
                             s.arm_repeat(true);
@@ -1191,77 +906,33 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
 }
 
 impl Dispatch<wl_pointer::WlPointer, ()> for State {
-    fn event(
-        s: &mut State,
-        _: &wl_pointer::WlPointer,
-        e: wl_pointer::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, _: &wl_pointer::WlPointer, e: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         match e {
-            wl_pointer::Event::Enter {
-                serial,
-                surface_x,
-                surface_y,
-                ..
-            } => {
+            wl_pointer::Event::Enter { serial, surface_x, surface_y, .. } => {
                 s.pointer_serial = serial;
                 if let Some(d) = &s.cursor_device {
                     d.set_shape(serial, shape_of(s.cursor_now));
                 }
                 s.px = (surface_x, surface_y);
-                s.inputs.push_back(Input::Move {
-                    x: surface_x,
-                    y: surface_y,
-                });
+                s.inputs.push_back(Input::Move { x: surface_x, y: surface_y });
             }
             wl_pointer::Event::Leave { .. } => s.inputs.push_back(Input::Leave),
-            wl_pointer::Event::Motion {
-                surface_x,
-                surface_y,
-                ..
-            } => {
+            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
                 s.px = (surface_x, surface_y);
-                s.inputs.push_back(Input::Move {
-                    x: surface_x,
-                    y: surface_y,
-                });
+                s.inputs.push_back(Input::Move { x: surface_x, y: surface_y });
             }
-            wl_pointer::Event::Button {
-                serial,
-                button,
-                state: WEnum::Value(st),
-                ..
-            } => {
+            wl_pointer::Event::Button { serial, button, state: WEnum::Value(st), .. } => {
                 s.input_serial = serial;
                 if st == wl_pointer::ButtonState::Pressed {
                     s.press_serial = serial;
                 }
-                s.inputs.push_back(Input::Button {
-                    button,
-                    pressed: st == wl_pointer::ButtonState::Pressed,
-                });
+                s.inputs.push_back(Input::Button { button, pressed: st == wl_pointer::ButtonState::Pressed });
             }
-            wl_pointer::Event::Axis {
-                axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
-                value,
-                ..
-            } => s.axis_pixels += value,
-            wl_pointer::Event::AxisValue120 {
-                axis: WEnum::Value(wl_pointer::Axis::VerticalScroll),
-                value120,
-            } => s.axis_lines += value120 as f64 / 120.0,
+            wl_pointer::Event::Axis { axis: WEnum::Value(wl_pointer::Axis::VerticalScroll), value, .. } => s.axis_pixels += value,
+            wl_pointer::Event::AxisValue120 { axis: WEnum::Value(wl_pointer::Axis::VerticalScroll), value120 } => s.axis_lines += value120 as f64 / 120.0,
             wl_pointer::Event::Frame if s.axis_lines != 0.0 || s.axis_pixels != 0.0 => {
-                let (lines, pixels) = (
-                    std::mem::take(&mut s.axis_lines),
-                    std::mem::take(&mut s.axis_pixels),
-                );
-                s.inputs.push_back(if lines != 0.0 {
-                    Input::Scroll { lines, pixels: 0.0 }
-                } else {
-                    Input::Scroll { lines: 0.0, pixels }
-                });
+                let (lines, pixels) = (std::mem::take(&mut s.axis_lines), std::mem::take(&mut s.axis_pixels));
+                s.inputs.push_back(if lines != 0.0 { Input::Scroll { lines, pixels: 0.0 } } else { Input::Scroll { lines: 0.0, pixels } });
             }
             _ => {}
         }
@@ -1269,40 +940,17 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
 }
 
 impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
-    fn event(
-        s: &mut State,
-        _: &wl_data_device::WlDataDevice,
-        e: wl_data_device::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, _: &wl_data_device::WlDataDevice, e: wl_data_device::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         match e {
             wl_data_device::Event::Selection { id } => {
                 if let Some(old) = std::mem::replace(&mut s.selection, id) {
                     old.destroy();
                 }
             }
-            wl_data_device::Event::Enter {
-                serial, x, y, id, ..
-            } => {
+            wl_data_device::Event::Enter { serial, x, y, id, .. } => {
                 s.drag_serial = serial;
-                let files = id
-                    .as_ref()
-                    .and_then(|o| o.data::<OfferData>())
-                    .is_some_and(|d| {
-                        d.mimes
-                            .lock()
-                            .is_ok_and(|m| m.iter().any(|m| m == clipboard::URI_LIST))
-                    });
-                let marker =
-                    id.as_ref()
-                        .and_then(|o| o.data::<OfferData>())
-                        .and_then(|d| {
-                            d.mimes.lock().ok().and_then(|m| {
-                                m.iter().find_map(|m| clipboard::DragMarker::parse(m))
-                            })
-                        });
+                let files = id.as_ref().and_then(|o| o.data::<OfferData>()).is_some_and(|d| d.mimes.lock().is_ok_and(|m| m.iter().any(|m| m == clipboard::URI_LIST)));
+                let marker = id.as_ref().and_then(|o| o.data::<OfferData>()).and_then(|d| d.mimes.lock().ok().and_then(|m| m.iter().find_map(|m| clipboard::DragMarker::parse(m))));
                 let (can_copy, can_move) = id.as_ref().map_or((false, false), offer_allows);
                 if let Some(offer) = id.as_ref().filter(|o| o.version() >= 3) {
                     // Only a copy whenever the other program allows one, so that no compositor
@@ -1317,18 +965,9 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 if let Some(old) = std::mem::replace(&mut s.drag_offer, id) {
                     old.destroy();
                 }
-                s.inputs.push_back(Input::DragEnter {
-                    x,
-                    y,
-                    files,
-                    can_copy,
-                    can_move,
-                    marker,
-                });
+                s.inputs.push_back(Input::DragEnter { x, y, files, can_copy, can_move, marker });
             }
-            wl_data_device::Event::Motion { x, y, .. } => {
-                s.inputs.push_back(Input::DragMove { x, y })
-            }
+            wl_data_device::Event::Motion { x, y, .. } => s.inputs.push_back(Input::DragMove { x, y }),
             wl_data_device::Event::Leave => {
                 if let Some(old) = s.drag_offer.take() {
                     old.destroy();
@@ -1359,30 +998,19 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
 }
 
 impl Dispatch<wl_data_offer::WlDataOffer, OfferData> for State {
-    fn event(
-        _: &mut State,
-        _: &wl_data_offer::WlDataOffer,
-        e: wl_data_offer::Event,
-        d: &OfferData,
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(_: &mut State, _: &wl_data_offer::WlDataOffer, e: wl_data_offer::Event, d: &OfferData, _: &Connection, _: &QueueHandle<State>) {
         match e {
             wl_data_offer::Event::Offer { mime_type } => {
                 if let Ok(mut m) = d.mimes.lock() {
                     m.push(mime_type);
                 }
             }
-            wl_data_offer::Event::SourceActions {
-                source_actions: WEnum::Value(a),
-            } => {
+            wl_data_offer::Event::SourceActions { source_actions: WEnum::Value(a) } => {
                 if let Ok(mut bits) = d.source_actions.lock() {
                     *bits = a.bits();
                 }
             }
-            wl_data_offer::Event::Action {
-                dnd_action: WEnum::Value(a),
-            } => {
+            wl_data_offer::Event::Action { dnd_action: WEnum::Value(a) } => {
                 if let Ok(mut bits) = d.action.lock() {
                     *bits = a.bits();
                 }
@@ -1393,14 +1021,7 @@ impl Dispatch<wl_data_offer::WlDataOffer, OfferData> for State {
 }
 
 impl Dispatch<wl_data_source::WlDataSource, ()> for State {
-    fn event(
-        s: &mut State,
-        src: &wl_data_source::WlDataSource,
-        e: wl_data_source::Event,
-        _: &(),
-        _: &Connection,
-        _: &QueueHandle<State>,
-    ) {
+    fn event(s: &mut State, src: &wl_data_source::WlDataSource, e: wl_data_source::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
         match e {
             wl_data_source::Event::Send { mime_type, fd } => {
                 let from = match &s.finishing_source {
@@ -1408,28 +1029,18 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for State {
                     _ if s.dnd_source.as_ref() == Some(src) => s.dnd_payload.as_ref(),
                     _ => s.offer.as_ref(),
                 };
-                let Some(data) = from.and_then(|o| {
-                    o.mimes
-                        .iter()
-                        .find(|(m, _)| *m == mime_type)
-                        .map(|(_, d)| d.clone())
-                }) else {
-                    return;
-                };
+                let Some(data) = from.and_then(|o| o.mimes.iter().find(|(m, _)| *m == mime_type).map(|(_, d)| d.clone())) else { return };
                 // A separate thread: a reader that stalls mustn't stall the window.
-                let _ = std::thread::Builder::new()
-                    .name("gannet-clip".into())
-                    .spawn(move || {
-                        let mut f = std::fs::File::from(fd);
-                        let _ = std::io::Write::write_all(&mut f, &data);
-                    });
+                let _ = std::thread::Builder::new().name("gannet-clip".into()).spawn(move || {
+                    let mut f = std::fs::File::from(fd);
+                    let _ = std::io::Write::write_all(&mut f, &data);
+                });
             }
             // The drag is over for the user, but the source has to live until the receiver has
             // read from it, so clicking right after a drop can't lose the drop.
             wl_data_source::Event::DndDropPerformed => {
                 if s.dnd_source.as_ref() == Some(src)
-                    && let (Some(source), Some(payload)) =
-                        (s.dnd_source.take(), s.dnd_payload.take())
+                    && let (Some(source), Some(payload)) = (s.dnd_source.take(), s.dnd_payload.take())
                 {
                     if let Some((older, _)) = s.finishing_source.replace((source, payload)) {
                         older.destroy();
@@ -1479,28 +1090,13 @@ mod tests {
     fn a_drop_never_agrees_to_a_move_when_a_copy_is_on_offer() {
         // The drop is finished before the files arrive, so an agreed move could lose them.
         assert_eq!(allowed_actions(true), DndAction::Copy);
-        assert!(
-            allowed_actions(false).contains(DndAction::Move),
-            "or a move-only source has nothing to agree on"
-        );
+        assert!(allowed_actions(false).contains(DndAction::Move), "or a move-only source has nothing to agree on");
     }
 
     #[test]
     fn a_drag_picture_is_rounded_up_to_a_multiple_of_the_scale() {
-        assert_eq!(
-            (
-                round_up(121, 2),
-                round_up(120, 2),
-                round_up(121, 3),
-                round_up(7, 1)
-            ),
-            (122, 120, 123, 7)
-        );
-        let icon = DragIcon {
-            w: 3,
-            h: 1,
-            pixels: vec![1, 2, 3],
-        };
+        assert_eq!((round_up(121, 2), round_up(120, 2), round_up(121, 3), round_up(7, 1)), (122, 120, 123, 7));
+        let icon = DragIcon { w: 3, h: 1, pixels: vec![1, 2, 3] };
         let mut px = vec![0; 8];
         copy_into_larger(&icon, &mut px, 4);
         assert_eq!(px, [1, 2, 3, 1, 1, 1, 1, 1]);

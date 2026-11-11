@@ -23,11 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use rustix::fs::{
-    AtFlags, CWD, RenameFlags, StatxAttributes, StatxFlags, Timespec, Timestamps, XattrFlags,
-    copy_file_range, fgetxattr, flistxattr, fsetxattr, futimens, renameat_with, sendfile, statx,
-    syncfs,
-};
+use rustix::fs::{AtFlags, CWD, RenameFlags, StatxAttributes, StatxFlags, Timespec, Timestamps, XattrFlags, copy_file_range, fgetxattr, flistxattr, fsetxattr, futimens, renameat_with, sendfile, statx, syncfs};
 use rustix::io::Errno;
 
 use crate::listing::describe;
@@ -35,38 +31,17 @@ use crate::trash::{self, MountCache, TrashConfig, TrashError, Trashed};
 
 #[derive(Clone, Debug)]
 pub enum Request {
-    Copy {
-        sources: Vec<PathBuf>,
-        dest: PathBuf,
-    },
-    Move {
-        sources: Vec<PathBuf>,
-        dest: PathBuf,
-    },
+    Copy { sources: Vec<PathBuf>, dest: PathBuf },
+    Move { sources: Vec<PathBuf>, dest: PathBuf },
     /// Makes a symbolic link in `dest` to each source.
-    Link {
-        sources: Vec<PathBuf>,
-        dest: PathBuf,
-    },
-    Trash {
-        paths: Vec<PathBuf>,
-    },
+    Link { sources: Vec<PathBuf>, dest: PathBuf },
+    Trash { paths: Vec<PathBuf> },
     /// Deletes for good. The UI must have asked first.
-    Delete {
-        paths: Vec<PathBuf>,
-    },
-    Rename {
-        from: PathBuf,
-        to_name: OsString,
-    },
-    NewFolder {
-        parent: PathBuf,
-        name: OsString,
-    },
+    Delete { paths: Vec<PathBuf> },
+    Rename { from: PathBuf, to_name: OsString },
+    NewFolder { parent: PathBuf, name: OsString },
     /// Puts items from the Trash back where they came from. Never overwrites.
-    Restore {
-        items: Vec<Trashed>,
-    },
+    Restore { items: Vec<Trashed> },
     Undo(Undo),
 }
 
@@ -149,11 +124,7 @@ pub enum Event {
     /// Totals moved. Throttled to about 20 per second per job.
     Progress(u64),
     Conflict(Conflict),
-    Error {
-        job: u64,
-        path: PathBuf,
-        message: String,
-    },
+    Error { job: u64, path: PathBuf, message: String },
     Finished(Outcome),
 }
 
@@ -174,25 +145,13 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(trash: TrashConfig, sink: Sink) -> Self {
-        Self {
-            trash,
-            sink,
-            next_id: Arc::new(AtomicU64::new(1)),
-            force_exdev: false,
-            force_sync_error: false,
-            force_no_sendfile: false,
-        }
+        Self { trash, sink, next_id: Arc::new(AtomicU64::new(1)), force_exdev: false, force_sync_error: false, force_no_sendfile: false }
     }
 
     pub fn start(&self, request: Request) -> Job {
         let request = clean_request(request);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let job = Job {
-            id,
-            label: label_for(&request),
-            progress: Arc::new(Progress::default()),
-            cancel: Arc::new(AtomicBool::new(false)),
-        };
+        let job = Job { id, label: label_for(&request), progress: Arc::new(Progress::default()), cancel: Arc::new(AtomicBool::new(false)) };
         let mut run = Run {
             job: job.clone(),
             sink: self.sink.clone(),
@@ -242,28 +201,13 @@ fn clean_path(p: PathBuf) -> PathBuf {
 fn clean_request(r: Request) -> Request {
     let many = |v: Vec<PathBuf>| v.into_iter().map(clean_path).collect::<Vec<_>>();
     match r {
-        Request::Copy { sources, dest } => Request::Copy {
-            sources: many(sources),
-            dest: clean_path(dest),
-        },
-        Request::Move { sources, dest } => Request::Move {
-            sources: many(sources),
-            dest: clean_path(dest),
-        },
-        Request::Link { sources, dest } => Request::Link {
-            sources: many(sources),
-            dest: clean_path(dest),
-        },
+        Request::Copy { sources, dest } => Request::Copy { sources: many(sources), dest: clean_path(dest) },
+        Request::Move { sources, dest } => Request::Move { sources: many(sources), dest: clean_path(dest) },
+        Request::Link { sources, dest } => Request::Link { sources: many(sources), dest: clean_path(dest) },
         Request::Trash { paths } => Request::Trash { paths: many(paths) },
         Request::Delete { paths } => Request::Delete { paths: many(paths) },
-        Request::Rename { from, to_name } => Request::Rename {
-            from: clean_path(from),
-            to_name,
-        },
-        Request::NewFolder { parent, name } => Request::NewFolder {
-            parent: clean_path(parent),
-            name,
-        },
+        Request::Rename { from, to_name } => Request::Rename { from: clean_path(from), to_name },
+        Request::NewFolder { parent, name } => Request::NewFolder { parent: clean_path(parent), name },
         Request::Restore { items } => Request::Restore { items },
         Request::Undo(u) => Request::Undo(u),
     }
@@ -272,39 +216,22 @@ fn clean_request(r: Request) -> Request {
 fn label_for(r: &Request) -> String {
     fn count(paths: &[PathBuf]) -> String {
         match paths {
-            [one] => format!(
-                "“{}”",
-                one.file_name().unwrap_or(OsStr::new("/")).to_string_lossy()
-            ),
+            [one] => format!("“{}”", one.file_name().unwrap_or(OsStr::new("/")).to_string_lossy()),
             many => format!("{} items", many.len()),
         }
     }
     fn folder(p: &Path) -> String {
-        p.file_name()
-            .unwrap_or(p.as_os_str())
-            .to_string_lossy()
-            .into_owned()
+        p.file_name().unwrap_or(p.as_os_str()).to_string_lossy().into_owned()
     }
     match r {
-        Request::Copy { sources, dest } => {
-            format!("Copying {} to {}", count(sources), folder(dest))
-        }
+        Request::Copy { sources, dest } => format!("Copying {} to {}", count(sources), folder(dest)),
         Request::Move { sources, dest } => format!("Moving {} to {}", count(sources), folder(dest)),
-        Request::Link { sources, dest } => {
-            format!("Linking {} in {}", count(sources), folder(dest))
-        }
+        Request::Link { sources, dest } => format!("Linking {} in {}", count(sources), folder(dest)),
         Request::Trash { paths } => format!("Moving {} to Trash", count(paths)),
         Request::Delete { paths } => format!("Deleting {}", count(paths)),
-        Request::Rename { from, to_name } => format!(
-            "Renaming {} to “{}”",
-            count(std::slice::from_ref(from)),
-            to_name.to_string_lossy()
-        ),
+        Request::Rename { from, to_name } => format!("Renaming {} to “{}”", count(std::slice::from_ref(from)), to_name.to_string_lossy()),
         Request::NewFolder { name, .. } => format!("Creating “{}”", name.to_string_lossy()),
-        Request::Restore { items } => format!(
-            "Restoring {}",
-            count(&items.iter().map(|t| t.original.clone()).collect::<Vec<_>>())
-        ),
+        Request::Restore { items } => format!("Restoring {}", count(&items.iter().map(|t| t.original.clone()).collect::<Vec<_>>())),
         Request::Undo(_) => "Undoing".to_string(),
     }
 }
@@ -364,11 +291,7 @@ enum Sent {
 /// Copies from the input's current position to its end. Faster than reading and writing
 /// when `copy_file_range` won't cross filesystems. `chunk_done` gets each chunk's size
 /// and returns false to stop.
-fn sendfile_rest(
-    input: &File,
-    output: &File,
-    mut chunk_done: impl FnMut(u64) -> bool,
-) -> io::Result<Sent> {
+fn sendfile_rest(input: &File, output: &File, mut chunk_done: impl FnMut(u64) -> bool) -> io::Result<Sent> {
     const CHUNK: usize = 8 * 1024 * 1024;
     let mut sent = 0u64;
     loop {
@@ -382,9 +305,7 @@ fn sendfile_rest(
                 }
             }
             Err(Errno::INTR) => continue,
-            Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP | Errno::BADF | Errno::PERM) => {
-                return Ok(Sent::Unsupported(sent));
-            }
+            Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP | Errno::BADF | Errno::PERM) => return Ok(Sent::Unsupported(sent)),
             Err(e) => return Err(e.into()),
         }
     }
@@ -450,19 +371,13 @@ impl Run {
                 None
             }
             Request::Move { sources, dest } => {
-                self.job
-                    .progress
-                    .total_items
-                    .store(sources.len() as u64, Ordering::Relaxed);
+                self.job.progress.total_items.store(sources.len() as u64, Ordering::Relaxed);
                 self.place_all(&sources, &dest, Mode::Move);
                 let moves = std::mem::take(&mut self.undo_moves);
                 (!moves.is_empty()).then_some(Undo::Moves(moves))
             }
             Request::Link { sources, dest } => {
-                self.job
-                    .progress
-                    .total_items
-                    .store(sources.len() as u64, Ordering::Relaxed);
+                self.job.progress.total_items.store(sources.len() as u64, Ordering::Relaxed);
                 self.link_all(&sources, &dest);
                 None
             }
@@ -489,10 +404,7 @@ impl Run {
             Request::Rename { from, to_name } => self.rename(from, to_name),
             Request::NewFolder { parent, name } => {
                 let target = parent.join(&name);
-                match validate_name(&name.to_string_lossy())
-                    .map_err(io::Error::other)
-                    .and_then(|_| fs::create_dir(&target))
-                {
+                match validate_name(&name.to_string_lossy()).map_err(io::Error::other).and_then(|_| fs::create_dir(&target)) {
                     Ok(()) => {
                         self.created.push(target);
                         self.touched.push(parent);
@@ -513,10 +425,7 @@ impl Run {
     }
 
     fn restore_all(&mut self, items: Vec<Trashed>) {
-        self.job
-            .progress
-            .total_items
-            .store(items.len() as u64, Ordering::Relaxed);
+        self.job.progress.total_items.store(items.len() as u64, Ordering::Relaxed);
         for t in items {
             if self.job.is_cancelled() {
                 break;
@@ -528,16 +437,8 @@ impl Run {
                     self.touch_parent(&t.file);
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let at = t
-                        .original
-                        .parent()
-                        .map_or_else(String::new, |p| format!(" in {}", p.display()));
-                    self.report(
-                        &t.original,
-                        format!(
-                            "Something with this name is already{at}, so it stayed in the Trash"
-                        ),
-                    );
+                    let at = t.original.parent().map_or_else(String::new, |p| format!(" in {}", p.display()));
+                    self.report(&t.original, format!("Something with this name is already{at}, so it stayed in the Trash"));
                 }
                 Err(e) => self.fail(&t.original, &e),
             }
@@ -567,10 +468,7 @@ impl Run {
     }
 
     fn trash_all(&mut self, paths: Vec<PathBuf>) -> Option<Undo> {
-        self.job
-            .progress
-            .total_items
-            .store(paths.len() as u64, Ordering::Relaxed);
+        self.job.progress.total_items.store(paths.len() as u64, Ordering::Relaxed);
         let mut done: Vec<Trashed> = Vec::new();
         let mut mounts = MountCache::default();
         for p in &paths {
@@ -602,19 +500,9 @@ impl Run {
             }
         }
         for folder in folders {
-            let synced = if self.force_sync_error {
-                Err(Errno::IO.into())
-            } else {
-                File::open(folder).and_then(|d| syncfs(&d).map_err(io::Error::from))
-            };
+            let synced = if self.force_sync_error { Err(Errno::IO.into()) } else { File::open(folder).and_then(|d| syncfs(&d).map_err(io::Error::from)) };
             if let Err(e) = synced {
-                self.report(
-                    folder,
-                    format!(
-                        "Moved to the Trash, but it may not be saved to disk yet: {}",
-                        describe(&e)
-                    ),
-                );
+                self.report(folder, format!("Moved to the Trash, but it may not be saved to disk yet: {}", describe(&e)));
             }
         }
     }
@@ -629,10 +517,7 @@ impl Run {
                 Err(e) => self.fail(&to, &e),
             },
             Undo::Moves(moves) => {
-                self.job
-                    .progress
-                    .total_items
-                    .store(moves.len() as u64, Ordering::Relaxed);
+                self.job.progress.total_items.store(moves.len() as u64, Ordering::Relaxed);
                 for (from, to) in moves.into_iter().rev() {
                     if self.job.is_cancelled() {
                         break;
@@ -676,11 +561,7 @@ impl Run {
 
     fn report(&mut self, path: &Path, message: String) {
         self.errors += 1;
-        (self.sink)(Event::Error {
-            job: self.job.id,
-            path: path.to_path_buf(),
-            message,
-        });
+        (self.sink)(Event::Error { job: self.job.id, path: path.to_path_buf(), message });
     }
 
     fn tick(&mut self) {
@@ -692,11 +573,7 @@ impl Run {
 
     fn set_current(&self, p: &Path) {
         if let Ok(mut c) = self.job.progress.current.lock() {
-            *c = p
-                .file_name()
-                .unwrap_or(p.as_os_str())
-                .to_string_lossy()
-                .into_owned();
+            *c = p.file_name().unwrap_or(p.as_os_str()).to_string_lossy().into_owned();
         }
     }
 
@@ -709,9 +586,7 @@ impl Run {
             if self.job.is_cancelled() {
                 break;
             }
-            let Ok(m) = fs::symlink_metadata(&p) else {
-                continue;
-            };
+            let Ok(m) = fs::symlink_metadata(&p) else { continue };
             progress.total_items.fetch_add(1, Ordering::Relaxed);
             if m.is_dir() {
                 if let Ok(rd) = fs::read_dir(&p) {
@@ -816,9 +691,7 @@ impl Run {
     /// and the list of things to select: undoing a folder's move brings its contents.
     fn record_top_level(&mut self, src: &Path, mode: Mode) {
         let merged = std::mem::take(&mut self.last_merged);
-        let Some(target) = self.last_target.take() else {
-            return;
-        };
+        let Some(target) = self.last_target.take() else { return };
         if fs::symlink_metadata(&target).is_err() {
             return;
         }
@@ -844,14 +717,8 @@ impl Run {
         };
         if self.depth == 0 {
             self.top_dev = smeta.dev();
-        } else if mode == Mode::Move
-            && smeta.is_dir()
-            && is_mount_boundary(src, &smeta, self.top_dev)
-        {
-            self.report(
-                src,
-                "This is a mount point, so it was left where it is".into(),
-            );
+        } else if mode == Mode::Move && smeta.is_dir() && is_mount_boundary(src, &smeta, self.top_dev) {
+            self.report(src, "This is a mount point, so it was left where it is".into());
             return Flow::Go;
         }
         let mut merge = false;
@@ -897,10 +764,7 @@ impl Run {
         if mode == Mode::Move && !merge {
             match self.try_rename(src, &target, replace) {
                 Ok(()) => {
-                    self.job.progress.done_bytes.fetch_add(
-                        if smeta.is_dir() { 0 } else { smeta.len() },
-                        Ordering::Relaxed,
-                    );
+                    self.job.progress.done_bytes.fetch_add(if smeta.is_dir() { 0 } else { smeta.len() }, Ordering::Relaxed);
                     return Flow::Go;
                 }
                 Err(e) if e.raw_os_error() == Some(Errno::XDEV.raw_os_error()) => {
@@ -924,10 +788,7 @@ impl Run {
         } else if ft.is_file() {
             self.copy_file(src, &target, &smeta, replace, mode)
         } else {
-            self.report(
-                src,
-                "Special files like sockets and devices aren't copied".into(),
-            );
+            self.report(src, "Special files like sockets and devices aren't copied".into());
             Flow::Go
         }
     }
@@ -953,19 +814,12 @@ impl Run {
 
     fn count_skipped(&self, m: &Metadata) {
         if !m.is_dir() {
-            self.job
-                .progress
-                .done_bytes
-                .fetch_add(m.len(), Ordering::Relaxed);
+            self.job.progress.done_bytes.fetch_add(m.len(), Ordering::Relaxed);
         }
     }
 
     fn ask(&mut self, src: &Path, target: &Path, both_folders: bool, can_replace: bool) -> Choice {
-        let sticky = if both_folders {
-            self.sticky_folders
-        } else {
-            self.sticky_files
-        };
+        let sticky = if both_folders { self.sticky_folders } else { self.sticky_files };
         if let Some(a) = sticky {
             // A sticky Replace can't apply where Replace isn't possible.
             if a.choice != Choice::Replace || can_replace {
@@ -973,14 +827,7 @@ impl Run {
             }
         }
         let (tx, rx) = mpsc::sync_channel(1);
-        (self.sink)(Event::Conflict(Conflict {
-            job: self.job.id,
-            source: src.to_path_buf(),
-            target: target.to_path_buf(),
-            both_folders,
-            can_replace,
-            reply: tx,
-        }));
+        (self.sink)(Event::Conflict(Conflict { job: self.job.id, source: src.to_path_buf(), target: target.to_path_buf(), both_folders, can_replace, reply: tx }));
         loop {
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(a) => {
@@ -1000,14 +847,7 @@ impl Run {
         }
     }
 
-    fn copy_dir(
-        &mut self,
-        src: &Path,
-        target: &Path,
-        smeta: &Metadata,
-        mode: Mode,
-        merging: bool,
-    ) -> Flow {
+    fn copy_dir(&mut self, src: &Path, target: &Path, smeta: &Metadata, mode: Mode, merging: bool) -> Flow {
         let mut created = false;
         if !merging {
             // Writable while we fill it; the real mode goes on at the end.
@@ -1060,20 +900,13 @@ impl Run {
                 // new appeared while we worked, and that deserves a mention.
                 Err(e) if e.raw_os_error() == Some(Errno::NOTEMPTY.raw_os_error()) => {
                     if self.errors + self.noted_leftovers == leftovers_before {
-                        self.report(
-                            src,
-                            "Something new appeared here during the move, so the folder was kept"
-                                .into(),
-                        );
+                        self.report(src, "Something new appeared here during the move, so the folder was kept".into());
                     }
                 }
                 Err(e) => self.fail(src, &e),
             }
         }
-        self.job
-            .progress
-            .done_items
-            .fetch_add(u64::from(mode == Mode::Copy), Ordering::Relaxed);
+        self.job.progress.done_items.fetch_add(u64::from(mode == Mode::Copy), Ordering::Relaxed);
         self.tick();
         Flow::Go
     }
@@ -1082,11 +915,7 @@ impl Run {
         let result = fs::read_link(src).and_then(|dest| {
             let tmp = temp_name(target);
             std::os::unix::fs::symlink(&dest, &tmp)?;
-            let moved = if replace {
-                fs::rename(&tmp, target)
-            } else {
-                rename_noreplace(&tmp, target)
-            };
+            let moved = if replace { fs::rename(&tmp, target) } else { rename_noreplace(&tmp, target) };
             if moved.is_err() {
                 let _ = fs::remove_file(&tmp);
             }
@@ -1103,9 +932,7 @@ impl Run {
     fn finish_item(&mut self, src: &Path, target: &Path, mode: Mode) {
         if mode == Mode::Move {
             // The name must be on disk too before the only other copy goes away.
-            let synced = target.parent().map_or(Ok(()), |p| {
-                File::open(p).and_then(|d| self.sync_for_move(&d))
-            });
+            let synced = target.parent().map_or(Ok(()), |p| File::open(p).and_then(|d| self.sync_for_move(&d)));
             if let Err(e) = synced {
                 self.report(src, format!("Copied, but couldn't confirm it reached the disk, so the original stays: {}", describe(&e)));
                 return;
@@ -1119,14 +946,7 @@ impl Run {
         self.tick();
     }
 
-    fn copy_file(
-        &mut self,
-        src: &Path,
-        target: &Path,
-        smeta: &Metadata,
-        replace: bool,
-        mode: Mode,
-    ) -> Flow {
+    fn copy_file(&mut self, src: &Path, target: &Path, smeta: &Metadata, replace: bool, mode: Mode) -> Flow {
         let tmp = temp_name(target);
         match self.copy_contents(src, &tmp, smeta, mode) {
             Ok(true) => {}
@@ -1140,11 +960,7 @@ impl Run {
                 return Flow::Go;
             }
         }
-        let placed = if replace {
-            fs::rename(&tmp, target)
-        } else {
-            rename_noreplace(&tmp, target)
-        };
+        let placed = if replace { fs::rename(&tmp, target) } else { rename_noreplace(&tmp, target) };
         match placed {
             Ok(()) => self.finish_item(src, target, mode),
             Err(e) => {
@@ -1156,22 +972,9 @@ impl Run {
     }
 
     /// Copies bytes and metadata to `tmp`. `Ok(false)` means cancelled.
-    fn copy_contents(
-        &mut self,
-        src: &Path,
-        tmp: &Path,
-        smeta: &Metadata,
-        mode: Mode,
-    ) -> io::Result<bool> {
-        let input = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(src)?;
-        let output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(tmp)?;
+    fn copy_contents(&mut self, src: &Path, tmp: &Path, smeta: &Metadata, mode: Mode) -> io::Result<bool> {
+        let input = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(src)?;
+        let output = OpenOptions::new().write(true).create_new(true).mode(0o600).open(tmp)?;
         let mut copied = 0u64;
         let mut fallback = false;
         const CHUNK: usize = 8 * 1024 * 1024;
@@ -1187,14 +990,7 @@ impl Run {
                     progress.done_bytes.fetch_add(n as u64, Ordering::Relaxed);
                     self.tick();
                 }
-                Err(
-                    Errno::XDEV
-                    | Errno::INVAL
-                    | Errno::NOSYS
-                    | Errno::OPNOTSUPP
-                    | Errno::BADF
-                    | Errno::PERM,
-                ) => {
+                Err(Errno::XDEV | Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP | Errno::BADF | Errno::PERM) => {
                     fallback = true;
                     break;
                 }
@@ -1244,24 +1040,13 @@ impl Run {
             }
         }
         if copied < smeta.len() {
-            return Err(io::Error::other(
-                "The file got shorter while it was being copied",
-            ));
+            return Err(io::Error::other("The file got shorter while it was being copied"));
         }
         copy_xattrs(&input, &output);
         // Setuid and setgid are dropped: the copy belongs to whoever made it. Some
         // filesystems (FAT, some FUSE) refuse chmod, and that's no reason to fail.
-        match output.set_permissions(fs::Permissions::from_mode(
-            smeta.permissions().mode() & 0o777,
-        )) {
-            Err(e)
-                if !matches!(
-                    e.raw_os_error().map(Errno::from_raw_os_error),
-                    Some(Errno::PERM | Errno::OPNOTSUPP)
-                ) =>
-            {
-                return Err(e);
-            }
+        match output.set_permissions(fs::Permissions::from_mode(smeta.permissions().mode() & 0o777)) {
+            Err(e) if !matches!(e.raw_os_error().map(Errno::from_raw_os_error), Some(Errno::PERM | Errno::OPNOTSUPP)) => return Err(e),
             _ => {}
         }
         let _ = set_mtime(&output, smeta);
@@ -1293,10 +1078,7 @@ impl Run {
         };
         if meta.is_dir() {
             if is_mount_boundary(path, &meta, self.top_dev) {
-                self.report(
-                    path,
-                    "This is a mount point, so its contents were not deleted".into(),
-                );
+                self.report(path, "This is a mount point, so its contents were not deleted".into());
                 return;
             }
             let errors_before = self.errors;
@@ -1322,21 +1104,14 @@ impl Run {
                 if !not_empty {
                     self.fail(path, &e);
                 } else if self.errors == errors_before {
-                    self.report(
-                        path,
-                        "Something new appeared here during the delete, so the folder was kept"
-                            .into(),
-                    );
+                    self.report(path, "Something new appeared here during the delete, so the folder was kept".into());
                 }
             }
         } else {
             if let Err(e) = fs::remove_file(path) {
                 self.fail(path, &e);
             }
-            self.job
-                .progress
-                .done_bytes
-                .fetch_add(meta.len(), Ordering::Relaxed);
+            self.job.progress.done_bytes.fetch_add(meta.len(), Ordering::Relaxed);
         }
         self.job.progress.done_items.fetch_add(1, Ordering::Relaxed);
         self.tick();
@@ -1349,16 +1124,7 @@ fn is_mount_boundary(path: &Path, m: &Metadata, top_dev: u64) -> bool {
     if m.dev() != top_dev {
         return true;
     }
-    statx(
-        CWD,
-        path,
-        AtFlags::SYMLINK_NOFOLLOW,
-        StatxFlags::BASIC_STATS,
-    )
-    .is_ok_and(|st| {
-        st.stx_attributes_mask.contains(StatxAttributes::MOUNT_ROOT)
-            && st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT)
-    })
+    statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::BASIC_STATS).is_ok_and(|st| st.stx_attributes_mask.contains(StatxAttributes::MOUNT_ROOT) && st.stx_attributes.contains(StatxAttributes::MOUNT_ROOT))
 }
 
 /// True if both paths name the same directory entry. Two hard links are one file but
@@ -1367,21 +1133,14 @@ fn same_location(a: &Path, b: &Path) -> bool {
     if a.file_name() != b.file_name() {
         return false;
     }
-    let canon = |p: &Path| {
-        p.parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .and_then(|d| fs::canonicalize(d).ok())
-    };
+    let canon = |p: &Path| p.parent().filter(|d| !d.as_os_str().is_empty()).and_then(|d| fs::canonicalize(d).ok());
     matches!((canon(a), canon(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// Restores what a finished or interrupted folder copy should have.
 fn finish_folder(target: &Path, smeta: &Metadata) {
     // Keep sticky on folders, drop setuid and setgid.
-    let _ = fs::set_permissions(
-        target,
-        fs::Permissions::from_mode(smeta.permissions().mode() & 0o1777),
-    );
+    let _ = fs::set_permissions(target, fs::Permissions::from_mode(smeta.permissions().mode() & 0o1777));
     if let Ok(f) = File::open(target) {
         let _ = set_mtime(&f, smeta);
     }
@@ -1391,14 +1150,10 @@ fn finish_folder(target: &Path, smeta: &Metadata) {
 /// filesystem takes them, and security labels often can't be set.
 fn copy_xattrs(from: &File, to: &File) {
     let mut names = vec![0u8; 4096];
-    let Ok(n) = flistxattr(from, &mut names) else {
-        return;
-    };
+    let Ok(n) = flistxattr(from, &mut names) else { return };
     let mut value = vec![0u8; 64 * 1024];
     for name in names[..n].split(|&b| b == 0).filter(|b| !b.is_empty()) {
-        let Ok(name) = std::ffi::CString::new(name) else {
-            continue;
-        };
+        let Ok(name) = std::ffi::CString::new(name) else { continue };
         if let Ok(len) = fgetxattr(from, name.as_c_str(), &mut value) {
             let _ = fsetxattr(to, name.as_c_str(), &value[..len], XattrFlags::empty());
         }
@@ -1420,14 +1175,8 @@ fn close_checked(f: File) -> io::Result<()> {
 
 fn set_mtime(f: &File, m: &Metadata) -> io::Result<()> {
     let times = Timestamps {
-        last_access: Timespec {
-            tv_sec: m.atime(),
-            tv_nsec: m.atime_nsec() as _,
-        },
-        last_modification: Timespec {
-            tv_sec: m.mtime(),
-            tv_nsec: m.mtime_nsec() as _,
-        },
+        last_access: Timespec { tv_sec: m.atime(), tv_nsec: m.atime_nsec() as _ },
+        last_modification: Timespec { tv_sec: m.mtime(), tv_nsec: m.mtime_nsec() as _ },
     };
     futimens(f.as_fd(), &times).map_err(Into::into)
 }
@@ -1442,9 +1191,7 @@ fn temp_name(target: &Path) -> PathBuf {
 /// True if `dest` is `src` or anywhere below it. Follows symlinks on both sides, except
 /// that a symlink source is only itself: copying a link never recurses into its target.
 fn is_inside_itself(src: &Path, dest: &Path) -> bool {
-    let Ok(m) = fs::symlink_metadata(src) else {
-        return false;
-    };
+    let Ok(m) = fs::symlink_metadata(src) else { return false };
     if !m.is_dir() {
         return false;
     }
@@ -1477,11 +1224,7 @@ pub fn unique_copy_name(target: &Path) -> PathBuf {
         _ => (name, &b""[..]),
     };
     for n in 1u32.. {
-        let suffix = if n == 1 {
-            " (copy)".to_string()
-        } else {
-            format!(" (copy {n})")
-        };
+        let suffix = if n == 1 { " (copy)".to_string() } else { format!(" (copy {n})") };
         let mut out = stem.to_vec();
         // Keep within the 255-byte limit by shortening the stem.
         let room = 255usize.saturating_sub(suffix.len() + ext.len());
@@ -1531,10 +1274,7 @@ mod tests {
     fn finish(rx: &Receiver<Event>, mut answers: Vec<Answer>) -> Done {
         let mut errors = Vec::new();
         loop {
-            match rx
-                .recv_timeout(Duration::from_secs(20))
-                .expect("job should finish")
-            {
+            match rx.recv_timeout(Duration::from_secs(20)).expect("job should finish") {
                 Event::Progress(_) => {}
                 Event::Error { path, message, .. } => errors.push((path, message)),
                 Event::Conflict(c) => {
@@ -1550,28 +1290,16 @@ mod tests {
     }
 
     fn answer(choice: Choice) -> Answer {
-        Answer {
-            choice,
-            apply_to_all: false,
-        }
+        Answer { choice, apply_to_all: false }
     }
 
     fn all(choice: Choice) -> Answer {
-        Answer {
-            choice,
-            apply_to_all: true,
-        }
+        Answer { choice, apply_to_all: true }
     }
 
     fn no_partials(dir: &Path) {
         for e in fs::read_dir(dir).unwrap().flatten() {
-            assert!(
-                !e.file_name()
-                    .to_string_lossy()
-                    .starts_with(".gannet-partial"),
-                "partial file left: {:?}",
-                e.path()
-            );
+            assert!(!e.file_name().to_string_lossy().starts_with(".gannet-partial"), "partial file left: {:?}", e.path());
             if e.file_type().unwrap().is_dir() {
                 no_partials(&e.path());
             }
@@ -1585,25 +1313,9 @@ mod tests {
         let f = s.file("a.sh", b"#!/bin/sh\n");
         fs::set_permissions(&f, fs::Permissions::from_mode(0o751)).unwrap();
         let old = File::open(&f).unwrap();
-        futimens(
-            old.as_fd(),
-            &Timestamps {
-                last_access: Timespec {
-                    tv_sec: 1000,
-                    tv_nsec: 0,
-                },
-                last_modification: Timespec {
-                    tv_sec: 2000,
-                    tv_nsec: 0,
-                },
-            },
-        )
-        .unwrap();
+        futimens(old.as_fd(), &Timestamps { last_access: Timespec { tv_sec: 1000, tv_nsec: 0 }, last_modification: Timespec { tv_sec: 2000, tv_nsec: 0 } }).unwrap();
         let d = s.dir("dest");
-        e.start(Request::Copy {
-            sources: vec![f.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Copy { sources: vec![f.clone()], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty());
         let m = fs::metadata(d.join("a.sh")).unwrap();
@@ -1625,23 +1337,14 @@ mod tests {
         symlink("x/y/deep", s.path().join("src/link")).unwrap();
         symlink("/nonexistent/gannet", s.path().join("src/broken")).unwrap();
         let d = s.dir("dest");
-        e.start(Request::Copy {
-            sources: vec![s.path().join("src")],
-            dest: d.clone(),
-        });
+        e.start(Request::Copy { sources: vec![s.path().join("src")], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         assert_eq!(fs::read(d.join("src/x/y/deep")).unwrap(), b"deep");
         assert_eq!(fs::read(d.join("src/empty")).unwrap(), b"");
         assert!(d.join("src/emptydir").is_dir());
-        assert_eq!(
-            fs::read_link(d.join("src/link")).unwrap(),
-            Path::new("x/y/deep")
-        );
-        assert_eq!(
-            fs::read_link(d.join("src/broken")).unwrap(),
-            Path::new("/nonexistent/gannet")
-        );
+        assert_eq!(fs::read_link(d.join("src/link")).unwrap(), Path::new("x/y/deep"));
+        assert_eq!(fs::read_link(d.join("src/broken")).unwrap(), Path::new("/nonexistent/gannet"));
         no_partials(&d);
     }
 
@@ -1653,10 +1356,7 @@ mod tests {
         s.file("src/f", b"x");
         fs::set_permissions(&src, fs::Permissions::from_mode(0o555)).unwrap();
         let d = s.dir("dest");
-        e.start(Request::Copy {
-            sources: vec![src.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Copy { sources: vec![src.clone()], dest: d.clone() });
         let done = finish(&rx, vec![]);
         fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(done.errors.is_empty());
@@ -1670,16 +1370,10 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let f = s.file("doc.txt", b"1");
-        e.start(Request::Copy {
-            sources: vec![f.clone()],
-            dest: s.path().to_path_buf(),
-        });
+        e.start(Request::Copy { sources: vec![f.clone()], dest: s.path().to_path_buf() });
         finish(&rx, vec![]);
         assert!(s.path().join("doc (copy).txt").exists());
-        e.start(Request::Copy {
-            sources: vec![f],
-            dest: s.path().to_path_buf(),
-        });
+        e.start(Request::Copy { sources: vec![f], dest: s.path().to_path_buf() });
         finish(&rx, vec![]);
         assert!(s.path().join("doc (copy 2).txt").exists());
     }
@@ -1689,10 +1383,7 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let f = s.file("doc.txt", b"1");
-        e.start(Request::Move {
-            sources: vec![f.clone()],
-            dest: s.path().to_path_buf(),
-        });
+        e.start(Request::Move { sources: vec![f.clone()], dest: s.path().to_path_buf() });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty());
         assert_eq!(fs::read(&f).unwrap(), b"1");
@@ -1705,16 +1396,7 @@ mod tests {
         let (e, rx) = engine(&s);
         let d = s.dir("top");
         let inner = s.dir("top/inner");
-        for req in [
-            Request::Copy {
-                sources: vec![d.clone()],
-                dest: inner.clone(),
-            },
-            Request::Move {
-                sources: vec![d.clone()],
-                dest: inner.clone(),
-            },
-        ] {
+        for req in [Request::Copy { sources: vec![d.clone()], dest: inner.clone() }, Request::Move { sources: vec![d.clone()], dest: inner.clone() }] {
             e.start(req);
             let done = finish(&rx, vec![]);
             assert_eq!(done.errors.len(), 1);
@@ -1732,10 +1414,7 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let (src, dst) = conflict_setup(&s);
-        e.start(Request::Copy {
-            sources: vec![src],
-            dest: dst.parent().unwrap().into(),
-        });
+        e.start(Request::Copy { sources: vec![src], dest: dst.parent().unwrap().into() });
         finish(&rx, vec![answer(Choice::Replace)]);
         assert_eq!(fs::read(&dst).unwrap(), b"new");
         no_partials(dst.parent().unwrap());
@@ -1746,10 +1425,7 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let (src, dst) = conflict_setup(&s);
-        e.start(Request::Copy {
-            sources: vec![src],
-            dest: dst.parent().unwrap().into(),
-        });
+        e.start(Request::Copy { sources: vec![src], dest: dst.parent().unwrap().into() });
         finish(&rx, vec![answer(Choice::Skip)]);
         assert_eq!(fs::read(&dst).unwrap(), b"old");
     }
@@ -1759,16 +1435,10 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let (src, dst) = conflict_setup(&s);
-        e.start(Request::Copy {
-            sources: vec![src],
-            dest: dst.parent().unwrap().into(),
-        });
+        e.start(Request::Copy { sources: vec![src], dest: dst.parent().unwrap().into() });
         finish(&rx, vec![answer(Choice::KeepBoth)]);
         assert_eq!(fs::read(&dst).unwrap(), b"old");
-        assert_eq!(
-            fs::read(s.path().join("dest/a (copy).txt")).unwrap(),
-            b"new"
-        );
+        assert_eq!(fs::read(s.path().join("dest/a (copy).txt")).unwrap(), b"new");
     }
 
     #[test]
@@ -1777,10 +1447,7 @@ mod tests {
         let (e, rx) = engine(&s);
         let (src, dst) = conflict_setup(&s);
         let other = s.file("src/z.txt", b"z");
-        e.start(Request::Copy {
-            sources: vec![src, other],
-            dest: dst.parent().unwrap().into(),
-        });
+        e.start(Request::Copy { sources: vec![src, other], dest: dst.parent().unwrap().into() });
         let done = finish(&rx, vec![answer(Choice::Cancel)]);
         assert!(done.outcome.cancelled);
         assert_eq!(fs::read(&dst).unwrap(), b"old");
@@ -1796,10 +1463,7 @@ mod tests {
             sources.push(s.file(&format!("src/{n}"), b"new"));
             s.file(&format!("dest/{n}"), b"old");
         }
-        e.start(Request::Copy {
-            sources,
-            dest: s.path().join("dest"),
-        });
+        e.start(Request::Copy { sources, dest: s.path().join("dest") });
         finish(&rx, vec![all(Choice::Replace)]);
         for n in ["a", "b", "c"] {
             assert_eq!(fs::read(s.path().join("dest").join(n)).unwrap(), b"new");
@@ -1814,10 +1478,7 @@ mod tests {
         s.file("src/d/both", b"new");
         s.file("dest/d/only-dest", b"d");
         s.file("dest/d/both", b"old");
-        e.start(Request::Copy {
-            sources: vec![s.path().join("src/d")],
-            dest: s.path().join("dest"),
-        });
+        e.start(Request::Copy { sources: vec![s.path().join("src/d")], dest: s.path().join("dest") });
         finish(&rx, vec![answer(Choice::Replace), answer(Choice::Skip)]);
         assert_eq!(fs::read(s.path().join("dest/d/only-dest")).unwrap(), b"d");
         assert_eq!(fs::read(s.path().join("dest/d/only-src")).unwrap(), b"s");
@@ -1830,10 +1491,7 @@ mod tests {
         let (e, rx) = engine(&s);
         s.file("src/x/inner", b"i");
         let target = s.file("dest/x", b"file");
-        e.start(Request::Copy {
-            sources: vec![s.path().join("src/x")],
-            dest: s.path().join("dest"),
-        });
+        e.start(Request::Copy { sources: vec![s.path().join("src/x")], dest: s.path().join("dest") });
         // A stray Replace (which the UI doesn't offer) must act as Skip.
         finish(&rx, vec![answer(Choice::Replace)]);
         assert_eq!(fs::read(&target).unwrap(), b"file");
@@ -1848,10 +1506,7 @@ mod tests {
         s.file("dest/a", b"old");
         let f2 = s.file("src/b", b"new");
         s.file("dest/b/inner", b"keep");
-        e.start(Request::Copy {
-            sources: vec![f1, f2],
-            dest: s.path().join("dest"),
-        });
+        e.start(Request::Copy { sources: vec![f1, f2], dest: s.path().join("dest") });
         finish(&rx, vec![all(Choice::Replace), answer(Choice::Skip)]);
         assert_eq!(fs::read(s.path().join("dest/b/inner")).unwrap(), b"keep");
     }
@@ -1863,10 +1518,7 @@ mod tests {
         let bad = s.file("src/bad", b"x");
         let good = s.file("src/good", b"y");
         fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
-        e.start(Request::Copy {
-            sources: vec![bad.clone(), good],
-            dest: s.dir("dest"),
-        });
+        e.start(Request::Copy { sources: vec![bad.clone(), good], dest: s.dir("dest") });
         let done = finish(&rx, vec![]);
         fs::set_permissions(&bad, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
@@ -1883,10 +1535,7 @@ mod tests {
         let f = s.file("a", b"x");
         let d = s.dir("ro");
         fs::set_permissions(&d, fs::Permissions::from_mode(0o500)).unwrap();
-        e.start(Request::Copy {
-            sources: vec![f.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Copy { sources: vec![f.clone()], dest: d.clone() });
         let done = finish(&rx, vec![]);
         fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(done.errors.len(), 1);
@@ -1902,10 +1551,7 @@ mod tests {
         let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         // SAFETY: the path is a valid C string; mkfifo reads it and returns.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-        e.start(Request::Copy {
-            sources: vec![fifo],
-            dest: s.dir("dest"),
-        });
+        e.start(Request::Copy { sources: vec![fifo], dest: s.dir("dest") });
         let done = finish(&rx, vec![]);
         assert_eq!(done.errors.len(), 1);
     }
@@ -1918,10 +1564,7 @@ mod tests {
         let f = s.path().join("big");
         File::create(&f).unwrap().set_len(1 << 33).unwrap();
         let d = s.dir("dest");
-        let job = e.start(Request::Copy {
-            sources: vec![f],
-            dest: d.clone(),
-        });
+        let job = e.start(Request::Copy { sources: vec![f], dest: d.clone() });
         job.cancel();
         let done = finish(&rx, vec![]);
         assert!(done.outcome.cancelled);
@@ -1936,10 +1579,7 @@ mod tests {
         let f = s.file("src/a", b"1");
         s.file("src/d/inner", b"2");
         let d = s.dir("dest");
-        e.start(Request::Move {
-            sources: vec![f.clone(), s.path().join("src/d")],
-            dest: d.clone(),
-        });
+        e.start(Request::Move { sources: vec![f.clone(), s.path().join("src/d")], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty());
         assert!(!f.exists());
@@ -1961,10 +1601,7 @@ mod tests {
         s.file("src/d/sub/deep", b"3");
         symlink("inner", s.path().join("src/d/lnk")).unwrap();
         let d = s.dir("dest");
-        e.start(Request::Move {
-            sources: vec![s.path().join("src/d")],
-            dest: d.clone(),
-        });
+        e.start(Request::Move { sources: vec![s.path().join("src/d")], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         assert!(!s.path().join("src/d").exists());
@@ -1980,16 +1617,10 @@ mod tests {
         s.file("src/d/sub/deep", b"3");
         s.file("src/d/top", b"4");
         let d = s.dir("dest");
-        e.start(Request::Move {
-            sources: vec![s.path().join("src/d")],
-            dest: d.clone(),
-        });
+        e.start(Request::Move { sources: vec![s.path().join("src/d")], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert_eq!(done.outcome.created, vec![d.join("d")]);
-        assert_eq!(
-            done.outcome.undo,
-            Some(Undo::Moves(vec![(s.path().join("src/d"), d.join("d"))]))
-        );
+        assert_eq!(done.outcome.undo, Some(Undo::Moves(vec![(s.path().join("src/d"), d.join("d"))])));
         e.start(Request::Undo(done.outcome.undo.unwrap()));
         let undone = finish(&rx, vec![]);
         assert!(undone.errors.is_empty(), "{:?}", undone.errors);
@@ -2002,15 +1633,9 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let (src, dst) = conflict_setup(&s);
-        e.start(Request::Move {
-            sources: vec![src.clone()],
-            dest: dst.parent().unwrap().into(),
-        });
+        e.start(Request::Move { sources: vec![src.clone()], dest: dst.parent().unwrap().into() });
         let done = finish(&rx, vec![answer(Choice::KeepBoth)]);
-        assert_eq!(
-            done.outcome.created,
-            vec![s.path().join("dest/a (copy).txt")]
-        );
+        assert_eq!(done.outcome.created, vec![s.path().join("dest/a (copy).txt")]);
         e.start(Request::Undo(done.outcome.undo.unwrap()));
         finish(&rx, vec![]);
         assert_eq!(fs::read(&src).unwrap(), b"new");
@@ -2026,24 +1651,14 @@ mod tests {
         s.file("src/d/good", b"y");
         fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
         let d = s.dir("dest");
-        e.start(Request::Move {
-            sources: vec![s.path().join("src/d")],
-            dest: d.clone(),
-        });
+        e.start(Request::Move { sources: vec![s.path().join("src/d")], dest: d.clone() });
         let done = finish(&rx, vec![]);
         fs::set_permissions(&bad, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
-        assert_eq!(
-            fs::read(&bad).unwrap(),
-            b"x",
-            "source that failed must stay"
-        );
+        assert_eq!(fs::read(&bad).unwrap(), b"x", "source that failed must stay");
         assert!(!s.path().join("src/d/good").exists());
         assert_eq!(fs::read(d.join("d/good")).unwrap(), b"y");
-        assert_eq!(
-            done.outcome.undo, None,
-            "a partial move can't be undone as a whole"
-        );
+        assert_eq!(done.outcome.undo, None, "a partial move can't be undone as a whole");
     }
 
     #[test]
@@ -2051,10 +1666,7 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let (src, dst) = conflict_setup(&s);
-        e.start(Request::Move {
-            sources: vec![src.clone()],
-            dest: dst.parent().unwrap().into(),
-        });
+        e.start(Request::Move { sources: vec![src.clone()], dest: dst.parent().unwrap().into() });
         finish(&rx, vec![answer(Choice::Replace)]);
         assert!(!src.exists());
         assert_eq!(fs::read(&dst).unwrap(), b"new");
@@ -2067,9 +1679,7 @@ mod tests {
         let keep = s.file("keep/precious", b"p");
         s.file("gone/sub/x", b"x");
         symlink(s.path().join("keep"), s.path().join("gone/link")).unwrap();
-        e.start(Request::Delete {
-            paths: vec![s.path().join("gone")],
-        });
+        e.start(Request::Delete { paths: vec![s.path().join("gone")] });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty());
         assert!(!s.path().join("gone").exists());
@@ -2083,9 +1693,7 @@ mod tests {
         let keep = s.file("keep/precious", b"p");
         let link = s.path().join("lnk");
         symlink(s.path().join("keep"), &link).unwrap();
-        e.start(Request::Delete {
-            paths: vec![link.clone()],
-        });
+        e.start(Request::Delete { paths: vec![link.clone()] });
         finish(&rx, vec![]);
         assert!(fs::symlink_metadata(&link).is_err());
         assert!(keep.exists());
@@ -2097,9 +1705,7 @@ mod tests {
         let (e, rx) = engine(&s);
         let f = s.file("work/a", b"1");
         let t = trash::trash(&e.trash, &f).unwrap();
-        e.start(Request::Delete {
-            paths: vec![t.file.clone()],
-        });
+        e.start(Request::Delete { paths: vec![t.file.clone()] });
         finish(&rx, vec![]);
         assert!(!t.file.exists());
         assert!(!t.info.exists(), "the info file must not be orphaned");
@@ -2111,9 +1717,7 @@ mod tests {
         let (e, rx) = engine(&s);
         let a = s.file("work/a", b"1");
         let b = s.file("work/b", b"2");
-        e.start(Request::Trash {
-            paths: vec![a.clone(), b.clone()],
-        });
+        e.start(Request::Trash { paths: vec![a.clone(), b.clone()] });
         let done = finish(&rx, vec![]);
         assert!(!a.exists() && !b.exists());
         assert!(s.path().join("data/Trash/files/a").exists());
@@ -2129,9 +1733,7 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let good = s.file("work/good", b"1");
-        e.start(Request::Trash {
-            paths: vec![s.path().join("work/missing"), good.clone()],
-        });
+        e.start(Request::Trash { paths: vec![s.path().join("work/missing"), good.clone()] });
         let done = finish(&rx, vec![]);
         assert_eq!(done.errors.len(), 1);
         assert!(!good.exists());
@@ -2151,11 +1753,7 @@ mod tests {
             (true, true, Some(true), true, Link),
             (true, true, None, false, Link),
         ] {
-            assert_eq!(
-                drop_verb(ctrl, shift, same, can_delete),
-                want,
-                "{ctrl} {shift} {same:?} {can_delete}"
-            );
+            assert_eq!(drop_verb(ctrl, shift, same, can_delete), want, "{ctrl} {shift} {same:?} {can_delete}");
         }
     }
 
@@ -2165,16 +1763,10 @@ mod tests {
         let (e, rx) = engine(&s);
         let here = s.file("work/here", b"1");
         let other = s.file("other/x", b"2");
-        e.start(Request::Move {
-            sources: vec![here.clone(), other],
-            dest: s.path().join("work"),
-        });
+        e.start(Request::Move { sources: vec![here.clone(), other], dest: s.path().join("work") });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
-        assert_eq!(
-            done.outcome.skipped, 1,
-            "so a drop isn't reported as having all arrived"
-        );
+        assert_eq!(done.outcome.skipped, 1, "so a drop isn't reported as having all arrived");
         assert_eq!(fs::read(&here).unwrap(), b"1");
         assert!(s.path().join("work/x").exists());
     }
@@ -2186,16 +1778,10 @@ mod tests {
         let f = s.file("src/a", b"1");
         let inner = s.file("src/d/inner", b"2");
         let d = s.dir("dest");
-        e.start(Request::Link {
-            sources: vec![f.clone(), s.path().join("src/d")],
-            dest: d.clone(),
-        });
+        e.start(Request::Link { sources: vec![f.clone(), s.path().join("src/d")], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
-        assert_eq!(
-            fs::read_link(d.join("a")).unwrap(),
-            fs::canonicalize(&f).unwrap()
-        );
+        assert_eq!(fs::read_link(d.join("a")).unwrap(), fs::canonicalize(&f).unwrap());
         assert_eq!(fs::read(d.join("d/inner")).unwrap(), b"2");
         assert!(f.exists() && inner.exists());
         assert_eq!(done.outcome.created, vec![d.join("a"), d.join("d")]);
@@ -2209,22 +1795,11 @@ mod tests {
         let f = s.file("src/a", b"new");
         let kept = s.file("dest/a", b"old");
         let d = s.path().join("dest");
-        e.start(Request::Link {
-            sources: vec![f.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Link { sources: vec![f.clone()], dest: d.clone() });
         finish(&rx, vec![answer(Choice::Replace)]);
         assert_eq!(fs::read(&kept).unwrap(), b"old");
-        assert!(
-            !fs::symlink_metadata(&kept)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        e.start(Request::Link {
-            sources: vec![f.clone()],
-            dest: d.clone(),
-        });
+        assert!(!fs::symlink_metadata(&kept).unwrap().file_type().is_symlink());
+        e.start(Request::Link { sources: vec![f.clone()], dest: d.clone() });
         let done = finish(&rx, vec![answer(Choice::KeepBoth)]);
         assert_eq!(fs::read(&kept).unwrap(), b"old");
         assert_eq!(done.outcome.created.len(), 1);
@@ -2239,15 +1814,9 @@ mod tests {
         let lnk = s.path().join("lnk");
         symlink(&real, &lnk).unwrap();
         let d = s.dir("dest");
-        e.start(Request::Link {
-            sources: vec![lnk.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Link { sources: vec![lnk.clone()], dest: d.clone() });
         finish(&rx, vec![]);
-        assert_eq!(
-            fs::read_link(d.join("lnk")).unwrap(),
-            fs::canonicalize(s.path()).unwrap().join("lnk")
-        );
+        assert_eq!(fs::read_link(d.join("lnk")).unwrap(), fs::canonicalize(s.path()).unwrap().join("lnk"));
     }
 
     #[test]
@@ -2260,12 +1829,7 @@ mod tests {
             counted.fetch_add(1, Ordering::Relaxed);
             None
         });
-        let paths = vec![
-            s.file("work/a", b"1"),
-            s.file("work/b", b"2"),
-            s.file("work/c", b"3"),
-            s.file("other/d", b"4"),
-        ];
+        let paths = vec![s.file("work/a", b"1"), s.file("work/b", b"2"), s.file("work/c", b"3"), s.file("other/d", b"4")];
         e.start(Request::Trash { paths });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
@@ -2279,24 +1843,13 @@ mod tests {
         e.force_sync_error = true;
         let a = s.file("work/a", b"1");
         let b = s.file("work/b", b"2");
-        e.start(Request::Trash {
-            paths: vec![a.clone(), b.clone()],
-        });
+        e.start(Request::Trash { paths: vec![a.clone(), b.clone()] });
         let done = finish(&rx, vec![]);
         assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
-        assert!(
-            done.errors[0].1.contains("may not be saved"),
-            "{:?}",
-            done.errors
-        );
+        assert!(done.errors[0].1.contains("may not be saved"), "{:?}", done.errors);
         assert!(!a.exists() && !b.exists());
-        assert!(
-            s.path().join("data/Trash/files/a").exists()
-                && s.path().join("data/Trash/info/a.trashinfo").exists()
-        );
-        e.start(Request::Undo(
-            done.outcome.undo.expect("the batch can still be undone"),
-        ));
+        assert!(s.path().join("data/Trash/files/a").exists() && s.path().join("data/Trash/info/a.trashinfo").exists());
+        e.start(Request::Undo(done.outcome.undo.expect("the batch can still be undone")));
         finish(&rx, vec![]);
         assert_eq!(fs::read(&a).unwrap(), b"1");
     }
@@ -2331,10 +1884,7 @@ mod tests {
         let s = Scratch::new();
         let src = s.file("src", &patterned(9 * 1024 * 1024));
         let output = File::create(s.path().join("out")).unwrap();
-        assert_eq!(
-            sendfile_rest(&File::open(&src).unwrap(), &output, |_| false).unwrap(),
-            Sent::Cancelled
-        );
+        assert_eq!(sendfile_rest(&File::open(&src).unwrap(), &output, |_| false).unwrap(), Sent::Cancelled);
     }
 
     #[test]
@@ -2342,10 +1892,7 @@ mod tests {
         let s = Scratch::new();
         let src = s.file("src", b"");
         let output = File::create(s.path().join("out")).unwrap();
-        assert_eq!(
-            sendfile_rest(&File::open(&src).unwrap(), &output, |_| true).unwrap(),
-            Sent::Unsupported(0)
-        );
+        assert_eq!(sendfile_rest(&File::open(&src).unwrap(), &output, |_| true).unwrap(), Sent::Unsupported(0));
     }
 
     #[test]
@@ -2360,21 +1907,11 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         for no_sendfile in [false, true] {
             e.force_no_sendfile = no_sendfile;
-            e.start(Request::Copy {
-                sources: vec![f.clone(), empty.clone()],
-                dest: d.clone(),
-            });
+            e.start(Request::Copy { sources: vec![f.clone(), empty.clone()], dest: d.clone() });
             let done = finish(&rx, vec![]);
             assert!(done.errors.is_empty(), "{:?}", done.errors);
-            assert_eq!(
-                fs::read(d.join("big")).unwrap(),
-                data,
-                "no_sendfile={no_sendfile}"
-            );
-            assert_eq!(
-                fs::metadata(d.join("big")).unwrap().permissions().mode() & 0o777,
-                0o640
-            );
+            assert_eq!(fs::read(d.join("big")).unwrap(), data, "no_sendfile={no_sendfile}");
+            assert_eq!(fs::metadata(d.join("big")).unwrap().permissions().mode() & 0o777, 0o640);
             assert_eq!(fs::read(d.join("empty")).unwrap(), b"");
             no_partials(&d);
             fs::remove_file(d.join("big")).unwrap();
@@ -2388,10 +1925,7 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let d = s.dir("dest");
-        e.start(Request::Copy {
-            sources: vec!["/proc/version".into()],
-            dest: d.clone(),
-        });
+        e.start(Request::Copy { sources: vec!["/proc/version".into()], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         let copied = fs::read(d.join("version")).unwrap();
@@ -2405,17 +1939,11 @@ mod tests {
         let (e, rx) = engine(&s);
         let a = s.file("a", b"1");
         let b = s.file("b", b"2");
-        e.start(Request::Rename {
-            from: a.clone(),
-            to_name: "b".into(),
-        });
+        e.start(Request::Rename { from: a.clone(), to_name: "b".into() });
         let done = finish(&rx, vec![]);
         assert_eq!(done.errors.len(), 1);
         assert_eq!(fs::read(&b).unwrap(), b"2");
-        e.start(Request::Rename {
-            from: a.clone(),
-            to_name: "c".into(),
-        });
+        e.start(Request::Rename { from: a.clone(), to_name: "c".into() });
         let done = finish(&rx, vec![]);
         assert_eq!(fs::read(s.path().join("c")).unwrap(), b"1");
         e.start(Request::Undo(done.outcome.undo.unwrap()));
@@ -2429,10 +1957,7 @@ mod tests {
         let (e, rx) = engine(&s);
         let a = s.file("a", b"1");
         for bad in ["", ".", "..", "x/y", &"n".repeat(256)] {
-            e.start(Request::Rename {
-                from: a.clone(),
-                to_name: bad.into(),
-            });
+            e.start(Request::Rename { from: a.clone(), to_name: bad.into() });
             let done = finish(&rx, vec![]);
             assert_eq!(done.errors.len(), 1, "{bad}");
             assert!(a.exists());
@@ -2443,23 +1968,14 @@ mod tests {
     fn new_folder_and_its_failures() {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
-        e.start(Request::NewFolder {
-            parent: s.path().into(),
-            name: "n".into(),
-        });
+        e.start(Request::NewFolder { parent: s.path().into(), name: "n".into() });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty());
         assert!(s.path().join("n").is_dir());
         assert_eq!(done.outcome.created, vec![s.path().join("n")]);
-        e.start(Request::NewFolder {
-            parent: s.path().into(),
-            name: "n".into(),
-        });
+        e.start(Request::NewFolder { parent: s.path().into(), name: "n".into() });
         assert_eq!(finish(&rx, vec![]).errors.len(), 1);
-        e.start(Request::NewFolder {
-            parent: s.path().into(),
-            name: "../escape".into(),
-        });
+        e.start(Request::NewFolder { parent: s.path().into(), name: "../escape".into() });
         assert_eq!(finish(&rx, vec![]).errors.len(), 1);
         assert!(!s.path().parent().unwrap().join("escape").exists());
     }
@@ -2472,10 +1988,7 @@ mod tests {
         e.force_sync_error = true;
         let f = s.file("src/a", b"only copy");
         let d = s.dir("dest");
-        e.start(Request::Move {
-            sources: vec![f.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Move { sources: vec![f.clone()], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
         assert_eq!(fs::read(&f).unwrap(), b"only copy");
@@ -2494,9 +2007,7 @@ mod tests {
         let precious = tree.join("mnt/precious");
         fs::write(&precious, b"on another disk").unwrap();
         fs::write(tree.join("ordinary"), b"x").unwrap();
-        e.start(Request::Delete {
-            paths: vec![tree.to_path_buf()],
-        });
+        e.start(Request::Delete { paths: vec![tree.to_path_buf()] });
         let done = finish(&rx, vec![]);
         assert_eq!(fs::read(&precious).unwrap(), b"on another disk");
         fs::remove_file(&precious).unwrap();
@@ -2511,10 +2022,7 @@ mod tests {
         let (e, rx) = engine(&s);
         s.file("src/d/f", b"incoming");
         s.file("dest/d/f", b"precious");
-        e.start(Request::Copy {
-            sources: vec![s.path().join("src/d")],
-            dest: s.path().join("dest"),
-        });
+        e.start(Request::Copy { sources: vec![s.path().join("src/d")], dest: s.path().join("dest") });
         finish(&rx, vec![all(Choice::Replace), answer(Choice::Skip)]);
         assert_eq!(fs::read(s.path().join("dest/d/f")).unwrap(), b"precious");
     }
@@ -2525,10 +2033,7 @@ mod tests {
         let (e, rx) = engine(&s);
         s.file("src/d/new", b"n");
         s.file("dest/d/preexisting", b"p");
-        e.start(Request::Move {
-            sources: vec![s.path().join("src/d")],
-            dest: s.path().join("dest"),
-        });
+        e.start(Request::Move { sources: vec![s.path().join("src/d")], dest: s.path().join("dest") });
         let done = finish(&rx, vec![answer(Choice::Replace)]);
         assert_eq!(done.outcome.undo, None);
         assert_eq!(fs::read(s.path().join("dest/d/preexisting")).unwrap(), b"p");
@@ -2544,9 +2049,7 @@ mod tests {
         symlink(s.path().join("real"), &link).unwrap();
         let mut slashed = link.clone().into_os_string();
         slashed.push("/");
-        e.start(Request::Delete {
-            paths: vec![PathBuf::from(slashed)],
-        });
+        e.start(Request::Delete { paths: vec![PathBuf::from(slashed)] });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         assert_eq!(fs::read(&kept).unwrap(), b"k");
@@ -2560,15 +2063,9 @@ mod tests {
         let f = s.file("a", b"x");
         fs::set_permissions(&f, fs::Permissions::from_mode(0o6755)).unwrap();
         let d = s.dir("dest");
-        e.start(Request::Copy {
-            sources: vec![f],
-            dest: d.clone(),
-        });
+        e.start(Request::Copy { sources: vec![f], dest: d.clone() });
         finish(&rx, vec![]);
-        assert_eq!(
-            fs::metadata(d.join("a")).unwrap().permissions().mode() & 0o7777,
-            0o755
-        );
+        assert_eq!(fs::metadata(d.join("a")).unwrap().permissions().mode() & 0o7777, 0o755);
     }
 
     #[test]
@@ -2578,33 +2075,15 @@ mod tests {
         let f = s.file("a", b"x");
         let c = std::ffi::CString::new(f.as_os_str().as_bytes()).unwrap();
         // SAFETY: valid C strings and a valid buffer of the given length.
-        let set = unsafe {
-            libc::setxattr(
-                c.as_ptr(),
-                c"user.gannet".as_ptr(),
-                b"v".as_ptr().cast(),
-                1,
-                0,
-            )
-        };
+        let set = unsafe { libc::setxattr(c.as_ptr(), c"user.gannet".as_ptr(), b"v".as_ptr().cast(), 1, 0) };
         assert_eq!(set, 0, "the sandbox's filesystem must support user xattrs");
         let d = s.dir("dest");
-        e.start(Request::Copy {
-            sources: vec![f],
-            dest: d.clone(),
-        });
+        e.start(Request::Copy { sources: vec![f], dest: d.clone() });
         finish(&rx, vec![]);
         let c = std::ffi::CString::new(d.join("a").as_os_str().as_bytes()).unwrap();
         let mut buf = [0u8; 8];
         // SAFETY: as above.
-        let got = unsafe {
-            libc::getxattr(
-                c.as_ptr(),
-                c"user.gannet".as_ptr(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-            )
-        };
+        let got = unsafe { libc::getxattr(c.as_ptr(), c"user.gannet".as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
         assert_eq!(got, 1);
         assert_eq!(buf[0], b'v');
     }
@@ -2614,10 +2093,7 @@ mod tests {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let (src, dst) = conflict_setup(&s);
-        let job = e.start(Request::Copy {
-            sources: vec![src],
-            dest: dst.parent().unwrap().into(),
-        });
+        let job = e.start(Request::Copy { sources: vec![src], dest: dst.parent().unwrap().into() });
         let mut held = None;
         loop {
             match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
@@ -2642,10 +2118,7 @@ mod tests {
         let a = s.file("src/a", b"x");
         let d = s.dir("dest");
         fs::hard_link(&a, d.join("a")).unwrap();
-        e.start(Request::Move {
-            sources: vec![a.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Move { sources: vec![a.clone()], dest: d.clone() });
         let done = finish(&rx, vec![answer(Choice::Replace)]);
         assert!(done.errors.is_empty());
         assert!(!a.exists());
@@ -2659,10 +2132,7 @@ mod tests {
         let src = s.dir("src");
         fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
         let d = s.dir("dest");
-        e.start(Request::Copy {
-            sources: vec![src.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Copy { sources: vec![src.clone()], dest: d.clone() });
         let done = finish(&rx, vec![]);
         fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(done.errors.len(), 1);
@@ -2675,10 +2145,7 @@ mod tests {
         let (mut e, rx) = engine(&s);
         e.force_exdev = true;
         s.file("src/a/b/c/f", &[0; 1000]);
-        let job = e.start(Request::Move {
-            sources: vec![s.path().join("src/a")],
-            dest: s.dir("dest"),
-        });
+        let job = e.start(Request::Move { sources: vec![s.path().join("src/a")], dest: s.dir("dest") });
         finish(&rx, vec![]);
         assert_eq!(job.progress.total_bytes.load(Ordering::Relaxed), 1000);
         assert_eq!(job.progress.done_bytes.load(Ordering::Relaxed), 1000);
@@ -2690,19 +2157,12 @@ mod tests {
         let (e, rx) = engine(&s);
         let f = s.file("src/a", b"1");
         let d = s.dir("dest");
-        e.start(Request::Move {
-            sources: vec![f.clone()],
-            dest: d.clone(),
-        });
+        e.start(Request::Move { sources: vec![f.clone()], dest: d.clone() });
         let done = finish(&rx, vec![]);
         fs::write(&f, b"took its place").unwrap();
         e.start(Request::Undo(done.outcome.undo.unwrap()));
         let undone = finish(&rx, vec![answer(Choice::Skip)]);
-        assert!(
-            undone.outcome.created.is_empty(),
-            "{:?}",
-            undone.outcome.created
-        );
+        assert!(undone.outcome.created.is_empty(), "{:?}", undone.outcome.created);
         assert_eq!(fs::read(&f).unwrap(), b"took its place");
         assert_eq!(fs::read(d.join("a")).unwrap(), b"1");
     }
@@ -2714,27 +2174,18 @@ mod tests {
         let name = format!("a{}", "é".repeat(127));
         let f = s.file(&name, b"");
         let n = unique_copy_name(&f);
-        assert!(
-            n.file_name().unwrap().to_str().is_some(),
-            "still valid UTF-8"
-        );
+        assert!(n.file_name().unwrap().to_str().is_some(), "still valid UTF-8");
     }
 
     #[test]
     fn copy_names_keep_extensions_except_folders_and_dotfiles() {
         let s = Scratch::new();
         let f = s.file("archive.tar.gz", b"");
-        assert_eq!(
-            unique_copy_name(&f).file_name().unwrap(),
-            "archive.tar (copy).gz"
-        );
+        assert_eq!(unique_copy_name(&f).file_name().unwrap(), "archive.tar (copy).gz");
         let d = s.dir("v1.2");
         assert_eq!(unique_copy_name(&d).file_name().unwrap(), "v1.2 (copy)");
         let dot = s.file(".bashrc", b"");
-        assert_eq!(
-            unique_copy_name(&dot).file_name().unwrap(),
-            ".bashrc (copy)"
-        );
+        assert_eq!(unique_copy_name(&dot).file_name().unwrap(), ".bashrc (copy)");
         let long = s.file(&"n".repeat(255), b"");
         assert!(unique_copy_name(&long).file_name().unwrap().len() <= 255);
     }
@@ -2745,10 +2196,7 @@ mod tests {
         let (e, rx) = engine(&s);
         s.file("src/a", &[0; 1000]);
         s.file("src/b", &[0; 2000]);
-        let job = e.start(Request::Copy {
-            sources: vec![s.path().join("src")],
-            dest: s.dir("dest"),
-        });
+        let job = e.start(Request::Copy { sources: vec![s.path().join("src")], dest: s.dir("dest") });
         finish(&rx, vec![]);
         assert_eq!(job.progress.total_bytes.load(Ordering::Relaxed), 3000);
         assert_eq!(job.progress.done_bytes.load(Ordering::Relaxed), 3000);
@@ -2764,24 +2212,14 @@ mod tests {
         let b = trash::trash(&e.trash, &s.file("work/gone/b", b"b")).unwrap();
         fs::remove_dir(s.path().join("work/gone")).unwrap();
         fs::write(s.path().join("work/a"), b"new a").unwrap();
-        e.start(Request::Restore {
-            items: vec![a.clone(), b.clone()],
-        });
+        e.start(Request::Restore { items: vec![a.clone(), b.clone()] });
         let d = finish(&rx, Vec::new());
         assert_eq!(d.errors.len(), 1);
-        assert!(
-            d.errors[0].1.contains("stayed in the Trash"),
-            "{}",
-            d.errors[0].1
-        );
+        assert!(d.errors[0].1.contains("stayed in the Trash"), "{}", d.errors[0].1);
         assert_eq!(fs::read(s.path().join("work/a")).unwrap(), b"new a");
         assert!(a.file.exists() && a.info.exists());
         assert_eq!(fs::read(&b.original).unwrap(), b"b");
         assert!(!b.file.exists() && !b.info.exists());
-        assert!(
-            d.outcome
-                .touched
-                .contains(&b.file.parent().unwrap().to_path_buf())
-        );
+        assert!(d.outcome.touched.contains(&b.file.parent().unwrap().to_path_buf()));
     }
 }

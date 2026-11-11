@@ -58,10 +58,7 @@ impl MimeDb {
     /// then each of `$XDG_DATA_DIRS`), the first folder's entries winning. Folders that don't
     /// exist or don't parse are left out, so this always gives a database, if an empty one.
     pub fn load(dirs: &[PathBuf]) -> Self {
-        let mut db = MimeDb {
-            dirs: dirs.to_vec(),
-            ..Default::default()
-        };
+        let mut db = MimeDb { dirs: dirs.to_vec(), ..Default::default() };
         for dir in dirs {
             if let Some(text) = read_capped(&dir.join("globs2"), MAX_DB_FILE) {
                 db.add_globs(&text);
@@ -72,9 +69,7 @@ impl MimeDb {
             if let Some(text) = read_capped(&dir.join("generic-icons"), MAX_DB_FILE) {
                 for line in String::from_utf8_lossy(&text).lines() {
                     if let Some((mime, icon)) = line.split_once(':') {
-                        db.generic_icons
-                            .entry(mime.to_string())
-                            .or_insert_with(|| icon.to_string());
+                        db.generic_icons.entry(mime.to_string()).or_insert_with(|| icon.to_string());
                     }
                 }
             }
@@ -94,71 +89,34 @@ impl MimeDb {
                 continue;
             }
             let mut parts = line.splitn(4, |&b| b == b':');
-            let (Some(weight), Some(mime), Some(pattern)) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let Some(weight) = std::str::from_utf8(weight)
-                .ok()
-                .and_then(|w| w.parse().ok())
-            else {
-                continue;
-            };
-            let (Ok(mime), false) = (std::str::from_utf8(mime), pattern.is_empty()) else {
-                continue;
-            };
-            let case_sensitive = parts
-                .next()
-                .is_some_and(|flags| flags.split(|&b| b == b',').any(|f| f == b"cs"));
-            let pattern = if case_sensitive {
-                pattern.to_vec()
-            } else {
-                pattern.to_ascii_lowercase()
-            };
+            let (Some(weight), Some(mime), Some(pattern)) = (parts.next(), parts.next(), parts.next()) else { continue };
+            let Some(weight) = std::str::from_utf8(weight).ok().and_then(|w| w.parse().ok()) else { continue };
+            let (Ok(mime), false) = (std::str::from_utf8(mime), pattern.is_empty()) else { continue };
+            let case_sensitive = parts.next().is_some_and(|flags| flags.split(|&b| b == b',').any(|f| f == b"cs"));
+            let pattern = if case_sensitive { pattern.to_vec() } else { pattern.to_ascii_lowercase() };
             let index = self.globs.len();
             match pattern.strip_prefix(b"*.") {
-                Some(ext) if !case_sensitive && !ext.iter().any(|b| b"*?[".contains(b)) => {
-                    self.by_ext.entry(ext.to_vec()).or_default().push(index)
-                }
+                Some(ext) if !case_sensitive && !ext.iter().any(|b| b"*?[".contains(b)) => self.by_ext.entry(ext.to_vec()).or_default().push(index),
                 _ => self.other.push(index),
             }
-            self.globs.push(Glob {
-                weight,
-                mime: mime.to_string(),
-                pattern,
-                case_sensitive,
-            });
+            self.globs.push(Glob { weight, mime: mime.to_string(), pattern, case_sensitive });
         }
     }
 
     fn add_magic(&mut self, bytes: &[u8]) {
-        let Some(mut rest) = bytes.strip_prefix(b"MIME-Magic\0\n") else {
-            return;
-        };
+        let Some(mut rest) = bytes.strip_prefix(b"MIME-Magic\0\n") else { return };
         let mut current: Option<Section> = None;
         while !rest.is_empty() {
             if rest[0] == b'[' {
-                let Some(end) = rest.iter().position(|&b| b == b'\n') else {
-                    break;
-                };
+                let Some(end) = rest.iter().position(|&b| b == b'\n') else { break };
                 let header = &rest[1..end];
                 rest = &rest[end + 1..];
                 if let Some(s) = current.take() {
                     self.magic.push(s);
                 }
                 let header = header.strip_suffix(b"]").unwrap_or(header);
-                let Some((priority, mime)) = std::str::from_utf8(header)
-                    .ok()
-                    .and_then(|h| h.split_once(':'))
-                else {
-                    continue;
-                };
-                current = priority.parse().ok().map(|priority| Section {
-                    priority,
-                    mime: mime.to_string(),
-                    tests: Vec::new(),
-                });
+                let Some((priority, mime)) = std::str::from_utf8(header).ok().and_then(|h| h.split_once(':')) else { continue };
+                current = priority.parse().ok().map(|priority| Section { priority, mime: mime.to_string(), tests: Vec::new() });
                 continue;
             }
             match parse_test(rest) {
@@ -189,11 +147,7 @@ impl MimeDb {
             if head.is_empty() {
                 return candidates.first().copied().unwrap_or(EMPTY);
             }
-            let found = if candidates.is_empty() {
-                self.by_magic(head, None)
-            } else {
-                self.by_magic(head, Some(&candidates))
-            };
+            let found = if candidates.is_empty() { self.by_magic(head, None) } else { self.by_magic(head, Some(&candidates)) };
             if let Some(found) = found {
                 return found;
             }
@@ -245,11 +199,7 @@ impl MimeDb {
 
     /// The highest-priority magic section that matches, from among `only` if given.
     fn by_magic(&self, head: &[u8], only: Option<&[&str]>) -> Option<&str> {
-        self.magic
-            .iter()
-            .filter(|s| only.is_none_or(|o| o.contains(&s.mime.as_str())))
-            .find(|s| section_matches(&s.tests, head))
-            .map(|s| s.mime.as_str())
+        self.magic.iter().filter(|s| only.is_none_or(|o| o.contains(&s.mime.as_str()))).find(|s| section_matches(&s.tests, head)).map(|s| s.mime.as_str())
     }
 
     /// The name of the generic icon for a type, like `audio-x-generic`, from the database or
@@ -266,12 +216,7 @@ impl MimeDb {
     pub fn describe(&self, mime: &str, lang: Option<&str>) -> Option<String> {
         // A type comes from the database or from code here, but keep it to a file name anyway.
         let (media, sub) = mime.split_once('/')?;
-        let plain = |s: &str| {
-            !s.is_empty()
-                && !s.starts_with('.')
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"+-._".contains(&b))
-        };
+        let plain = |s: &str| !s.is_empty() && !s.starts_with('.') && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-._".contains(&b));
         if !plain(media) || !plain(sub) {
             return None;
         }
@@ -300,10 +245,7 @@ pub fn looks_like_text(head: &[u8]) -> bool {
         Ok(_) => true,
         Err(e) => e.error_len().is_none(),
     };
-    valid
-        && !head
-            .iter()
-            .any(|&b| b < 0x20 && !b"\t\n\r\x0c\x1b".contains(&b) || b == 0x7f)
+    valid && !head.iter().any(|&b| b < 0x20 && !b"\t\n\r\x0c\x1b".contains(&b) || b == 0x7f)
 }
 
 /// `[indent]>start=LLvalue[&mask][~size][+range]\n`, numbers in decimal, `LL` big-endian.
@@ -313,11 +255,7 @@ fn parse_test(line: &[u8]) -> Option<(Test, &[u8])> {
         Some((std::str::from_utf8(&s[..n]).ok()?.parse().ok()?, n))
     };
     let mut at = 0;
-    let (indent, n) = if line[0] == b'>' {
-        (0, 0)
-    } else {
-        number(line)?
-    };
+    let (indent, n) = if line[0] == b'>' { (0, 0) } else { number(line)? };
     at += n;
     if line.get(at) != Some(&b'>') {
         return None;
@@ -366,16 +304,7 @@ fn parse_test(line: &[u8]) -> Option<(Test, &[u8])> {
             }
         }
     }
-    Some((
-        Test {
-            indent: indent as u32,
-            start,
-            range,
-            value,
-            mask,
-        },
-        &line[at + 1..],
-    ))
+    Some((Test { indent: indent as u32, start, range, value, mask }, &line[at + 1..]))
 }
 
 fn test_matches(t: &Test, head: &[u8]) -> bool {
@@ -384,16 +313,10 @@ fn test_matches(t: &Test, head: &[u8]) -> bool {
         return false;
     }
     (t.start..t.start.saturating_add(t.range)).any(|at| {
-        let Some(bytes) = head.get(at..at + len) else {
-            return false;
-        };
+        let Some(bytes) = head.get(at..at + len) else { return false };
         match &t.mask {
             None => bytes == t.value.as_slice(),
-            Some(mask) => bytes
-                .iter()
-                .zip(mask)
-                .zip(&t.value)
-                .all(|((b, m), v)| b & m == v & m),
+            Some(mask) => bytes.iter().zip(mask).zip(&t.value).all(|((b, m), v)| b & m == v & m),
         }
     })
 }
@@ -406,15 +329,10 @@ fn section_matches(tests: &[Test], head: &[u8]) -> bool {
             return false;
         }
         let indent = tests[i].indent;
-        let mut children = (i + 1..tests.len())
-            .take_while(|&j| tests[j].indent > indent)
-            .filter(|&j| tests[j].indent == indent + 1)
-            .peekable();
+        let mut children = (i + 1..tests.len()).take_while(|&j| tests[j].indent > indent).filter(|&j| tests[j].indent == indent + 1).peekable();
         children.peek().is_none() || children.any(|j| matches_from(tests, j, head))
     }
-    (0..tests.len())
-        .filter(|&i| tests[i].indent == 0)
-        .any(|i| matches_from(tests, i, head))
+    (0..tests.len()).filter(|&i| tests[i].indent == 0).any(|i| matches_from(tests, i, head))
 }
 
 /// Shell-style patterns: `*`, `?` and `[...]` classes, with `!` negating a class.
@@ -510,16 +428,10 @@ fn comment(xml: &str, lang: Option<&str>) -> Option<String> {
         let Some(close) = rest.find('>') else { break };
         let attrs = &rest[..close];
         let body_start = close + 1;
-        let Some(end) = rest[body_start..].find("</comment>") else {
-            break;
-        };
+        let Some(end) = rest[body_start..].find("</comment>") else { break };
         let body = unescape(rest[body_start..body_start + end].trim());
         rest = &rest[body_start + end..];
-        match attrs
-            .split("xml:lang=\"")
-            .nth(1)
-            .and_then(|a| a.split('"').next())
-        {
+        match attrs.split("xml:lang=\"").nth(1).and_then(|a| a.split('"').next()) {
             None => {
                 plain.get_or_insert(body);
             }
@@ -536,11 +448,7 @@ fn comment(xml: &str, lang: Option<&str>) -> Option<String> {
 }
 
 fn unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
+    s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
 }
 
 #[cfg(test)]
@@ -571,11 +479,7 @@ mod tests {
     }
 
     fn magic_line(indent: u32, start: usize, value: &[u8], extra: &[u8]) -> Vec<u8> {
-        let mut out = if indent > 0 {
-            indent.to_string().into_bytes()
-        } else {
-            Vec::new()
-        };
+        let mut out = if indent > 0 { indent.to_string().into_bytes() } else { Vec::new() };
         out.extend_from_slice(format!(">{start}=").as_bytes());
         out.extend_from_slice(&(value.len() as u16).to_be_bytes());
         out.extend_from_slice(value);
@@ -601,15 +505,9 @@ mod tests {
     #[test]
     fn contents_decide_when_the_name_cant() {
         let d = db(GLOBS, &magic());
-        assert_eq!(
-            d.guess(b"no-extension", Some(b"%PDF-1.7\n")),
-            "application/pdf"
-        );
+        assert_eq!(d.guess(b"no-extension", Some(b"%PDF-1.7\n")), "application/pdf");
         // Inside the range.
-        assert_eq!(
-            d.guess(b"no-extension", Some(b"junk junk %PDF-1.7")),
-            "application/pdf"
-        );
+        assert_eq!(d.guess(b"no-extension", Some(b"junk junk %PDF-1.7")), "application/pdf");
         // Two types share a name, and the bytes pick: the child test makes foo match.
         assert_eq!(d.guess(b"x.amb", Some(b"AB..FOO")), "application/x-foo");
         assert_eq!(d.guess(b"x.amb", Some(b"AB..BAR")), "application/x-bar");
@@ -643,10 +541,7 @@ mod tests {
         let mut m = b"MIME-Magic\0\n[50:application/x-word]\n".to_vec();
         m.extend(magic_line(0, 0, &[0x12, 0x34], b"~2"));
         let d = db("", &m);
-        assert_eq!(
-            d.guess(b"x", Some(&0x1234u16.to_ne_bytes())),
-            "application/x-word"
-        );
+        assert_eq!(d.guess(b"x", Some(&0x1234u16.to_ne_bytes())), "application/x-word");
     }
 
     #[test]
@@ -666,18 +561,9 @@ mod tests {
     fn descriptions_come_in_the_users_language() {
         let xml = r#"<mime-type type="application/pdf"><comment>PDF document</comment><comment xml:lang="de">PDF-Dokument</comment><comment xml:lang="pt_BR">Documento PDF</comment><comment xml:lang="zh-Hant-TW">PDF 文件</comment><comment xml:lang="x">A &amp; B</comment></mime-type>"#;
         assert_eq!(comment(xml, None).as_deref(), Some("PDF document"));
-        assert_eq!(
-            comment(xml, Some("de_DE.UTF-8")).as_deref(),
-            Some("PDF-Dokument")
-        );
-        assert_eq!(
-            comment(xml, Some("pt_BR.UTF-8")).as_deref(),
-            Some("Documento PDF")
-        );
-        assert_eq!(
-            comment(xml, Some("fr_FR.UTF-8")).as_deref(),
-            Some("PDF document")
-        );
+        assert_eq!(comment(xml, Some("de_DE.UTF-8")).as_deref(), Some("PDF-Dokument"));
+        assert_eq!(comment(xml, Some("pt_BR.UTF-8")).as_deref(), Some("Documento PDF"));
+        assert_eq!(comment(xml, Some("fr_FR.UTF-8")).as_deref(), Some("PDF document"));
         assert_eq!(comment(xml, Some("C")).as_deref(), Some("PDF document"));
         assert_eq!(comment(xml, Some("x")).as_deref(), Some("A & B"));
     }
@@ -686,14 +572,8 @@ mod tests {
     fn describe_reads_the_types_file_and_refuses_odd_names() {
         let s = crate::testutil::Scratch::new();
         s.file("application/pdf.xml", b"<comment>PDF document</comment>");
-        let d = MimeDb {
-            dirs: vec![s.path().to_path_buf()],
-            ..Default::default()
-        };
-        assert_eq!(
-            d.describe("application/pdf", None).as_deref(),
-            Some("PDF document")
-        );
+        let d = MimeDb { dirs: vec![s.path().to_path_buf()], ..Default::default() };
+        assert_eq!(d.describe("application/pdf", None).as_deref(), Some("PDF document"));
         assert_eq!(d.describe("application/missing", None), None);
         assert_eq!(d.describe("../etc/passwd", None), None);
         assert_eq!(d.describe("application/../pdf", None), None);
@@ -702,8 +582,7 @@ mod tests {
     #[test]
     fn generic_icons_fall_back_to_the_media_type() {
         let mut d = MimeDb::default();
-        d.generic_icons
-            .insert("application/zip".into(), "package-x-generic".into());
+        d.generic_icons.insert("application/zip".into(), "package-x-generic".into());
         assert_eq!(d.generic_icon("application/zip"), "package-x-generic");
         assert_eq!(d.generic_icon("audio/flac"), "audio-x-generic");
     }
