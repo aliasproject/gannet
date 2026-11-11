@@ -107,7 +107,7 @@
       <h1 class="text-[clamp(2.75rem,7vw,5.25rem)] leading-none font-bold tracking-[-0.035em] text-balance text-ink">A hundred thousand files. Twenty-eight milliseconds.</h1>
       <p class="max-w-[640px] text-xl leading-normal text-pretty text-muted">Gannet is written in Rust and draws on the CPU, with no toolkit and no GPU. Your biggest folder is sorted and on screen before your finger has left the key.</p>
       <div class="mt-2 flex flex-wrap items-center gap-x-5 gap-y-3">
-        <a href="#get" class="flex min-h-[52px] items-center rounded-[10px] bg-accent px-6 font-semibold text-on-accent hover:opacity-85">Get Gannet 0.1.12</a>
+        <a href="#get" class="flex min-h-[52px] items-center rounded-[10px] bg-accent px-6 font-semibold text-on-accent hover:opacity-85">Get Gannet 0.1.13</a>
         <span class="text-[0.9375rem] text-muted">MIT licensed. Wayland only.</span>
       </div>
     </header>
@@ -200,7 +200,7 @@
       </div>
       <div class="flex flex-col gap-4">
         <h2 class="text-[clamp(2rem,4vw,3.25rem)] leading-[1.05] font-bold tracking-[-0.03em] text-balance text-ink">Press Space. Previews run in a sandbox.</h2>
-        <p class="text-pretty text-muted">Space previews any file in a window of its own: images and animations, video and sound, text and Markdown, and what a folder holds. The arrow keys go to the next file, and plus and minus zoom.</p>
+        <p class="text-pretty text-muted">Space previews any file in a window of its own: images and animations, video and sound, text, Markdown and PDFs, and what a folder holds. Anything else the system has a thumbnailer for, like HEIC photos and office documents, shows as a picture. The arrow keys go to the next file, and plus and minus zoom.</p>
         <p class="text-pretty text-muted">Decoding a file you downloaded shouldn't put your home folder at risk. Each image or text file is read in its own process under a seccomp sandbox, with no network and no other files. Video and sound play in a bubblewrap jail with no home folder and no network.</p>
       </div>
     </section>
@@ -257,8 +257,8 @@
           </svg>
           <span class="text-[44px] font-bold tracking-[-0.03em]">Gannet</span>
         </div>
-        <p class="max-w-[460px] text-pretty text-muted">Build it from source with Rust. It needs libxkbcommon to link, and at run time fontconfig for fonts, xdg-open for opening files, and libmpv and bubblewrap for video and sound previews.</p>
-        <a href="https://github.com/aliasproject/gannet" class="flex min-h-[52px] items-center rounded-[10px] bg-accent px-6 font-semibold text-on-accent hover:opacity-85">Get Gannet 0.1.12</a>
+        <p class="max-w-[460px] text-pretty text-muted">Build it from source with Rust. It needs libxkbcommon to link, and at run time fontconfig for fonts, xdg-open for opening files, libmpv and bubblewrap for video and sound previews, and poppler for PDFs.</p>
+        <a href="https://github.com/aliasproject/gannet" class="flex min-h-[52px] items-center rounded-[10px] bg-accent px-6 font-semibold text-on-accent hover:opacity-85">Get Gannet 0.1.13</a>
       </div>
       <pre class="min-w-0 overflow-x-auto rounded-xl border border-line bg-surface p-6 font-mono text-[0.9375rem] leading-[1.8]">git clone https://github.com/aliasproject/gannet
 cd gannet

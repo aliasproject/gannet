@@ -49,6 +49,7 @@ Gannet also has a set of performance budgets, which `bench/run.py` checks:
 | Space to a 1600x1200 photo in the preview | 100 ms | 11.1 ms |
 | Space to 128 kB of text in the preview | 100 ms | 25.6 ms |
 | Space to 128 kB of Markdown in the preview | 150 ms | 25.8 ms |
+| Space to the first page of a PDF in the preview | 200 ms | 48.2 ms |
 | Idle wakeups | 1 per second | 0 |
 
 To run them yourself, see [bench/README.md](bench/README.md).
@@ -72,7 +73,10 @@ At run time, Gannet uses these:
 |---|---|---|
 | `fc-match` (fontconfig) | Finding fonts | Gannet can't find a font, so install this |
 | `xdg-open` | Opening files in other apps | Opening files fails |
-| `libmpv` (part of `mpv` on many systems) and `bubblewrap` | Video previews | Videos show a message saying what's needed |
+| `libmpv` (part of `mpv` on many systems) and `bubblewrap` | Video and sound previews | Videos show a message saying what's needed |
+| `shared-mime-info` | Saying what a file is, like "PDF document" | Previews name types like `application/pdf` |
+| `poppler` (`pdfinfo`, `pdftoppm`) and `bubblewrap` | PDF previews | PDFs say what they are, or show a thumbnailer's picture |
+| Thumbnailers, like `glycin` and `libgsf`, and `bubblewrap` | Previews of HEIC, JPEG XL, SVG, office files and more | Those files say what they are |
 
 To add it to your app launcher:
 
@@ -186,6 +190,13 @@ Text shows the first 128 KiB of the file, cut at the end of a line, and Markdown
 formatted. A file with a zero byte in its first 8,000 bytes isn't text. Page Up, Page Down,
 Home, End, Shift+Up, Shift+Down and the mouse wheel scroll it.
 
+PDFs show their pages one under another, each drawn by poppler's `pdftoppm` as it scrolls into
+view, and scroll like text. A locked or damaged PDF says so.
+
+HEIC and JPEG XL photos, SVG drawings, office documents and anything else the system has a
+thumbnailer for (the `.thumbnailer` files under `/usr/share/thumbnailers`) show the biggest
+picture the thumbnailer makes for the window's size.
+
 Folders show how many items they hold and their total size, counted in the background. Like
 `du`, the count doesn't follow symlinks or go onto other disks, and a file with several hard
 links counts once.
@@ -206,6 +217,12 @@ A seccomp sandbox stops that process opening or looking up files, making network
 starting programs or making memory executable, and it won't decode if the sandbox can't be set
 up. It can still read the one file it was given and write its one output. Stopping a preview
 kills that process.
+
+**PDFs and thumbnailers** run in the same bubblewrap jail as videos, below, with fonts to draw
+text and limits on memory, CPU time and output. The file is handed in already open, so it can't
+be swapped on the way. What they make is a PNG, which the image decoder above reads in its own
+sandbox. They don't get the player's seccomp filter, as some thumbnailers start sandboxes of
+their own, which it would stop.
 
 **Videos and sound** play in a bubblewrap jail with no home folder, no network, no `/proc` and read-only
 system files, under a seccomp filter that stops it starting programs, creating processes or

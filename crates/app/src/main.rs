@@ -14,6 +14,7 @@ mod preview;
 mod preview_window;
 mod service;
 mod text;
+mod tools;
 mod wl;
 
 use std::ffi::OsString;
@@ -42,6 +43,8 @@ struct Dirs {
     data: PathBuf,
     /// The shared-mime-info folders, first wins.
     mime: Vec<PathBuf>,
+    /// Where thumbnailers are described, first wins.
+    thumbnailers: Vec<PathBuf>,
 }
 
 /// The one place Gannet reads where things live. Everything else gets paths as arguments.
@@ -50,9 +53,9 @@ fn dirs() -> Dirs {
     let var = |name: &str, default: &str| std::env::var_os(name).map(PathBuf::from).filter(|p| p.is_absolute()).unwrap_or_else(|| home.join(default));
     let data = var("XDG_DATA_HOME", ".local/share");
     let data_dirs = std::env::var_os("XDG_DATA_DIRS").filter(|d| !d.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
-    let mut mime = vec![data.join("mime")];
-    mime.extend(std::env::split_paths(&data_dirs).filter(|p| p.is_absolute()).map(|p| p.join("mime")));
-    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data, home, mime }
+    let in_data = |name: &str| std::iter::once(data.join(name)).chain(std::env::split_paths(&data_dirs).filter(|p| p.is_absolute()).map(|p| p.join(name))).collect::<Vec<_>>();
+    let (mime, thumbnailers) = (in_data("mime"), in_data("thumbnailers"));
+    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data, home, mime, thumbnailers }
 }
 
 /// The language messages are in, as GLib chooses it for GTK apps: the first of `LANGUAGE`, then
@@ -178,7 +181,7 @@ fn main() {
     let dir_watch = Watch::new().ok().map(Arc::new);
     app.watch = dir_watch.clone();
     app.cache_home = Some(d.cache.clone());
-    app.kinds = Arc::new(preview::Kinds::new(d.mime.clone(), language()));
+    app.kinds = Arc::new(preview::Kinds::new(d.mime.clone(), language()).with_thumbnailers(d.thumbnailers.clone()));
     let mut theme_watch = ThemeWatch::new(theme_paths.clone()).ok();
     let mut theme_due: Option<Instant> = None;
     #[cfg(feature = "bench")]
@@ -676,12 +679,14 @@ mod bench {
             Content::Video(Video { sound: Some(info), .. }) => ("sound", 0, 0, info.description.as_str()),
             Content::Video(video) => ("video", video.frame.map_or(0, |f| f.1), video.frame.map_or(0, |f| f.2), ""),
             Content::Message(m) => ("message", 0, 0, m.as_str()),
+            Content::Pdf(pdf) => ("pdf", 0, 0, pdf.info.description.as_str()),
             Content::Doc { doc, info } if doc.lines() > 0 => ("text", 0, 0, info.description.as_str()),
             Content::Doc { info, .. } => ("markdown", 0, 0, info.description.as_str()),
             Content::Info(i) => ("info", i.thumbnail.as_ref().map_or(0, |t| t.w), i.thumbnail.as_ref().map_or(0, |t| t.h), i.description.as_str()),
         };
         let kind = match &p.content {
             Content::Info(i) | Content::Video(Video { sound: Some(i), .. }) | Content::Doc { info: i, .. } => esc(&i.mime),
+            Content::Pdf(pdf) => esc(&pdf.info.mime),
             _ => "null".to_string(),
         };
         let rect = a.preview_rect();
@@ -708,13 +713,22 @@ mod bench {
             ),
             _ => "null".to_string(),
         };
+        let pdf = match &p.content {
+            Content::Pdf(pdf) => {
+                let mut drawn: Vec<String> = pdf.drawn.iter().map(|(i, (w, image))| format!("[{i},{w},{}]", image.is_some())).collect();
+                drawn.sort();
+                format!("{{\"pages\":{},\"drawn\":[{}],\"scroll\":{:.0}}}", pdf.pages.len(), drawn.join(","), p.scroll)
+            }
+            _ => "null".to_string(),
+        };
+        let by = p.made_by.as_deref().map_or_else(|| "null".to_string(), esc);
         let folder = match &p.content {
             Content::Info(crate::preview::Info { folder: Some(t), .. }) => format!("{{\"items\":{},\"bytes\":{},\"done\":{},\"incomplete\":{}}}", t.items, t.bytes, t.done, t.incomplete),
             _ => "null".to_string(),
         };
         let zoom = p.zoom.map_or_else(|| "null".to_string(), |z| format!("{z:.3}"));
         format!(
-            "{{\"name\":{},\"state\":{},\"kind\":{kind},\"w\":{w},\"h\":{h},\"frame\":{},\"frames\":{frames},\"message\":{},\"zoom\":{zoom},\"pan\":[{:.0},{:.0}],\"scaled\":{},\"size\":{},\"rect\":[{},{},{},{}],\"video\":{video},\"doc\":{doc},\"folder\":{folder}}}",
+            "{{\"name\":{},\"state\":{},\"kind\":{kind},\"w\":{w},\"h\":{h},\"frame\":{},\"frames\":{frames},\"message\":{},\"zoom\":{zoom},\"pan\":[{:.0},{:.0}],\"scaled\":{},\"size\":{},\"rect\":[{},{},{},{}],\"video\":{video},\"doc\":{doc},\"folder\":{folder},\"pdf\":{pdf},\"by\":{by}}}",
             esc(&name),
             esc(state),
             p.frame,

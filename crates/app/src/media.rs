@@ -191,7 +191,7 @@ pub fn parts_for_test() -> (Remote, Frames) {
 }
 
 /// The jail every player gets, whatever the video: each bubblewrap option with its values.
-const JAIL_RULES: &[(&str, &[&str])] = &[
+pub(crate) const JAIL_RULES: &[(&str, &[&str])] = &[
     // The process: alone, without privileges, and gone when the app is.
     ("--unshare-all", &[]),
     ("--cap-drop", &["ALL"]),
