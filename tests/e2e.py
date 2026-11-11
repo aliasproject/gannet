@@ -1232,9 +1232,8 @@ def space_previews_images_and_walks_the_folder(h):
     s = a.wait(lambda s: preview_of(s).get("name") == "claims.png" and preview_of(s)["state"] == "message", "a huge image")
     assert "too large" in preview_of(s)["message"], s["preview"]
     a.key("Right")
-    s = a.wait(lambda s: preview_of(s).get("name") == "notes.txt" and preview_of(s)["state"] == "info", "a text file")
+    s = a.wait(lambda s: preview_of(s).get("name") == "notes.txt" and preview_of(s)["state"] == "text", "a text file")
     assert preview_of(s)["kind"] == "text/plain", s["preview"]
-    a.shot("preview-info")
     a.key("Right")
     s = a.wait(lambda s: preview_of(s).get("name") == "small.png" and preview_of(s)["state"] == "image", "a small image")
     assert not preview_of(s)["scaled"], "shown at its own size, so nothing to shrink"
@@ -1319,6 +1318,129 @@ def any_file_says_what_it_is_and_opens_in_its_app(h):
     a.wait(lambda s: json.loads(a.preview_file.read_text())["notices"], "a failure shows in the window", timeout=5)
     assert "c-blob.xyz" in log.read_text()
     a.shot("preview-open-failed")
+    a.close()
+
+
+def ffmpeg(*args):
+    subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", *map(str, args)], check=True, capture_output=True)
+
+
+def doc_of(s):
+    return preview_of(s).get("doc") or {}
+
+
+@check
+def text_and_markdown_show_as_documents(h):
+    fs = fresh_fs()
+    (fs / "a-notes.txt").write_bytes(b"first line\r\nsecond\tline\r\n" + "日本語のテキスト\n".encode() + b"x" * 400 + b"\n")
+    (fs / "b-readme.md").write_text("# Gannet\n\nA *fast* file manager with **bold** ideas and `code`.\n\n- one\n- two\n  1. nested\n\n> A quote.\n\n```\nfn main() {}\n```\n\n---\n\nThe end, see [the site](https://example.com).\n")
+    (fs / "c-long.log").write_bytes(b"".join(b"%06d a line of a long log file\n" % i for i in range(6000)))
+    (fs / "d-binary.dat").write_bytes(b"MZ\0\0" + bytes(range(256)) * 4)
+    (fs / "e-late-zero.txt").write_bytes(b"text " * 2000 + b"\0" + b"more")
+    a = App(h, fs, extra_env={"LANG": "C.UTF-8"})
+    a.wait(lambda s: s["count"] == 5, "listing")
+    a.key("space")
+    s = a.wait(lambda s: preview_of(s).get("state") == "text" and doc_of(s).get("lines", 0) > 0, "the text, laid out")
+    d = doc_of(s)
+    assert d["text"].startswith("first line\nsecond\tline\n"), d
+    assert d["lines"] >= 5, f"the long line wraps: {d}"
+    assert not d["cut"], d
+    a.shot("preview-text")
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "b-readme.md" and preview_of(s)["state"] == "markdown" and doc_of(s).get("lines", 0) > 0, "the Markdown")
+    assert preview_of(s)["kind"] == "text/markdown", s["preview"]
+    assert doc_of(s)["text"].startswith("GannetA "), doc_of(s)
+    a.shot("preview-markdown")
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "c-long.log" and doc_of(s).get("lines", 0) > 0, "the long file")
+    d = doc_of(s)
+    assert d["cut"] and d["height"] > 20000, f"only the first 128 kB: {d}"
+    assert d["scroll"] == 0
+    # Page Down, the wheel and End scroll it; the arrows still go to other files.
+    a.key("Next")
+    s = a.wait(lambda s: doc_of(s).get("scroll", 0) > 300, "a page down")
+    paged = doc_of(s)["scroll"]
+    x, y, w, h_ = a.preview_window()
+    a.move(x + w // 2, y + h_ // 2)
+    a.scroll(3)
+    s = a.wait(lambda s: doc_of(s).get("scroll", 0) > paged, "the wheel")
+    a.key("End")
+    s = a.wait(lambda s: doc_of(s)["scroll"] >= doc_of(s)["height"] - h_, "the end")
+    a.shot("preview-text-end")
+    a.key("Home")
+    a.wait(lambda s: doc_of(s)["scroll"] == 0, "back to the top")
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "d-binary.dat" and preview_of(s)["state"] == "info", "binary isn't text")
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "e-late-zero.txt" and preview_of(s)["state"] == "text", "a zero far in is still text")
+    assert a.alive()
+    a.close()
+
+
+@check
+def animations_move(h):
+    fs = fresh_fs()
+    ffmpeg("-f", "lavfi", "-i", "testsrc=size=120x90:rate=10", "-t", "1", fs / "a-moving.gif")
+    ffmpeg("-f", "lavfi", "-i", "testsrc=size=120x90:rate=10", "-t", "1", "-plays", "0", "-f", "apng", fs / "b-moving.png")
+    ffmpeg("-f", "lavfi", "-i", "testsrc=size=120x90:rate=10", "-t", "1", "-c:v", "libwebp_anim", "-loop", "0", fs / "c-moving.webp")
+    (fs / "d-still.png").write_bytes(png_bytes(40, 30))
+    a = App(h, fs)
+    a.wait(lambda s: s["count"] == 4, "listing")
+    a.key("space")
+    for name in ("a-moving.gif", "b-moving.png", "c-moving.webp"):
+        s = a.wait(lambda s: preview_of(s).get("name") == name and preview_of(s)["state"] == "image", name)
+        assert preview_of(s)["frames"] == 10 and (preview_of(s)["w"], preview_of(s)["h"]) == (120, 90), s["preview"]
+        seen = {preview_of(a.state())["frame"]}
+        end = time.monotonic() + 3
+        while len(seen) < 4 and time.monotonic() < end:
+            seen.add(preview_of(a.state())["frame"])
+            time.sleep(0.02)
+        assert len(seen) >= 4, f"{name} should move: {seen}"
+        a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "d-still.png" and preview_of(s)["state"] == "image", "a still one")
+    assert preview_of(s)["frames"] == 1, s["preview"]
+    a.close()
+
+
+@check
+def sound_plays_with_its_controls(h):
+    fs = fresh_fs()
+    ffmpeg("-f", "lavfi", "-i", "sine=frequency=440:duration=20", "-c:a", "libmp3lame", fs / "a-tone.mp3")
+    ffmpeg("-f", "lavfi", "-i", "sine=frequency=330:duration=20", "-c:a", "flac", fs / "b-tone.flac")
+    ffmpeg("-f", "lavfi", "-i", "sine=frequency=220:duration=20", "-c:a", "libvorbis", fs / "c-tone.ogg")
+    a = App(h, fs, extra_env={"LANG": "C.UTF-8"})
+    a.wait(lambda s: s["count"] == 3, "listing")
+    a.key("space")
+    for name, kind in (("a-tone.mp3", "audio/mpeg"), ("b-tone.flac", "audio/flac"), ("c-tone.ogg", "audio/")):
+        s = a.wait(lambda s: preview_of(s).get("name") == name and preview_of(s)["state"] == "sound" and video_of(s).get("position", 0) > 0.3, f"{name} playing", timeout=10)
+        assert preview_of(s)["kind"].startswith(kind), s["preview"]
+        assert abs(video_of(s)["duration"] - 20) < 1, video_of(s)
+        if name == "a-tone.mp3":
+            a.shot("preview-sound")
+            a.key("p")
+            s = a.wait(lambda s: video_of(s).get("paused"), "paused")
+            at = video_of(s)["position"]
+            time.sleep(0.5)
+            assert abs(video_of(a.state())["position"] - at) < 0.05, "it stays paused"
+        a.key("Down")
+    assert a.alive()
+    a.close()
+
+
+@check
+def a_folder_says_what_it_holds(h):
+    fs = fresh_fs()
+    tree(fs, {"box/a": "x" * 1000, "box/.hidden": "y" * 10, "box/inner/b": "z" * 5000, "box/inner/deeper/c": "w" * 100, "empty": None})
+    a = App(h, fs, extra_env={"LANG": "C.UTF-8"})
+    a.wait(lambda s: s["count"] == 2, "listing")
+    a.key("space")
+    s = a.wait(lambda s: preview_of(s).get("name") == "box" and (preview_of(s).get("folder") or {}).get("done"), "counted")
+    assert preview_of(s)["folder"] == {"items": 3, "bytes": 6110, "done": True, "incomplete": False}, s["preview"]
+    assert preview_of(s)["kind"] == "inode/directory", s["preview"]
+    a.shot("preview-folder")
+    a.key("Down")
+    s = a.wait(lambda s: preview_of(s).get("name") == "empty" and (preview_of(s).get("folder") or {}).get("done"), "the empty one")
+    assert preview_of(s)["folder"]["items"] == 0
     a.close()
 
 
@@ -1472,7 +1594,7 @@ def the_preview_fills_its_window_through_a_folder(h):
     assert rect(s) == [0, 0, 960, 720], "the whole window"
     assert a.preview_window()[2:] == (960, 720), "as the window rule sized it"
     a.shot("static-wide")
-    for name, state in (("b-tall.png", "image"), ("c-small.png", "image"), ("d-notes.txt", "info")):
+    for name, state in (("b-tall.png", "image"), ("c-small.png", "image"), ("d-notes.txt", "text")):
         a.key("Down")
         s = a.wait(lambda s: preview_of(s).get("name") == name, f"moved to {name}")
         s = a.wait(lambda s: preview_of(s)["state"] == state, name)
@@ -1788,8 +1910,8 @@ def files_that_wont_play_say_why(h):
         s = a.wait(lambda s: preview_of(s).get("name") == name and preview_of(s)["state"] == "message", name, timeout=10)
         assert words in preview_of(s)["message"], s["preview"]
         a.key("Down")
-    # No picture, so it says what it is.
-    s = a.wait(lambda s: preview_of(s).get("name") == "c-sound-only.m4a" and preview_of(s)["state"] == "info", "sound only", timeout=10)
+    # No picture, so it plays as sound, and says what it is.
+    s = a.wait(lambda s: preview_of(s).get("name") == "c-sound-only.m4a" and preview_of(s)["state"] == "sound", "sound only", timeout=10)
     assert preview_of(s)["kind"].startswith("audio/"), s["preview"]
     assert a.alive()
     a.close()

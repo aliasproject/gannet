@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use gannet_core::foldersize::{self, Tally};
 use gannet_core::history::Stop;
 use gannet_core::listing::Stat;
 use gannet_core::mime::{self, MimeDb};
@@ -29,6 +30,8 @@ use xkbcommon::xkb::keysyms as k;
 use crate::app::{App, BTN_EXTRA, BTN_LEFT, BTN_SIDE, Cmd, Hit, Hub, Msg};
 use crate::canvas::{Canvas, Rect};
 use crate::decode;
+use crate::doc::{self, Doc};
+use crate::docview;
 use crate::format;
 use crate::icons::{self, Icon};
 use crate::media::{self, Ending, Frames, PlayState, Remote, Said, StartError};
@@ -54,12 +57,13 @@ const TITLE_H: f64 = 38.0;
 const FOOT_H: f64 = 32.0;
 
 const DAMAGED: &str = "This image can't be read. It may be damaged.";
+const DAMAGED_TEXT: &str = "This file can't be read as text";
 const TOO_LARGE: &str = "This image is too large to preview";
-const NO_BUBBLEWRAP: &str = "Video previews need bubblewrap, which isn't installed";
-const NO_MPV: &str = "Video previews need mpv, which isn't installed";
-const PLAYER_FAILED: &str = "The video player couldn't start";
-const NO_JAIL: &str = "Video previews couldn't start their sandbox";
-const CANT_PLAY: &str = "This video can't be played. It may be damaged.";
+const NO_BUBBLEWRAP: &str = "Playing video and sound needs bubblewrap, which isn't installed";
+const NO_MPV: &str = "Playing video and sound needs mpv, which isn't installed";
+const PLAYER_FAILED: &str = "The player couldn't start";
+const NO_JAIL: &str = "The player couldn't start its sandbox";
+const CANT_PLAY: &str = "This can't be played. It may be damaged.";
 const SANDBOX_STOPPED: &str = "The preview was stopped by its sandbox";
 const NO_SANDBOX: &str = "Previews are off: this system can't run the previewer safely";
 
@@ -69,6 +73,8 @@ pub struct ImageBuf {
     len: usize,
     pub w: u32,
     pub h: u32,
+    /// How long each frame shows, for an image that moves. Empty for a still one.
+    pub delays: Vec<Duration>,
 }
 
 // SAFETY: the mapping is read-only and sealed against shrinking, and only `Drop` unmaps it.
@@ -87,22 +93,72 @@ impl ImageBuf {
         }
         // SAFETY: a new read-only mapping of a sealed file, at an address the kernel chooses.
         let ptr = unsafe { mmap(std::ptr::null_mut(), len, ProtFlags::READ, MapFlags::SHARED, fd, 0) }.ok()?;
-        let mut image = Self { ptr, len, w: 0, h: 0 };
-        // SAFETY: `len` bytes are mapped, and at least `HEADER` of them exist.
-        let header = unsafe { std::slice::from_raw_parts(ptr as *const u8, decode::HEADER) };
-        if &header[..4] != decode::MAGIC {
+        // Unmapped again by `drop` if it turns out to be wrong.
+        let mut image = Self { ptr, len, w: 0, h: 0, delays: Vec::new() };
+        // SAFETY: `len` bytes are mapped until `image` is dropped, and at least `HEADER` exist.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+        let word = |at: usize| Some(u32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?));
+        image.w = word(4)?;
+        image.h = word(8)?;
+        let frame = (image.w as u64).checked_mul(image.h as u64)?.checked_mul(4)?;
+        let frames = match &bytes[..4] {
+            magic if magic == decode::MAGIC => 1,
+            magic if magic == decode::ANIMATION_MAGIC => {
+                let count = word(len.checked_sub(4)?)? as u64;
+                if !(2..=decode::MAX_FRAMES as u64).contains(&count) {
+                    return None;
+                }
+                count
+            }
+            _ => return None,
+        };
+        let pixels_end = frame.checked_mul(frames)?.checked_add(decode::HEADER as u64)?;
+        let want = if frames == 1 { pixels_end } else { pixels_end.checked_add(4 * frames + 4)? };
+        if image.w == 0 || image.h == 0 || want != len as u64 {
             return None;
         }
-        image.w = u32::from_ne_bytes(header[4..8].try_into().ok()?);
-        image.h = u32::from_ne_bytes(header[8..12].try_into().ok()?);
-        let want = (image.w as u64).checked_mul(image.h as u64)?.checked_mul(4)?.checked_add(decode::HEADER as u64)?;
-        (image.w > 0 && image.h > 0 && want == len as u64).then_some(image)
+        if frames > 1 {
+            image.delays = (0..frames as usize).map(|i| word(pixels_end as usize + i * 4).map(frame_delay)).collect::<Option<_>>()?;
+        }
+        Some(image)
     }
 
-    pub fn pixels(&self) -> &[u8] {
-        // SAFETY: mapped for `len` bytes until drop, and `from_memfd` checked the header fits.
-        unsafe { std::slice::from_raw_parts((self.ptr as *const u8).add(decode::HEADER), self.len - decode::HEADER) }
+    /// How many pictures it holds: one, or an animation's frames.
+    pub fn frames(&self) -> usize {
+        self.delays.len().max(1)
     }
+
+    /// The first frame, which is the whole of a still image.
+    pub fn pixels(&self) -> &[u8] {
+        self.frame(0)
+    }
+
+    pub fn frame(&self, index: usize) -> &[u8] {
+        let size = self.w as usize * self.h as usize * 4;
+        let start = decode::HEADER + index.min(self.frames() - 1) * size;
+        // SAFETY: mapped for `len` bytes until drop, and `from_memfd` checked every frame fits.
+        unsafe { std::slice::from_raw_parts((self.ptr as *const u8).add(start), size) }
+    }
+}
+
+#[cfg(test)]
+impl ImageBuf {
+    /// A 1×1 animation with these delays, as a decoder would write it.
+    pub fn animation_for_test(delays_ms: &[u32]) -> Self {
+        let mut out = decode::ANIMATION_MAGIC.to_vec();
+        for word in [1, 1].into_iter().chain(std::iter::repeat_n(0, delays_ms.len())).chain(delays_ms.iter().copied()).chain([delays_ms.len() as u32]) {
+            out.extend_from_slice(&word.to_ne_bytes());
+        }
+        let fd = memfd_create("test", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).unwrap();
+        rustix::io::write(&fd, &out).unwrap();
+        Self::from_memfd(&fd).unwrap()
+    }
+}
+
+/// How long a frame shows. Browsers show a frame asking for next to no time for a tenth of a
+/// second, and files are made to look right in them.
+fn frame_delay(ms: u32) -> Duration {
+    Duration::from_millis(if ms < 20 { 100 } else { ms.min(60_000) as u64 })
 }
 
 impl Drop for ImageBuf {
@@ -145,17 +201,25 @@ pub struct Info {
     pub modified: Option<i64>,
     /// A picture another program already made of it, if there is one.
     pub thumbnail: Option<Arc<ImageBuf>>,
+    /// For a folder, what's in it, once counting has started.
+    pub folder: Option<Tally>,
 }
 
 pub enum Found {
     Thumbnail(Arc<ImageBuf>),
     Info(Info),
+    /// How far counting a folder's contents has got.
+    Folder(Tally),
     Full { image: Arc<ImageBuf>, size: u64 },
     Message(String),
     Scaled { scale_gen: u64, w: i32, h: i32, rgba: Vec<u8> },
     VideoStarted { remote: Remote, frames: Frames },
     VideoFrame { index: usize, w: u32, h: u32 },
     VideoState(PlayState),
+    /// The player has no picture to show, but it's playing: this is what it's playing.
+    Sound(Info),
+    /// Text, or Markdown, ready to lay out.
+    Doc { doc: Doc, info: Info },
 }
 
 pub struct Event {
@@ -182,11 +246,12 @@ enum Waited {
 }
 
 impl Helper {
-    fn spawn(input: File) -> std::io::Result<Self> {
+    /// Decodes `input` as an image, or as a document with `mode` (see `decode::TEXT_ARG`).
+    fn spawn(input: File, mode: Option<&str>) -> std::io::Result<Self> {
         let output = memfd_create("gannet-preview", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
         // `/proc/self/exe` rather than a path: this binary, even if it's been upgraded since.
         let mut command = Command::new("/proc/self/exe");
-        command.arg(decode::ARG).env_clear().current_dir("/").stdin(Stdio::from(input));
+        command.arg(decode::ARG).args(mode).env_clear().current_dir("/").stdin(Stdio::from(input));
         Self::run(command, output)
     }
 
@@ -295,7 +360,13 @@ fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &Ow
     if let Ok(meta) = std::fs::metadata(path)
         && !meta.is_file()
     {
-        return Some(describe(at, &meta, None, None, cancel));
+        let found = describe(at, &meta, None, None, cancel);
+        if !meta.is_dir() {
+            return Some(found);
+        }
+        send(found);
+        let tally = foldersize::measure(path, &|| cancelled_within(cancel, Duration::ZERO), &mut |tally| send(Found::Folder(tally)))?;
+        return Some(Found::Folder(tally));
     }
     // Non-blocking so a FIFO swapped in since can't hang this on open. It's turned away just below.
     let file = match File::options().read(true).custom_flags(libc::O_NONBLOCK).open(path) {
@@ -311,7 +382,9 @@ fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &Ow
     // Read where it is rather than with `read`, which would move the decoder's starting point.
     let mut head = vec![0u8; mime::HEAD];
     let head = file.read_at(&mut head, 0).ok().map(|n| head[..n].to_vec());
-    let mut helper = match Helper::spawn(file) {
+    // Text goes to the decoder as text: no image starts out looking like it.
+    let mode = head.as_deref().filter(|h| !h.is_empty() && mime::looks_like_text(h)).map(|h| if is_markdown(at, h) { decode::MARKDOWN_ARG } else { decode::TEXT_ARG });
+    let mut helper = match Helper::spawn(file, mode) {
         Ok(h) => h,
         Err(_) => return message("The previewer couldn't start"),
     };
@@ -332,10 +405,24 @@ fn fetch(at: &Place, slow: Option<Duration>, video_size: (i32, i32), cancel: &Ow
         waited = helper.wait(cancel, DECODE_LIMIT);
     }
     let unsupported = || Some(describe(at, &meta, head.as_deref(), looked.clone(), cancel));
+    if mode.is_some()
+        && let Waited::Exited(status) = waited
+    {
+        // A zero byte past the part that was looked at means it isn't text after all.
+        return match (status.code(), read_doc(&helper.output)) {
+            (Some(0), Some(doc)) => match describe(at, &meta, head.as_deref(), Some(None), cancel) {
+                Found::Info(info) => Some(Found::Doc { doc, info }),
+                other => Some(other),
+            },
+            (Some(0), None) => message(DAMAGED_TEXT),
+            (Some(decode::EXIT_UNSUPPORTED), _) => unsupported(),
+            _ => answer(status, &helper.output, meta.len()).or_else(unsupported),
+        };
+    }
     match waited {
         Waited::Cancelled => None,
         Waited::TimedOut => message("This file is taking too long to read"),
-        Waited::Exited(status) if status.code() == Some(decode::EXIT_UNSUPPORTED) && head.as_deref().is_some_and(media::looks_like_video) => play_video(path, video_size, cancel, send, &|| describe(at, &meta, head.as_deref(), looked.clone(), cancel)),
+        Waited::Exited(status) if status.code() == Some(decode::EXIT_UNSUPPORTED) && playable(at, head.as_deref()) => play(path, video_size, cancel, send, &|| describe(at, &meta, head.as_deref(), looked.clone(), cancel)),
         Waited::Exited(status) => answer(status, &helper.output, meta.len()).or_else(unsupported),
     }
 }
@@ -367,7 +454,7 @@ fn describe(at: &Place, meta: &std::fs::Metadata, head: Option<&[u8]>, looked: O
         _ => None,
     };
     let size = kind.is_file().then_some(meta.len());
-    Found::Info(Info { mime: mime.to_string(), description, icon, size, modified: Some(meta.mtime()), thumbnail })
+    Found::Info(Info { mime: mime.to_string(), description, icon, size, modified: Some(meta.mtime()), thumbnail, folder: None })
 }
 
 /// Words for a type the database doesn't name, which is what an empty database gives.
@@ -403,15 +490,51 @@ fn icon_for(mime: &str, generic: &str, name: &[u8]) -> Icon {
     }
 }
 
-/// Plays a video until it's cancelled or something stops it. Returns the words to show if so.
-/// A file that turns out to have no picture gets `otherwise` instead.
-fn play_video(path: &Path, size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Found), otherwise: &dyn Fn() -> Found) -> Option<Found> {
+/// Markdown, by its name or by what the database says it is.
+fn is_markdown(at: &Place, head: &[u8]) -> bool {
+    let name = at.path.file_name().map_or(&b""[..], |n| n.as_encoded_bytes());
+    let lower = name.to_ascii_lowercase();
+    // The database may be missing, and these are what Markdown is called.
+    [&b".md"[..], b".markdown", b".mkd", b".mdown"].iter().any(|ext| lower.ends_with(ext)) || at.kinds.db().guess(name, Some(head)) == "text/markdown"
+}
+
+/// The document the decoder wrote, if it's all there and makes sense.
+fn read_doc(output: &OwnedFd) -> Option<doc::Doc> {
+    let len = usize::try_from(fstat(output).ok()?.st_size).ok()?;
+    if len > doc::MAX_ENCODED {
+        return None;
+    }
+    let mut bytes = vec![0u8; len];
+    let mut at = 0;
+    while at < len {
+        match rustix::io::pread(output, &mut bytes[at..], at as u64) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => at += n,
+        }
+    }
+    doc::decode(&bytes)
+}
+
+/// Whether the player should have a go at a file the image decoder doesn't know: one that starts
+/// like a video, or that the database says is sound or video.
+fn playable(at: &Place, head: Option<&[u8]>) -> bool {
+    if head.is_some_and(media::looks_like_video) {
+        return true;
+    }
+    let name = at.path.file_name().map_or(&b""[..], |n| n.as_encoded_bytes());
+    let mime = at.kinds.db().guess(name, head);
+    mime.starts_with("audio/") || mime.starts_with("video/")
+}
+
+/// Plays a video, or sound, until it's cancelled or something stops it. Returns the words to show
+/// if so. A file with no picture plays with `otherwise`'s description of it in the picture's place.
+fn play(path: &Path, size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Found), otherwise: &dyn Fn() -> Found) -> Option<Found> {
     let Ok(video) = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(path) else { return message("This file can't be read") };
     // It may have been swapped for something else since it was first looked at.
     if !video.metadata().is_ok_and(|m| m.is_file()) {
         return message("This file has changed. Look at it again to see what it is now.");
     }
-    let started = match media::start_jailed(video, size, &[media::ARG]) {
+    let started = match media::start_jailed(video, size, &[media::ARG], true) {
         Ok(started) => started,
         Err(StartError::NoBubblewrap) => return message(NO_BUBBLEWRAP),
         Err(StartError::Other) => return message(NO_JAIL),
@@ -424,6 +547,10 @@ fn play_video(path: &Path, size: (i32, i32), cancel: &OwnedFd, send: &dyn Fn(Fou
         Said::State(state) => send(Found::VideoState(state)),
         // Showing something else drops this job, and that stops the player.
         Said::NoVideo => send(otherwise()),
+        Said::Sound => send(match otherwise() {
+            Found::Info(info) => Found::Sound(info),
+            other => other,
+        }),
         Said::CantPlay => send(Found::Message(CANT_PLAY.to_string())),
     })?;
     match media::ending(status, hello) {
@@ -483,7 +610,7 @@ fn thumbnail(cache_home: &Path, path: &Path, mtime: i64, cancel: &OwnedFd) -> Op
             continue;
         }
         let Ok(input) = File::open(&candidate) else { continue };
-        let Ok(mut helper) = Helper::spawn(input) else { continue };
+        let Ok(mut helper) = Helper::spawn(input, None) else { continue };
         match helper.wait(cancel, THUMBNAIL_LIMIT) {
             Waited::Cancelled => return None,
             Waited::Exited(status) if status.success() => {
@@ -535,6 +662,7 @@ pub enum Content {
     Image { image: Arc<ImageBuf>, thumbnail: bool },
     Info(Info),
     Video(Video),
+    Doc { doc: Doc, info: Info },
     Message(String),
 }
 
@@ -545,6 +673,8 @@ pub struct Video {
     pub frame: Option<(usize, u32, u32)>,
     pub state: PlayState,
     pub frames_shown: u64,
+    /// Playing sound, with no picture: what's shown instead.
+    pub sound: Option<Info>,
     /// What was asked for stands until then, as reports on their way may be from before it.
     settled_at: Instant,
 }
@@ -589,6 +719,12 @@ pub struct Preview {
     pub zoom: Option<f64>,
     pub pan: (f64, f64),
     pub loading_shown: bool,
+    /// The frame of an animation that's showing, and when the next one is due.
+    pub frame: usize,
+    frame_at: Option<Instant>,
+    /// How far down a document is scrolled, in pixels, and where its lines go at this width.
+    pub scroll: f64,
+    pub doc_layout: Option<docview::Layout>,
     /// The size and time the listing has for this file, to notice it being overwritten.
     seen: Option<(u64, i64)>,
     scaled: Option<Scaled>,
@@ -729,6 +865,10 @@ impl App {
             zoom: None,
             pan: (0.0, 0.0),
             loading_shown: false,
+            frame: 0,
+            frame_at: None,
+            scroll: 0.0,
+            doc_layout: None,
             // Only the cursor's row is this file, and only once the listing has caught up.
             seen: if self.path_at_cursor().as_ref() == Some(&path) { self.stat_at_cursor() } else { None },
             scaled: None,
@@ -851,11 +991,28 @@ impl App {
         if self.preview.as_ref().is_some_and(|p| p.start_at.is_some_and(|t| t <= now)) {
             self.preview_start_job();
         }
+        self.preview_animate(now);
     }
 
     pub fn preview_deadline(&self) -> Option<Instant> {
         let p = self.preview.as_ref()?;
-        [p.start_at, p.loading_at].into_iter().flatten().min()
+        [p.start_at, p.loading_at, p.frame_at].into_iter().flatten().min()
+    }
+
+    /// Moves an animation on to the frame that's due.
+    fn preview_animate(&mut self, now: Instant) {
+        let area = self.preview_geometry().area;
+        let Some(p) = self.preview.as_mut() else { return };
+        let (Some(due), Content::Image { image, .. }) = (p.frame_at, &p.content) else { return };
+        if due > now || image.delays.is_empty() {
+            return;
+        }
+        p.frame = (p.frame + 1) % image.delays.len();
+        let next = due + image.delays[p.frame];
+        // Falling well behind, as after the machine slept, starts the timing again from now
+        // rather than racing through the frames it missed.
+        p.frame_at = Some(if next < now { now + image.delays[p.frame] } else { next });
+        self.invalidate(area);
     }
 
     pub fn on_preview(&mut self, e: Event) {
@@ -869,6 +1026,8 @@ impl App {
                 }
             }
             Found::Full { image, size } => {
+                p.frame = 0;
+                p.frame_at = image.delays.first().map(|d| Instant::now() + *d);
                 p.content = Content::Image { image, thumbnail: false };
                 p.size = Some(size);
                 p.loading_at = None;
@@ -881,9 +1040,30 @@ impl App {
                 p.job = None;
             }
             Found::Info(info) => {
+                // A folder's contents are still being counted.
+                if info.mime != mime::FOLDER {
+                    p.job = None;
+                }
                 p.content = Content::Info(info);
                 p.loading_at = None;
+            }
+            Found::Doc { doc, info } => {
+                p.content = Content::Doc { doc, info };
+                p.loading_at = None;
                 p.job = None;
+                if self.doc_fonts.is_none() {
+                    self.doc_fonts = Some(docview::Fonts::new(&self.text, self.scale, self.colors.dark, self.cache_home.as_deref()));
+                    let hub = self.hub.clone();
+                    docview::find_fonts(self.cache_home.clone(), move |role, path, index| hub.send(Msg::DocFont(role, path, index)));
+                }
+            }
+            Found::Folder(tally) => {
+                if let Content::Info(info) = &mut p.content {
+                    info.folder = Some(tally);
+                }
+                if tally.done {
+                    p.job = None;
+                }
             }
             Found::VideoStarted { remote, frames } => {
                 let area = self.preview_geometry().area;
@@ -893,7 +1073,7 @@ impl App {
                 remote.set_size(area.w.max(1), area.h.max(1));
                 // What it starts as, so a key pressed before it first reports does the right thing.
                 let state = PlayState { volume: 100.0, ..PlayState::default() };
-                p.content = Content::Video(Video { remote, frames, frame: None, state, frames_shown: 0, settled_at: Instant::now() });
+                p.content = Content::Video(Video { remote, frames, frame: None, state, frames_shown: 0, sound: None, settled_at: Instant::now() });
             }
             Found::VideoFrame { index, w, h } => {
                 if let Content::Video(video) = &mut p.content {
@@ -906,6 +1086,12 @@ impl App {
                         let area = self.preview_geometry().area;
                         return self.invalidate(area);
                     }
+                }
+            }
+            Found::Sound(info) => {
+                if let Content::Video(video) = &mut p.content {
+                    video.sound = Some(info);
+                    p.loading_at = None;
                 }
             }
             Found::VideoState(state) => {
@@ -989,7 +1175,8 @@ impl App {
         let Some(p) = self.preview.as_mut() else { return };
         let Content::Image { image, thumbnail: false } = &p.content else { return };
         let wanted = (view.dest.w, view.dest.h);
-        let smooth = worth_smoothing(&view);
+        // A smooth copy of every frame of an animation would cost far more than it's worth.
+        let smooth = worth_smoothing(&view) && image.frames() == 1;
         if p.scaled.as_ref().is_some_and(|s| (s.w, s.h) == wanted) || (p.scale_wanted == wanted && smooth) {
             return;
         }
@@ -1018,7 +1205,7 @@ impl App {
         if m.alt {
             return;
         }
-        if self.preview_video_key(sym, m) {
+        if self.preview_video_key(sym, m) || self.preview_doc_key(sym, m) {
             return;
         }
         let pan = self.px(80.0) as f64;
@@ -1245,7 +1432,7 @@ impl App {
         }
         let view = self.preview_view();
         let open = self.info_open_rect();
-        let Some(p) = self.preview.take() else { return };
+        let Some(mut p) = self.preview.take() else { return };
         let co = self.colors;
         c.fill(r, co.surface);
         c.fill(Rect::new(r.x, area.y - 1, r.w, 1), co.border);
@@ -1261,7 +1448,7 @@ impl App {
                 (Content::Image { image, .. }, Some(view)) => {
                     App::with_clip(c, area, |c| match &p.scaled {
                         Some(s) if (s.w, s.h) == (view.dest.w, view.dest.h) => c.image(&s.rgba, s.w, s.h, view.dest),
-                        _ => c.image(image.pixels(), image.w as i32, image.h as i32, view.dest),
+                        _ => c.image(image.frame(p.frame), image.w as i32, image.h as i32, view.dest),
                     });
                 }
                 (Content::Video(Video { frame: Some((index, w, h)), frames, .. }), _) => {
@@ -1269,10 +1456,16 @@ impl App {
                     let dest = place(area, *w, *h, scale, fit, (0.0, 0.0)).dest;
                     App::with_clip(c, area, |c| c.xrgb(frames.frame(*index, *w, *h), *w as i32, *h as i32, dest));
                 }
+                (Content::Video(Video { sound: Some(info), .. }), _) => self.paint_info(c, area, info, None),
+                // Drawn below, as laying it out changes the preview.
+                (Content::Doc { .. }, _) => {}
                 (Content::Message(text), _) => self.paint_center(c, area, text, co.muted),
                 (Content::Info(info), _) => self.paint_info(c, area, info, open),
                 _ if p.loading_shown => self.paint_center(c, area, "Loading…", co.muted),
                 _ => {}
+            }
+            if matches!(p.content, Content::Doc { .. }) {
+                self.paint_doc(c, area, &mut p);
             }
             let foot = match (&p.content, &view) {
                 (Content::Image { image, thumbnail: false }, Some(view)) => {
@@ -1281,6 +1474,12 @@ impl App {
                 }
                 (Content::Image { thumbnail: true, .. }, _) => "Loading the full image…".to_string(),
                 (Content::Info(info), _) => info.mime.clone(),
+                (Content::Doc { doc, info }, _) => {
+                    let lines = doc.lines();
+                    let lines = (lines > 0).then(|| format::count(lines, "line", "lines"));
+                    let cut = doc.cut.then(|| format!("showing the first {}", format::size(doc::TEXT_LIMIT as u64)));
+                    [Some(info.description.clone()), info.size.map(format::size), lines, cut].into_iter().flatten().collect::<Vec<_>>().join("  ·  ")
+                }
                 _ => String::new(),
             };
             let foot_y = self.baseline(area.bottom(), self.px(FOOT_H));
@@ -1298,9 +1497,88 @@ impl App {
     }
 }
 
+impl App {
+    /// Text or Markdown, laid out again if the window's width or the fonts have changed.
+    fn paint_doc(&mut self, c: &mut Canvas, area: Rect, p: &mut Preview) {
+        let Content::Doc { doc, .. } = &p.content else { return };
+        let Some(fonts) = self.doc_fonts.as_mut() else { return };
+        if !p.doc_layout.as_ref().is_some_and(|l| l.fits(area.w, fonts)) {
+            // Keeps the same part of it in view, as near as can be.
+            let along = p.doc_layout.as_ref().map_or(0.0, |l| p.scroll / l.height.max(1) as f64);
+            let layout = docview::lay_out(doc, area.w, fonts);
+            p.scroll = along * layout.height as f64;
+            p.doc_layout = Some(layout);
+        }
+        let Some(layout) = &p.doc_layout else { return };
+        p.scroll = p.scroll.clamp(0.0, (layout.height - area.h).max(0) as f64);
+        let co = self.colors;
+        let ink = docview::Ink { text: co.foreground, muted: co.muted, link: co.accent, code: co.surface, rule: co.border };
+        App::with_clip(c, area, |c| docview::paint(c, area, p.scroll as i32, layout, fonts, ink));
+    }
+
+    /// Scrolls a document by this much, if one's showing.
+    fn doc_scroll_by(&mut self, pixels: f64) {
+        let area = self.preview_geometry().area;
+        let Some(p) = self.preview.as_mut() else { return };
+        if !matches!(p.content, Content::Doc { .. }) {
+            return;
+        }
+        // Until it's been laid out, painting stops it at the end.
+        let most = p.doc_layout.as_ref().map_or(f64::MAX, |l| (l.height - area.h).max(0) as f64);
+        let next = (p.scroll + pixels).clamp(0.0, most);
+        if next != p.scroll {
+            p.scroll = next;
+            self.invalidate(area);
+        }
+    }
+
+    fn doc_line(&mut self) -> f64 {
+        let fallback = self.px(20.0) as f64;
+        self.doc_fonts.as_mut().map_or(fallback, docview::Layout::line_height)
+    }
+
+    /// The wheel: scrolls a document. Nothing else in the preview scrolls.
+    pub fn preview_scroll(&mut self, lines: f64, pixels: f64) {
+        let by = lines * 3.0 * self.doc_line() + pixels * self.scale;
+        self.doc_scroll_by(by);
+    }
+
+    /// Keys that move through a document. Arrows without Shift still go to other files.
+    fn preview_doc_key(&mut self, sym: u32, m: Mods) -> bool {
+        if !self.preview.as_ref().is_some_and(|p| matches!(p.content, Content::Doc { .. })) || m.ctrl {
+            return false;
+        }
+        let page = (self.preview_geometry().area.h as f64 - self.doc_line() * 2.0).max(self.doc_line());
+        let line = self.doc_line();
+        match sym {
+            k::KEY_Page_Down => self.doc_scroll_by(page),
+            k::KEY_Page_Up => self.doc_scroll_by(-page),
+            k::KEY_Down if m.shift => self.doc_scroll_by(line),
+            k::KEY_Up if m.shift => self.doc_scroll_by(-line),
+            k::KEY_Home => self.doc_scroll_by(f64::MIN),
+            k::KEY_End => self.doc_scroll_by(f64::MAX),
+            _ => return false,
+        }
+        true
+    }
+}
+
 /// A file's name as it's shown, or its whole path if it has none.
 fn display_name(path: &Path) -> String {
     path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
+}
+
+/// What a folder holds, as far as it's been counted.
+fn folder_contents(tally: Option<Tally>) -> String {
+    let Some(t) = tally else { return "Counting…".to_string() };
+    let items = format::count(t.items as usize, "item", "items");
+    let bytes = format::size(t.bytes);
+    match (t.done, t.incomplete) {
+        (false, _) => format!("{items}  ·  {bytes} so far…"),
+        (true, false) => format!("{items}  ·  {bytes} in all"),
+        // Some of it couldn't be read, so the real total is more.
+        (true, true) => format!("{items}  ·  at least {bytes}"),
+    }
 }
 
 /// Where the parts of the view for any file go.
@@ -1341,7 +1619,8 @@ impl App {
             None => self.icons.draw(c, info.icon, l.picture.x, l.picture.y, l.picture.w, co.muted),
         }
         let now = gannet_core::time::now();
-        let details: Vec<String> = [info.size.map(format::size), info.modified.map(|m| format!("Modified {}", format::date(m, now)))].into_iter().flatten().collect();
+        let contents = (info.mime == mime::FOLDER).then(|| folder_contents(info.folder));
+        let details: Vec<String> = [contents, info.size.map(format::size), info.modified.map(|m| format!("Modified {}", format::date(m, now)))].into_iter().flatten().collect();
         self.paint_line(c, l.lines[0], &info.description, co.foreground);
         self.paint_line(c, l.lines[1], &details.join("  ·  "), co.muted);
         if let Some(open) = open {
@@ -1567,19 +1846,27 @@ mod tests {
         assert!(std::env::var_os("GANNET_TEST_SANDBOX").is_some(), "run tests with scripts/test.sh");
         let dir = std::env::temp_dir().join(format!("gannet-test-describe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("folder")).unwrap();
+        std::fs::create_dir_all(dir.join("folder/inner")).unwrap();
+        std::fs::write(dir.join("folder/inner/a"), [0; 1234]).unwrap();
         let _socket = std::os::unix::net::UnixListener::bind(dir.join("socket")).unwrap();
         let kinds = Kinds::default();
         let cancel = event();
-        for (name, mime) in [("socket", "inode/socket"), ("folder", mime::FOLDER)] {
-            let path = dir.join(name);
-            let at = Place { path: &path, kinds: &kinds, cache_home: None };
-            match fetch(&at, None, (100, 100), &cancel, &|_| {}) {
-                Some(Found::Info(info)) => assert_eq!(info.mime, mime),
-                Some(Found::Message(m)) => panic!("{name}: {m}"),
-                _ => panic!("{name}: no answer"),
-            }
+        let socket = dir.join("socket");
+        let at = Place { path: &socket, kinds: &kinds, cache_home: None };
+        match fetch(&at, None, (100, 100), &cancel, &|_| {}) {
+            Some(Found::Info(info)) => assert_eq!(info.mime, "inode/socket"),
+            Some(Found::Message(m)) => panic!("socket: {m}"),
+            _ => panic!("socket: no answer"),
         }
+        // A folder is described first, then counted.
+        let folder = dir.join("folder");
+        let at = Place { path: &folder, kinds: &kinds, cache_home: None };
+        let sent = std::cell::RefCell::new(Vec::new());
+        match fetch(&at, None, (100, 100), &cancel, &|found| sent.borrow_mut().push(found)) {
+            Some(Found::Folder(tally)) => assert_eq!((tally.items, tally.bytes, tally.done), (1, 1234, true)),
+            _ => panic!("folder: no count"),
+        }
+        assert!(matches!(sent.borrow().first(), Some(Found::Info(info)) if info.mime == mime::FOLDER));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1644,6 +1931,39 @@ mod tests {
         assert!(ImageBuf::from_memfd(&memfd_with(&wrote(0, 0, &[]))).is_none());
         assert!(ImageBuf::from_memfd(&memfd_with(b"NOPE\0\0\0\0\0\0\0\0")).is_none());
         assert!(ImageBuf::from_memfd(&memfd_with(b"GN")).is_none());
+    }
+
+    fn animation(w: u32, h: u32, frames: &[u8], delays: &[u32], count: u32) -> Vec<u8> {
+        let mut out = decode::ANIMATION_MAGIC.to_vec();
+        for word in [w, h] {
+            out.extend_from_slice(&word.to_ne_bytes());
+        }
+        out.extend_from_slice(frames);
+        for word in delays.iter().chain([&count]) {
+            out.extend_from_slice(&word.to_ne_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn reads_an_animation_and_its_timing() {
+        let image = ImageBuf::from_memfd(&memfd_with(&animation(1, 1, &[1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3], &[50, 0, 250], 3))).unwrap();
+        assert_eq!(image.frames(), 3);
+        assert_eq!((image.frame(0), image.frame(2)), (&[1u8; 4][..], &[3u8; 4][..]));
+        assert_eq!(image.pixels(), image.frame(0));
+        // Next to no time reads as a tenth of a second, as in browsers.
+        assert_eq!(image.delays, [Duration::from_millis(50), Duration::from_millis(100), Duration::from_millis(250)]);
+        assert_eq!(image.frame(99), image.frame(2), "past the end is the last frame, not past the mapping");
+    }
+
+    #[test]
+    fn doesnt_believe_a_bad_animation() {
+        // A count that doesn't match, one frame, too many, and a count off the end.
+        assert!(ImageBuf::from_memfd(&memfd_with(&animation(1, 1, &[0; 8], &[10, 10], 3))).is_none());
+        assert!(ImageBuf::from_memfd(&memfd_with(&animation(1, 1, &[0; 4], &[10], 1))).is_none());
+        assert!(ImageBuf::from_memfd(&memfd_with(&animation(1, 1, &[0; 8], &[10, 10], decode::MAX_FRAMES + 1))).is_none());
+        assert!(ImageBuf::from_memfd(&memfd_with(&animation(u32::MAX, u32::MAX, &[0; 8], &[10, 10], 2))).is_none());
+        assert!(ImageBuf::from_memfd(&memfd_with(&decode::ANIMATION_MAGIC[..].repeat(3))).is_none());
     }
 
     #[test]

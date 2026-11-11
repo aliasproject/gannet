@@ -37,6 +37,8 @@ BUDGETS = [
     ("move 5,000 files to Trash", 1000, "ms"),
     ("Space to the preview window", 25, "ms"),
     ("Space to a 1600x1200 photo in the preview", 100, "ms"),
+    ("Space to 128 kB of text in the preview", 100, "ms"),
+    ("Space to 128 kB of Markdown in the preview", 150, "ms"),
 ]
 
 
@@ -290,6 +292,45 @@ def measure_preview(h, results, runs):
     results["Space to a 1600x1200 photo in the preview"] = median(image)
 
 
+def measure_preview_documents(h, results, runs):
+    """Space on a text file, and on a Markdown one, each longer than what's shown: until it's laid
+    out and drawn in the preview window."""
+    folder = DATA / "fixture-documents"
+    folder.mkdir(parents=True, exist_ok=True)
+    text = folder / "long.log"
+    if not text.exists():
+        text.write_bytes(b"".join(b"%06d some words in a line of a long log file, for the preview\n" % i for i in range(4000)))
+    markdown = folder / "long.md"
+    if not markdown.exists():
+        section = "## A heading\n\nSome *words* in a paragraph, with **bold** ones and `code`, going on long enough to wrap a few times across the window. " * 2 + "\n\n- an item\n- another, with [a link](https://example.com)\n\n```\nlet code = 1;\n```\n\n"
+        markdown.write_text(section * (200_000 // len(section)))
+    state = Path("/tmp/gnbench-client/documents-state.json")
+    shown = Path(str(state) + ".preview")
+    log, env = log_env(h, "documents", {"GANNET_STATE": str(state)})
+    for path, label in ((text, "Space to 128 kB of text in the preview"), (markdown, "Space to 128 kB of Markdown in the preview")):
+        times = []
+        for _ in range(runs):
+            shown.unlink(missing_ok=True)
+            p = subprocess.Popen([str(BENCH), str(path)], env=env, stderr=subprocess.DEVNULL)
+            h.wait_window(30)
+            wait_log(log, "rows")
+            time.sleep(0.2)
+            t0 = time.monotonic()
+            key(env, "space")
+            end = time.monotonic() + 10
+            while time.monotonic() < end:
+                try:
+                    if ((json.loads(shown.read_text()).get("preview") or {}).get("doc") or {}).get("lines", 0) > 0:
+                        break
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.001)
+            times.append((time.monotonic() - t0) * 1000)
+            stop(p)
+            time.sleep(0.3)
+        results[label] = median(times)
+
+
 def measure_copy(results):
     src = DATA / "copy-1g.bin"
     if not src.exists() or src.stat().st_size != 1 << 30:
@@ -392,6 +433,7 @@ def main():
         measure_stall(h, results)
         measure_theme(h, results, a.runs)
         measure_preview(h, results, a.runs)
+        measure_preview_documents(h, results, a.runs)
     finally:
         h.stop()
     h = Headless("/tmp/gnbench-h", "3840x2160")

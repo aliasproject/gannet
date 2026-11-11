@@ -47,6 +47,8 @@ Gannet also has a set of performance budgets, which `bench/run.py` checks:
 | Moving 5,000 files to Trash | 1,000 ms | 216 ms |
 | Space to the preview window | 25 ms | 6.5 ms |
 | Space to a 1600x1200 photo in the preview | 100 ms | 11.1 ms |
+| Space to 128 kB of text in the preview | 100 ms | 25.6 ms |
+| Space to 128 kB of Markdown in the preview | 150 ms | 25.8 ms |
 | Idle wakeups | 1 per second | 0 |
 
 To run them yourself, see [bench/README.md](bench/README.md).
@@ -173,12 +175,20 @@ closes only the preview, and the list says so. Its app ID is `com.aliasproject.G
 for window rules: on aliasOS it floats over the list. Elsewhere, add a rule to float it if you
 like; without one, it opens beside the list like any other window.
 
-Images are PNG, JPEG, WebP, GIF (its first frame), BMP, TIFF and ICO. If another program has
-already made a thumbnail, it shows until the full image is ready.
+Images are PNG, JPEG, WebP, GIF, BMP, TIFF and ICO. GIFs, animated WebPs and animated PNGs
+move. If another program has already made a thumbnail, it shows until the full image is ready.
 
-Videos play with sound, using libmpv. P or Enter pauses, Shift+Left and Shift+Right seek,
+Videos and sound play using libmpv. P or Enter pauses, Shift+Left and Shift+Right seek,
 Shift+Up and Shift+Down set the volume, and M mutes. Clicking the picture pauses, and the
-footer has the same controls for the mouse.
+footer has the same controls for the mouse. Sound shows what the file is while it plays.
+
+Text shows the first 128 KiB of the file, cut at the end of a line, and Markdown is shown
+formatted. A file with a zero byte in its first 8,000 bytes isn't text. Page Up, Page Down,
+Home, End, Shift+Up, Shift+Down and the mouse wheel scroll it.
+
+Folders show how many items they hold and their total size, counted in the background. Like
+`du`, the count doesn't follow symlinks or go onto other disks, and a file with several hard
+links counts once.
 
 Anything else shows what it is, from the system's file type database (shared-mime-info): its
 icon, or a thumbnail another program made, its type ("PDF document"), size and date, and an
@@ -190,13 +200,14 @@ name doesn't say.
 Files you preview may have come from anywhere, so the code that reads them runs apart from
 the app.
 
-**Images** decode in a separate process, one per file, with limits on its memory and CPU time.
+**Images, text and Markdown** are read in a separate process, one per file, with limits on its
+memory and CPU time.
 A seccomp sandbox stops that process opening or looking up files, making network connections,
 starting programs or making memory executable, and it won't decode if the sandbox can't be set
 up. It can still read the one file it was given and write its one output. Stopping a preview
 kills that process.
 
-**Videos** play in a bubblewrap jail with no home folder, no network, no `/proc` and read-only
+**Videos and sound** play in a bubblewrap jail with no home folder, no network, no `/proc` and read-only
 system files, under a seccomp filter that stops it starting programs, creating processes or
 asking for executable memory. The player can read the one video and system files, run the code
 already loaded, draw its frames, write to its own temporary folder, and use the sound socket.

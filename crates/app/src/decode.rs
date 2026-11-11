@@ -9,12 +9,19 @@ use std::fs::File;
 use std::io::{BufReader, Read, Seek, Write};
 use std::os::fd::FromRawFd;
 
+use crate::doc;
+use image::codecs::gif::GifDecoder;
+use image::codecs::png::PngDecoder;
+use image::codecs::webp::WebPDecoder;
 use image::error::ImageError;
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageReader, Limits};
+use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 
 /// The argument that makes this program a decoder rather than a window.
 pub const ARG: &str = "--preview-helper";
+/// After `ARG`: read the file as text, or as Markdown, rather than as an image.
+pub const TEXT_ARG: &str = "text";
+pub const MARKDOWN_ARG: &str = "markdown";
 
 pub const EXIT_UNSUPPORTED: i32 = 3;
 pub const EXIT_DAMAGED: i32 = 4;
@@ -24,6 +31,13 @@ pub const EXIT_NO_SANDBOX: i32 = 6;
 /// What comes before the pixels: `MAGIC`, then width and height as native-endian `u32`s.
 pub const MAGIC: &[u8; 4] = b"GNPV";
 pub const HEADER: usize = 12;
+/// An animation starts with this in `MAGIC`'s place, then the same width and height. Its frames
+/// follow one after another, whole, then each one's time on screen in milliseconds, then how many
+/// frames there are, all as native-endian `u32`s.
+pub const ANIMATION_MAGIC: &[u8; 4] = b"GNPA";
+/// More than this and an animation is cut short, as it is when all its frames would come to more
+/// pixels than one image may have.
+pub const MAX_FRAMES: u32 = 2000;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 /// Past this, a photo is a poster scan or a trap. At 4 bytes a pixel, this is 600 MB.
@@ -40,13 +54,18 @@ pub enum Failure {
     TooLarge,
 }
 
-pub fn helper_main() -> ! {
+pub fn helper_main(mode: Option<&str>) -> ! {
     if !lock_down() {
         std::process::exit(EXIT_NO_SANDBOX);
     }
     // SAFETY: the app gave us these three descriptors, and nothing else here uses them.
     let (input, output) = unsafe { (File::from_raw_fd(0), File::from_raw_fd(1)) };
-    std::process::exit(match decode(input, output) {
+    let done = match mode {
+        Some(TEXT_ARG) => document(input, output, false),
+        Some(MARKDOWN_ARG) => document(input, output, true),
+        _ => decode(input, output),
+    };
+    std::process::exit(match done {
         Ok(()) => 0,
         Err(Failure::Unsupported) => EXIT_UNSUPPORTED,
         Err(Failure::Damaged) => EXIT_DAMAGED,
@@ -80,7 +99,7 @@ fn lock_down() -> bool {
         && limit(libc::RLIMIT_NOFILE, 3)
         && limit(libc::RLIMIT_AS, MAX_ADDRESS_SPACE)
         && limit(libc::RLIMIT_CPU, MAX_CPU_SECONDS)
-        && limit(libc::RLIMIT_FSIZE, MAX_PIXELS * 4 + HEADER as u64)
+        && limit(libc::RLIMIT_FSIZE, MAX_PIXELS * 4 + HEADER as u64 + 4 * (MAX_FRAMES as u64 + 1))
         && limit(libc::RLIMIT_CORE, 0)
         // Last, as it forbids almost everything above.
         && sandbox::enter()
@@ -406,17 +425,37 @@ fn classify(e: ImageError) -> Failure {
     }
 }
 
-/// Decodes any image `input` holds, upright, and writes it out as straight RGBA.
-pub fn decode(input: impl Read + Seek, mut output: impl Write) -> Result<(), Failure> {
-    let mut reader = ImageReader::new(BufReader::new(input)).with_guessed_format().map_err(|_| Failure::Damaged)?;
-    if reader.format().is_none() {
-        return Err(Failure::Unsupported);
-    }
+/// Reads the start of a text file and writes it out as a document, laid out as Markdown or as it
+/// is. A file with a zero byte near the start isn't text, which is `Unsupported`.
+pub fn document(input: impl Read, mut output: impl Write, markdown: bool) -> Result<(), Failure> {
+    let mut raw = Vec::with_capacity(doc::TEXT_LIMIT + 1);
+    // One byte past the limit says whether there's more.
+    input.take(doc::TEXT_LIMIT as u64 + 1).read_to_end(&mut raw).map_err(|_| Failure::Damaged)?;
+    let (text, cut) = doc::excerpt(&raw).ok_or(Failure::Unsupported)?;
+    let doc = if markdown { doc::markdown(&text, cut) } else { doc::plain(text, cut) };
+    output.write_all(&doc::encode(&doc)).map_err(|_| Failure::TooLarge)
+}
+
+fn limits() -> Limits {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_SIDE);
     limits.max_image_height = Some(MAX_SIDE);
     limits.max_alloc = Some(MAX_ALLOC);
-    reader.limits(limits);
+    limits
+}
+
+/// Decodes any image `input` holds, upright, and writes it out as straight RGBA. One that moves
+/// is written as an animation.
+pub fn decode<R: Read + Seek>(input: R, mut output: impl Write) -> Result<(), Failure> {
+    let reader = ImageReader::new(BufReader::new(input)).with_guessed_format().map_err(|_| Failure::Damaged)?;
+    let Some(format) = reader.format() else { return Err(Failure::Unsupported) };
+    let mut input = reader.into_inner();
+    if let Some(frames) = animation(format, &mut input)? {
+        return write_animation(frames, &mut output);
+    }
+    input.rewind().map_err(|_| Failure::Damaged)?;
+    let mut reader = ImageReader::with_format(input, format);
+    reader.limits(limits());
     let mut decoder = reader.into_decoder().map_err(classify)?;
     let (w, h) = decoder.dimensions();
     if w as u64 * h as u64 > MAX_PIXELS {
@@ -433,6 +472,86 @@ pub fn decode(input: impl Read + Seek, mut output: impl Write) -> Result<(), Fai
     output.write_all(&header).map_err(|_| Failure::TooLarge)?;
     output.write_all(rgba.as_raw()).map_err(|_| Failure::TooLarge)?;
     Ok(())
+}
+
+/// The frames of an image that moves, or `None` if it's a still one. Leaves `input` somewhere to
+/// rewind from either way.
+fn animation<'a, R: Read + Seek + 'a>(format: ImageFormat, input: &'a mut BufReader<R>) -> Result<Option<image::Frames<'a>>, Failure> {
+    input.rewind().map_err(|_| Failure::Damaged)?;
+    let frames = match format {
+        // Every GIF can move. One with a single frame is written as one anyway, which costs nothing.
+        ImageFormat::Gif => {
+            let mut decoder = GifDecoder::new(input).map_err(classify)?;
+            decoder.set_limits(limits()).map_err(classify)?;
+            decoder.into_frames()
+        }
+        ImageFormat::WebP => {
+            let mut decoder = WebPDecoder::new(input).map_err(classify)?;
+            if !decoder.has_animation() {
+                return Ok(None);
+            }
+            decoder.set_limits(limits()).map_err(classify)?;
+            decoder.into_frames()
+        }
+        ImageFormat::Png => {
+            let mut decoder = PngDecoder::new(input).map_err(classify)?;
+            if !decoder.is_apng().map_err(classify)? {
+                return Ok(None);
+            }
+            decoder.set_limits(limits()).map_err(classify)?;
+            decoder.apng().map_err(classify)?.into_frames()
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(frames))
+}
+
+/// Writes frames out as they're decoded, so no more than two are ever held here. A frame that fails
+/// after the first ends the animation there, which shows what could be read, and one that turns out
+/// to have a single frame is written as a still image.
+fn write_animation(frames: image::Frames, output: &mut impl Write) -> Result<(), Failure> {
+    let header = |magic: &[u8; 4], w: u32, h: u32| [&magic[..], &w.to_ne_bytes(), &h.to_ne_bytes()].concat();
+    let mut first: Option<image::RgbaImage> = None;
+    let mut delays: Vec<u32> = Vec::new();
+    let mut pixels = 0u64;
+    for frame in frames {
+        let frame = match frame {
+            Ok(frame) => frame,
+            Err(e) if first.is_none() => return Err(classify(e)),
+            Err(_) => break,
+        };
+        let (numerator, denominator) = frame.delay().numer_denom_ms();
+        let buffer = frame.into_buffer();
+        let (w, h) = buffer.dimensions();
+        let Some(held) = &first else {
+            if w == 0 || h == 0 || w as u64 * h as u64 > MAX_PIXELS {
+                return Err(Failure::TooLarge);
+            }
+            pixels = w as u64 * h as u64;
+            delays.push(numerator.checked_div(denominator).unwrap_or(0));
+            first = Some(buffer);
+            continue;
+        };
+        if buffer.dimensions() != held.dimensions() || delays.len() as u32 >= MAX_FRAMES || pixels + w as u64 * h as u64 > MAX_PIXELS {
+            break;
+        }
+        // The second frame: it moves, so the first goes out as an animation's.
+        if delays.len() == 1 {
+            output.write_all(&header(ANIMATION_MAGIC, w, h)).map_err(|_| Failure::TooLarge)?;
+            output.write_all(held.as_raw()).map_err(|_| Failure::TooLarge)?;
+        }
+        pixels += w as u64 * h as u64;
+        output.write_all(buffer.as_raw()).map_err(|_| Failure::TooLarge)?;
+        delays.push(numerator.checked_div(denominator).unwrap_or(0));
+    }
+    let Some(first) = first else { return Err(Failure::Damaged) };
+    if delays.len() == 1 {
+        output.write_all(&header(MAGIC, first.width(), first.height())).map_err(|_| Failure::TooLarge)?;
+        return output.write_all(first.as_raw()).map_err(|_| Failure::TooLarge);
+    }
+    let mut trailer: Vec<u8> = delays.iter().flat_map(|d| d.to_ne_bytes()).collect();
+    trailer.extend_from_slice(&(delays.len() as u32).to_ne_bytes());
+    output.write_all(&trailer).map_err(|_| Failure::TooLarge)
 }
 
 #[cfg(test)]
@@ -475,6 +594,54 @@ mod tests {
             let (w, h, _) = run(&encoded(&two_by_one(), format)).unwrap_or_else(|e| panic!("{format:?}: {e:?}"));
             assert_eq!((w, h), (2, 1), "{format:?}");
         }
+    }
+
+    fn gif(frames: &[(u8, u32)]) -> Vec<u8> {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        let mut out = Vec::new();
+        {
+            let mut encoder = GifEncoder::new(&mut out);
+            encoder.set_repeat(Repeat::Infinite).unwrap();
+            for &(shade, ms) in frames {
+                let buffer = RgbaImage::from_pixel(3, 2, image::Rgba([shade, 0, 0, 255]));
+                encoder.encode_frame(image::Frame::from_parts(buffer, 0, 0, image::Delay::from_numer_denom_ms(ms, 1))).unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_gif_that_moves_comes_out_frame_by_frame_with_its_timing() {
+        let mut out = Vec::new();
+        decode(Cursor::new(gif(&[(255, 100), (128, 250), (0, 40)])), &mut out).unwrap();
+        assert_eq!(&out[..4], ANIMATION_MAGIC);
+        let word = |at: usize| u32::from_ne_bytes(out[at..at + 4].try_into().unwrap());
+        assert_eq!((word(4), word(8)), (3, 2));
+        let frame = 3 * 2 * 4;
+        assert_eq!(word(out.len() - 4), 3);
+        assert_eq!(out.len(), HEADER + 3 * frame + 3 * 4 + 4);
+        let delays = HEADER + 3 * frame;
+        assert_eq!([word(delays), word(delays + 4), word(delays + 8)], [100, 250, 40]);
+        // Each frame whole, in order.
+        assert_eq!([out[HEADER], out[HEADER + frame], out[HEADER + 2 * frame]], [255, 128, 0]);
+    }
+
+    #[test]
+    fn text_comes_out_as_a_document_and_binary_doesnt() {
+        let mut out = Vec::new();
+        document(&b"# Hi\n\nthere\n"[..], &mut out, true).unwrap();
+        let doc = crate::doc::decode(&out).unwrap();
+        assert_eq!((doc.blocks.len(), doc.cut), (2, false));
+        let mut out = Vec::new();
+        document(&b"# Hi\n"[..], &mut out, false).unwrap();
+        assert_eq!(crate::doc::decode(&out).unwrap().blocks[0].kind, crate::doc::Kind::Plain, "as it is, not as Markdown");
+        assert_eq!(document(&b"\x7fELF\x02\x01\x01\0\0\0"[..], &mut Vec::new(), false), Err(Failure::Unsupported));
+    }
+
+    #[test]
+    fn a_gif_with_one_frame_is_a_still_image() {
+        let (w, h, px) = run(&gif(&[(200, 100)])).unwrap();
+        assert_eq!((w, h, px[0]), (3, 2, 200));
     }
 
     /// A JPEG whose EXIF says to turn it a quarter clockwise, the way phones save portraits.
@@ -547,8 +714,16 @@ mod tests {
         let jpeg = sideways_jpeg();
         let others: Vec<Vec<u8>> = [image::ImageFormat::Gif, image::ImageFormat::WebP, image::ImageFormat::Bmp, image::ImageFormat::Tiff, image::ImageFormat::Ico].map(|f| encoded(&two_by_one(), f)).into();
         let big = encoded(&RgbaImage::from_raw(4000, 4000, vec![9u8; 4000 * 4000 * 4]).unwrap(), image::ImageFormat::Png);
+        let moving = gif(&[(1, 50), (2, 50)]);
+        let markdown = "# Title\n\n- *one*\n- [two](x)\n\n```\ncode\n```\n".repeat(4000);
         assert!(sandbox::enter());
         if what == "decode" {
+            decode(Cursor::new(&moving), &mut Vec::new()).unwrap();
+            for as_markdown in [false, true] {
+                let mut out = Vec::new();
+                document(markdown.as_bytes(), &mut out, as_markdown).unwrap();
+                assert!(crate::doc::decode(&out).is_some_and(|d| d.cut));
+            }
             run(&png).unwrap();
             run(&jpeg).unwrap();
             others.iter().for_each(|other| drop(run(other).unwrap()));
