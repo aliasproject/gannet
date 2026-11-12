@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use swash::zeno::{Cap, Format, Join, Mask, Stroke, Transform};
+use swash::zeno::{Cap, Fill, Format, Join, Mask, Stroke, Transform};
 
 use crate::canvas::Canvas;
 
@@ -46,7 +46,7 @@ fn path_of(i: Icon) -> &'static str {
         Icon::File => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h10v1h-10ZM3 11h10v1h-10ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
         Icon::FileLink => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h6v1h-6ZM10 8h3v1h-3ZM3 9h6v1h-6ZM11 9h2v1h-2ZM3 10h2v1h-2ZM12 10h1v1h-1ZM3 11h2v1h-2ZM12 11h1v1h-1ZM3 12h6v1h-6ZM11 12h2v1h-2ZM3 13h6v1h-6ZM10 13h3v1h-3ZM3 14h10v1h-10Z",
         Icon::Image => "M1 2h14v1h-14ZM1 3h1v1h-1ZM14 3h1v1h-1ZM1 4h1v1h-1ZM10 4h2v1h-2ZM14 4h1v1h-1ZM1 5h1v1h-1ZM10 5h2v1h-2ZM14 5h1v1h-1ZM1 6h1v1h-1ZM14 6h1v1h-1ZM1 7h1v1h-1ZM14 7h1v1h-1ZM1 8h1v1h-1ZM5 8h1v1h-1ZM14 8h1v1h-1ZM1 9h1v1h-1ZM4 9h3v1h-3ZM10 9h1v1h-1ZM14 9h1v1h-1ZM1 10h1v1h-1ZM3 10h5v1h-5ZM9 10h3v1h-3ZM14 10h1v1h-1ZM1 11h14v1h-14ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
-        Icon::Video => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h5v1h-5ZM7 4h8v1h-8ZM1 5h5v1h-5ZM8 5h7v1h-7ZM1 6h5v1h-5ZM9 6h6v1h-6ZM1 7h5v1h-5ZM10 7h5v1h-5ZM1 8h5v1h-5ZM10 8h5v1h-5ZM1 9h5v1h-5ZM9 9h6v1h-6ZM1 10h5v1h-5ZM8 10h7v1h-7ZM1 11h5v1h-5ZM7 11h8v1h-8ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
+        Icon::Video => "M3 2h10a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2ZM6 5v6l5-3Z",
         Icon::Audio => "M6 4.25 14 1.75v1.75L7 5.7V12.5H6V4.25ZM13 3h1v8.5h-1ZM2.25 12.5a2.25 2.25 0 0 1 4.5 0a2.25 2.25 0 0 1-4.5 0ZM9.25 11.5a2.25 2.25 0 0 1 4.5 0a2.25 2.25 0 0 1-4.5 0Z",
         Icon::Archive => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h14v1h-14ZM2 6h12v1h-12ZM2 7h12v1h-12ZM2 8h4v1h-4ZM10 8h4v1h-4ZM2 9h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12ZM2 12h12v1h-12ZM2 13h12v1h-12Z",
         Icon::Code => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h3v1h-3ZM7 8h2v1h-2ZM10 8h3v1h-3ZM3 9h2v1h-2ZM6 9h4v1h-4ZM11 9h2v1h-2ZM3 10h1v1h-1ZM5 10h6v1h-6ZM12 10h1v1h-1ZM3 11h2v1h-2ZM6 11h4v1h-4ZM11 11h2v1h-2ZM3 12h3v1h-3ZM7 12h2v1h-2ZM10 12h3v1h-3ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
@@ -58,7 +58,7 @@ fn path_of(i: Icon) -> &'static str {
         // Lucide's chevron-up.
         Icon::Up => "M18 15l-6-6-6 6",
         Icon::Home => "M7 1h2v1h-2ZM6 2h4v1h-4ZM5 3h6v1h-6ZM4 4h8v1h-8ZM3 5h10v1h-10ZM2 6h12v1h-12ZM1 7h14v1h-14ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h3v1h-3ZM10 10h3v1h-3ZM3 11h3v1h-3ZM10 11h3v1h-3ZM3 12h3v1h-3ZM10 12h3v1h-3ZM3 13h3v1h-3ZM10 13h3v1h-3ZM3 14h3v1h-3ZM10 14h3v1h-3Z",
-        Icon::Trash => "M6 1h4v1h-4ZM2 2h12v1h-12ZM2 3h12v1h-12ZM4 5h8v1h-8ZM4 6h8v1h-8ZM4 7h2v1h-2ZM7 7h2v1h-2ZM10 7h2v1h-2ZM4 8h2v1h-2ZM7 8h2v1h-2ZM10 8h2v1h-2ZM4 9h2v1h-2ZM7 9h2v1h-2ZM10 9h2v1h-2ZM4 10h2v1h-2ZM7 10h2v1h-2ZM10 10h2v1h-2ZM4 11h2v1h-2ZM7 11h2v1h-2ZM10 11h2v1h-2ZM4 12h2v1h-2ZM7 12h2v1h-2ZM10 12h2v1h-2ZM4 13h8v1h-8ZM4 14h8v1h-8Z",
+        Icon::Trash => "M6 1h4v1h4v2H2V2h4ZM3.5 5h9l-.8 8.6a1.5 1.5 0 0 1-1.5 1.4H5.8a1.5 1.5 0 0 1-1.5-1.4ZM6 7v5h1V7ZM9 7v5h1V7Z",
         // Lucide's hard-drive.
         Icon::Disk => "M22 12L2 12M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11zM6 16L6.01 16M10 16L10.01 16",
         Icon::Eject => "M7 3h2v1h-2ZM6 4h4v1h-4ZM5 5h6v1h-6ZM4 6h8v1h-8ZM3 7h10v1h-10ZM2 8h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12Z",
@@ -112,6 +112,11 @@ impl Icons {
             stroke.cap(Cap::Round).join(Join::Round);
             if stroked(icon) {
                 mask.style(stroke);
+            } else if icon != Icon::Audio {
+                // A shape inside another is a hole, like video's play button and the can's slits.
+                // Music is drawn from overlapping parts, its heads over its stems, which this
+                // would cut away, so it's filled as drawn.
+                mask.style(Fill::EvenOdd);
             }
             let (data, _) = mask.size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
             (data, size)
@@ -170,12 +175,12 @@ mod tests {
         }
     }
 
-    /// Icons are sharp at the size they're drawn, and at twice it: every pixel is fully on or
-    /// fully off, with nothing smoothed in between to blur them.
+    /// The pixel-drawn icons are sharp at the size they're drawn, and at twice it: every pixel is
+    /// fully on or fully off. (Music, video, the can and Lucide's outlines have smoothed curves.)
     #[test]
     fn icons_are_whole_pixels() {
         use Icon::*;
-        for i in [Folder, FolderLink, File, FileLink, Image, Video, Archive, Code, Document, Home, Trash, Eject, Download, Close] {
+        for i in [Folder, FolderLink, File, FileLink, Image, Archive, Code, Document, Home, Eject, Download, Close] {
             for times in [1, 2] {
                 let size = grid_of(i) as i32 * times;
                 let mut px = vec![0u32; (size * size) as usize];
