@@ -49,8 +49,8 @@ impl Doing {
 }
 
 /// Follows udisks2 on the system bus at `address`, sending `Msg::Volumes` with what's there now,
-/// and again whenever it changes. Without udisks2, or a system bus, it gives up quietly, and the
-/// sidebar keeps the disks it found mounted.
+/// and again whenever it changes. Without a system bus it gives up quietly. Without udisks2, its
+/// drives leave the sidebar, though anything mounted still shows as a mount.
 pub fn watch(hub: Hub, address: String) {
     let _ = std::thread::Builder::new().name("gannet-drives".into()).spawn(move || {
         let Ok(bus) = Bus::connect_with_limit(&address, CONNECT_LIMIT) else { return };

@@ -2023,7 +2023,8 @@ impl App {
     /// shown, so the window goes home.
     fn set_volumes(&mut self, volumes: Vec<Volume>) {
         let mounts = gannet_core::mounts::read_mounts();
-        let gone = self.volumes.iter().filter_map(|v| v.mount.clone()).find(|m| self.dir.starts_with(m) && !volumes.iter().any(|v| v.mount.as_ref() == Some(m)));
+        // Gone means unmounted, not just out of udisks2's list, which empties if udisks2 stops.
+        let gone = self.volumes.iter().filter_map(|v| v.mount.clone()).find(|m| self.dir.starts_with(m) && !volumes.iter().any(|v| v.mount.as_ref() == Some(m)) && !mounts.iter().any(|x| x.point == *m));
         // The drive whose passphrase is being asked for has gone.
         if let Some(Dialog::Unlock { volume, waiting: false, .. }) = &self.dialog
             && !volumes.iter().any(|v| v.block == volume.block)
@@ -6031,6 +6032,19 @@ mod tests {
         let photos = stick(&r, Some("PHOTOS"), Some(&mount), false);
         r.app.on_msg(Msg::DiskDone { volume: photos, doing: Doing::Eject, result: Err(DiskError::Cancelled) });
         assert!(r.app.notices.is_empty(), "the user said no to polkit, and knows: {:?}", r.app.notices);
+    }
+
+    #[test]
+    fn udisks_stopping_doesnt_send_the_window_off_a_drive_still_mounted() {
+        let mut r = drive_rig("drives-udisks-gone");
+        // A folder that's really a mount point, as the sandbox's own are.
+        let mounts = gannet_core::mounts::read_mounts();
+        let Some(mounted) = mounts.iter().map(|m| m.point.clone()).find(|p| p != Path::new("/") && std::fs::read_dir(p).is_ok()) else { return };
+        let v = stick(&r, Some("STILL"), Some(&mounted), false);
+        r.app.on_msg(Msg::Volumes(vec![v]));
+        r.app.navigate(mounted.clone(), None);
+        r.app.on_msg(Msg::Volumes(vec![]));
+        assert_eq!(r.app.dir, mounted, "still mounted, so it stays");
     }
 
     #[test]

@@ -366,21 +366,22 @@ impl Udisks {
         let cleartext: OwnedObjectPath = self.call(&volume.block, "Encrypted", "Unlock", &(passphrase, options()), true)?;
         // The contents' filesystem can take a moment to show up after the unlock returns.
         let mut tries = 0;
-        loop {
+        let mounted = loop {
             match self.mount_block(cleartext.as_str()) {
                 Err(DiskError::Changed) if tries < 20 => {
                     tries += 1;
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                // Something other than a filesystem inside, like LVM: there's nothing here to open,
-                // so it's locked again rather than left open with no way to lock it.
-                Err(DiskError::Changed) => {
-                    let _ = self.call::<()>(&volume.block, "Encrypted", "Lock", &(options(),), false);
-                    return Err(DiskError::Other("there's nothing on it that can be opened".into()));
-                }
-                other => return other,
+                // Something other than a filesystem inside, like LVM: there's nothing here to open.
+                Err(DiskError::Changed) => break Err(DiskError::Other("there's nothing on it that can be opened".into())),
+                other => break other,
             }
+        };
+        // Unlocked but not opened, it's locked again rather than left open.
+        if mounted.is_err() {
+            let _ = self.call::<()>(&volume.block, "Encrypted", "Lock", &(options(),), false);
         }
+        mounted
     }
 
     /// Unmounts a volume, and locks it again if it was encrypted.
@@ -417,14 +418,22 @@ impl Udisks {
         let Some(drive) = now.drives.get(&volume.drive) else { return Err(DiskError::Changed) };
         // Ejecting opens a tray or lets a card go. Powering off then makes it safe to pull out,
         // and a drive that can be powered off doesn't need its eject to have worked.
+        let mut ejected = false;
         if drive.ejectable {
-            let ejected = self.call::<()>(&drive.path, "Drive", "Eject", &(options(),), false);
-            if !drive.can_power_off {
-                return ejected;
+            match self.call::<()>(&drive.path, "Drive", "Eject", &(options(),), false) {
+                Ok(()) => ejected = true,
+                // A no at polkit's prompt is a no to all of it.
+                Err(DiskError::Cancelled) => return Err(DiskError::Cancelled),
+                Err(e) if !drive.can_power_off => return Err(e),
+                Err(_) => {}
             }
         }
         if drive.can_power_off {
-            self.call::<()>(&drive.path, "Drive", "PowerOff", &(options(),), false)?;
+            match self.call::<()>(&drive.path, "Drive", "PowerOff", &(options(),), false) {
+                // Ejected, and gone before it could be powered off: that's done too.
+                Err(DiskError::Changed) if ejected => {}
+                other => other?,
+            }
         }
         Ok(())
     }
