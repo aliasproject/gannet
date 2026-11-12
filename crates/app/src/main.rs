@@ -627,7 +627,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"devices_heading\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -665,6 +665,7 @@ mod bench {
             a.previewer.as_ref().and_then(|p| p.file_name()).map_or_else(|| "null".to_string(), |n| esc(&n.to_string_lossy())),
             esc(&drag(a)),
             places(a),
+            a.devices_heading().map_or("null".to_string(), |i| i.to_string()),
         )
     }
 

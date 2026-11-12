@@ -913,8 +913,18 @@ def place_index(s, label):
     return names.index(label)
 
 
+SIDEBAR_HEADING = 26
+
+
+def place_y(s, label):
+    """The middle of a place's row, below the "Devices" heading for the rows after it."""
+    i = place_index(s, label)
+    heading = SIDEBAR_HEADING if s.get("devices_heading") is not None and i >= s["devices_heading"] else 0
+    return BAR + 8 + 30 * i + heading + 15
+
+
 def click_place(a, s, label, eject=False):
-    y = BAR + 8 + 30 * place_index(s, label) + 15
+    y = place_y(s, label)
     a.click(SIDE - 20 if eject else 60, y)
 
 
@@ -981,7 +991,7 @@ def drives_mount_unlock_and_eject_from_the_sidebar(h):
         click_place(a, s, "Home")
         s = a.wait(lambda s: not s["dir"].startswith(str(media)), "gone home")
         # The preview can cover the eject button, so it's ejected from the drive's menu.
-        a.click(60, BAR + 8 + 30 * place_index(s, "CARD") + 15, 0x111)
+        a.click(60, place_y(s, "CARD"), 0x111)
         a.wait(lambda s: s["menu"], "the drive's menu")
         a.key("Up")
         a.key("Return")
@@ -2725,8 +2735,8 @@ def dropping_on_the_sidebar_moves_there_and_trash_really_trashes(h):
     (home / "a.txt").unlink(missing_ok=True)
     shutil.rmtree(Path(a.env["XDG_DATA_HOME"]) / "Trash", ignore_errors=True)
     # Home is the first place.
-    place_y = BAR + 8 + 15
-    press_and_carry(a, h, "a.txt", 60, place_y)
+    home_y = BAR + 8 + 15
+    press_and_carry(a, h, "a.txt", 60, home_y)
     a.wait(lambda s: s["drag"] == f"Move “a.txt” to {home.name}" or s["drag"] == f"Copy “a.txt” to {home.name}", "over Home")
     a.shot("drag-over-place")
     release(a, h)
