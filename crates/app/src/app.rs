@@ -2035,9 +2035,13 @@ impl App {
         {
             self.close_dialog();
         }
-        self.volumes = volumes;
         let mut places = self.standard_places.clone();
-        places.extend(gannet_core::places::all_disk_places(&self.volumes, &mounts, Self::drive_name));
+        places.extend(gannet_core::places::all_disk_places(&volumes, &mounts, Self::drive_name));
+        // While udisks2 is away, what it last said is kept, so a drive pulled out meanwhile is
+        // noticed when it's back.
+        if leave {
+            self.volumes = volumes;
+        }
         if let Some(gone) = gone {
             self.places = places;
             return self.leave_drive(&gone);
@@ -6039,20 +6043,18 @@ mod tests {
     }
 
     #[test]
-    fn udisks_stopping_doesnt_send_the_window_off_a_drive_still_mounted() {
+    fn udisks_stopping_leaves_the_window_be_and_a_drive_pulled_meanwhile_is_noticed() {
         let mut r = drive_rig("drives-udisks-gone");
-        // A folder that's really a mount point, as the sandbox's own are.
-        let mounts = gannet_core::mounts::read_mounts();
-        let Some(mounted) = mounts.iter().map(|m| m.point.clone()).find(|p| p != Path::new("/") && std::fs::read_dir(p).is_ok()) else { return };
+        let mounted = r.root.join("media/STILL");
+        fs::create_dir_all(&mounted).unwrap();
         let v = stick(&r, Some("STILL"), Some(&mounted), false);
         r.app.on_msg(Msg::Volumes(vec![v]));
         r.app.navigate(mounted.clone(), None);
         r.app.on_msg(Msg::NoUdisks);
         assert_eq!(r.app.dir, mounted, "nothing was unmounted, so it stays");
         assert!(r.app.places.iter().all(|p| p.volume.is_none()), "though udisks2's drives are gone from the sidebar");
-        // A drive udisks2 drops, though, is gone, even if the mount table hasn't caught up yet.
-        let v = stick(&r, Some("STILL"), Some(&mounted), false);
-        r.app.on_msg(Msg::Volumes(vec![v]));
+        // Back, and the stick was pulled out meanwhile: it's gone, even if the mount table
+        // hasn't caught up yet.
         r.app.on_msg(Msg::Volumes(vec![]));
         assert_eq!(r.app.dir, r.root.join("home"), "pulled out, so home");
     }
