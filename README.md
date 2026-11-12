@@ -175,9 +175,10 @@ unmounts everything on it and powers it off so it's safe to pull out. Right-clic
 Unmount and Eject. An encrypted drive shows a lock, and asks for its passphrase when you open
 it. Unmounting or ejecting it locks it again.
 
-If files on a drive are in use, it stays put and Gannet says why. If the window is showing a
-drive that goes away, it goes home. The computer's own disks stay out of the way, as udisks2
-marks them.
+Unmounting or ejecting a drive closes the preview window, and if the window is showing the
+drive, takes it home first. If another program has files on the drive open, it stays put and
+Gannet says why. If the window is showing a drive that goes away, it goes home. The computer's
+own disks stay out of the way, as udisks2 marks them.
 
 This goes through udisks2, which most Linux desktops run. Polkit decides what's allowed, and
 asks for a password if the system says to. Before acting on a drive, Gannet checks it's still

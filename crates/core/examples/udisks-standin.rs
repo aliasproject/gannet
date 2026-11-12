@@ -10,11 +10,14 @@
 //!   idle NAME
 //!   mount NAME            mounted by someone else
 //!
+//! As with the kernel, unmounting a filesystem is also refused while any process has a file,
+//! folder or working directory open inside its folder.
+//!
 //! Usage: udisks-standin ADDRESS ROOT
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use gannet_core::bus::Bus;
@@ -58,6 +61,17 @@ enum UdError {
     Failed(String),
     AlreadyMounted(String),
     NotMounted(String),
+}
+
+/// Whether any process has something open inside `dir`, or is working in it, which would make
+/// the kernel refuse to unmount it.
+fn held_open(dir: &Path) -> bool {
+    let Ok(procs) = std::fs::read_dir("/proc") else { return false };
+    let inside = |p: &Path| std::fs::read_link(p).is_ok_and(|t| t.starts_with(dir));
+    procs.flatten().filter(|p| p.file_name().to_str().is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))).any(|p| {
+        let p = p.path();
+        inside(&p.join("cwd")) || std::fs::read_dir(p.join("fd")).is_ok_and(|fds| fds.flatten().any(|fd| inside(&fd.path())))
+    })
 }
 
 fn path(kind: &str, name: &str) -> String {
@@ -195,11 +209,9 @@ impl FilesystemIface {
         {
             let mut state = self.state.lock().unwrap();
             let b = state.blocks.get_mut(&self.at).ok_or_else(|| UdError::Failed("gone".into()))?;
-            if b.busy {
+            let Some(Some(at)) = &b.mounted else { return Err(UdError::NotMounted("not mounted".into())) };
+            if b.busy || held_open(at) {
                 return Err(UdError::DeviceBusy("Error unmounting: target is busy".into()));
-            }
-            if !matches!(b.mounted, Some(Some(_))) {
-                return Err(UdError::NotMounted("not mounted".into()));
             }
             b.mounted = Some(None);
         }

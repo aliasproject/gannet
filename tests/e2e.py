@@ -931,7 +931,7 @@ def drives_mount_unlock_and_eject_from_the_sidebar(h):
     fs = fresh_fs()
     media = SCRATCH / "media"
     shutil.rmtree(media, ignore_errors=True)
-    tree(media, {"PHOTOS/beach.png": png_bytes(10, 10), "SECRETS/diary.txt": "dear diary"})
+    tree(media, {"PHOTOS/beach.png": png_bytes(10, 10), "SECRETS/diary.txt": "dear diary", "CARD/pic.png": png_bytes(20, 20)})
     disks = StandIn(media)
     try:
         disks.say("drive Stick Kingston-1234", "fs sdb1 Stick PHOTOS", "luks sdb2 Stick hunter2 SECRETS")
@@ -970,9 +970,24 @@ def drives_mount_unlock_and_eject_from_the_sidebar(h):
         disks.say("drive Card SD-1", "fs mmc1 Card CARD")
         a.wait(lambda s: place_flags(s, "CARD") == {"eject"}, "a card put in")
         disks.say("mount mmc1")
-        a.wait(lambda s: place_flags(s, "CARD") == {"mounted", "eject"}, "mounted by something else")
-        disks.say("unplug Card")
-        a.wait(lambda s: place_flags(s, "CARD") is None, "and taken out")
+        s = a.wait(lambda s: place_flags(s, "CARD") == {"mounted", "eject"}, "mounted by something else")
+        # Opened, its picture previewed and the window gone home: the kernel won't unmount a
+        # folder that's open, and none of those may keep one open on it.
+        click_place(a, s, "CARD")
+        s = a.wait(lambda s: s["dir"] == str(media / "CARD") and s["names"] == ["pic.png"], "the card's files", timeout=10)
+        go_to(a, "pic.png")
+        a.key("space")
+        s = a.wait(lambda s: preview_of(s).get("state") == "image", "its picture previewed")
+        click_place(a, s, "Home")
+        s = a.wait(lambda s: not s["dir"].startswith(str(media)), "gone home")
+        # The preview can cover the eject button, so it's ejected from the drive's menu.
+        a.click(60, BAR + 8 + 30 * place_index(s, "CARD") + 15, 0x111)
+        a.wait(lambda s: s["menu"], "the drive's menu")
+        a.key("Up")
+        a.key("Return")
+        s = a.wait(lambda s: place_flags(s, "CARD") is None, "ejected", timeout=10)
+        assert not any("CARD" in n for n in s["notices"]), s["notices"]
+        assert s["previewing"] is None, "the preview of its picture closed"
         assert a.alive()
         a.close()
     finally:

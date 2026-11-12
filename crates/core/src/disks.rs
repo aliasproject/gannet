@@ -302,6 +302,10 @@ pub struct Udisks {
     bus: Bus,
 }
 
+/// Busy filesystems are tried this many times, this far apart: a second in all.
+const UNMOUNT_TRIES: u32 = 5;
+const UNMOUNT_RETRY: Duration = Duration::from_millis(250);
+
 /// Long enough for someone to answer polkit's password prompt.
 pub const ACTION_LIMIT: Duration = Duration::from_secs(600);
 
@@ -337,6 +341,21 @@ impl Udisks {
         R: for<'d> zbus::zvariant::DynamicDeserialize<'d>,
     {
         self.bus.call(SERVICE, path, &format!("{PREFIX}{interface}"), method, body).map_err(|e| disk_error(e, unlocking))
+    }
+
+    /// Unmounts a block. A program that was just told to let go of a folder on it, like this
+    /// app's own window, can take a moment to, so a busy filesystem gets a few more tries.
+    fn unmount_block(&self, block: &str) -> Result<(), DiskError> {
+        let mut tries = UNMOUNT_TRIES;
+        loop {
+            match self.call::<()>(block, "Filesystem", "Unmount", &(options(),), false) {
+                Err(DiskError::Busy) if tries > 1 => {
+                    tries -= 1;
+                    std::thread::sleep(UNMOUNT_RETRY);
+                }
+                other => return other,
+            }
+        }
     }
 
     /// Mounts a block, and says where. If something else, like an automounter, got there
@@ -389,7 +408,7 @@ impl Udisks {
         let now = self.checked(volume)?;
         let Some(block) = now.blocks.get(&volume.block) else { return Err(DiskError::Changed) };
         if block.mount_points.as_ref().is_some_and(|m| !m.is_empty()) {
-            self.call::<()>(&block.path, "Filesystem", "Unmount", &(options(),), false)?;
+            self.unmount_block(&block.path)?;
         }
         if block.crypto_backing != NONE && now.blocks.contains_key(&block.crypto_backing) {
             self.call::<()>(&block.crypto_backing, "Encrypted", "Lock", &(options(),), false)?;
@@ -407,7 +426,7 @@ impl Udisks {
         order.sort_by_key(|b| b.crypto_backing == NONE);
         for b in &order {
             if b.mount_points.as_ref().is_some_and(|m| !m.is_empty()) {
-                self.call::<()>(&b.path, "Filesystem", "Unmount", &(options(),), false)?;
+                self.unmount_block(&b.path)?;
             }
         }
         for b in &blocks {
@@ -620,7 +639,16 @@ mod tests {
         standin.say("busy sdb1");
         assert_eq!(udisks.unmount(&photos), Err(DiskError::Busy));
         standin.say("idle sdb1");
+        // A folder left open keeps it in, as with the kernel, and one let go of a moment
+        // later doesn't.
+        let open = std::fs::File::open(&at).unwrap();
+        assert_eq!(udisks.unmount(&photos), Err(DiskError::Busy));
+        let letting_go = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(open);
+        });
         udisks.unmount(&photos).unwrap();
+        letting_go.join().unwrap();
         assert_eq!(udisks.snapshot().unwrap().volumes()[0].mount, None);
         // A wrong passphrase, then the right one, which mounts what's inside.
         assert_eq!(udisks.unlock(&secret, "nope"), Err(DiskError::WrongPassphrase));
