@@ -2009,15 +2009,17 @@ impl App {
     /// eject that's every volume on the drive.
     fn let_go_of_drive(&mut self, v: &Volume, whole_drive: bool) {
         let mounts: Vec<PathBuf> = if whole_drive { self.volumes.iter().filter(|o| o.drive == v.drive).filter_map(|o| o.mount.clone()).chain(v.mount.clone()).collect() } else { v.mount.iter().cloned().collect() };
-        // A folder reached through a symlink is on the drive too.
-        let on = |p: &Path| mounts.iter().any(|m| p.starts_with(m) || std::fs::canonicalize(p).is_ok_and(|c| c.starts_with(m)));
-        self.cache.retain(|c| !on(&c.listing.dir));
-        if self.previewer.as_deref().is_some_and(on) {
+        let on = |p: &Path| mounts.iter().any(|m| p.starts_with(m));
+        // A folder reached through a symlink is on the drive too. Where it really is comes from
+        // the folder its listing holds open, as asking the filesystem could hang on one that's
+        // stopped answering.
+        let held_on = |l: &Listing| on(&l.dir) || l.real_dir().is_some_and(|d| on(&d));
+        self.cache.retain(|c| !held_on(&c.listing));
+        let here = on(&self.dir) || self.listing.as_ref().is_some_and(|l| l.dir == self.dir && held_on(l));
+        if self.previewer.as_deref().is_some_and(|p| on(p) || (here && p.parent() == Some(self.dir.as_path()))) {
             self.close_preview();
         }
-        if on(&self.dir.clone())
-            && let Some(home) = self.standard_places.first().map(|p| p.path.clone())
-        {
+        if here && let Some(home) = self.standard_places.first().map(|p| p.path.clone()) {
             self.navigate(home, None);
         }
     }
@@ -2238,6 +2240,8 @@ impl App {
             }
             Input::Move { x, y } => self.pointer_moved(x, y),
             Input::Leave => {
+                // The release may never come, or come somewhere else.
+                self.eject_pressed = None;
                 match &self.file_drag {
                     // The drag goes on, over whatever's outside. If the button has really been
                     // let go, the compositor refuses it and says so.
@@ -6123,6 +6127,12 @@ mod tests {
         r.app.input(Input::Move { x: 40.0, y: off });
         r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
         assert!(!ejecting(&r), "the pointer left it");
+        // The pointer left the window while pressed: the release, wherever it comes, is nothing.
+        r.app.input(Input::Move { x: on, y: off });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.input(Input::Leave);
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        assert!(!ejecting(&r), "the pointer left the window");
         // Another drive takes that row between the press and the release: nothing.
         let card_mount = r.root.join("media/CARD");
         fs::create_dir_all(&card_mount).unwrap();

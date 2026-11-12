@@ -92,6 +92,14 @@ pub struct TrashRows {
 }
 
 impl Listing {
+    /// Where the folder really is, symlinks resolved, from the folder it holds open. That's
+    /// asked of the kernel's own record of the open folder, so it doesn't touch the filesystem,
+    /// and can't hang on one that's stopped answering.
+    pub fn real_dir(&self) -> Option<PathBuf> {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", self.fd.as_ref()?.as_raw_fd())).ok()
+    }
+
     pub fn len(&self) -> usize {
         self.slots.len()
     }
