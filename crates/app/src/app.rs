@@ -2157,6 +2157,9 @@ impl App {
     /// The sidebar's sections, as the place each starts at and its heading: Places from the
     /// top, and Devices from the first drive or mount, if there is one.
     pub fn sidebar_headings(&self) -> Vec<(usize, &'static str)> {
+        if self.places.is_empty() {
+            return Vec::new();
+        }
         let mut out = vec![(0, "Places")];
         out.extend(self.places.iter().position(|p| p.kind == PlaceKind::Disk).filter(|&i| i > 0).map(|i| (i, "Devices")));
         out
@@ -5971,7 +5974,9 @@ mod tests {
     #[test]
     fn each_sidebar_section_has_a_heading_and_headings_arent_places() {
         let mut r = drive_rig("drives-heading");
-        assert_eq!(r.app.sidebar_headings(), [(0, "Places")], "no drives, no Devices");
+        assert_eq!(r.app.sidebar_headings(), [], "no places, no headings");
+        r.app.on_msg(Msg::Volumes(vec![]));
+        assert_eq!(r.app.sidebar_headings().first(), Some(&(0, "Places")), "Places heads the top");
         let mount = r.root.join("media/PHOTOS");
         fs::create_dir_all(&mount).unwrap();
         r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));

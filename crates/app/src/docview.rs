@@ -40,8 +40,10 @@ impl Role {
     pub fn pattern(self) -> &'static str {
         match self {
             Role::Mono => "monospace",
-            Role::Bold => "sans:bold",
-            Role::Italic => "sans:italic",
+            // Bold and italic are the interface's font, which body text is in, so a document reads
+            // in one typeface.
+            Role::Bold => "monospace:bold",
+            Role::Italic => "monospace:italic",
         }
     }
 
@@ -49,8 +51,9 @@ impl Role {
     fn cache_name(self) -> &'static str {
         match self {
             Role::Mono => "font-mono",
-            Role::Bold => "font-bold",
-            Role::Italic => "font-italic",
+            // Named for the font asked for, so one remembered when another was asked for isn't used.
+            Role::Bold => "font-bold-monospace",
+            Role::Italic => "font-italic-monospace",
         }
     }
 }
@@ -69,7 +72,7 @@ impl Fonts {
     pub fn new(ui: &Text, scale: f64, light_on_dark: bool, cache_home: Option<&Path>) -> Self {
         let fonts = ui.fonts();
         let make = |px: f32, role: Option<Role>| {
-            let mut t = Text::new(px * scale as f32, scale < 1.5);
+            let mut t = Text::new(px * scale as f32, text::UI_HINTED && scale < 1.5);
             t.set_contrast(light_on_dark);
             for (path, index) in &fonts {
                 t.add_font(path, *index);
@@ -135,7 +138,7 @@ impl Fonts {
         let sizes = [BODY_PX, BODY_PX, BODY_PX, MONO_PX].into_iter().chain(HEADING_PX);
         let list: Vec<&mut Text> = self.all().collect();
         for (t, px) in list.into_iter().zip(sizes) {
-            t.set_size(px * scale as f32, scale < 1.5);
+            t.set_size(px * scale as f32, text::UI_HINTED && scale < 1.5);
         }
     }
 
@@ -506,6 +509,12 @@ mod tests {
         assert_eq!(wrap_columns("日本語", 4), ["日本", "語"], "two columns each");
         assert_eq!(wrap_columns("e\u{301}x", 2), ["e\u{301}x"], "a mark takes no room of its own");
         assert_eq!(wrap_columns("ab", 0), ["a", "b"], "a window too narrow still shows something");
+    }
+
+    #[test]
+    fn documents_are_in_the_interface_font_throughout() {
+        // Body text is in the interface's font, so bold, italic and headings are too.
+        assert!(Role::ALL.iter().all(|r| r.pattern().starts_with(text::UI_FONT)), "{:?}", Role::ALL.map(Role::pattern));
     }
 
     fn fonts() -> Option<Fonts> {
