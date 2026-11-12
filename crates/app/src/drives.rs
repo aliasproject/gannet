@@ -64,18 +64,23 @@ pub fn watch(hub: Hub, address: String) {
         let udisks = Udisks::new(bus);
         let mut sent: Option<Vec<disks::Volume>> = None;
         loop {
-            // With udisks2 gone, so are its drives, until it's back.
-            let volumes = match udisks.snapshot() {
-                Ok(snapshot) => Some(snapshot.volumes()),
-                Err(disks::DiskError::NoService) => Some(Vec::new()),
-                Err(_) => None,
-            };
-            // Most of what udisks2 says doesn't change what the sidebar shows.
-            if let Some(volumes) = volumes
-                && sent.as_ref() != Some(&volumes)
-            {
-                sent = Some(volumes.clone());
-                hub.send(Msg::Volumes(volumes));
+            match udisks.snapshot() {
+                // Most of what udisks2 says doesn't change what the sidebar shows.
+                Ok(snapshot) => {
+                    let volumes = snapshot.volumes();
+                    if sent.as_ref() != Some(&volumes) {
+                        sent = Some(volumes.clone());
+                        hub.send(Msg::Volumes(volumes));
+                    }
+                }
+                // With udisks2 gone, so are its drives, until it's back.
+                Err(disks::DiskError::NoService) => {
+                    if sent.as_ref().is_none_or(|v| !v.is_empty()) {
+                        sent = Some(Vec::new());
+                        hub.send(Msg::NoUdisks);
+                    }
+                }
+                Err(_) => {}
             }
             if rx.recv().is_err() {
                 return;

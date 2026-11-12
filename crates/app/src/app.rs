@@ -71,6 +71,9 @@ pub enum Msg {
     DocFont(crate::docview::Role, PathBuf, u32),
     /// The drives udisks2 knows about now.
     Volumes(Vec<Volume>),
+    /// udisks2 has stopped, so what it said about drives no longer holds. Unlike a drive going,
+    /// that doesn't mean anything's been unmounted.
+    NoUdisks,
     /// A mount, unlock, unmount or eject has finished: where it's mounted, for the first two.
     DiskDone { volume: Volume, doing: Doing, result: Result<Option<PathBuf>, DiskError> },
     DesktopDark(bool),
@@ -1102,7 +1105,8 @@ impl App {
                     self.invalidate_all();
                 }
             }
-            Msg::Volumes(volumes) => self.set_volumes(volumes),
+            Msg::Volumes(volumes) => self.set_volumes(volumes, true),
+            Msg::NoUdisks => self.set_volumes(Vec::new(), false),
             Msg::DiskDone { volume, doing, result } => self.drive_done(volume, doing, result),
             Msg::DocFont(role, path, index) => {
                 if self.doc_fonts.as_mut().is_some_and(|f| f.set_role(role, &path, index)) {
@@ -2020,11 +2024,11 @@ impl App {
     }
 
     /// The drives udisks2 reports now. A folder on one that's gone, or no longer mounted, can't be
-    /// shown, so the window goes home.
-    fn set_volumes(&mut self, volumes: Vec<Volume>) {
+    /// shown, so the window goes home, when `leave` says the list is udisks2's word on it. A drive
+    /// pulled out can still be in the mount table for a moment, so that isn't asked.
+    fn set_volumes(&mut self, volumes: Vec<Volume>, leave: bool) {
         let mounts = gannet_core::mounts::read_mounts();
-        // Gone means unmounted, not just out of udisks2's list, which empties if udisks2 stops.
-        let gone = self.volumes.iter().filter_map(|v| v.mount.clone()).find(|m| self.dir.starts_with(m) && !volumes.iter().any(|v| v.mount.as_ref() == Some(m)) && !mounts.iter().any(|x| x.point == *m));
+        let gone = self.volumes.iter().filter_map(|v| v.mount.clone()).filter(|_| leave).find(|m| self.dir.starts_with(m) && !volumes.iter().any(|v| v.mount.as_ref() == Some(m)));
         // The drive whose passphrase is being asked for has gone.
         if let Some(Dialog::Unlock { volume, waiting: false, .. }) = &self.dialog
             && !volumes.iter().any(|v| v.block == volume.block)
@@ -6043,8 +6047,14 @@ mod tests {
         let v = stick(&r, Some("STILL"), Some(&mounted), false);
         r.app.on_msg(Msg::Volumes(vec![v]));
         r.app.navigate(mounted.clone(), None);
+        r.app.on_msg(Msg::NoUdisks);
+        assert_eq!(r.app.dir, mounted, "nothing was unmounted, so it stays");
+        assert!(r.app.places.iter().all(|p| p.volume.is_none()), "though udisks2's drives are gone from the sidebar");
+        // A drive udisks2 drops, though, is gone, even if the mount table hasn't caught up yet.
+        let v = stick(&r, Some("STILL"), Some(&mounted), false);
+        r.app.on_msg(Msg::Volumes(vec![v]));
         r.app.on_msg(Msg::Volumes(vec![]));
-        assert_eq!(r.app.dir, mounted, "still mounted, so it stays");
+        assert_eq!(r.app.dir, r.root.join("home"), "pulled out, so home");
     }
 
     #[test]
