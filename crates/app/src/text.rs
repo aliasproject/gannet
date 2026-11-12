@@ -459,6 +459,9 @@ pub fn font_has(bytes: &[u8], index: u32, ch: char) -> bool {
 pub const UI_FONT: &str = "monospace";
 /// Its size, in pixels at scale 1.
 pub const UI_PX: f32 = 13.0;
+/// Whether its letters are hinted onto whole pixels. Not, as fontconfig's usual slight hinting
+/// and Qt don't: letters keep their true shapes and spacing, which reads smoother.
+pub const UI_HINTED: bool = false;
 
 /// The font to use, from a small cache file so the first frame needn't start a process.
 pub fn primary_font(cache_home: &Path) -> Option<(PathBuf, u32)> {

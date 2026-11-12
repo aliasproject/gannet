@@ -667,7 +667,7 @@ impl App {
             self.scroll *= scale / self.scale;
         }
         self.scale = scale;
-        self.text.set_size(14.0 * scale as f32, scale < 1.5);
+        self.text.set_size(crate::text::UI_PX * scale as f32, crate::text::UI_HINTED && scale < 1.5);
         if let Some(fonts) = self.doc_fonts.as_mut() {
             fonts.set_scale(scale);
         }

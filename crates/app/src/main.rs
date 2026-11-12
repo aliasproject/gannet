@@ -157,7 +157,7 @@ fn main() {
         }
     };
 
-    let mut text = text::Text::new(text::UI_PX, true);
+    let mut text = text::Text::new(text::UI_PX, text::UI_HINTED);
     text.set_contrast(colors.dark);
     let primary = text::primary_font(&d.cache);
     match &primary {
