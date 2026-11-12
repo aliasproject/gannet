@@ -451,6 +451,9 @@ pub struct App {
     pub volumes: Vec<Volume>,
     /// The drive a sidebar menu is open for.
     drive_menu: Option<Volume>,
+    /// The eject button that was pressed. Ejecting can't be taken back, so it happens on the
+    /// release, and only if the pointer is still on it.
+    eject_pressed: Option<usize>,
     /// Drives with something under way, so a second click doesn't start it again.
     pub drives_busy: Vec<String>,
     /// The drive being opened, and the folder the window was on then. The window only goes to
@@ -586,6 +589,7 @@ impl App {
             system_bus: None,
             volumes: Vec::new(),
             drive_menu: None,
+            eject_pressed: None,
             drives_busy: Vec::new(),
             opening: None,
             edit: Edit::None,
@@ -1990,9 +1994,28 @@ impl App {
             return false;
         }
         self.drives_busy.push(v.block.clone());
+        if matches!(doing, Doing::Unmount | Doing::Eject) {
+            self.let_go_of_drive(&v, doing == Doing::Eject);
+        }
         crate::drives::act(self.hub.clone(), address, v, doing);
         self.invalidate_all();
         true
+    }
+
+    /// Before a drive is unmounted, lets go of every folder the window holds open on it, as
+    /// udisks2 can't unmount a folder that's open: the one showing (the window goes home), those
+    /// kept for going back, and the preview window's, which reads the file's folder too. For an
+    /// eject that's every volume on the drive.
+    fn let_go_of_drive(&mut self, v: &Volume, whole_drive: bool) {
+        let mounts: Vec<PathBuf> = if whole_drive { self.volumes.iter().filter(|o| o.drive == v.drive).filter_map(|o| o.mount.clone()).chain(v.mount.clone()).collect() } else { v.mount.iter().cloned().collect() };
+        let on = |p: &Path| mounts.iter().any(|m| p.starts_with(m));
+        self.cache.retain(|c| !on(&c.listing.dir));
+        if self.previewer.as_deref().is_some_and(on) {
+            self.close_preview();
+        }
+        if let Some(m) = mounts.iter().find(|m| self.dir.starts_with(m)).cloned() {
+            self.leave_drive(&m);
+        }
     }
 
     /// Closes the dialog, and shows the next question a job is waiting on, if there is one.
@@ -2832,9 +2855,17 @@ impl App {
                 self.drag_scroll = None;
                 self.preview_release();
                 self.finish_file_drag();
+                if let Some(i) = self.eject_pressed.take()
+                    && self.hit(self.pointer.0, self.pointer.1) == Hit::Eject(i)
+                    && let Some(v) = self.places.get(i).and_then(|p| p.volume.clone())
+                {
+                    self.drive_act(v, Doing::Eject);
+                }
             }
             return;
         }
+        // A release that went missing, as when the compositor took the pointer away, ejects nothing.
+        self.eject_pressed = None;
         // The release of a drag can go missing if the compositor takes the pointer away.
         self.cancel_file_drag();
         let (x, y) = self.pointer;
@@ -2935,11 +2966,7 @@ impl App {
                 }
             }
             Hit::Place(i) => self.open_place(i),
-            Hit::Eject(i) => {
-                if let Some(v) = self.places.get(i).and_then(|p| p.volume.clone()) {
-                    self.drive_act(v, Doing::Eject);
-                }
-            }
+            Hit::Eject(i) => self.eject_pressed = Some(i),
             Hit::Header(key) => self.action(Action::SortBy(key)),
             Hit::Scrollbar => {
                 let l = self.layout();
@@ -6072,6 +6099,58 @@ mod tests {
         assert_eq!(r.app.dir, mount, "still there");
         r.app.on_msg(Msg::DiskDone { volume: photos, doing: Doing::Eject, result: Ok(None) });
         assert_eq!(r.app.dir, r.root.join("home"), "ejected, so home");
+    }
+
+    #[test]
+    fn the_eject_button_ejects_on_the_release_and_not_if_the_pointer_left_it() {
+        let mut r = drive_rig("drives-eject-release");
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        let photos = stick(&r, Some("PHOTOS"), Some(&mount), false);
+        r.app.on_msg(Msg::Volumes(vec![photos.clone()]));
+        let e = r.app.eject_rect(1).unwrap();
+        let (on, off) = ((e.x + e.w / 2) as f64, (e.y + e.h / 2) as f64);
+        let ejecting = |r: &Rig| r.app.drives_busy.contains(&photos.block);
+        // Pressed, then slid off before letting go: nothing.
+        r.app.input(Input::Move { x: on, y: off });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        assert!(!ejecting(&r), "not on the press");
+        r.app.input(Input::Move { x: 40.0, y: off });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        assert!(!ejecting(&r), "the pointer left it");
+        // Pressed and let go on it: ejected.
+        r.app.input(Input::Move { x: on, y: off });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        assert!(ejecting(&r), "on the release");
+    }
+
+    #[test]
+    fn ejecting_lets_go_of_every_folder_on_the_drive_first() {
+        let mut r = drive_rig("drives-let-go");
+        // Nothing answers, so nothing's really ejected: only what happens before is looked at.
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        let (mount, other) = (r.root.join("media/PHOTOS"), r.root.join("media/CARD"));
+        fs::create_dir_all(mount.join("inner")).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let photos = stick(&r, Some("PHOTOS"), Some(&mount), false);
+        let mut card = stick(&r, Some("CARD"), Some(&other), false);
+        card.drive = "/d/card".into();
+        r.app.on_msg(Msg::Volumes(vec![photos.clone(), card]));
+        for dir in [mount.clone(), mount.join("inner"), other.clone(), r.root.join("home"), mount.join("inner")] {
+            r.app.navigate(dir, None);
+            r.pump_until("read", |a| !a.loading);
+        }
+        r.app.previewer = Some(mount.join("inner/beach.png"));
+        let held = |a: &App| a.cache.iter().map(|c| c.listing.dir.clone()).chain(a.listing.iter().map(|l| l.dir.clone())).filter(|d| d.starts_with(&mount)).collect::<Vec<_>>();
+        assert!(held(&r.app).len() >= 2, "it was holding folders on the drive: {:?}", held(&r.app));
+        r.app.cmds.clear();
+        assert!(r.app.drive_act(photos, Doing::Eject));
+        assert_eq!(r.app.dir, r.root.join("home"), "the window left the drive");
+        assert_eq!(held(&r.app), Vec::<PathBuf>::new(), "and holds nothing on it");
+        assert!(r.app.previewer.is_none() && r.app.cmds.iter().any(|c| matches!(c, Cmd::ClosePreview)), "the preview of a file on it closed");
+        assert!(r.app.cache.iter().any(|c| c.listing.dir == other), "another drive's folder is still remembered");
     }
 
     #[test]
