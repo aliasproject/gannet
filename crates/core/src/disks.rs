@@ -242,6 +242,8 @@ impl Snapshot {
 pub enum DiskError {
     /// The system doesn't allow it, or the password asked for wasn't given.
     NotAuthorized,
+    /// The user said no at polkit's prompt, which needs no message.
+    Cancelled,
     /// Something has files on it open.
     Busy,
     WrongPassphrase,
@@ -256,6 +258,7 @@ impl std::fmt::Display for DiskError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotAuthorized => write!(f, "the system didn't allow it"),
+            Self::Cancelled => write!(f, "it was cancelled"),
             Self::Busy => write!(f, "files on it are in use"),
             Self::WrongPassphrase => write!(f, "that passphrase isn't right"),
             Self::Changed => write!(f, "it's been taken out, or swapped for another"),
@@ -273,6 +276,7 @@ fn disk_error(e: zbus::Error, unlocking: bool) -> DiskError {
             let name = name.as_str();
             let message = message.clone().unwrap_or_default();
             match name.strip_prefix("org.freedesktop.UDisks2.Error.") {
+                Some("NotAuthorizedDismissed") => DiskError::Cancelled,
                 Some(n) if n.starts_with("NotAuthorized") => DiskError::NotAuthorized,
                 Some("DeviceBusy") => DiskError::Busy,
                 Some("Failed") if unlocking && (message.contains("passphrase") || message.contains("not permitted") || message.contains("No key available")) => DiskError::WrongPassphrase,
@@ -368,9 +372,12 @@ impl Udisks {
                     tries += 1;
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                // Something other than a filesystem inside, like LVM: it's unlocked, but there's
-                // nothing here to open.
-                Err(DiskError::Changed) => return Err(DiskError::Other("it's unlocked, but there's nothing on it that can be opened".into())),
+                // Something other than a filesystem inside, like LVM: there's nothing here to open,
+                // so it's locked again rather than left open with no way to lock it.
+                Err(DiskError::Changed) => {
+                    let _ = self.call::<()>(&volume.block, "Encrypted", "Lock", &(options(),), false);
+                    return Err(DiskError::Other("there's nothing on it that can be opened".into()));
+                }
                 other => return other,
             }
         }
@@ -389,8 +396,8 @@ impl Udisks {
         Ok(())
     }
 
-    /// Unmounts everything on the volume's drive, locks what's encrypted, then powers the drive
-    /// off if it can be, or ejects it.
+    /// Unmounts everything on the volume's drive, locks what's encrypted, then ejects the media
+    /// if the drive can, and powers the drive off if it can, so it's safe to pull out.
     pub fn eject(&self, volume: &Volume) -> Result<(), DiskError> {
         let now = self.checked(volume)?;
         let blocks = now.on_drive(&volume.drive);
@@ -408,15 +415,18 @@ impl Udisks {
             }
         }
         let Some(drive) = now.drives.get(&volume.drive) else { return Err(DiskError::Changed) };
-        // A drive with a tray or slot ejects its media. Anything else is powered off, so it's
-        // safe to pull out.
+        // Ejecting opens a tray or lets a card go. Powering off then makes it safe to pull out,
+        // and a drive that can be powered off doesn't need its eject to have worked.
         if drive.ejectable {
-            self.call::<()>(&drive.path, "Drive", "Eject", &(options(),), false)
-        } else if drive.can_power_off {
-            self.call::<()>(&drive.path, "Drive", "PowerOff", &(options(),), false)
-        } else {
-            Ok(())
+            let ejected = self.call::<()>(&drive.path, "Drive", "Eject", &(options(),), false);
+            if !drive.can_power_off {
+                return ejected;
+            }
         }
+        if drive.can_power_off {
+            self.call::<()>(&drive.path, "Drive", "PowerOff", &(options(),), false)?;
+        }
+        Ok(())
     }
 }
 
@@ -531,6 +541,7 @@ mod tests {
     fn udisks_errors_become_words() {
         let err = |name: &str, message: &str| zbus::Error::MethodError(name.try_into().unwrap(), Some(message.to_string()), zbus::message::Message::method_call("/", "x").build(&()).unwrap());
         assert_eq!(disk_error(err("org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain", ""), false), DiskError::NotAuthorized);
+        assert_eq!(disk_error(err("org.freedesktop.UDisks2.Error.NotAuthorizedDismissed", ""), false), DiskError::Cancelled, "the user said no");
         assert_eq!(disk_error(err("org.freedesktop.UDisks2.Error.DeviceBusy", "busy"), false), DiskError::Busy);
         assert_eq!(disk_error(err("org.freedesktop.UDisks2.Error.Failed", "Error unmounting: target is busy"), false), DiskError::Busy);
         assert_eq!(disk_error(err("org.freedesktop.UDisks2.Error.Failed", "Failed to activate device: Incorrect passphrase."), true), DiskError::WrongPassphrase);

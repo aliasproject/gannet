@@ -1800,14 +1800,20 @@ impl App {
                     self.start_job(Request::Delete { paths });
                 }
             }
+            Dialog::Unlock { volume, field, error, waiting: true, at } if label == "Unlock" => {
+                // Already being tried: a second press waits with the first.
+                self.dialog = Some(Dialog::Unlock { volume, field, at, error, waiting: true });
+                return;
+            }
             Dialog::Unlock { volume, field, error, .. } => {
                 if label == "Unlock" {
                     // Kept open, waiting, until udisks2 says whether it worked.
+                    let busy = self.drives_busy.contains(&volume.block);
                     let waiting = !field.text.is_empty() && self.drive_act(volume.clone(), Doing::Unlock(field.text.clone()));
                     if waiting {
                         self.opening = Some((volume.block.clone(), self.dir.clone()));
                     }
-                    let error = if waiting || field.text.is_empty() { error } else { Some("Something's already under way on this drive. Try again in a moment.".to_string()) };
+                    let error = if busy { Some("Something's already under way on this drive. Try again in a moment.".to_string()) } else { error };
                     self.dialog = Some(Dialog::Unlock { volume, field, at: 0, error, waiting });
                     self.invalidate_all();
                     return;
@@ -2018,6 +2024,12 @@ impl App {
     fn set_volumes(&mut self, volumes: Vec<Volume>) {
         let mounts = gannet_core::mounts::read_mounts();
         let gone = self.volumes.iter().filter_map(|v| v.mount.clone()).find(|m| self.dir.starts_with(m) && !volumes.iter().any(|v| v.mount.as_ref() == Some(m)));
+        // The drive whose passphrase is being asked for has gone.
+        if let Some(Dialog::Unlock { volume, waiting: false, .. }) = &self.dialog
+            && !volumes.iter().any(|v| v.block == volume.block)
+        {
+            self.close_dialog();
+        }
         self.volumes = volumes;
         let mut places = self.standard_places.clone();
         places.extend(gannet_core::places::all_disk_places(&self.volumes, &mounts, Self::drive_name));
@@ -2062,11 +2074,19 @@ impl App {
             }
             // Cancelled while it was tried: a wrong passphrase isn't news any more.
             (Doing::Unlock(_), Err(DiskError::WrongPassphrase)) => {}
+            // The user said no to polkit, and knows.
+            (_, Err(DiskError::Cancelled)) => {
+                if unlocking {
+                    self.close_dialog();
+                }
+            }
             (_, Err(e)) => {
                 if unlocking {
                     self.close_dialog();
                 }
-                self.notice(format!("Couldn't {} “{name}”: {e}", doing.verb()));
+                // Unmounting what's inside a locked-again volume that isn't mounted is locking it.
+                let verb = if doing == Doing::Unmount && volume.unlocked && volume.mount.is_none() { "lock" } else { doing.verb() };
+                self.notice(format!("Couldn't {verb} “{name}”: {e}"));
             }
             (Doing::Mount | Doing::Unlock(_), Ok(at)) => {
                 if unlocking {
@@ -5980,6 +6000,37 @@ mod tests {
             _ => panic!("no dialog"),
         }
         assert_eq!(format!("{:?}", Doing::Unlock("hunter2".into())), "Unlock(…)", "the passphrase never shows");
+    }
+
+    #[test]
+    fn pressing_unlock_again_while_it_is_tried_changes_nothing() {
+        let mut r = drive_rig("drives-press-twice");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.app.open_place(1);
+        r.key(0, "x");
+        r.key(k::KEY_Return, "");
+        r.app.press_dialog_button(0);
+        match &r.app.dialog {
+            Some(Dialog::Unlock { waiting, error, field, .. }) => assert!(*waiting && error.is_none() && field.text == "x", "still waiting on the first: {error:?}"),
+            _ => panic!("no dialog"),
+        }
+    }
+
+    #[test]
+    fn the_passphrase_dialog_goes_with_its_drive_and_a_cancelled_prompt_says_nothing() {
+        let mut r = drive_rig("drives-dialog-gone");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.open_place(1);
+        r.app.on_msg(Msg::Volumes(vec![]));
+        assert!(r.app.dialog.is_none(), "pulled out while it asked");
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        let photos = stick(&r, Some("PHOTOS"), Some(&mount), false);
+        r.app.on_msg(Msg::DiskDone { volume: photos, doing: Doing::Eject, result: Err(DiskError::Cancelled) });
+        assert!(r.app.notices.is_empty(), "the user said no to polkit, and knows: {:?}", r.app.notices);
     }
 
     #[test]
