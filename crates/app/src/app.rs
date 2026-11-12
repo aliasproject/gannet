@@ -2005,18 +2005,25 @@ impl App {
 
     /// Before a drive is unmounted, lets go of every folder the window holds open on it, as
     /// udisks2 can't unmount a folder that's open: the one showing (the window goes home), those
-    /// kept for going back, and the preview window's, which reads the file's folder too. For an
-    /// eject that's every volume on the drive.
+    /// kept for going back, and the preview window's. For an eject that's every volume on the
+    /// drive.
     fn let_go_of_drive(&mut self, v: &Volume, whole_drive: bool) {
         let mounts: Vec<PathBuf> = if whole_drive { self.volumes.iter().filter(|o| o.drive == v.drive).filter_map(|o| o.mount.clone()).chain(v.mount.clone()).collect() } else { v.mount.iter().cloned().collect() };
+        if mounts.is_empty() {
+            return;
+        }
         let on = |p: &Path| mounts.iter().any(|m| p.starts_with(m));
-        // A folder reached through a symlink is on the drive too. Where it really is comes from
-        // the folder its listing holds open, as asking the filesystem could hang on one that's
-        // stopped answering.
-        let held_on = |l: &Listing| on(&l.dir) || l.real_dir().is_some_and(|d| on(&d));
+        // Each listing says which folders it holds, including those reached through a symlink
+        // and the Trash view's Trash folders on other drives.
+        let held_on = |l: &Listing| l.held_dirs().iter().any(|d| on(d));
         self.cache.retain(|c| !held_on(&c.listing));
-        let here = on(&self.dir) || self.listing.as_ref().is_some_and(|l| l.dir == self.dir && held_on(l));
-        if self.previewer.as_deref().is_some_and(|p| on(p) || (here && p.parent() == Some(self.dir.as_path()))) {
+        // Until the window's folder is read, where it really is isn't known, so it goes home
+        // anyway: once read, it would hold the folder open.
+        let here = on(&self.dir) || self.listing.as_ref().filter(|l| l.dir == self.dir).map_or(self.loading, |l| held_on(l));
+        // The preview window reads the folder of the file it shows, which can be on the drive
+        // through a link from anywhere, and it can't be asked where that really is. It's quick to
+        // open again.
+        if self.previewer.is_some() {
             self.close_preview();
         }
         if here && let Some(home) = self.standard_places.first().map(|p| p.path.clone()) {
@@ -6179,11 +6186,21 @@ mod tests {
         // On the card through a symlink: still the card.
         let link = r.root.join("home/card-link");
         std::os::unix::fs::symlink(&other, &link).unwrap();
-        r.app.navigate(link, None);
+        r.app.navigate(link.clone(), None);
         r.pump_until("read", |a| !a.loading);
+        assert!(r.app.listing.as_ref().unwrap().held_dirs().iter().any(|d| d.starts_with(&other)), "the listing knows where it really is");
+        // And while it's still being read, when where it really is isn't known yet.
+        r.app.navigate(r.root.join("home"), None);
+        r.pump_until("home", |a| !a.loading);
+        r.app.cache.clear();
+        r.app.navigate(link, None);
+        assert!(r.app.loading);
+        // A preview of a file anywhere goes too: it can be on the drive through a link.
+        r.app.previewer = Some(r.root.join("home/elsewhere.png"));
         let card = r.app.volumes.iter().find(|v| v.drive == "/d/card").unwrap().clone();
         assert!(r.app.drive_act(card, Doing::Unmount));
         assert_eq!(r.app.dir, r.root.join("home"), "the window left the card it reached by a symlink");
+        assert!(r.app.previewer.is_none(), "the preview closed");
     }
 
     #[test]

@@ -92,12 +92,21 @@ pub struct TrashRows {
 }
 
 impl Listing {
-    /// Where the folder really is, symlinks resolved, from the folder it holds open. That's
-    /// asked of the kernel's own record of the open folder, so it doesn't touch the filesystem,
-    /// and can't hang on one that's stopped answering.
-    pub fn real_dir(&self) -> Option<PathBuf> {
+    /// Every folder this listing holds open, both as it was named and where it really is, with
+    /// symlinks resolved: its own, or for the Trash view, each Trash folder it reads from, which
+    /// can be on another drive. Where one really is comes from the kernel's record of the open
+    /// folder, so this doesn't touch the filesystem, and can't hang on one that's stopped
+    /// answering.
+    pub fn held_dirs(&self) -> Vec<PathBuf> {
         use std::os::fd::AsRawFd;
-        std::fs::read_link(format!("/proc/self/fd/{}", self.fd.as_ref()?.as_raw_fd())).ok()
+        let real = |f: &Arc<File>| std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok();
+        let mut out = vec![self.dir.clone()];
+        out.extend(self.fd.iter().filter_map(real));
+        if let Some(t) = &self.trash {
+            out.extend(t.roots.iter().map(|r| r.root.clone()));
+            out.extend(t.fds.iter().filter_map(real));
+        }
+        out
     }
 
     pub fn len(&self) -> usize {
@@ -1218,6 +1227,21 @@ mod tests {
         l.listing.stat_entries(&[i]);
         let deleted = trash::parse_info(&fs::read(&far.info).unwrap(), Some(&disk)).unwrap().deleted.unwrap();
         assert_eq!(l.listing.stat(i), Stat::Known { size: 3, mtime: deleted });
+        // The disk's Trash folder is held open too, which matters for unmounting it.
+        let held = l.listing.held_dirs();
+        assert!(held.iter().any(|d| d.starts_with(&disk)), "{held:?}");
+    }
+
+    #[test]
+    fn a_folder_reached_through_a_symlink_says_where_it_really_is() {
+        let s = Scratch::new();
+        let real = s.dir("media/STICK");
+        s.file("media/STICK/a", b"");
+        symlink(&real, s.path().join("stick")).unwrap();
+        let l = last(run(request(&s.path().join("stick"))));
+        let held = l.listing.held_dirs();
+        assert!(held.contains(&s.path().join("stick")), "as it was named: {held:?}");
+        assert!(held.contains(&fs::canonicalize(&real).unwrap()), "and where it really is: {held:?}");
     }
 
     #[test]
