@@ -31,6 +31,8 @@ pub enum Icon {
     Eject,
     Lock,
     Download,
+    /// The `>` between the path bar's folders.
+    Crumb,
 }
 
 // All on a 16x16 grid, with every straight edge on a whole pixel, so they're sharp when drawn
@@ -65,9 +67,23 @@ fn path_of(i: Icon) -> &'static str {
         Icon::Lock => "M5 7V5a3 3 0 0 1 6 0v2H9V5a1 1 0 0 0-2 0v2H5ZM3 7h10v8H3V7Z",
         // An arrow down into a tray.
         Icon::Download => "M7 1h2v6h3l-4 4-4-4h3V1ZM1 10h2v3h10v-3h2v5H1v-5Z",
-        Icon::ArrowUp => "M8 5 12 10H4L8 5Z",
-        Icon::ArrowDown => "M8 11 4 6h8L8 11Z",
-        Icon::Close => "M4 3 8 7l4-4 1 1-4 4 4 4-1 1-4-4-4 4-1-1 4-4-4-4 1-1Z",
+        // Small marks, each on the grid of the size it's drawn at (see `grid_of`), and drawn
+        // pixel by pixel: at these sizes a slanted edge would leave grey half-pixels.
+        Icon::ArrowUp => "M6 5h2v1h-2ZM5 6h4v1h-4ZM4 7h6v1h-6ZM3 8h8v1h-8Z",
+        Icon::ArrowDown => "M3 5h8v1h-8ZM4 6h6v1h-6ZM5 7h4v1h-4ZM6 8h2v1h-2Z",
+        Icon::Close => "M2 2h2v1h-2ZM8 2h2v1h-2ZM3 3h2v1h-2ZM7 3h2v1h-2ZM4 4h4v1h-4ZM5 5h2v1h-2ZM4 6h4v1h-4ZM3 7h2v1h-2ZM7 7h2v1h-2ZM2 8h2v1h-2ZM8 8h2v1h-2Z",
+        Icon::Crumb => "M3 1h1v1h-1ZM3 2h2v1h-2ZM4 3h2v1h-2ZM5 4h2v1h-2ZM4 5h2v1h-2ZM3 6h2v1h-2ZM3 7h1v1h-1Z",
+    }
+}
+
+/// The grid an icon is drawn on, in pixels. It's sharp drawn at that size or a whole multiple of
+/// it: the small marks are drawn smaller than the rest, so each has a grid of its own.
+pub fn grid_of(i: Icon) -> f32 {
+    match i {
+        Icon::Crumb => 10.0,
+        Icon::Close => 12.0,
+        Icon::ArrowUp | Icon::ArrowDown => 14.0,
+        _ => 16.0,
     }
 }
 
@@ -79,7 +95,7 @@ pub struct Icons {
 impl Icons {
     pub fn draw(&mut self, canvas: &mut Canvas, icon: Icon, x: i32, y: i32, size: i32, color: u32) {
         let (mask, s) = self.cache.entry((icon, size)).or_insert_with(|| {
-            let scale = size as f32 / 16.0;
+            let scale = size as f32 / grid_of(icon);
             let (data, _) = Mask::new(path_of(icon)).style(Fill::EvenOdd).size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
             (data, size)
         });
@@ -129,7 +145,7 @@ mod tests {
     #[test]
     fn every_icon_draws_something() {
         use Icon::*;
-        for i in [Folder, FolderLink, File, FileLink, Image, Video, Audio, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, ArrowUp, ArrowDown, Close, Download] {
+        for i in [Folder, FolderLink, File, FileLink, Image, Video, Audio, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, ArrowUp, ArrowDown, Close, Download, Crumb] {
             let mut px = vec![0u32; 32 * 32];
             let mut c = Canvas::new(&mut px, 32, 32);
             Icons::default().draw(&mut c, i, 0, 0, 32, 0xffffff);
@@ -137,15 +153,18 @@ mod tests {
         }
     }
 
-    /// The icons drawn at 16 pixels are sharp there: their straight edges sit on whole pixels.
+    /// Icons are sharp at the size they're drawn: their straight edges sit on whole pixels.
     /// A rectangle's inside at 16 pixels is solid, with no half-covered pixels along its edges.
     #[test]
-    fn icons_drawn_at_16_pixels_have_whole_pixel_edges() {
+    fn icons_have_whole_pixel_edges() {
         use Icon::*;
         for i in [Folder, FolderLink, File, FileLink, Image, Video, Archive, Code, Document, Home, Trash, Disk, Eject, Lock, Download] {
             let numbers = path_of(i).split(|c: char| !(c.is_ascii_digit() || c == '.')).filter(|n| !n.is_empty());
             // Arcs' radii can be anything: only Lock has them, and its are whole too.
             assert!(numbers.clone().all(|n| !n.contains('.')), "{i:?} has an edge between pixels: {}", path_of(i));
+        }
+        for i in [ArrowUp, ArrowDown, Close, Crumb] {
+            assert!(!path_of(i).contains('.'), "{i:?} has an edge between pixels");
         }
         let mut px = vec![0u32; 16 * 16];
         let mut c = Canvas::new(&mut px, 16, 16);

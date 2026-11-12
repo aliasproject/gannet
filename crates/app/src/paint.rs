@@ -162,7 +162,7 @@ impl App {
                 let label = self.crumb_label(&path);
                 self.text.draw_str(c, &label, (x + self.px(6.0)) as f32, y, if i == last { co.foreground } else { co.muted });
                 if i != last {
-                    self.icons.draw(c, Icon::Forward, x + w + (gap - self.px(10.0)) / 2, (l.toolbar.h - self.px(10.0)) / 2, self.px(10.0), co.muted);
+                    self.icons.draw(c, Icon::Crumb, x + w + (gap - self.px(10.0)) / 2, (l.toolbar.h - self.px(10.0)) / 2, self.px(10.0), co.muted);
                 }
             }
         }
