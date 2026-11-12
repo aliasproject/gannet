@@ -47,7 +47,7 @@ fn path_of(i: Icon) -> &'static str {
         Icon::FileLink => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h6v1h-6ZM10 8h3v1h-3ZM3 9h6v1h-6ZM11 9h2v1h-2ZM3 10h2v1h-2ZM12 10h1v1h-1ZM3 11h2v1h-2ZM12 11h1v1h-1ZM3 12h6v1h-6ZM11 12h2v1h-2ZM3 13h6v1h-6ZM10 13h3v1h-3ZM3 14h10v1h-10Z",
         Icon::Image => "M1 2h14v1h-14ZM1 3h1v1h-1ZM14 3h1v1h-1ZM1 4h1v1h-1ZM10 4h2v1h-2ZM14 4h1v1h-1ZM1 5h1v1h-1ZM10 5h2v1h-2ZM14 5h1v1h-1ZM1 6h1v1h-1ZM14 6h1v1h-1ZM1 7h1v1h-1ZM14 7h1v1h-1ZM1 8h1v1h-1ZM5 8h1v1h-1ZM14 8h1v1h-1ZM1 9h1v1h-1ZM4 9h3v1h-3ZM10 9h1v1h-1ZM14 9h1v1h-1ZM1 10h1v1h-1ZM3 10h5v1h-5ZM9 10h3v1h-3ZM14 10h1v1h-1ZM1 11h14v1h-14ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
         Icon::Video => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h5v1h-5ZM7 4h8v1h-8ZM1 5h5v1h-5ZM8 5h7v1h-7ZM1 6h5v1h-5ZM9 6h6v1h-6ZM1 7h5v1h-5ZM10 7h5v1h-5ZM1 8h5v1h-5ZM10 8h5v1h-5ZM1 9h5v1h-5ZM9 9h6v1h-6ZM1 10h5v1h-5ZM8 10h7v1h-7ZM1 11h5v1h-5ZM7 11h8v1h-8ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
-        Icon::Audio => "M5 4 14 1.5v2.5L7 6v6.5H5V4ZM12 3h2v8.5h-2ZM2 12.5a2.5 2.5 0 0 1 5 0a2.5 2.5 0 0 1-5 0ZM9 11.5a2.5 2.5 0 0 1 5 0a2.5 2.5 0 0 1-5 0Z",
+        Icon::Audio => "M6 4.25 14 1.75v1.75L7 5.7V12.5H6V4.25ZM13 3h1v8.5h-1ZM2.25 12.5a2.25 2.25 0 0 1 4.5 0a2.25 2.25 0 0 1-4.5 0ZM9.25 11.5a2.25 2.25 0 0 1 4.5 0a2.25 2.25 0 0 1-4.5 0Z",
         Icon::Archive => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h14v1h-14ZM2 6h12v1h-12ZM2 7h12v1h-12ZM2 8h4v1h-4ZM10 8h4v1h-4ZM2 9h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12ZM2 12h12v1h-12ZM2 13h12v1h-12Z",
         Icon::Code => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h3v1h-3ZM7 8h2v1h-2ZM10 8h3v1h-3ZM3 9h2v1h-2ZM6 9h4v1h-4ZM11 9h2v1h-2ZM3 10h1v1h-1ZM5 10h6v1h-6ZM12 10h1v1h-1ZM3 11h2v1h-2ZM6 11h4v1h-4ZM11 11h2v1h-2ZM3 12h3v1h-3ZM7 12h2v1h-2ZM10 12h3v1h-3ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
         Icon::Document => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h2v1h-2ZM11 7h2v1h-2ZM3 8h10v1h-10ZM3 9h2v1h-2ZM11 9h2v1h-2ZM3 10h10v1h-10ZM3 11h2v1h-2ZM9 11h4v1h-4ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
@@ -185,13 +185,13 @@ mod tests {
                 assert_eq!(partial, 0, "{i:?} at {size} pixels has {partial} half-covered pixels");
             }
         }
-        // Music's stems are whole pixels under a smooth slanted beam, and its round heads stand two
-        // pixels apart.
+        // Music's one-pixel stems are whole pixels under a smooth slanted beam, and its round heads
+        // stand two pixels apart.
         let mut px = vec![0u32; 16 * 16];
         let mut c = Canvas::new(&mut px, 16, 16);
         Icons::default().draw(&mut c, Audio, 0, 0, 16, 0xffffff);
         let at = |x: usize, y: usize| px[y * 16 + x];
-        assert!(at(10, 3) != 0 && at(5, 8) == 0xffffff && at(12, 7) == 0xffffff && at(3, 12) == 0xffffff && at(11, 11) == 0xffffff, "beam, stems and both heads");
+        assert!(at(10, 3) != 0 && at(6, 8) == 0xffffff && at(13, 7) == 0xffffff && at(4, 12) == 0xffffff && at(11, 11) == 0xffffff, "beam, stems and both heads");
         assert!((10..16).all(|y| at(7, y) == 0 && at(8, y) == 0), "the heads stand apart");
     }
 }
