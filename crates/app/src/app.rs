@@ -450,6 +450,9 @@ pub struct App {
     drive_menu: Option<Volume>,
     /// Drives with something under way, so a second click doesn't start it again.
     pub drives_busy: Vec<String>,
+    /// The drive being opened, and the folder the window was on then. The window only goes to
+    /// the drive if it's still there, as the user may have gone elsewhere meanwhile.
+    opening: Option<(String, PathBuf)>,
     pub edit: Edit,
     pub menu: Option<Menu>,
     pub notices: Vec<String>,
@@ -581,6 +584,7 @@ impl App {
             volumes: Vec::new(),
             drive_menu: None,
             drives_busy: Vec::new(),
+            opening: None,
             edit: Edit::None,
             menu: None,
             notices: Vec::new(),
@@ -1364,8 +1368,12 @@ impl App {
                 let Some(v) = self.drive_menu.take() else { return };
                 match a {
                     Action::OpenDrive => self.open_volume(v),
-                    Action::Unmount => self.drive_act(v, Doing::Unmount),
-                    _ => self.drive_act(v, Doing::Eject),
+                    Action::Unmount => {
+                        self.drive_act(v, Doing::Unmount);
+                    }
+                    _ => {
+                        self.drive_act(v, Doing::Eject);
+                    }
                 }
             }
             Action::Undo => {
@@ -1795,14 +1803,17 @@ impl App {
             Dialog::Unlock { volume, field, error, .. } => {
                 if label == "Unlock" {
                     // Kept open, waiting, until udisks2 says whether it worked.
-                    if !field.text.is_empty() {
-                        self.drive_act(volume.clone(), Doing::Unlock(field.text.clone()));
+                    let waiting = !field.text.is_empty() && self.drive_act(volume.clone(), Doing::Unlock(field.text.clone()));
+                    if waiting {
+                        self.opening = Some((volume.block.clone(), self.dir.clone()));
                     }
-                    let waiting = !field.text.is_empty();
+                    let error = if waiting || field.text.is_empty() { error } else { Some("Something's already under way on this drive. Try again in a moment.".to_string()) };
                     self.dialog = Some(Dialog::Unlock { volume, field, at: 0, error, waiting });
                     self.invalidate_all();
                     return;
                 }
+                // Cancelled: if it was already being tried, the window stays where it is.
+                self.opening = None;
             }
             Dialog::ConfirmQuit { .. } => {
                 if label != "Keep working" {
@@ -1948,28 +1959,48 @@ impl App {
             return self.navigate(at, None);
         }
         if v.locked {
-            self.dialog = Some(Dialog::Unlock { volume: v, field: Field::new(""), at: 0, error: None, waiting: false });
-            self.invalidate_all();
-        } else {
-            self.drive_act(v, Doing::Mount);
+            // Another question, like a copy's, comes first.
+            if self.dialog.is_none() {
+                self.dialog = Some(Dialog::Unlock { volume: v, field: Field::new(""), at: 0, error: None, waiting: false });
+                self.invalidate_all();
+            }
+        } else if self.drive_act(v.clone(), Doing::Mount) {
+            self.opening = Some((v.block, self.dir.clone()));
         }
     }
 
-    /// Starts something on a drive, unless something's already under way on it.
-    fn drive_act(&mut self, v: Volume, doing: Doing) {
-        let Some(address) = self.system_bus.clone() else { return };
+    /// Starts something on a drive, unless something's already under way on it. Returns whether
+    /// it started.
+    fn drive_act(&mut self, v: Volume, doing: Doing) -> bool {
+        let Some(address) = self.system_bus.clone() else {
+            self.notice(format!("Couldn't {} “{}”: udisks2 isn't running", doing.verb(), Self::drive_name(&v)));
+            return false;
+        };
         if self.drives_busy.contains(&v.block) {
-            return;
+            return false;
         }
         self.drives_busy.push(v.block.clone());
         crate::drives::act(self.hub.clone(), address, v, doing);
+        self.invalidate_all();
+        true
+    }
+
+    /// Closes the dialog, and shows the next question a job is waiting on, if there is one.
+    fn close_dialog(&mut self) {
+        self.dialog = None;
+        if !self.pending_conflicts.is_empty() {
+            let c = self.pending_conflicts.remove(0);
+            self.show_conflict(c);
+        }
         self.invalidate_all();
     }
 
     fn open_drive_menu(&mut self, v: Volume, x: i32, y: i32) {
         let items = vec![
             MenuItem { label: if v.locked { "Unlock" } else { "Open" }, keys: "", action: Action::OpenDrive, enabled: true },
-            MenuItem { label: "Unmount", keys: "", action: Action::Unmount, enabled: v.mount.is_some() },
+            // Unmounting what's inside an encrypted volume locks it, and one that's unlocked but
+            // not mounted can still be locked.
+            MenuItem { label: if v.unlocked && v.mount.is_none() { "Lock" } else { "Unmount" }, keys: "", action: Action::Unmount, enabled: v.mount.is_some() || v.unlocked },
             MenuItem { label: "Eject", keys: "", action: Action::Eject, enabled: v.removable },
         ];
         self.drive_menu = Some(v);
@@ -1990,11 +2021,15 @@ impl App {
         self.volumes = volumes;
         let mut places = self.standard_places.clone();
         places.extend(gannet_core::places::all_disk_places(&self.volumes, &mounts, Self::drive_name));
-        self.places = places;
         if let Some(gone) = gone {
-            self.leave_drive(&gone);
+            self.places = places;
+            return self.leave_drive(&gone);
         }
-        self.invalidate_all();
+        // udisks2 says plenty that doesn't change the sidebar.
+        if places != self.places {
+            self.places = places;
+            self.invalidate_all();
+        }
     }
 
     /// The window was on a drive that's gone: it goes home.
@@ -2011,6 +2046,12 @@ impl App {
         self.drives_busy.retain(|b| *b != volume.block);
         let name = Self::drive_name(&volume);
         let unlocking = matches!(&self.dialog, Some(Dialog::Unlock { volume: v, .. }) if v.block == volume.block);
+        // Only what the user's still waiting for takes the window there.
+        let wanted = self.opening.as_ref().is_some_and(|(block, dir)| *block == volume.block && *dir == self.dir);
+        if matches!(doing, Doing::Mount | Doing::Unlock(_)) && self.opening.as_ref().is_some_and(|(block, _)| *block == volume.block) {
+            self.opening = None;
+        }
+        let unlocking = unlocking && matches!(doing, Doing::Unlock(_));
         match (&doing, result) {
             (Doing::Unlock(_), Err(DiskError::WrongPassphrase)) if unlocking => {
                 if let Some(Dialog::Unlock { field, error, waiting, .. }) = self.dialog.as_mut() {
@@ -2019,17 +2060,19 @@ impl App {
                     *waiting = false;
                 }
             }
+            // Cancelled while it was tried: a wrong passphrase isn't news any more.
+            (Doing::Unlock(_), Err(DiskError::WrongPassphrase)) => {}
             (_, Err(e)) => {
                 if unlocking {
-                    self.dialog = None;
+                    self.close_dialog();
                 }
                 self.notice(format!("Couldn't {} “{name}”: {e}", doing.verb()));
             }
             (Doing::Mount | Doing::Unlock(_), Ok(at)) => {
                 if unlocking {
-                    self.dialog = None;
+                    self.close_dialog();
                 }
-                if let Some(at) = at {
+                if let Some(at) = at.filter(|_| wanted) {
                     self.navigate(at, None);
                 }
             }
@@ -3745,7 +3788,7 @@ fn verb_is_move(can_copy: bool, can_move: bool) -> bool {
 
 fn cursor_for(h: Hit) -> Cursor {
     match h {
-        Hit::Header(_) | Hit::Crumb(_) | Hit::Back | Hit::Forward | Hit::Up | Hit::EmptyTrash | Hit::Place(_) | Hit::MenuItem(_) | Hit::NoticeClose(_) | Hit::JobCancel(_) | Hit::DialogButton(_) | Hit::DialogCheck => Cursor::Pointer,
+        Hit::Header(_) | Hit::Crumb(_) | Hit::Back | Hit::Forward | Hit::Up | Hit::EmptyTrash | Hit::Place(_) | Hit::Eject(_) | Hit::MenuItem(_) | Hit::NoticeClose(_) | Hit::JobCancel(_) | Hit::DialogButton(_) | Hit::DialogCheck => Cursor::Pointer,
         Hit::PathBar | Hit::FilterBox => Cursor::Text,
         _ => Cursor::Default,
     }
@@ -5799,7 +5842,7 @@ mod tests {
 
     fn stick(r: &Rig, label: Option<&str>, mount: Option<&Path>, locked: bool) -> Volume {
         let _ = r;
-        Volume { block: format!("/b/{}", label.unwrap_or("none")), drive: "/d/stick".into(), label: label.map(String::from), size: 8_000_000_000, mount: mount.map(Path::to_path_buf), locked, removable: true, identity: gannet_core::disks::Identity { id: "stick".into(), size: 1, media_detected: 1 } }
+        Volume { block: format!("/b/{}", label.unwrap_or("none")), drive: "/d/stick".into(), label: label.map(String::from), size: 8_000_000_000, mount: mount.map(Path::to_path_buf), locked, unlocked: false, removable: true, identity: gannet_core::disks::Identity { id: "stick".into(), size: 1, media_detected: 1 } }
     }
 
     fn drive_rig(tag: &str) -> Rig {
@@ -5875,12 +5918,68 @@ mod tests {
         r.app.on_msg(Msg::DiskDone { volume: secret.clone(), doing: Doing::Unlock(String::new()), result: Err(DiskError::WrongPassphrase) });
         let (text, waiting, error) = typed(&r);
         assert!(text.is_empty() && !waiting && error.is_some(), "cleared, to try again: {error:?}");
-        // Then it worked, and the window goes there.
+        // Typed again, and this time it works, and the window goes there.
+        r.app.drives_busy.clear();
+        r.key(0, "s");
+        r.key(k::KEY_Return, "");
+        assert!(typed(&r).1, "trying again");
         let inside = r.root.join("media/SECRETS");
         fs::create_dir_all(&inside).unwrap();
         r.app.on_msg(Msg::DiskDone { volume: secret, doing: Doing::Unlock(String::new()), result: Ok(Some(inside.clone())) });
         assert!(r.app.dialog.is_none());
         assert_eq!(r.app.dir, inside);
+    }
+
+    #[test]
+    fn a_copys_question_waiting_behind_the_passphrase_is_asked_after_it() {
+        let mut r = drive_rig("drives-conflict");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.open_place(1);
+        let (reply, _answers) = std::sync::mpsc::sync_channel(1);
+        r.app.pending_conflicts.push(gannet_core::ops::Conflict { job: 1, source: "/a".into(), target: "/b".into(), both_folders: false, can_replace: true, reply });
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.app.on_msg(Msg::DiskDone { volume: secret, doing: Doing::Unlock(String::new()), result: Err(DiskError::NoService) });
+        assert!(matches!(r.app.dialog, Some(Dialog::Conflict { .. })), "the copy's question is next, or the copy would wait for ever");
+    }
+
+    #[test]
+    fn a_drive_opened_after_the_user_went_elsewhere_doesnt_pull_the_window_back() {
+        let mut r = drive_rig("drives-moved-on");
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        let photos = stick(&r, Some("PHOTOS"), None, false);
+        r.app.on_msg(Msg::Volumes(vec![photos.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.app.open_place(1);
+        assert!(r.app.drives_busy.contains(&photos.block), "mounting");
+        // Meanwhile, somewhere else.
+        let elsewhere = r.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        r.app.navigate(elsewhere.clone(), None);
+        r.app.on_msg(Msg::DiskDone { volume: photos.clone(), doing: Doing::Mount, result: Ok(Some(mount.clone())) });
+        assert_eq!(r.app.dir, elsewhere, "stays where the user went");
+        // Opened and left alone, it goes there.
+        r.app.open_place(1);
+        r.app.on_msg(Msg::DiskDone { volume: photos, doing: Doing::Mount, result: Ok(Some(mount.clone())) });
+        assert_eq!(r.app.dir, mount);
+    }
+
+    #[test]
+    fn unlock_while_something_else_is_under_way_says_so_rather_than_waiting() {
+        let mut r = drive_rig("drives-busy-unlock");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.app.drives_busy.push(secret.block.clone());
+        r.app.open_place(1);
+        r.key(0, "x");
+        r.key(k::KEY_Return, "");
+        match &r.app.dialog {
+            Some(Dialog::Unlock { waiting, error, .. }) => assert!(!*waiting && error.is_some(), "not stuck waiting: {error:?}"),
+            _ => panic!("no dialog"),
+        }
+        assert_eq!(format!("{:?}", Doing::Unlock("hunter2".into())), "Unlock(…)", "the passphrase never shows");
     }
 
     #[test]

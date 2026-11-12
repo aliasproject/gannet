@@ -16,12 +16,24 @@ use crate::app::{Hub, Msg};
 const SETTLE: Duration = Duration::from_millis(100);
 const CONNECT_LIMIT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Doing {
     Mount,
     Unlock(String),
     Unmount,
     Eject,
+}
+
+/// Never with the passphrase, so a log or a panic can't show it.
+impl std::fmt::Debug for Doing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Doing::Mount => "Mount",
+            Doing::Unlock(_) => "Unlock(…)",
+            Doing::Unmount => "Unmount",
+            Doing::Eject => "Eject",
+        })
+    }
 }
 
 impl Doing {
@@ -44,11 +56,21 @@ pub fn watch(hub: Hub, address: String) {
         let Ok(bus) = Bus::connect_with_limit(&address, CONNECT_LIMIT) else { return };
         let (tx, rx) = channel();
         let Ok(rule) = zbus::MatchRule::builder().msg_type(zbus::message::Type::Signal).sender(disks::SERVICE).build() else { return };
+        // udisks2 starting late, or again, says nothing itself: the bus says its name changed hands.
+        let Ok(started) = zbus::MatchRule::builder().msg_type(zbus::message::Type::Signal).sender("org.freedesktop.DBus").member("NameOwnerChanged").arg(0, disks::SERVICE).build() else { return };
+        let tx2 = tx.clone();
         let Ok(_following) = bus.follow(rule, move |_| tx.send(()).is_ok()) else { return };
+        let Ok(_starting) = bus.follow(started, move |_| tx2.send(()).is_ok()) else { return };
         let udisks = Udisks::new(bus);
+        let mut sent: Option<Vec<disks::Volume>> = None;
         loop {
             if let Ok(snapshot) = udisks.snapshot() {
-                hub.send(Msg::Volumes(snapshot.volumes()));
+                // Most of what udisks2 says doesn't change what the sidebar shows.
+                let volumes = snapshot.volumes();
+                if sent.as_ref() != Some(&volumes) {
+                    sent = Some(volumes.clone());
+                    hub.send(Msg::Volumes(volumes));
+                }
             }
             if rx.recv().is_err() {
                 return;

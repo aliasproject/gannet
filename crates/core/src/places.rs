@@ -153,7 +153,7 @@ mod tests {
         use crate::disks::Identity;
         let m = parse_mountinfo(b"5 1 8:17 / /run/media/me/PHOTOS rw - exfat /dev/sdb1 rw\n7 1 0:9 / /mnt/share rw - nfs4 host:/x rw\n");
         let identity = Identity { id: "stick".into(), size: 1, media_detected: 1 };
-        let volume = |label: Option<&str>, mount: Option<&str>| Volume { block: "b".into(), drive: "d".into(), label: label.map(String::from), size: 8_000_000_000, mount: mount.map(PathBuf::from), locked: false, removable: true, identity: identity.clone() };
+        let volume = |label: Option<&str>, mount: Option<&str>| Volume { block: "b".into(), drive: "d".into(), label: label.map(String::from), size: 8_000_000_000, mount: mount.map(PathBuf::from), locked: false, unlocked: false, removable: true, identity: identity.clone() };
         let volumes = [volume(Some("PHOTOS"), Some("/run/media/me/PHOTOS")), volume(None, None)];
         let places = all_disk_places(&volumes, &m, |v| format!("{} GB Volume", v.size / 1_000_000_000));
         let shown: Vec<(&str, &str, bool)> = places.iter().map(|p| (p.label.as_str(), p.path.to_str().unwrap(), p.volume.is_some())).collect();

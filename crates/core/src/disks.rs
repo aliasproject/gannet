@@ -36,8 +36,18 @@ pub struct Drive {
     pub removable: bool,
     pub ejectable: bool,
     pub can_power_off: bool,
+    /// How it's connected, like `usb` or `sdio`.
+    pub connection: String,
     /// Microseconds since 1970 when the media went in, which changes when a card is swapped.
     pub media_detected: u64,
+}
+
+impl Drive {
+    /// Whether it's meant to be taken out. Plenty of internal disks can be powered off, so
+    /// that alone doesn't count.
+    pub fn can_come_out(&self) -> bool {
+        self.removable || self.ejectable || ["usb", "sdio", "ieee1394"].contains(&self.connection.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -86,6 +96,8 @@ pub struct Volume {
     pub size: u64,
     pub mount: Option<PathBuf>,
     pub locked: bool,
+    /// It's the contents of an encrypted volume, which unmounting locks again.
+    pub unlocked: bool,
     /// Whether the drive can be taken out, so it gets an eject button.
     pub removable: bool,
     pub identity: Identity,
@@ -142,6 +154,7 @@ impl Snapshot {
                         removable: bool_of(d, "Removable") || bool_of(d, "MediaRemovable"),
                         ejectable: bool_of(d, "Ejectable"),
                         can_power_off: bool_of(d, "CanPowerOff"),
+                        connection: string_of(d, "ConnectionBus"),
                         media_detected: u64_of(d, "TimeMediaDetected"),
                     },
                 );
@@ -205,7 +218,8 @@ impl Snapshot {
                 size: if block.size > 0 { block.size } else { underlying.size },
                 mount: block.mount_points.as_ref().and_then(|m| m.first().cloned()),
                 locked,
-                removable: drive.removable || drive.ejectable || drive.can_power_off,
+                unlocked: block.crypto_backing != NONE && !block.crypto_backing.is_empty(),
+                removable: drive.can_come_out(),
                 identity: Identity { id: drive.id.clone(), size: drive.size, media_detected: drive.media_detected },
             });
         }
@@ -321,9 +335,16 @@ impl Udisks {
         self.bus.call(SERVICE, path, &format!("{PREFIX}{interface}"), method, body).map_err(|e| disk_error(e, unlocking))
     }
 
+    /// Mounts a block, and says where. If something else, like an automounter, got there
+    /// first, that's where it is.
     fn mount_block(&self, block: &str) -> Result<PathBuf, DiskError> {
-        let at: String = self.call(block, "Filesystem", "Mount", &(options(),), false)?;
-        Ok(PathBuf::from(at))
+        match self.call::<String>(block, "Filesystem", "Mount", &(options(),), false) {
+            Ok(at) => Ok(PathBuf::from(at)),
+            Err(e) => match self.snapshot().ok().and_then(|s| s.blocks.get(block)?.mount_points.as_ref()?.first().cloned()) {
+                Some(at) => Ok(at),
+                None => Err(e),
+            },
+        }
     }
 
     /// Mounts a volume that isn't locked, and says where.
@@ -347,6 +368,9 @@ impl Udisks {
                     tries += 1;
                     std::thread::sleep(Duration::from_millis(50));
                 }
+                // Something other than a filesystem inside, like LVM: it's unlocked, but there's
+                // nothing here to open.
+                Err(DiskError::Changed) => return Err(DiskError::Other("it's unlocked, but there's nothing on it that can be opened".into())),
                 other => return other,
             }
         }
@@ -384,10 +408,12 @@ impl Udisks {
             }
         }
         let Some(drive) = now.drives.get(&volume.drive) else { return Err(DiskError::Changed) };
-        if drive.can_power_off {
-            self.call::<()>(&drive.path, "Drive", "PowerOff", &(options(),), false)
-        } else if drive.ejectable {
+        // A drive with a tray or slot ejects its media. Anything else is powered off, so it's
+        // safe to pull out.
+        if drive.ejectable {
             self.call::<()>(&drive.path, "Drive", "Eject", &(options(),), false)
+        } else if drive.can_power_off {
+            self.call::<()>(&drive.path, "Drive", "PowerOff", &(options(),), false)
         } else {
             Ok(())
         }
@@ -412,7 +438,8 @@ mod tests {
     }
 
     fn drive(objects: &mut Objects, name: &str, id: &str, removable: bool) {
-        object(objects, &format!("drives/{name}"), vec![("Drive", props(vec![("Id", v(Variant::from(id.to_string()))), ("Size", v(Variant::U64(32_000_000_000))), ("Removable", v(Variant::Bool(removable))), ("CanPowerOff", v(Variant::Bool(removable))), ("TimeMediaDetected", v(Variant::U64(1000)))]))]);
+        // Internal disks can often be powered off too, which doesn't make them removable.
+        object(objects, &format!("drives/{name}"), vec![("Drive", props(vec![("Id", v(Variant::from(id.to_string()))), ("Size", v(Variant::U64(32_000_000_000))), ("Removable", v(Variant::Bool(removable))), ("CanPowerOff", v(Variant::Bool(true))), ("ConnectionBus", v(Variant::from(if removable { "usb" } else { "" }.to_string()))), ("TimeMediaDetected", v(Variant::U64(1000)))]))]);
     }
 
     fn block(name: &str, drive: &str, label: &str, usage: &str, hint_system: bool) -> Properties {
@@ -464,6 +491,17 @@ mod tests {
     }
 
     #[test]
+    fn an_internal_disk_that_can_power_off_gets_no_eject_button() {
+        let mut o = machine(false);
+        drive(&mut o, "Data", "WD-Blue", false);
+        object(&mut o, "block_devices/sdc1", vec![("Block", block("sdc1", "Data", "DATA", "filesystem", false)), ("Filesystem", mounts(&["/run/media/me/DATA"]))]);
+        let s = Snapshot::from_objects(&o);
+        let data = s.volumes().into_iter().find(|v| v.label.as_deref() == Some("DATA")).unwrap();
+        assert!(!data.removable, "shown, as udisks2 doesn't call it the system's, but it doesn't come out");
+        assert!(s.volumes().iter().filter(|v| v.label.as_deref() != Some("DATA")).all(|v| v.removable), "the USB stick does");
+    }
+
+    #[test]
     fn an_unlocked_volume_shows_as_what_is_inside() {
         let s = Snapshot::from_objects(&machine(true));
         let volumes = s.volumes();
@@ -471,7 +509,8 @@ mod tests {
         assert_eq!(labels, [Some("SECRETS"), Some("PHOTOS"), Some("SPARE")], "the locked one is gone, and its contents show");
         let secrets = &s.volumes()[0];
         assert!(secrets.drive.ends_with("/drives/Stick"), "on the stick it's really on");
-        assert!(!secrets.locked && secrets.removable);
+        assert!(!secrets.locked && secrets.removable && secrets.unlocked);
+        assert!(!s.volumes()[1].unlocked, "a plain one isn't");
         assert_eq!(s.blocks[&format!("{ROOT}/block_devices/sdb2")].encrypted, Some(Some(format!("{ROOT}/block_devices/dm_2d1"))));
     }
 
@@ -584,6 +623,19 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(udisks.snapshot().unwrap().volumes().is_empty(), "powered off and gone");
+    }
+
+    #[test]
+    fn something_else_mounting_it_first_still_says_where_it_is() {
+        assert!(std::env::var_os("GANNET_TEST_SANDBOX").is_some(), "run tests with scripts/test.sh");
+        let mut standin = StandIn::start();
+        standin.say("drive Stick Kingston-1234");
+        standin.say("fs sdb1 Stick PHOTOS");
+        let udisks = Udisks::connect(&standin.bus.address).unwrap();
+        // An automounter gets there between the look and the mount.
+        standin.say("mount sdb1");
+        let at = udisks.mount_block(&format!("{ROOT}/block_devices/sdb1")).unwrap();
+        assert_eq!(at, standin.root.path().join("PHOTOS"));
     }
 
     #[test]
