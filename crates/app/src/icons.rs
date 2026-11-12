@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use swash::zeno::{Format, Mask, Transform};
+use swash::zeno::{Cap, Format, Join, Mask, Stroke, Transform};
 
 use crate::canvas::Canvas;
 
@@ -47,36 +47,51 @@ fn path_of(i: Icon) -> &'static str {
         Icon::FileLink => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h6v1h-6ZM10 8h3v1h-3ZM3 9h6v1h-6ZM11 9h2v1h-2ZM3 10h2v1h-2ZM12 10h1v1h-1ZM3 11h2v1h-2ZM12 11h1v1h-1ZM3 12h6v1h-6ZM11 12h2v1h-2ZM3 13h6v1h-6ZM10 13h3v1h-3ZM3 14h10v1h-10Z",
         Icon::Image => "M1 2h14v1h-14ZM1 3h1v1h-1ZM14 3h1v1h-1ZM1 4h1v1h-1ZM10 4h2v1h-2ZM14 4h1v1h-1ZM1 5h1v1h-1ZM10 5h2v1h-2ZM14 5h1v1h-1ZM1 6h1v1h-1ZM14 6h1v1h-1ZM1 7h1v1h-1ZM14 7h1v1h-1ZM1 8h1v1h-1ZM5 8h1v1h-1ZM14 8h1v1h-1ZM1 9h1v1h-1ZM4 9h3v1h-3ZM10 9h1v1h-1ZM14 9h1v1h-1ZM1 10h1v1h-1ZM3 10h5v1h-5ZM9 10h3v1h-3ZM14 10h1v1h-1ZM1 11h14v1h-14ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
         Icon::Video => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h5v1h-5ZM7 4h8v1h-8ZM1 5h5v1h-5ZM8 5h7v1h-7ZM1 6h5v1h-5ZM9 6h6v1h-6ZM1 7h5v1h-5ZM10 7h5v1h-5ZM1 8h5v1h-5ZM10 8h5v1h-5ZM1 9h5v1h-5ZM9 9h6v1h-6ZM1 10h5v1h-5ZM8 10h7v1h-7ZM1 11h5v1h-5ZM7 11h8v1h-8ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
-        Icon::Audio => "M6 2.8 13.5 1.5v9.2a2 2 0 1 1-1.3-1.9V4L7.3 4.9v7.6a2 2 0 1 1-1.3-1.9V2.8Z",
+        Icon::Audio => "M5 1h9v10h-2V3H7v9.5H5V1ZM2 12.5a2.5 2.5 0 0 1 5 0a2.5 2.5 0 0 1-5 0ZM9 11.5a2.5 2.5 0 0 1 5 0a2.5 2.5 0 0 1-5 0Z",
         Icon::Archive => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h14v1h-14ZM2 6h12v1h-12ZM2 7h12v1h-12ZM2 8h4v1h-4ZM10 8h4v1h-4ZM2 9h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12ZM2 12h12v1h-12ZM2 13h12v1h-12Z",
         Icon::Code => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h3v1h-3ZM7 8h2v1h-2ZM10 8h3v1h-3ZM3 9h2v1h-2ZM6 9h4v1h-4ZM11 9h2v1h-2ZM3 10h1v1h-1ZM5 10h6v1h-6ZM12 10h1v1h-1ZM3 11h2v1h-2ZM6 11h4v1h-4ZM11 11h2v1h-2ZM3 12h3v1h-3ZM7 12h2v1h-2ZM10 12h3v1h-3ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
         Icon::Document => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h2v1h-2ZM11 7h2v1h-2ZM3 8h10v1h-10ZM3 9h2v1h-2ZM11 9h2v1h-2ZM3 10h10v1h-10ZM3 11h2v1h-2ZM9 11h4v1h-4ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
-        Icon::Back => "M9 2h3v1h-3ZM8 3h3v1h-3ZM7 4h3v1h-3ZM6 5h3v1h-3ZM5 6h3v1h-3ZM4 7h3v1h-3ZM4 8h3v1h-3ZM5 9h3v1h-3ZM6 10h3v1h-3ZM7 11h3v1h-3ZM8 12h3v1h-3ZM9 13h3v1h-3Z",
-        Icon::Forward => "M4 2h3v1h-3ZM5 3h3v1h-3ZM6 4h3v1h-3ZM7 5h3v1h-3ZM8 6h3v1h-3ZM9 7h3v1h-3ZM9 8h3v1h-3ZM8 9h3v1h-3ZM7 10h3v1h-3ZM6 11h3v1h-3ZM5 12h3v1h-3ZM4 13h3v1h-3Z",
-        Icon::Up => "M7 4h2v1h-2ZM6 5h4v1h-4ZM5 6h6v1h-6ZM4 7h3v1h-3ZM9 7h3v1h-3ZM3 8h3v1h-3ZM10 8h3v1h-3ZM2 9h3v1h-3ZM11 9h3v1h-3ZM2 10h2v1h-2ZM12 10h2v1h-2ZM2 11h1v1h-1ZM13 11h1v1h-1Z",
+        // Lucide's chevron-left.
+        Icon::Back => "M15 18l-6-6 6-6",
+        // Lucide's chevron-right.
+        Icon::Forward => "M9 18l6-6-6-6",
+        // Lucide's chevron-up.
+        Icon::Up => "M18 15l-6-6-6 6",
         Icon::Home => "M7 1h2v1h-2ZM6 2h4v1h-4ZM5 3h6v1h-6ZM4 4h8v1h-8ZM3 5h10v1h-10ZM2 6h12v1h-12ZM1 7h14v1h-14ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h3v1h-3ZM10 10h3v1h-3ZM3 11h3v1h-3ZM10 11h3v1h-3ZM3 12h3v1h-3ZM10 12h3v1h-3ZM3 13h3v1h-3ZM10 13h3v1h-3ZM3 14h3v1h-3ZM10 14h3v1h-3Z",
         Icon::Trash => "M6 1h4v1h-4ZM2 2h12v1h-12ZM2 3h12v1h-12ZM4 5h8v1h-8ZM4 6h8v1h-8ZM4 7h2v1h-2ZM7 7h2v1h-2ZM10 7h2v1h-2ZM4 8h2v1h-2ZM7 8h2v1h-2ZM10 8h2v1h-2ZM4 9h2v1h-2ZM7 9h2v1h-2ZM10 9h2v1h-2ZM4 10h2v1h-2ZM7 10h2v1h-2ZM10 10h2v1h-2ZM4 11h2v1h-2ZM7 11h2v1h-2ZM10 11h2v1h-2ZM4 12h2v1h-2ZM7 12h2v1h-2ZM10 12h2v1h-2ZM4 13h8v1h-8ZM4 14h8v1h-8Z",
-        Icon::Disk => "M1 4h14v1h-14ZM1 5h14v1h-14ZM1 6h14v1h-14ZM1 7h10v1h-10ZM13 7h2v1h-2ZM1 8h10v1h-10ZM13 8h2v1h-2ZM1 9h14v1h-14ZM1 10h14v1h-14ZM1 11h14v1h-14Z",
+        Icon::Disk => "M4 3h8v1h-8ZM3 4h2v1h-2ZM11 4h2v1h-2ZM2 5h2v1h-2ZM12 5h2v1h-2ZM1 6h2v1h-2ZM13 6h2v1h-2ZM1 7h14v1h-14ZM1 8h14v1h-14ZM1 9h14v1h-14ZM1 10h3v1h-3ZM5 10h2v1h-2ZM8 10h7v1h-7ZM1 11h14v1h-14ZM2 12h12v1h-12Z",
         Icon::Eject => "M7 3h2v1h-2ZM6 4h4v1h-4ZM5 5h6v1h-6ZM4 6h8v1h-8ZM3 7h10v1h-10ZM2 8h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12Z",
         Icon::Lock => "M6 1h4v1h-4ZM5 2h2v1h-2ZM9 2h2v1h-2ZM5 3h2v1h-2ZM9 3h2v1h-2ZM5 4h2v1h-2ZM9 4h2v1h-2ZM5 5h2v1h-2ZM9 5h2v1h-2ZM5 6h2v1h-2ZM9 6h2v1h-2ZM3 7h10v1h-10ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h10v1h-10ZM3 11h10v1h-10ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
         // An arrow down into a tray.
         Icon::Download => "M7 1h2v1h-2ZM7 2h2v1h-2ZM7 3h2v1h-2ZM7 4h2v1h-2ZM7 5h2v1h-2ZM7 6h2v1h-2ZM4 7h8v1h-8ZM5 8h6v1h-6ZM6 9h4v1h-4ZM1 10h2v1h-2ZM7 10h2v1h-2ZM13 10h2v1h-2ZM1 11h2v1h-2ZM13 11h2v1h-2ZM1 12h2v1h-2ZM13 12h2v1h-2ZM1 13h14v1h-14ZM1 14h14v1h-14Z",
         // Small marks, each on the grid of the size it's drawn at (see `grid_of`), and drawn
-        // pixel by pixel: at these sizes a slanted edge would leave grey half-pixels.
-        Icon::ArrowUp => "M6 5h2v1h-2ZM5 6h4v1h-4ZM4 7h6v1h-6ZM3 8h8v1h-8Z",
-        Icon::ArrowDown => "M3 5h8v1h-8ZM4 6h6v1h-6ZM5 7h4v1h-4ZM6 8h2v1h-2Z",
+        // Lucide's chevron-up.
+        Icon::ArrowUp => "M18 15l-6-6-6 6",
+        // Lucide's chevron-down.
+        Icon::ArrowDown => "M6 9l6 6 6-6",
         Icon::Close => "M2 2h2v1h-2ZM8 2h2v1h-2ZM3 3h2v1h-2ZM7 3h2v1h-2ZM4 4h4v1h-4ZM5 5h2v1h-2ZM4 6h4v1h-4ZM3 7h2v1h-2ZM7 7h2v1h-2ZM2 8h2v1h-2ZM8 8h2v1h-2Z",
-        Icon::Crumb => "M3 1h1v1h-1ZM3 2h2v1h-2ZM4 3h2v1h-2ZM5 4h2v1h-2ZM4 5h2v1h-2ZM3 6h2v1h-2ZM3 7h1v1h-1Z",
+        // Lucide's chevron-right.
+        Icon::Crumb => "M9 18l6-6-6-6",
     }
 }
 
+/// The chevrons are Lucide's (https://lucide.dev, ISC; see LICENSES/lucide.txt): outlines on a
+/// 24-unit grid, stroked 2 units wide with round ends, as Lucide draws them. The rest are solid.
+fn stroked(i: Icon) -> bool {
+    matches!(i, Icon::Back | Icon::Forward | Icon::Up | Icon::Crumb | Icon::ArrowUp | Icon::ArrowDown)
+}
+/// Lucide's grid and stroke, in its units.
+const LUCIDE_GRID: f32 = 24.0;
+const LUCIDE_STROKE: f32 = 2.0;
+/// The thinnest a chevron's stroke gets, in pixels, so those drawn at 10 or 14 pixels don't fade.
+const MIN_STROKE_PX: f32 = 1.25;
+
 /// The grid an icon is drawn on, in pixels. It's sharp drawn at that size or a whole multiple of
-/// it: the small marks are drawn smaller than the rest, so each has a grid of its own.
+/// it: the close cross is drawn smaller than the rest, so it has a grid of its own.
 pub fn grid_of(i: Icon) -> f32 {
     match i {
-        Icon::Crumb => 10.0,
+        _ if stroked(i) => LUCIDE_GRID,
         Icon::Close => 12.0,
-        Icon::ArrowUp | Icon::ArrowDown => 14.0,
         _ => 16.0,
     }
 }
@@ -90,7 +105,13 @@ impl Icons {
     pub fn draw(&mut self, canvas: &mut Canvas, icon: Icon, x: i32, y: i32, size: i32, color: u32) {
         let (mask, s) = self.cache.entry((icon, size)).or_insert_with(|| {
             let scale = size as f32 / grid_of(icon);
-            let (data, _) = Mask::new(path_of(icon)).size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
+            let mut mask = Mask::new(path_of(icon));
+            let mut stroke = Stroke::new(LUCIDE_STROKE.max(MIN_STROKE_PX / scale));
+            stroke.cap(Cap::Round).join(Join::Round);
+            if stroked(icon) {
+                mask.style(stroke);
+            }
+            let (data, _) = mask.size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
             (data, size)
         });
         canvas.mask(mask, *s, *s, x, y, color);
@@ -152,7 +173,7 @@ mod tests {
     #[test]
     fn icons_are_whole_pixels() {
         use Icon::*;
-        for i in [Folder, FolderLink, File, FileLink, Image, Video, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, Eject, Lock, Download, ArrowUp, ArrowDown, Close, Crumb] {
+        for i in [Folder, FolderLink, File, FileLink, Image, Video, Archive, Code, Document, Home, Trash, Disk, Eject, Lock, Download, Close] {
             for times in [1, 2] {
                 let size = grid_of(i) as i32 * times;
                 let mut px = vec![0u32; (size * size) as usize];
@@ -162,6 +183,12 @@ mod tests {
                 assert_eq!(partial, 0, "{i:?} at {size} pixels has {partial} half-covered pixels");
             }
         }
-        // Music keeps its original, smoothed outline, which reads better than any pixel version.
+        // Music's stems and beam are whole pixels, and its round heads stand two pixels apart.
+        let mut px = vec![0u32; 16 * 16];
+        let mut c = Canvas::new(&mut px, 16, 16);
+        Icons::default().draw(&mut c, Audio, 0, 0, 16, 0xffffff);
+        let at = |x: usize, y: usize| px[y * 16 + x];
+        assert!(at(13, 1) == 0xffffff && at(5, 6) == 0xffffff && at(3, 12) == 0xffffff && at(11, 11) == 0xffffff, "beam, stem and both heads");
+        assert!((10..16).all(|y| at(7, y) == 0 && at(8, y) == 0), "the heads stand apart");
     }
 }
