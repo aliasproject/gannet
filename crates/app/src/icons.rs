@@ -36,7 +36,8 @@ pub enum Icon {
 }
 
 // All on a 16x16 grid, with every straight edge on a whole pixel, so they're sharp when drawn
-// at 16 pixels or a whole multiple of it. Holes are cut with the even-odd rule.
+// at 16 pixels or a whole multiple of it, and each filling about the same 14x14 area, so none
+// looks smaller or squashed beside the others. Holes are cut as `fill_of` says.
 /// A page with its corner folded, and whatever's cut out of it.
 macro_rules! concat_file {
     ($rest:literal) => {
@@ -51,9 +52,9 @@ fn path_of(i: Icon) -> &'static str {
         Icon::FolderLink => "M1 3h6v2h8v8H1V3Zm4 5h3V6l3 3-3 3v-2H5V8Z",
         Icon::File => FILE,
         Icon::FileLink => concat_file!("M5 10h3V8l3 3-3 3v-2H5v-2Z"),
-        Icon::Image => "M1 3h14v10H1V3Zm1 1v8h12V4H2Zm1 7 3-4 2 2 2-1 3 3H3Zm8-6h2v2h-2V5Z",
-        Icon::Video => "M1 3h14v10H1V3Zm5 2v6l5-3-5-3Z",
-        Icon::Audio => "M6 4 14 2v8.5a2 2 0 1 1-1-1.73V5L7 6.5v6a2 2 0 1 1-1-1.73V4Z",
+        Icon::Image => "M1 2h14v12H1V2Zm1 1v10h12V3H2Zm1 10 3-4 2 2 2-2 4 4H3Zm7-8h2v2h-2V5Z",
+        Icon::Video => "M1 2h14v12H1V2Zm5 3v6l5-3-5-3Z",
+        Icon::Audio => "M6 2h8v9h-2V5H8v7.5H6V2ZM8.5 12.5a2.5 2.5 0 1 1-5 0a2.5 2.5 0 1 1 5 0ZM14 11.5a2.5 2.5 0 1 1-5 0a2.5 2.5 0 1 1 5 0Z",
         Icon::Archive => "M2 2h12v3H2V2Zm1 4h10v8H3V6Zm3 2v1h4V8H6Z",
         Icon::Code => concat_file!("M7 8h1v1h-1ZM6 9h1v1h-1ZM5 10h1v1h-1ZM6 11h1v1h-1ZM7 12h1v1h-1ZM9 8h1v1h-1ZM10 9h1v1h-1ZM11 10h1v1h-1ZM10 11h1v1h-1ZM9 12h1v1h-1Z"),
         Icon::Document => concat_file!("M5 7h6v1H5V7Zm0 2h6v1H5V9Zm0 2h4v1H5v-1Z"),
@@ -76,6 +77,12 @@ fn path_of(i: Icon) -> &'static str {
     }
 }
 
+/// How an icon's holes are cut: most use even-odd, so a shape inside another is a hole. Music
+/// is drawn from overlapping parts, its note heads over its stems, which even-odd would cut away.
+fn fill_of(i: Icon) -> Fill {
+    if i == Icon::Audio { Fill::NonZero } else { Fill::EvenOdd }
+}
+
 /// The grid an icon is drawn on, in pixels. It's sharp drawn at that size or a whole multiple of
 /// it: the small marks are drawn smaller than the rest, so each has a grid of its own.
 pub fn grid_of(i: Icon) -> f32 {
@@ -96,7 +103,7 @@ impl Icons {
     pub fn draw(&mut self, canvas: &mut Canvas, icon: Icon, x: i32, y: i32, size: i32, color: u32) {
         let (mask, s) = self.cache.entry((icon, size)).or_insert_with(|| {
             let scale = size as f32 / grid_of(icon);
-            let (data, _) = Mask::new(path_of(icon)).style(Fill::EvenOdd).size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
+            let (data, _) = Mask::new(path_of(icon)).style(fill_of(icon)).size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
             (data, size)
         });
         canvas.mask(mask, *s, *s, x, y, color);
@@ -163,6 +170,11 @@ mod tests {
             // Arcs' radii can be anything: only Lock has them, and its are whole too.
             assert!(numbers.clone().all(|n| !n.contains('.')), "{i:?} has an edge between pixels: {}", path_of(i));
         }
+        // Music's note heads are arcs: one written without its letter is dropped, leaving stems.
+        let mut px = vec![0u32; 16 * 16];
+        let mut c = Canvas::new(&mut px, 16, 16);
+        Icons::default().draw(&mut c, Audio, 0, 0, 16, 0xffffff);
+        assert!([(5, 13), (11, 12)].iter().all(|&(x, y)| px[y * 16 + x] == 0xffffff), "music has both note heads");
         for i in [ArrowUp, ArrowDown, Close, Crumb] {
             assert!(!path_of(i).contains('.'), "{i:?} has an edge between pixels");
         }
