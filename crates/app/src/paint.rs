@@ -222,10 +222,10 @@ impl App {
         // Worked out while the places are still here: they're moved out while they're drawn.
         let ejects: Vec<Option<Rect>> = (0..self.places.len()).map(|i| self.eject_rect(i)).collect();
         let tops: Vec<i32> = (0..self.places.len()).map(|i| self.place_top(i)).collect();
-        if let Some(h) = self.devices_heading() {
-            let y = tops[h] - self.px(crate::app::SIDEBAR_HEADING);
-            let by = self.baseline(y, self.px(crate::app::SIDEBAR_HEADING));
-            self.text.draw_fitted(c, "Devices", (l.sidebar.x + self.px(14.0)) as f32, by + self.px(2.0), (l.sidebar.w - self.px(28.0)) as f32, co.muted);
+        let heading = self.px(crate::app::SIDEBAR_HEADING);
+        for (h, label) in self.sidebar_headings() {
+            let by = self.baseline(tops[h] - heading, heading);
+            self.text.draw_fitted(c, label, (l.sidebar.x + self.px(14.0)) as f32, by, (l.sidebar.w - self.px(28.0)) as f32, co.muted);
         }
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {

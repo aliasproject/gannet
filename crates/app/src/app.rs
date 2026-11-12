@@ -35,8 +35,10 @@ pub const BTN_RIGHT: u32 = 0x111;
 pub const BTN_SIDE: u32 = 0x113;
 pub const BTN_EXTRA: u32 = 0x114;
 
-/// The height of a heading in the sidebar, like "Devices", in unscaled pixels.
-pub const SIDEBAR_HEADING: f64 = 26.0;
+/// The height of a heading in the sidebar, like "Devices", and the space above each after the
+/// first, in unscaled pixels.
+pub const SIDEBAR_HEADING: f64 = 24.0;
+pub const SIDEBAR_GAP: f64 = 10.0;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const TYPE_AHEAD_RESET: Duration = Duration::from_millis(900);
 const HOLD_FOR_LOAD: Duration = Duration::from_millis(16);
@@ -2152,15 +2154,20 @@ impl App {
         self.invalidate_all();
     }
 
-    /// Which place the "Devices" heading sits above: the first drive or mount, if there is one.
-    pub fn devices_heading(&self) -> Option<usize> {
-        self.places.iter().position(|p| p.kind == PlaceKind::Disk)
+    /// The sidebar's sections, as the place each starts at and its heading: Places from the
+    /// top, and Devices from the first drive or mount, if there is one.
+    pub fn sidebar_headings(&self) -> Vec<(usize, &'static str)> {
+        let mut out = vec![(0, "Places")];
+        out.extend(self.places.iter().position(|p| p.kind == PlaceKind::Disk).filter(|&i| i > 0).map(|i| (i, "Devices")));
+        out
     }
 
-    /// The top of a place's row in the sidebar, below the heading for the rows after it.
+    /// The top of a place's row in the sidebar, below the headings of its section and the ones
+    /// before it, each after the first with a gap above it.
     pub fn place_top(&self, i: usize) -> i32 {
-        let heading = if self.devices_heading().is_some_and(|h| i >= h) { self.px(SIDEBAR_HEADING) } else { 0 };
-        self.layout().sidebar.y + self.px(8.0) + i as i32 * self.px(30.0) + heading
+        let headings = self.sidebar_headings().iter().filter(|(h, _)| *h <= i).count() as i32;
+        let above = headings * self.px(SIDEBAR_HEADING) + (headings - 1).max(0) * self.px(SIDEBAR_GAP);
+        self.layout().sidebar.y + self.px(8.0) + i as i32 * self.px(30.0) + above
     }
 
     /// The place whose row is at `y`, if any: the heading isn't one.
@@ -5962,24 +5969,26 @@ mod tests {
     }
 
     #[test]
-    fn a_devices_heading_sits_above_the_drives_and_isnt_a_place() {
+    fn each_sidebar_section_has_a_heading_and_headings_arent_places() {
         let mut r = drive_rig("drives-heading");
-        assert_eq!(r.app.devices_heading(), None, "no drives, no heading");
+        assert_eq!(r.app.sidebar_headings(), [(0, "Places")], "no drives, no Devices");
         let mount = r.root.join("media/PHOTOS");
         fs::create_dir_all(&mount).unwrap();
         r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
-        assert_eq!(r.app.devices_heading(), Some(1), "above the first drive");
+        assert_eq!(r.app.sidebar_headings(), [(0, "Places"), (1, "Devices")], "above the first drive");
         let (home, photos) = (r.app.place_top(0), r.app.place_top(1));
-        let (row, heading) = (r.app.px(30.0), r.app.px(SIDEBAR_HEADING));
-        assert_eq!(photos, home + row + heading, "the drive's row is below the heading");
+        let (row, heading, gap) = (r.app.px(30.0), r.app.px(SIDEBAR_HEADING), r.app.px(SIDEBAR_GAP));
+        assert_eq!(home, r.app.layout().sidebar.y + r.app.px(8.0) + heading, "Home is below the Places heading");
+        assert_eq!(photos, home + row + gap + heading, "the drive's row is below a gap and its heading");
         let x = r.app.layout().sidebar.x + r.app.px(40.0);
+        assert_eq!(r.app.hit(x, home - heading / 2), Hit::None, "the Places heading isn't a place");
         assert_eq!(r.app.hit(x, home + row / 2), Hit::Place(0));
-        assert_eq!(r.app.hit(x, home + row + heading / 2), Hit::None, "the heading isn't a place");
+        assert_eq!(r.app.hit(x, photos - heading / 2), Hit::None, "nor is the Devices heading");
         assert_eq!(r.app.hit(x, photos + row / 2), Hit::Place(1));
         let e = r.app.eject_rect(1).unwrap();
         assert_eq!((e.y, r.app.hit(e.x + e.w / 2, e.y + e.h / 2)), (photos, Hit::Eject(1)), "the eject button is on the drive's row");
         r.app.on_msg(Msg::Volumes(vec![]));
-        assert!(r.app.devices_heading().is_none_or(|i| r.app.places[i].volume.is_none()), "only mounts udisks2 doesn't know of are left under it, if any");
+        assert!(r.app.sidebar_headings().iter().all(|&(i, _)| r.app.places[i].volume.is_none()), "only mounts udisks2 doesn't know of are left under Devices, if any");
     }
 
     #[test]
