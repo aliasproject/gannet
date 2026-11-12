@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use swash::zeno::{Fill, Format, Mask, Transform};
+use swash::zeno::{Format, Mask, Transform};
 
 use crate::canvas::Canvas;
 
@@ -35,39 +35,32 @@ pub enum Icon {
     Crumb,
 }
 
-// All on a 16x16 grid, with every straight edge on a whole pixel, so they're sharp when drawn
-// at 16 pixels or a whole multiple of it, and each filling about the same 14x14 area, so none
-// looks smaller or squashed beside the others. Holes are cut as `fill_of` says.
-/// A page with its corner folded, and whatever's cut out of it.
-macro_rules! concat_file {
-    ($rest:literal) => {
-        concat!("M3 1h6v5h4v9H3V1Zm7 0 3 3h-3V1Z", $rest)
-    };
-}
-const FILE: &str = concat_file!("");
+// Each drawn pixel by pixel on a 16x16 grid: every pixel is fully on or off, so they're sharp
+// at 16 pixels and any whole multiple of it, with no smoothing to blur them. Each fills about
+// the same 14x14 area, so none looks smaller or squashed beside the others.
 
 fn path_of(i: Icon) -> &'static str {
     match i {
-        Icon::Folder => "M1 3h6v2h8v8H1V3Z",
-        Icon::FolderLink => "M1 3h6v2h8v8H1V3Zm4 5h3V6l3 3-3 3v-2H5V8Z",
-        Icon::File => FILE,
-        Icon::FileLink => concat_file!("M5 10h3V8l3 3-3 3v-2H5v-2Z"),
-        Icon::Image => "M1 2h14v12H1V2Zm1 1v10h12V3H2Zm1 10 3-4 2 2 2-2 4 4H3Zm7-8h2v2h-2V5Z",
-        Icon::Video => "M1 2h14v12H1V2Zm5 3v6l5-3-5-3Z",
-        Icon::Audio => "M6 2h8v9h-2V5H8v7.5H6V2ZM8.5 12.5a2.5 2.5 0 1 1-5 0a2.5 2.5 0 1 1 5 0ZM14 11.5a2.5 2.5 0 1 1-5 0a2.5 2.5 0 1 1 5 0Z",
-        Icon::Archive => "M2 2h12v3H2V2Zm1 4h10v8H3V6Zm3 2v1h4V8H6Z",
-        Icon::Code => concat_file!("M7 8h1v1h-1ZM6 9h1v1h-1ZM5 10h1v1h-1ZM6 11h1v1h-1ZM7 12h1v1h-1ZM9 8h1v1h-1ZM10 9h1v1h-1ZM11 10h1v1h-1ZM10 11h1v1h-1ZM9 12h1v1h-1Z"),
-        Icon::Document => concat_file!("M5 7h6v1H5V7Zm0 2h6v1H5V9Zm0 2h4v1H5v-1Z"),
-        Icon::Back => "M10 2l2 2-4 4 4 4-2 2-6-6 6-6Z",
-        Icon::Forward => "M6 2 4 4l4 4-4 4 2 2 6-6-6-6Z",
-        Icon::Up => "M2 10l2 2 4-4 4 4 2-2-6-6-6 6Z",
-        Icon::Home => "M8 1l7 7h-2v7h-3v-5H6v5H3V8H1l7-7Z",
-        Icon::Trash => "M6 1h4v1h4v2H2V2h4V1ZM4 5h8v10H4V5Zm2 2v6h1V7H6Zm3 0v6h1V7H9Z",
-        Icon::Disk => "M1 4h14v8H1V4Zm10 3v2h2V7h-2Z",
-        Icon::Eject => "M8 3l6 6H2l6-6ZM2 11h12v2H2v-2Z",
-        Icon::Lock => "M5 7V5a3 3 0 0 1 6 0v2H9V5a1 1 0 0 0-2 0v2H5ZM3 7h10v8H3V7Z",
+        Icon::Folder => "M1 3h6v1h-6ZM1 4h6v1h-6ZM1 5h14v1h-14ZM1 6h14v1h-14ZM1 7h14v1h-14ZM1 8h14v1h-14ZM1 9h14v1h-14ZM1 10h14v1h-14ZM1 11h14v1h-14ZM1 12h14v1h-14Z",
+        Icon::FolderLink => "M1 3h6v1h-6ZM1 4h6v1h-6ZM1 5h14v1h-14ZM1 6h7v1h-7ZM9 6h6v1h-6ZM1 7h7v1h-7ZM10 7h5v1h-5ZM1 8h3v1h-3ZM11 8h4v1h-4ZM1 9h3v1h-3ZM11 9h4v1h-4ZM1 10h7v1h-7ZM10 10h5v1h-5ZM1 11h7v1h-7ZM9 11h6v1h-6ZM1 12h14v1h-14Z",
+        Icon::File => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h10v1h-10ZM3 11h10v1h-10ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
+        Icon::FileLink => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h6v1h-6ZM10 8h3v1h-3ZM3 9h6v1h-6ZM11 9h2v1h-2ZM3 10h2v1h-2ZM12 10h1v1h-1ZM3 11h2v1h-2ZM12 11h1v1h-1ZM3 12h6v1h-6ZM11 12h2v1h-2ZM3 13h6v1h-6ZM10 13h3v1h-3ZM3 14h10v1h-10Z",
+        Icon::Image => "M1 2h14v1h-14ZM1 3h1v1h-1ZM14 3h1v1h-1ZM1 4h1v1h-1ZM10 4h2v1h-2ZM14 4h1v1h-1ZM1 5h1v1h-1ZM10 5h2v1h-2ZM14 5h1v1h-1ZM1 6h1v1h-1ZM14 6h1v1h-1ZM1 7h1v1h-1ZM14 7h1v1h-1ZM1 8h1v1h-1ZM5 8h1v1h-1ZM14 8h1v1h-1ZM1 9h1v1h-1ZM4 9h3v1h-3ZM10 9h1v1h-1ZM14 9h1v1h-1ZM1 10h1v1h-1ZM3 10h5v1h-5ZM9 10h3v1h-3ZM14 10h1v1h-1ZM1 11h14v1h-14ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
+        Icon::Video => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h5v1h-5ZM7 4h8v1h-8ZM1 5h5v1h-5ZM8 5h7v1h-7ZM1 6h5v1h-5ZM9 6h6v1h-6ZM1 7h5v1h-5ZM10 7h5v1h-5ZM1 8h5v1h-5ZM10 8h5v1h-5ZM1 9h5v1h-5ZM9 9h6v1h-6ZM1 10h5v1h-5ZM8 10h7v1h-7ZM1 11h5v1h-5ZM7 11h8v1h-8ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
+        Icon::Audio => "M7 1h8v1h-8ZM7 2h8v1h-8ZM7 3h2v1h-2ZM13 3h2v1h-2ZM7 4h2v1h-2ZM13 4h2v1h-2ZM7 5h2v1h-2ZM13 5h2v1h-2ZM7 6h2v1h-2ZM13 6h2v1h-2ZM7 7h2v1h-2ZM13 7h2v1h-2ZM7 8h2v1h-2ZM11 8h4v1h-4ZM7 9h2v1h-2ZM10 9h5v1h-5ZM4 10h5v1h-5ZM10 10h5v1h-5ZM3 11h6v1h-6ZM11 11h4v1h-4ZM3 12h6v1h-6ZM4 13h4v1h-4Z",
+        Icon::Archive => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h14v1h-14ZM2 6h12v1h-12ZM2 7h12v1h-12ZM2 8h4v1h-4ZM10 8h4v1h-4ZM2 9h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12ZM2 12h12v1h-12ZM2 13h12v1h-12Z",
+        Icon::Code => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h3v1h-3ZM7 8h2v1h-2ZM10 8h3v1h-3ZM3 9h2v1h-2ZM6 9h4v1h-4ZM11 9h2v1h-2ZM3 10h1v1h-1ZM5 10h6v1h-6ZM12 10h1v1h-1ZM3 11h2v1h-2ZM6 11h4v1h-4ZM11 11h2v1h-2ZM3 12h3v1h-3ZM7 12h2v1h-2ZM10 12h3v1h-3ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
+        Icon::Document => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h2v1h-2ZM11 7h2v1h-2ZM3 8h10v1h-10ZM3 9h2v1h-2ZM11 9h2v1h-2ZM3 10h10v1h-10ZM3 11h2v1h-2ZM9 11h4v1h-4ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
+        Icon::Back => "M9 2h3v1h-3ZM8 3h3v1h-3ZM7 4h3v1h-3ZM6 5h3v1h-3ZM5 6h3v1h-3ZM4 7h3v1h-3ZM4 8h3v1h-3ZM5 9h3v1h-3ZM6 10h3v1h-3ZM7 11h3v1h-3ZM8 12h3v1h-3ZM9 13h3v1h-3Z",
+        Icon::Forward => "M4 2h3v1h-3ZM5 3h3v1h-3ZM6 4h3v1h-3ZM7 5h3v1h-3ZM8 6h3v1h-3ZM9 7h3v1h-3ZM9 8h3v1h-3ZM8 9h3v1h-3ZM7 10h3v1h-3ZM6 11h3v1h-3ZM5 12h3v1h-3ZM4 13h3v1h-3Z",
+        Icon::Up => "M7 4h2v1h-2ZM6 5h4v1h-4ZM5 6h6v1h-6ZM4 7h3v1h-3ZM9 7h3v1h-3ZM3 8h3v1h-3ZM10 8h3v1h-3ZM2 9h3v1h-3ZM11 9h3v1h-3ZM2 10h2v1h-2ZM12 10h2v1h-2ZM2 11h1v1h-1ZM13 11h1v1h-1Z",
+        Icon::Home => "M7 1h2v1h-2ZM6 2h4v1h-4ZM5 3h6v1h-6ZM4 4h8v1h-8ZM3 5h10v1h-10ZM2 6h12v1h-12ZM1 7h14v1h-14ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h3v1h-3ZM10 10h3v1h-3ZM3 11h3v1h-3ZM10 11h3v1h-3ZM3 12h3v1h-3ZM10 12h3v1h-3ZM3 13h3v1h-3ZM10 13h3v1h-3ZM3 14h3v1h-3ZM10 14h3v1h-3Z",
+        Icon::Trash => "M6 1h4v1h-4ZM2 2h12v1h-12ZM2 3h12v1h-12ZM4 5h8v1h-8ZM4 6h8v1h-8ZM4 7h2v1h-2ZM7 7h2v1h-2ZM10 7h2v1h-2ZM4 8h2v1h-2ZM7 8h2v1h-2ZM10 8h2v1h-2ZM4 9h2v1h-2ZM7 9h2v1h-2ZM10 9h2v1h-2ZM4 10h2v1h-2ZM7 10h2v1h-2ZM10 10h2v1h-2ZM4 11h2v1h-2ZM7 11h2v1h-2ZM10 11h2v1h-2ZM4 12h2v1h-2ZM7 12h2v1h-2ZM10 12h2v1h-2ZM4 13h8v1h-8ZM4 14h8v1h-8Z",
+        Icon::Disk => "M1 4h14v1h-14ZM1 5h14v1h-14ZM1 6h14v1h-14ZM1 7h10v1h-10ZM13 7h2v1h-2ZM1 8h10v1h-10ZM13 8h2v1h-2ZM1 9h14v1h-14ZM1 10h14v1h-14ZM1 11h14v1h-14Z",
+        Icon::Eject => "M7 3h2v1h-2ZM6 4h4v1h-4ZM5 5h6v1h-6ZM4 6h8v1h-8ZM3 7h10v1h-10ZM2 8h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12Z",
+        Icon::Lock => "M6 1h4v1h-4ZM5 2h2v1h-2ZM9 2h2v1h-2ZM5 3h2v1h-2ZM9 3h2v1h-2ZM5 4h2v1h-2ZM9 4h2v1h-2ZM5 5h2v1h-2ZM9 5h2v1h-2ZM5 6h2v1h-2ZM9 6h2v1h-2ZM3 7h10v1h-10ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h10v1h-10ZM3 11h10v1h-10ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
         // An arrow down into a tray.
-        Icon::Download => "M7 1h2v6h3l-4 4-4-4h3V1ZM1 10h2v3h10v-3h2v5H1v-5Z",
+        Icon::Download => "M7 1h2v1h-2ZM7 2h2v1h-2ZM7 3h2v1h-2ZM7 4h2v1h-2ZM7 5h2v1h-2ZM7 6h2v1h-2ZM4 7h8v1h-8ZM5 8h6v1h-6ZM6 9h4v1h-4ZM1 10h2v1h-2ZM7 10h2v1h-2ZM13 10h2v1h-2ZM1 11h2v1h-2ZM13 11h2v1h-2ZM1 12h2v1h-2ZM13 12h2v1h-2ZM1 13h14v1h-14ZM1 14h14v1h-14Z",
         // Small marks, each on the grid of the size it's drawn at (see `grid_of`), and drawn
         // pixel by pixel: at these sizes a slanted edge would leave grey half-pixels.
         Icon::ArrowUp => "M6 5h2v1h-2ZM5 6h4v1h-4ZM4 7h6v1h-6ZM3 8h8v1h-8Z",
@@ -75,12 +68,6 @@ fn path_of(i: Icon) -> &'static str {
         Icon::Close => "M2 2h2v1h-2ZM8 2h2v1h-2ZM3 3h2v1h-2ZM7 3h2v1h-2ZM4 4h4v1h-4ZM5 5h2v1h-2ZM4 6h4v1h-4ZM3 7h2v1h-2ZM7 7h2v1h-2ZM2 8h2v1h-2ZM8 8h2v1h-2Z",
         Icon::Crumb => "M3 1h1v1h-1ZM3 2h2v1h-2ZM4 3h2v1h-2ZM5 4h2v1h-2ZM4 5h2v1h-2ZM3 6h2v1h-2ZM3 7h1v1h-1Z",
     }
-}
-
-/// How an icon's holes are cut: most use even-odd, so a shape inside another is a hole. Music
-/// is drawn from overlapping parts, its note heads over its stems, which even-odd would cut away.
-fn fill_of(i: Icon) -> Fill {
-    if i == Icon::Audio { Fill::NonZero } else { Fill::EvenOdd }
 }
 
 /// The grid an icon is drawn on, in pixels. It's sharp drawn at that size or a whole multiple of
@@ -103,7 +90,7 @@ impl Icons {
     pub fn draw(&mut self, canvas: &mut Canvas, icon: Icon, x: i32, y: i32, size: i32, color: u32) {
         let (mask, s) = self.cache.entry((icon, size)).or_insert_with(|| {
             let scale = size as f32 / grid_of(icon);
-            let (data, _) = Mask::new(path_of(icon)).style(fill_of(icon)).size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
+            let (data, _) = Mask::new(path_of(icon)).size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
             (data, size)
         });
         canvas.mask(mask, *s, *s, x, y, color);
@@ -160,28 +147,25 @@ mod tests {
         }
     }
 
-    /// Icons are sharp at the size they're drawn: their straight edges sit on whole pixels.
-    /// A rectangle's inside at 16 pixels is solid, with no half-covered pixels along its edges.
+    /// Icons are sharp at the size they're drawn, and at twice it: every pixel is fully on or
+    /// fully off, with nothing smoothed in between to blur them.
     #[test]
-    fn icons_have_whole_pixel_edges() {
+    fn icons_are_whole_pixels() {
         use Icon::*;
-        for i in [Folder, FolderLink, File, FileLink, Image, Video, Archive, Code, Document, Home, Trash, Disk, Eject, Lock, Download] {
-            let numbers = path_of(i).split(|c: char| !(c.is_ascii_digit() || c == '.')).filter(|n| !n.is_empty());
-            // Arcs' radii can be anything: only Lock has them, and its are whole too.
-            assert!(numbers.clone().all(|n| !n.contains('.')), "{i:?} has an edge between pixels: {}", path_of(i));
+        for i in [Folder, FolderLink, File, FileLink, Image, Video, Audio, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, Eject, Lock, Download, ArrowUp, ArrowDown, Close, Crumb] {
+            for times in [1, 2] {
+                let size = grid_of(i) as i32 * times;
+                let mut px = vec![0u32; (size * size) as usize];
+                let mut c = Canvas::new(&mut px, size, size);
+                Icons::default().draw(&mut c, i, 0, 0, size, 0xffffff);
+                let partial = px.iter().filter(|&&p| p != 0 && p & 0xffffff != 0xffffff).count();
+                assert_eq!(partial, 0, "{i:?} at {size} pixels has {partial} half-covered pixels");
+            }
         }
-        // Music's note heads are arcs: one written without its letter is dropped, leaving stems.
+        // The note heads stand apart from each other.
         let mut px = vec![0u32; 16 * 16];
         let mut c = Canvas::new(&mut px, 16, 16);
         Icons::default().draw(&mut c, Audio, 0, 0, 16, 0xffffff);
-        assert!([(5, 13), (11, 12)].iter().all(|&(x, y)| px[y * 16 + x] == 0xffffff), "music has both note heads");
-        for i in [ArrowUp, ArrowDown, Close, Crumb] {
-            assert!(!path_of(i).contains('.'), "{i:?} has an edge between pixels");
-        }
-        let mut px = vec![0u32; 16 * 16];
-        let mut c = Canvas::new(&mut px, 16, 16);
-        Icons::default().draw(&mut c, Disk, 0, 0, 16, 0xffffff);
-        let partial = px.iter().filter(|&&p| p != 0 && p & 0xffffff != 0xffffff).count();
-        assert_eq!(partial, 0, "a drive's outline is all whole pixels");
+        assert!(px[11 * 16 + 5] == 0xffffff && px[10 * 16 + 12] == 0xffffff && px[10 * 16 + 9] == 0, "music has two note heads, apart");
     }
 }
