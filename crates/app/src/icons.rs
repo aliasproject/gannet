@@ -25,12 +25,12 @@ pub enum Icon {
     Home,
     Trash,
     Disk,
-    Computer,
     ArrowUp,
     ArrowDown,
     Close,
     Eject,
     Lock,
+    Download,
 }
 
 // All on a 16x16 grid.
@@ -56,7 +56,8 @@ fn path_of(i: Icon) -> &'static str {
         Icon::Disk => "M2 4h12v8H2V4Zm9.5 3a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z",
         Icon::Eject => "M8 3.5L13 9.5H3L8 3.5ZM3 11h10v1.8H3V11Z",
         Icon::Lock => "M5 7V5.2a3 3 0 0 1 6 0V7h1.2v6.8H3.8V7H5Zm1.5 0h3V5.2a1.5 1.5 0 0 0-3 0V7Z",
-        Icon::Computer => "M1.5 2.5h13v8.5h-13V2.5ZM3 4v5.5h10V4H3Zm2.5 8.5h5v1.5h-5v-1.5Z",
+        // An arrow down into a tray.
+        Icon::Download => "M7.25 1.5h1.5V7h2.75L8 10.5 4.5 7h2.75V1.5ZM2 10h1.5v2.5h9V10H14v4H2v-4Z",
         Icon::ArrowUp => "M8 5 12 10H4L8 5Z",
         Icon::ArrowDown => "M8 11 4 6h8L8 11Z",
         Icon::Close => "M4 3 8 7l4-4 1 1-4 4 4 4-1 1-4-4-4 4-1-1 4-4-4-4 1-1Z",
@@ -121,7 +122,7 @@ mod tests {
     #[test]
     fn every_icon_draws_something() {
         use Icon::*;
-        for i in [Folder, FolderLink, File, FileLink, Image, Video, Audio, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, Computer, ArrowUp, ArrowDown, Close] {
+        for i in [Folder, FolderLink, File, FileLink, Image, Video, Audio, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, ArrowUp, ArrowDown, Close, Download] {
             let mut px = vec![0u32; 32 * 32];
             let mut c = Canvas::new(&mut px, 32, 32);
             Icons::default().draw(&mut c, i, 0, 0, 32, 0xffffff);
