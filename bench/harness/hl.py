@@ -89,7 +89,7 @@ class Headless:
         scratch = Path(scratch)
         assert scratch.is_absolute() and not str(scratch).startswith(os.path.expanduser("~") + "/."), scratch
         e = {"PATH": "/usr/bin", "LANG": os.environ.get("LANG", "C.UTF-8"), "XDG_RUNTIME_DIR": str(self.root / "runtime"), "WAYLAND_DISPLAY": "wayland-1",
-             "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent", "XDG_SESSION_TYPE": "wayland", "GTK_USE_PORTAL": "0", "QT_FORCE_STDERR_LOGGING": "1"}
+             "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent", "DBUS_SYSTEM_BUS_ADDRESS": "unix:path=/nonexistent", "XDG_SESSION_TYPE": "wayland", "GTK_USE_PORTAL": "0", "QT_FORCE_STDERR_LOGGING": "1"}
         for k, d in {"HOME": "home", "XDG_CONFIG_HOME": "config", "XDG_CACHE_HOME": "cache", "XDG_DATA_HOME": "data", "XDG_STATE_HOME": "state"}.items():
             p = scratch / d
             p.mkdir(parents=True, exist_ok=True)

@@ -11,3 +11,7 @@ md5 = "0.8.1"
 zbus.workspace = true
 futures-core = "0.3"
 serde = "1"
+
+# The stand-in udisks2 for the checks serves an object manager, which Gannet itself never does.
+[dev-dependencies]
+zbus = { workspace = true, features = ["object-manager"] }

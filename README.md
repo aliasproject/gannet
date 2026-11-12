@@ -74,6 +74,7 @@ At run time, Gannet uses these:
 | `fc-match` (fontconfig) | Finding fonts | Gannet can't find a font, so install this |
 | `xdg-open` | Opening files in other apps | Opening files fails |
 | `libmpv` (part of `mpv` on many systems) and `bubblewrap` | Video and sound previews | Videos show a message saying what's needed |
+| `udisks2` | Mounting, unlocking and ejecting drives | Only drives that are already mounted show |
 | `shared-mime-info` | Saying what a file is, like "PDF document" | Previews name types like `application/pdf` |
 | `poppler` (`pdfinfo`, `pdftoppm`) and `bubblewrap` | PDF previews | PDFs say what they are, or show a thumbnailer's picture |
 | Thumbnailers, like `glycin` and `libgsf`, and `bubblewrap` | Previews of HEIC, JPEG XL, SVG, office files and more | Those files say what they are |
@@ -165,6 +166,22 @@ use Empty Trash in the toolbar. Restoring never overwrites anything: if somethin
 taken an item's place, the item stays in the Trash and Gannet says why. Network shares'
 and automounted disks' Trash folders aren't shown. A disk that stops answering is left out
 after a few seconds, and the status bar says so.
+
+## Drives
+
+USB sticks, SD cards and other drives you plug in show in the sidebar, whether they're mounted
+or not. Click one to mount and open it. A drive that can come out has an eject button, which
+unmounts everything on it and powers it off so it's safe to pull out. Right-click a drive for
+Unmount and Eject. An encrypted drive shows a lock, and asks for its passphrase when you open
+it. Unmounting or ejecting it locks it again.
+
+If files on a drive are in use, it stays put and Gannet says why. If the window is showing a
+drive that goes away, it goes home. The computer's own disks stay out of the way, as udisks2
+marks them.
+
+This goes through udisks2, which most Linux desktops run. Polkit decides what's allowed, and
+asks for a password if the system says to. Before acting on a drive, Gannet checks it's still
+the one you picked, as another stick put in can take the same place.
 
 ## Preview
 
@@ -259,14 +276,19 @@ Tests can destroy data, so they're fenced in:
     python3 -B bench/run.py       # budgets; see bench/README.md for what to build first
 
 Plain `cargo test` refuses to run anything that touches files, so run the unit tests with
-`scripts/test.sh`. The D-Bus tests start a private `dbus-daemon` of their own and call it with
-`busctl`, so both need to be installed.
+`scripts/test.sh`, which also builds the stand-in udisks2 the drive tests talk to. The D-Bus
+tests start a private `dbus-daemon` of their own and call it with `busctl`, so both need to be
+installed.
 
 For the end-to-end checks:
 
     bench/harness/fetch-tools.sh
     CARGO_TARGET_DIR=target/bench cargo build --release -p gannet --features bench
+    CARGO_TARGET_DIR=target/bench cargo build --release -p gannet-core --example udisks-standin
     (cd bench/harness/vptr && CARGO_TARGET_DIR=../../../target/vptr cargo build --release)
+
+The drive checks run a stand-in for udisks2 (`crates/core/examples/udisks-standin.rs`) on a
+private bus, so no check ever reaches the real one or a real drive.
 
 ## License
 

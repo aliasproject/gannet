@@ -22,7 +22,7 @@ for_window [app_id="com.aliasproject.Gannet.Preview"] floating enable, resize se
 CONF
 exec env -i PATH=/usr/bin HOME="$ROOT/home" XDG_CACHE_HOME="$ROOT/cache" XDG_CONFIG_HOME="$ROOT/config" \
   XDG_STATE_HOME="$ROOT/state" XDG_DATA_HOME="$ROOT/data" XDG_RUNTIME_DIR="$ROOT/runtime" \
-  DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent LD_LIBRARY_PATH="$TOOLS/usr/lib" \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent LD_LIBRARY_PATH="$TOOLS/usr/lib" \
   WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 WLR_HEADLESS_OUTPUTS=1 LIBSEAT_BACKEND=noop \
   bwrap --die-with-parent --ro-bind / / --dev /dev --proc /proc --tmpfs /run --bind "$ROOT" "$ROOT" --unshare-pid \
   "$TOOLS/usr/bin/sway" --unsupported-gpu -c "$ROOT/sway.conf"

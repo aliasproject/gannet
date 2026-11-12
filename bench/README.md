@@ -21,7 +21,7 @@ spawn to sway reporting the mapped window, which happens on the first committed 
 
     cargo build --release -p gannet
     CARGO_TARGET_DIR=target/bench cargo build --release -p gannet --features bench
-    CARGO_TARGET_DIR=target/bench cargo build --release -p gannet-core --example copybench --example trashbench
+    CARGO_TARGET_DIR=target/bench cargo build --release -p gannet-core --example copybench --example trashbench --example udisks-standin
     (cd bench/harness/vptr && CARGO_TARGET_DIR=../../../target/vptr cargo build --release)
     python3 -B bench/run.py
 

@@ -880,6 +880,105 @@ class PrivateBus:
         self.proc.wait()
 
 
+STANDIN = ROOT / "target/bench/release/examples/udisks-standin"
+
+
+class StandIn:
+    """The stand-in udisks2, on a private bus, with drives that "mount" onto folders in `root`."""
+
+    def __init__(self, root):
+        assert STANDIN.exists(), "run: CARGO_TARGET_DIR=target/bench cargo build --release -p gannet-core --example udisks-standin"
+        self.bus = PrivateBus()
+        self.root = root
+        root.mkdir(parents=True, exist_ok=True)
+        self.proc = subprocess.Popen([str(STANDIN), self.bus.address, str(root)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(SCRATCH / "stderr.log", "a"), text=True)
+        assert self.proc.stdout.readline().strip() == "ok", "the stand-in didn't start"
+
+    def say(self, *lines):
+        for line in lines:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+            answer = self.proc.stdout.readline().strip()
+            assert answer == "ok", f"{line}: {answer}"
+
+    def stop(self):
+        self.proc.kill()
+        self.proc.wait()
+        self.bus.stop()
+
+
+def place_index(s, label):
+    """Where a place is in the sidebar, by its label (before any `|` flags)."""
+    names = [p.split("|")[0] for p in s["places"]]
+    return names.index(label)
+
+
+def click_place(a, s, label, eject=False):
+    y = BAR + 8 + 30 * place_index(s, label) + 15
+    a.click(SIDE - 20 if eject else 60, y)
+
+
+def place_flags(s, label):
+    for p in s["places"]:
+        name, *flags = p.split("|")
+        if name == label:
+            return set(flags)
+    return None
+
+
+@check
+def drives_mount_unlock_and_eject_from_the_sidebar(h):
+    fs = fresh_fs()
+    media = SCRATCH / "media"
+    shutil.rmtree(media, ignore_errors=True)
+    tree(media, {"PHOTOS/beach.png": png_bytes(10, 10), "SECRETS/diary.txt": "dear diary"})
+    disks = StandIn(media)
+    try:
+        disks.say("drive Stick Kingston-1234", "fs sdb1 Stick PHOTOS", "luks sdb2 Stick hunter2 SECRETS")
+        a = App(h, fs, extra_env={"DBUS_SYSTEM_BUS_ADDRESS": disks.bus.address})
+        s = a.wait(lambda s: place_flags(s, "PHOTOS") == {"eject"} and place_flags(s, "8.0 GB Volume") == {"locked", "eject"}, "both volumes, not mounted yet")
+        a.shot("drives-sidebar")
+        # A click mounts it and opens it.
+        click_place(a, s, "PHOTOS")
+        s = a.wait(lambda s: s["dir"] == str(media / "PHOTOS") and s["names"] == ["beach.png"], "the drive's files", timeout=10)
+        # udisks2's news of the mount comes a moment after its answer.
+        s = a.wait(lambda s: place_flags(s, "PHOTOS") == {"mounted", "eject"}, "shown as mounted")
+        # The locked one asks for its passphrase, and says when it's wrong.
+        click_place(a, s, "8.0 GB Volume")
+        a.wait(lambda s: s["dialog"] == "unlock", "asked for the passphrase")
+        a.type("nope")
+        a.key("Return")
+        a.wait(lambda s: s["dialog"] == "unlock-again", "told it's wrong", timeout=10)
+        a.shot("drives-wrong-passphrase")
+        a.type("hunter2")
+        a.key("Return")
+        s = a.wait(lambda s: s["dialog"] == "" and s["dir"] == str(media / "SECRETS"), "unlocked and opened", timeout=10)
+        assert s["names"] == ["diary.txt"], s
+        s = a.wait(lambda s: place_flags(s, "SECRETS") == {"mounted", "eject"} and place_flags(s, "8.0 GB Volume") is None, "shown as what's inside now")
+        # Busy files keep it in, and say so.
+        disks.say("busy sdb1")
+        click_place(a, s, "PHOTOS", eject=True)
+        s = a.wait(lambda s: any("files on it are in use" in n for n in s["notices"]), "says it's busy", timeout=10)
+        assert place_flags(s, "PHOTOS") == {"mounted", "eject"}, "still there"
+        disks.say("idle sdb1")
+        # Eject: everything on it is unmounted and locked, it's powered off, and the window
+        # goes home from the drive it was on.
+        click_place(a, s, "PHOTOS", eject=True)
+        s = a.wait(lambda s: not any(p.split("|")[0] in ("PHOTOS", "SECRETS") for p in s["places"]), "gone from the sidebar", timeout=10)
+        a.wait(lambda s: not s["dir"].startswith(str(media)), "the window left the drive")
+        # Drives come and go while the window's open.
+        disks.say("drive Card SD-1", "fs mmc1 Card CARD")
+        a.wait(lambda s: place_flags(s, "CARD") == {"eject"}, "a card put in")
+        disks.say("mount mmc1")
+        a.wait(lambda s: place_flags(s, "CARD") == {"mounted", "eject"}, "mounted by something else")
+        disks.say("unplug Card")
+        a.wait(lambda s: place_flags(s, "CARD") is None, "and taken out")
+        assert a.alive()
+        a.close()
+    finally:
+        disks.stop()
+
+
 FM1 = ["org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1"]
 
 

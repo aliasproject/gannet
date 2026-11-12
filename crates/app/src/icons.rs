@@ -29,6 +29,8 @@ pub enum Icon {
     ArrowUp,
     ArrowDown,
     Close,
+    Eject,
+    Lock,
 }
 
 // All on a 16x16 grid.
@@ -52,6 +54,8 @@ fn path_of(i: Icon) -> &'static str {
         Icon::Home => "M8 1.8 15 8h-2v6.2H9.5V10h-3v4.2H3V8H1L8 1.8Z",
         Icon::Trash => "M6 1.5h4l.6 1.5H14v1.5H2V3h3.4L6 1.5ZM3.2 5.5h9.6l-.7 9H3.9l-.7-9Z",
         Icon::Disk => "M2 4h12v8H2V4Zm9.5 3a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z",
+        Icon::Eject => "M8 3.5L13 9.5H3L8 3.5ZM3 11h10v1.8H3V11Z",
+        Icon::Lock => "M5 7V5.2a3 3 0 0 1 6 0V7h1.2v6.8H3.8V7H5Zm1.5 0h3V5.2a1.5 1.5 0 0 0-3 0V7Z",
         Icon::Computer => "M1.5 2.5h13v8.5h-13V2.5ZM3 4v5.5h10V4H3Zm2.5 8.5h5v1.5h-5v-1.5Z",
         Icon::ArrowUp => "M8 5 12 10H4L8 5Z",
         Icon::ArrowDown => "M8 11 4 6h8L8 11Z",
