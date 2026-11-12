@@ -451,9 +451,10 @@ pub struct App {
     pub volumes: Vec<Volume>,
     /// The drive a sidebar menu is open for.
     drive_menu: Option<Volume>,
-    /// The eject button that was pressed. Ejecting can't be taken back, so it happens on the
-    /// release, and only if the pointer is still on it.
-    eject_pressed: Option<usize>,
+    /// The drive whose eject button was pressed, by its block. Ejecting can't be taken back, so
+    /// it happens on the release, and only if the pointer is still on that drive's button: the
+    /// sidebar can change in between, putting another drive in that row.
+    eject_pressed: Option<String>,
     /// Drives with something under way, so a second click doesn't start it again.
     pub drives_busy: Vec<String>,
     /// The drive being opened, and the folder the window was on then. The window only goes to
@@ -2008,13 +2009,16 @@ impl App {
     /// eject that's every volume on the drive.
     fn let_go_of_drive(&mut self, v: &Volume, whole_drive: bool) {
         let mounts: Vec<PathBuf> = if whole_drive { self.volumes.iter().filter(|o| o.drive == v.drive).filter_map(|o| o.mount.clone()).chain(v.mount.clone()).collect() } else { v.mount.iter().cloned().collect() };
-        let on = |p: &Path| mounts.iter().any(|m| p.starts_with(m));
+        // A folder reached through a symlink is on the drive too.
+        let on = |p: &Path| mounts.iter().any(|m| p.starts_with(m) || std::fs::canonicalize(p).is_ok_and(|c| c.starts_with(m)));
         self.cache.retain(|c| !on(&c.listing.dir));
         if self.previewer.as_deref().is_some_and(on) {
             self.close_preview();
         }
-        if let Some(m) = mounts.iter().find(|m| self.dir.starts_with(m)).cloned() {
-            self.leave_drive(&m);
+        if on(&self.dir.clone())
+            && let Some(home) = self.standard_places.first().map(|p| p.path.clone())
+        {
+            self.navigate(home, None);
         }
     }
 
@@ -2855,9 +2859,9 @@ impl App {
                 self.drag_scroll = None;
                 self.preview_release();
                 self.finish_file_drag();
-                if let Some(i) = self.eject_pressed.take()
-                    && self.hit(self.pointer.0, self.pointer.1) == Hit::Eject(i)
-                    && let Some(v) = self.places.get(i).and_then(|p| p.volume.clone())
+                if let Some(block) = self.eject_pressed.take()
+                    && let Hit::Eject(i) = self.hit(self.pointer.0, self.pointer.1)
+                    && let Some(v) = self.places.get(i).and_then(|p| p.volume.clone()).filter(|v| v.block == block)
                 {
                     self.drive_act(v, Doing::Eject);
                 }
@@ -2966,7 +2970,7 @@ impl App {
                 }
             }
             Hit::Place(i) => self.open_place(i),
-            Hit::Eject(i) => self.eject_pressed = Some(i),
+            Hit::Eject(i) => self.eject_pressed = self.places.get(i).and_then(|p| p.volume.as_ref()).map(|v| v.block.clone()),
             Hit::Header(key) => self.action(Action::SortBy(key)),
             Hit::Scrollbar => {
                 let l = self.layout();
@@ -6119,8 +6123,19 @@ mod tests {
         r.app.input(Input::Move { x: 40.0, y: off });
         r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
         assert!(!ejecting(&r), "the pointer left it");
-        // Pressed and let go on it: ejected.
+        // Another drive takes that row between the press and the release: nothing.
+        let card_mount = r.root.join("media/CARD");
+        fs::create_dir_all(&card_mount).unwrap();
+        let mut card = stick(&r, Some("CARD"), Some(&card_mount), false);
+        card.drive = "/d/card".into();
         r.app.input(Input::Move { x: on, y: off });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.on_msg(Msg::Volumes(vec![card.clone(), photos.clone()]));
+        assert_eq!(r.app.places[1].label, "CARD", "the card is in that row now");
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        assert!(!ejecting(&r) && !r.app.drives_busy.contains(&card.block), "neither drive was ejected");
+        // Pressed and let go on it: ejected.
+        r.app.on_msg(Msg::Volumes(vec![photos.clone()]));
         r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
         r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
         assert!(ejecting(&r), "on the release");
@@ -6151,6 +6166,14 @@ mod tests {
         assert_eq!(held(&r.app), Vec::<PathBuf>::new(), "and holds nothing on it");
         assert!(r.app.previewer.is_none() && r.app.cmds.iter().any(|c| matches!(c, Cmd::ClosePreview)), "the preview of a file on it closed");
         assert!(r.app.cache.iter().any(|c| c.listing.dir == other), "another drive's folder is still remembered");
+        // On the card through a symlink: still the card.
+        let link = r.root.join("home/card-link");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        r.app.navigate(link, None);
+        r.pump_until("read", |a| !a.loading);
+        let card = r.app.volumes.iter().find(|v| v.drive == "/d/card").unwrap().clone();
+        assert!(r.app.drive_act(card, Doing::Unmount));
+        assert_eq!(r.app.dir, r.root.join("home"), "the window left the card it reached by a symlink");
     }
 
     #[test]

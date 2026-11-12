@@ -177,8 +177,8 @@ it. Unmounting or ejecting it locks it again.
 
 Unmounting or ejecting the drive the window is showing takes the window home first, and closes
 a preview of a file on it. If another program has files on the drive open, it stays put and
-Gannet says why. If the window is showing a drive that goes away, it goes home. The computer's own disks stay out of the way, as udisks2
-marks them.
+Gannet says why. If the window is showing a drive that goes away, it goes home. The computer's
+own disks stay out of the way, as udisks2 marks them.
 
 This goes through udisks2, which most Linux desktops run. Polkit decides what's allowed, and
 asks for a password if the system says to. Before acting on a drive, Gannet checks it's still
