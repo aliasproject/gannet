@@ -137,7 +137,7 @@ impl App {
         let co = self.colors;
         c.fill(l.toolbar, co.surface);
         c.fill(Rect::new(0, l.toolbar.bottom() - 1, l.toolbar.w, 1), co.border);
-        let (b, pad, icon) = (self.px(36.0), self.px(6.0), self.px(18.0));
+        let (b, pad, icon) = (self.px(36.0), self.px(6.0), self.px(16.0));
         let buttons = [(Hit::Back, Icon::Back, self.history.can_go_back()), (Hit::Forward, Icon::Forward, self.history.can_go_forward()), (Hit::Up, Icon::Up, self.up_target().is_some())];
         for (i, (hit, ic, on)) in buttons.into_iter().enumerate() {
             let x = pad + i as i32 * b;
@@ -264,7 +264,7 @@ impl App {
                 if self.hover == Hit::Eject(i) {
                     c.rrect(Rect::new(e.x + self.px(2.0), e.y + self.px(3.0), e.w - self.px(4.0), e.h - self.px(6.0)), self.px(4.0), if here { co.accent } else { co.border });
                 }
-                let s = self.px(14.0);
+                let s = self.px(16.0);
                 self.icons.draw(c, Icon::Eject, e.x + (e.w - s) / 2, e.y + (e.h - s) / 2, s, if here { co.on_selection } else { co.muted });
             }
         }
