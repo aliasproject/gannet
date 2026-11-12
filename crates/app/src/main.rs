@@ -157,7 +157,7 @@ fn main() {
         }
     };
 
-    let mut text = text::Text::new(14.0, true);
+    let mut text = text::Text::new(text::UI_PX, true);
     text.set_contrast(colors.dark);
     let primary = text::primary_font(&d.cache);
     match &primary {
@@ -454,7 +454,7 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
 fn after_first_frame(hub: &Hub, cache: &Path, primary: Option<(PathBuf, u32)>) {
     let (hub, cache) = (hub.clone(), cache.to_path_buf());
     let _ = std::thread::Builder::new().name("gannet-fonts".into()).spawn(move || {
-        if let Some(found) = text::fc_match("sans")
+        if let Some(found) = text::fc_match(text::UI_FONT)
             && Some(&found) != primary.as_ref()
         {
             text::store_primary_font(&cache, &found);
@@ -484,7 +484,7 @@ fn find_fallback_fonts(hub: &Hub, chars: Vec<char>) {
                 continue;
             }
             asked += 1;
-            if let Some((path, index)) = text::fc_match(&format!("sans:charset={:x}", ch as u32))
+            if let Some((path, index)) = text::fc_match(&format!("{}:charset={:x}", text::UI_FONT, ch as u32))
                 && !found.contains(&path)
             {
                 found.push(path.clone());

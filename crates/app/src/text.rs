@@ -454,19 +454,29 @@ pub fn font_has(bytes: &[u8], index: u32, ch: char) -> bool {
     FontRef::from_index(bytes, index as usize).is_some_and(|f| f.charmap().map(ch) != 0)
 }
 
+/// The interface's font: the desktop's monospace font, which aliasOS's font menu
+/// (`aliasos-font-set`) sets, so Gannet matches the terminal, the bar and the launcher.
+pub const UI_FONT: &str = "monospace";
+/// Its size, in pixels at scale 1.
+pub const UI_PX: f32 = 13.0;
+
 /// The font to use, from a small cache file so the first frame needn't start a process.
 pub fn primary_font(cache_home: &Path) -> Option<(PathBuf, u32)> {
-    if let Some(found) = cached_font(cache_home, "font") {
+    if let Some(found) = cached_font(cache_home, UI_CACHE) {
         return Some(found);
     }
-    let found = fc_match("sans")?;
+    let found = fc_match(UI_FONT)?;
     store_primary_font(cache_home, &found);
     Some(found)
 }
 
 pub fn store_primary_font(cache_home: &Path, found: &(PathBuf, u32)) {
-    store_font(cache_home, "font", found);
+    store_font(cache_home, UI_CACHE, found);
 }
+
+/// Where the interface's font is remembered. Named for the font asked for, so one remembered
+/// for an older Gannet that asked for another isn't shown even for a frame.
+const UI_CACHE: &str = "ui-font-monospace";
 
 /// A font fontconfig chose last time, kept in the cache folder under `name`.
 pub fn cached_font(cache_home: &Path, name: &str) -> Option<(PathBuf, u32)> {
