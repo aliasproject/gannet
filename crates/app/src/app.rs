@@ -16,7 +16,9 @@ use gannet_core::mounts::Mount;
 use gannet_core::trash;
 use gannet_core::ops::{self, Answer, Choice, Conflict, Engine, Job, Request, Undo};
 use gannet_core::watch::Watch;
+use gannet_core::disks::{DiskError, Volume};
 use gannet_core::places::{Place, PlaceKind};
+use crate::drives::Doing;
 use gannet_core::theme::{Colors, Source};
 use rustix::fd::OwnedFd;
 use xkbcommon::xkb::keysyms as k;
@@ -67,6 +69,10 @@ pub enum Msg {
     PrimaryFont(PathBuf, u32),
     /// What fontconfig chose for one of the preview's document fonts.
     DocFont(crate::docview::Role, PathBuf, u32),
+    /// The drives udisks2 knows about now.
+    Volumes(Vec<Volume>),
+    /// A mount, unlock, unmount or eject has finished: where it's mounted, for the first two.
+    DiskDone { volume: Volume, doing: Doing, result: Result<Option<PathBuf>, DiskError> },
     DesktopDark(bool),
     Notice(String),
     Op(ops::Event),
@@ -159,6 +165,9 @@ pub enum Dialog {
     /// `empty` is for emptying the Trash, which words the question differently.
     ConfirmDelete { paths: Vec<PathBuf>, at: usize, empty: bool },
     ConfirmQuit { at: usize },
+    /// The passphrase for an encrypted drive. `error` says why the last one didn't work, and
+    /// `waiting` is set while udisks2 tries it.
+    Unlock { volume: Volume, field: Field, at: usize, error: Option<String>, waiting: bool },
 }
 
 /// One dialog button: its label and the key that presses it.
@@ -179,6 +188,8 @@ pub enum Hit {
     Crumb(usize),
     FilterBox,
     Place(usize),
+    /// A drive's eject button in the sidebar.
+    Eject(usize),
     Header(SortKey),
     Row(usize),
     ListEmpty,
@@ -342,6 +353,10 @@ pub enum Action {
     Undo,
     Restore,
     EmptyTrash,
+    /// For the drive whose menu it is.
+    OpenDrive,
+    Unmount,
+    Eject,
 }
 
 pub struct MenuItem {
@@ -425,6 +440,16 @@ pub struct App {
     pub history: History,
     cache: Vec<Cached>,
     pub places: Vec<Place>,
+    /// The places that aren't disks, which stay as they are when drives come and go.
+    standard_places: Vec<Place>,
+    /// Where the system bus is, for udisks2. `None` until drives are being watched.
+    pub system_bus: Option<String>,
+    /// The drives udisks2 reported last.
+    pub volumes: Vec<Volume>,
+    /// The drive a sidebar menu is open for.
+    drive_menu: Option<Volume>,
+    /// Drives with something under way, so a second click doesn't start it again.
+    pub drives_busy: Vec<String>,
     pub edit: Edit,
     pub menu: Option<Menu>,
     pub notices: Vec<String>,
@@ -550,7 +575,12 @@ impl App {
             scroll: 0.0,
             history: History::default(),
             cache: Vec::new(),
+            standard_places: places.iter().filter(|p| p.kind != PlaceKind::Disk).cloned().collect(),
             places,
+            system_bus: None,
+            volumes: Vec::new(),
+            drive_menu: None,
+            drives_busy: Vec::new(),
             edit: Edit::None,
             menu: None,
             notices: Vec::new(),
@@ -1068,6 +1098,8 @@ impl App {
                     self.invalidate_all();
                 }
             }
+            Msg::Volumes(volumes) => self.set_volumes(volumes),
+            Msg::DiskDone { volume, doing, result } => self.drive_done(volume, doing, result),
             Msg::DocFont(role, path, index) => {
                 if self.doc_fonts.as_mut().is_some_and(|f| f.set_role(role, &path, index)) {
                     self.invalidate_all();
@@ -1328,6 +1360,14 @@ impl App {
             Action::Trash => self.trash_selection(),
             Action::DeleteForGood => self.ask_delete(),
             Action::NewFolder => self.start_new_folder(),
+            Action::OpenDrive | Action::Unmount | Action::Eject => {
+                let Some(v) = self.drive_menu.take() else { return };
+                match a {
+                    Action::OpenDrive => self.open_volume(v),
+                    Action::Unmount => self.drive_act(v, Doing::Unmount),
+                    _ => self.drive_act(v, Doing::Eject),
+                }
+            }
             Action::Undo => {
                 if let Some(u) = self.undo.pop() {
                     self.start_job(Request::Undo(u));
@@ -1714,6 +1754,7 @@ impl App {
             Dialog::ConfirmDelete { empty: true, .. } => vec![b("Empty Trash", "E", true), b("Cancel", "Esc", false)],
             Dialog::ConfirmDelete { .. } => vec![b("Delete", "D", true), b("Cancel", "Esc", false)],
             Dialog::ConfirmQuit { .. } => vec![b("Stop them and close", "S", true), b("Keep working", "Esc", false)],
+            Dialog::Unlock { .. } => vec![b("Unlock", "", false), b("Cancel", "Esc", false)],
         }
     }
 
@@ -1751,6 +1792,18 @@ impl App {
                     self.start_job(Request::Delete { paths });
                 }
             }
+            Dialog::Unlock { volume, field, error, .. } => {
+                if label == "Unlock" {
+                    // Kept open, waiting, until udisks2 says whether it worked.
+                    if !field.text.is_empty() {
+                        self.drive_act(volume.clone(), Doing::Unlock(field.text.clone()));
+                    }
+                    let waiting = !field.text.is_empty();
+                    self.dialog = Some(Dialog::Unlock { volume, field, at: 0, error, waiting });
+                    self.invalidate_all();
+                    return;
+                }
+            }
             Dialog::ConfirmQuit { .. } => {
                 if label != "Keep working" {
                     self.jobs.iter().for_each(|j| j.job.cancel());
@@ -1776,8 +1829,46 @@ impl App {
         let Some(d) = self.dialog.as_mut() else { return };
         let buttons = Self::dialog_buttons(d);
         let n = buttons.len();
+        if let Dialog::Unlock { field, waiting, .. } = d {
+            // Typing goes to the passphrase, and it's left alone while it's being tried.
+            let edited = !*waiting && match sym {
+                k::KEY_BackSpace => {
+                    field.backspace(false);
+                    true
+                }
+                k::KEY_Delete => {
+                    field.delete(false);
+                    true
+                }
+                k::KEY_Left => {
+                    field.left(false, false);
+                    true
+                }
+                k::KEY_Right => {
+                    field.right(false, false);
+                    true
+                }
+                k::KEY_Home => {
+                    field.move_to(0, false);
+                    true
+                }
+                k::KEY_End => {
+                    field.move_to(field.text.len(), false);
+                    true
+                }
+                k::KEY_Return | k::KEY_KP_Enter | k::KEY_Escape | k::KEY_Tab => false,
+                _ if !utf8.is_empty() && !utf8.chars().any(char::is_control) => {
+                    field.insert(utf8);
+                    true
+                }
+                _ => false,
+            };
+            if edited || (*waiting && sym != k::KEY_Escape) {
+                return self.invalidate_all();
+            }
+        }
         let at = match d {
-            Dialog::Conflict { at, .. } | Dialog::ConfirmDelete { at, .. } | Dialog::ConfirmQuit { at } => at,
+            Dialog::Conflict { at, .. } | Dialog::ConfirmDelete { at, .. } | Dialog::ConfirmQuit { at } | Dialog::Unlock { at, .. } => at,
         };
         match sym {
             k::KEY_Left => *at = (*at + n - 1) % n,
@@ -1835,6 +1926,133 @@ impl App {
             self.dialog = Some(Dialog::ConfirmQuit { at: 1 });
             self.invalidate_all();
         }
+    }
+
+    // ---- Drives ----
+
+    /// Opens a place: a drive that isn't mounted is mounted first, and a locked one asks for
+    /// its passphrase.
+    fn open_place(&mut self, i: usize) {
+        let Some(p) = self.places.get(i) else { return };
+        match p.volume.clone() {
+            Some(v) => self.open_volume(v),
+            None => {
+                let path = p.path.clone();
+                self.navigate(path, None);
+            }
+        }
+    }
+
+    fn open_volume(&mut self, v: Volume) {
+        if let Some(at) = v.mount.clone() {
+            return self.navigate(at, None);
+        }
+        if v.locked {
+            self.dialog = Some(Dialog::Unlock { volume: v, field: Field::new(""), at: 0, error: None, waiting: false });
+            self.invalidate_all();
+        } else {
+            self.drive_act(v, Doing::Mount);
+        }
+    }
+
+    /// Starts something on a drive, unless something's already under way on it.
+    fn drive_act(&mut self, v: Volume, doing: Doing) {
+        let Some(address) = self.system_bus.clone() else { return };
+        if self.drives_busy.contains(&v.block) {
+            return;
+        }
+        self.drives_busy.push(v.block.clone());
+        crate::drives::act(self.hub.clone(), address, v, doing);
+        self.invalidate_all();
+    }
+
+    fn open_drive_menu(&mut self, v: Volume, x: i32, y: i32) {
+        let items = vec![
+            MenuItem { label: if v.locked { "Unlock" } else { "Open" }, keys: "", action: Action::OpenDrive, enabled: true },
+            MenuItem { label: "Unmount", keys: "", action: Action::Unmount, enabled: v.mount.is_some() },
+            MenuItem { label: "Eject", keys: "", action: Action::Eject, enabled: v.removable },
+        ];
+        self.drive_menu = Some(v);
+        self.menu = Some(Menu { items, x, y, at: usize::MAX });
+        self.invalidate_all();
+    }
+
+    /// What a drive's called in the sidebar and in messages.
+    pub fn drive_name(v: &Volume) -> String {
+        v.label.clone().unwrap_or_else(|| format!("{} Volume", crate::format::size(v.size)))
+    }
+
+    /// The drives udisks2 reports now. A folder on one that's gone, or no longer mounted, can't be
+    /// shown, so the window goes home.
+    fn set_volumes(&mut self, volumes: Vec<Volume>) {
+        let mounts = gannet_core::mounts::read_mounts();
+        let gone = self.volumes.iter().filter_map(|v| v.mount.clone()).find(|m| self.dir.starts_with(m) && !volumes.iter().any(|v| v.mount.as_ref() == Some(m)));
+        self.volumes = volumes;
+        let mut places = self.standard_places.clone();
+        places.extend(gannet_core::places::all_disk_places(&self.volumes, &mounts, Self::drive_name));
+        self.places = places;
+        if let Some(gone) = gone {
+            self.leave_drive(&gone);
+        }
+        self.invalidate_all();
+    }
+
+    /// The window was on a drive that's gone: it goes home.
+    fn leave_drive(&mut self, mount: &Path) {
+        if !self.dir.starts_with(mount) {
+            return;
+        }
+        if let Some(home) = self.standard_places.first().map(|p| p.path.clone()) {
+            self.navigate(home, None);
+        }
+    }
+
+    fn drive_done(&mut self, volume: Volume, doing: Doing, result: Result<Option<PathBuf>, DiskError>) {
+        self.drives_busy.retain(|b| *b != volume.block);
+        let name = Self::drive_name(&volume);
+        let unlocking = matches!(&self.dialog, Some(Dialog::Unlock { volume: v, .. }) if v.block == volume.block);
+        match (&doing, result) {
+            (Doing::Unlock(_), Err(DiskError::WrongPassphrase)) if unlocking => {
+                if let Some(Dialog::Unlock { field, error, waiting, .. }) = self.dialog.as_mut() {
+                    *field = Field::new("");
+                    *error = Some("That passphrase isn't right. Try again.".to_string());
+                    *waiting = false;
+                }
+            }
+            (_, Err(e)) => {
+                if unlocking {
+                    self.dialog = None;
+                }
+                self.notice(format!("Couldn't {} “{name}”: {e}", doing.verb()));
+            }
+            (Doing::Mount | Doing::Unlock(_), Ok(at)) => {
+                if unlocking {
+                    self.dialog = None;
+                }
+                if let Some(at) = at {
+                    self.navigate(at, None);
+                }
+            }
+            (Doing::Unmount | Doing::Eject, Ok(_)) => {
+                if let Some(m) = volume.mount.as_ref() {
+                    self.leave_drive(m);
+                }
+            }
+        }
+        self.invalidate_all();
+    }
+
+    /// A drive's eject button, at the right of its row, for one that can be taken out.
+    pub fn eject_rect(&self, i: usize) -> Option<Rect> {
+        let p = self.places.get(i)?;
+        if !p.volume.as_ref().is_some_and(|v| v.removable) {
+            return None;
+        }
+        let l = self.layout();
+        let row = self.px(30.0);
+        let y = l.sidebar.y + self.px(8.0) + i as i32 * row;
+        let w = self.px(26.0);
+        Some(Rect::new(l.sidebar.right() - self.px(7.0) - w, y, w, row))
     }
 
     fn context_items(&self) -> Vec<MenuItem> {
@@ -2230,10 +2448,8 @@ impl App {
             (k::KEY_2, true, _) => self.action(Action::SortBy(SortKey::Size)),
             (k::KEY_3, true, _) => self.action(Action::SortBy(SortKey::Modified)),
             (_, false, true) => {
-                if let Some(d) = utf8.chars().next().and_then(|c| c.to_digit(10)).filter(|&d| d > 0)
-                    && let Some(p) = self.places.get(d as usize - 1).map(|p| p.path.clone())
-                {
-                    self.navigate(p, None);
+                if let Some(d) = utf8.chars().next().and_then(|c| c.to_digit(10)).filter(|&d| d > 0) {
+                    self.open_place(d as usize - 1);
                 }
             }
             (_, false, false) if !m.logo && utf8 == "/" => self.start_filter(""),
@@ -2311,6 +2527,9 @@ impl App {
             let row = self.px(30.0);
             let i = (y - l.sidebar.y - self.px(8.0)) / row.max(1);
             if i >= 0 && (i as usize) < self.places.len() {
+                if self.eject_rect(i as usize).is_some_and(|r| r.contains(x, y)) {
+                    return Hit::Eject(i as usize);
+                }
                 return Hit::Place(i as usize);
             }
             return Hit::None;
@@ -2593,6 +2812,10 @@ impl App {
                 self.clear_selection();
                 self.invalidate_list();
                 self.open_menu(x, y);
+            } else if let Hit::Place(i) | Hit::Eject(i) = self.hit(x, y)
+                && let Some(v) = self.places.get(i).and_then(|p| p.volume.clone())
+            {
+                self.open_drive_menu(v, x, y);
             }
             return;
         }
@@ -2639,9 +2862,10 @@ impl App {
                     self.start_filter("");
                 }
             }
-            Hit::Place(i) => {
-                if let Some(p) = self.places.get(i).map(|p| p.path.clone()) {
-                    self.navigate(p, None);
+            Hit::Place(i) => self.open_place(i),
+            Hit::Eject(i) => {
+                if let Some(v) = self.places.get(i).and_then(|p| p.volume.clone()) {
+                    self.drive_act(v, Doing::Eject);
                 }
             }
             Hit::Header(key) => self.action(Action::SortBy(key)),
@@ -2960,6 +3184,10 @@ impl App {
             }
             Hit::Place(i) => {
                 let place = self.places.get(i)?;
+                // A drive that isn't mounted has no folder to drop into yet.
+                if place.path.as_os_str().is_empty() {
+                    return None;
+                }
                 let trash = place.kind == PlaceKind::Trash;
                 // Ctrl asks for a copy, and trashing the originals would be the opposite.
                 if place.path == self.dir || (trash && (self.in_trash() || self.mods_now.ctrl)) {
@@ -3278,6 +3506,10 @@ impl App {
             Hit::ListEmpty => Some(DropTarget { hit, dest: self.dir.clone(), trash: false }),
             Hit::Place(i) => {
                 let place = self.places.get(i)?;
+                // A drive that isn't mounted has no folder to drop into yet.
+                if place.path.as_os_str().is_empty() {
+                    return None;
+                }
                 let trash = place.kind == PlaceKind::Trash;
                 // Trashing takes the files away, so the other program has to allow that.
                 if trash && !can_trash {
@@ -5563,6 +5795,107 @@ mod tests {
         r.app.dirty = Rect::default();
         r.app.input(Input::Scroll { lines: 1.0, pixels: 0.0 });
         assert!(footer(r.app.dirty, &r), "and by the wheel: {:?}", r.app.dirty);
+    }
+
+    fn stick(r: &Rig, label: Option<&str>, mount: Option<&Path>, locked: bool) -> Volume {
+        let _ = r;
+        Volume { block: format!("/b/{}", label.unwrap_or("none")), drive: "/d/stick".into(), label: label.map(String::from), size: 8_000_000_000, mount: mount.map(Path::to_path_buf), locked, removable: true, identity: gannet_core::disks::Identity { id: "stick".into(), size: 1, media_detected: 1 } }
+    }
+
+    fn drive_rig(tag: &str) -> Rig {
+        let mut r = Rig::new(tag);
+        let home = r.root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        r.app.standard_places = vec![Place { label: "Home".into(), path: home, kind: PlaceKind::Home, volume: None }];
+        r
+    }
+
+    #[test]
+    fn drives_show_in_the_sidebar_and_one_taken_out_sends_the_window_home() {
+        let mut r = drive_rig("drives-sidebar");
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(mount.join("inner")).unwrap();
+        let photos = stick(&r, Some("PHOTOS"), Some(&mount), false);
+        let unnamed = stick(&r, None, None, false);
+        r.app.on_msg(Msg::Volumes(vec![photos.clone(), unnamed]));
+        // Mounts udisks2 doesn't know about, like the sandbox's own, follow these.
+        let labels: Vec<&str> = r.app.places.iter().take(3).map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["Home", "PHOTOS", "8.0 GB Volume"]);
+        assert!(r.app.eject_rect(1).is_some() && r.app.eject_rect(0).is_none(), "drives that come out have an eject button");
+        r.app.navigate(mount.join("inner"), None);
+        r.pump_until("on the drive", |a| !a.loading);
+        // It's still there after other changes.
+        r.app.on_msg(Msg::Volumes(vec![photos.clone()]));
+        assert_eq!(r.app.dir, mount.join("inner"));
+        r.app.on_msg(Msg::Volumes(vec![]));
+        assert_eq!(r.app.dir, r.root.join("home"), "gone, so home");
+        assert!(r.app.places.iter().all(|p| p.volume.is_none()), "and out of the sidebar");
+    }
+
+    #[test]
+    fn the_eject_button_is_drawn() {
+        let mut r = drive_rig("drives-paint");
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        let e = r.app.eject_rect(1).expect("a drive that comes out has one");
+        let (w, h) = (r.app.w, r.app.h);
+        let mut pixels = vec![0u32; (w * h) as usize];
+        let mut canvas = crate::canvas::Canvas::new(&mut pixels, w, h);
+        canvas.set_clip(Rect::new(0, 0, w, h));
+        r.app.paint(&mut canvas);
+        let surface = r.app.colors.surface;
+        let inked = (e.y..e.bottom()).flat_map(|y| (e.x..e.right()).map(move |x| (x, y))).filter(|&(x, y)| pixels[(y * w + x) as usize] != surface).count();
+        assert!(inked > 10, "something drawn in the button: {inked} pixels");
+    }
+
+    #[test]
+    fn a_locked_drive_asks_for_its_passphrase_and_says_when_its_wrong() {
+        let mut r = drive_rig("drives-unlock");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.open_place(1);
+        assert!(matches!(r.app.dialog, Some(Dialog::Unlock { .. })), "asked for the passphrase");
+        for c in ["h", "u", "n", "t", "e", "r", "x"] {
+            r.key(0, c);
+        }
+        r.key(k::KEY_BackSpace, "");
+        let typed = |r: &Rig| match &r.app.dialog {
+            Some(Dialog::Unlock { field, waiting, error, .. }) => (field.text.clone(), *waiting, error.clone()),
+            _ => panic!("no dialog"),
+        };
+        assert_eq!(typed(&r).0, "hunter");
+        // Somewhere for the work to go, which fails at once, as there's no bus there.
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.key(k::KEY_Return, "");
+        assert!(typed(&r).1, "waiting for udisks2");
+        r.key(0, "z");
+        assert_eq!(typed(&r).0, "hunter", "typing waits too");
+        // The answer: it was wrong.
+        r.app.on_msg(Msg::DiskDone { volume: secret.clone(), doing: Doing::Unlock(String::new()), result: Err(DiskError::WrongPassphrase) });
+        let (text, waiting, error) = typed(&r);
+        assert!(text.is_empty() && !waiting && error.is_some(), "cleared, to try again: {error:?}");
+        // Then it worked, and the window goes there.
+        let inside = r.root.join("media/SECRETS");
+        fs::create_dir_all(&inside).unwrap();
+        r.app.on_msg(Msg::DiskDone { volume: secret, doing: Doing::Unlock(String::new()), result: Ok(Some(inside.clone())) });
+        assert!(r.app.dialog.is_none());
+        assert_eq!(r.app.dir, inside);
+    }
+
+    #[test]
+    fn a_drive_that_wont_go_says_why_and_the_window_stays() {
+        let mut r = drive_rig("drives-busy");
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        let photos = stick(&r, Some("PHOTOS"), Some(&mount), false);
+        r.app.on_msg(Msg::Volumes(vec![photos.clone()]));
+        r.app.navigate(mount.clone(), None);
+        r.app.on_msg(Msg::DiskDone { volume: photos.clone(), doing: Doing::Eject, result: Err(DiskError::Busy) });
+        assert_eq!(r.app.notices.last().map(String::as_str), Some("Couldn't eject “PHOTOS”: files on it are in use"));
+        assert_eq!(r.app.dir, mount, "still there");
+        r.app.on_msg(Msg::DiskDone { volume: photos, doing: Doing::Eject, result: Ok(None) });
+        assert_eq!(r.app.dir, r.root.join("home"), "ejected, so home");
     }
 
     #[test]

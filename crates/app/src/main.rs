@@ -4,6 +4,7 @@ mod app;
 mod canvas;
 mod decode;
 mod doc;
+mod drives;
 mod docview;
 mod field;
 mod format;
@@ -291,6 +292,12 @@ fn main() {
                 first_frame = false;
                 after_first_frame(&hub, &d.cache, primary.clone());
                 app.ask_desktop_theme();
+                // Drives aren't needed for the first frame, and the preview window has no sidebar.
+                if !app.viewer {
+                    let address = gannet_core::bus::system_address(std::env::var("DBUS_SYSTEM_BUS_ADDRESS").ok().as_deref());
+                    app.system_bus = Some(address.clone());
+                    drives::watch(hub.clone(), address);
+                }
             }
             let mut missing = app.text.take_missing();
             missing.extend(app.doc_fonts.as_mut().map(|f| f.take_missing()).unwrap_or_default());
@@ -620,7 +627,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -648,13 +655,34 @@ mod bench {
                 Some(crate::app::Dialog::ConfirmDelete { empty: true, .. }) => "empty",
                 Some(crate::app::Dialog::ConfirmDelete { .. }) => "delete",
                 Some(crate::app::Dialog::ConfirmQuit { .. }) => "quit",
+                Some(crate::app::Dialog::Unlock { waiting: true, .. }) => "unlock-waiting",
+                Some(crate::app::Dialog::Unlock { error: Some(_), .. }) => "unlock-again",
+                Some(crate::app::Dialog::Unlock { .. }) => "unlock",
             }),
             a.undo.len(),
             a.panel_rows(),
             preview(a),
             a.previewer.as_ref().and_then(|p| p.file_name()).map_or_else(|| "null".to_string(), |n| esc(&n.to_string_lossy())),
             esc(&drag(a)),
+            places(a),
         )
+    }
+
+    /// Each place as `label`, then what's true of it: a drive's `mounted`, `locked`, `eject` and
+    /// `busy`.
+    fn places(a: &App) -> String {
+        list(a.places.iter().map(|p| {
+            let mut s = p.label.clone();
+            if let Some(v) = &p.volume {
+                for (on, word) in [(v.mount.is_some(), "mounted"), (v.locked, "locked"), (v.removable, "eject"), (a.drives_busy.contains(&v.block), "busy")] {
+                    if on {
+                        s.push('|');
+                        s.push_str(word);
+                    }
+                }
+            }
+            s
+        }))
     }
 
     fn drag(a: &App) -> String {

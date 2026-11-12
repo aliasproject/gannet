@@ -220,6 +220,8 @@ impl App {
         let row = self.px(30.0);
         let icon = self.px(16.0);
         let top = l.sidebar.y + self.px(8.0);
+        // Worked out while the places are still here: they're moved out while they're drawn.
+        let ejects: Vec<Option<Rect>> = (0..self.places.len()).map(|i| self.eject_rect(i)).collect();
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {
             let y = top + i as i32 * row;
@@ -233,6 +235,7 @@ impl App {
                 c.rrect(r, self.px(5.0), co.hover);
             }
             let ic = match p.kind {
+                PlaceKind::Disk if p.volume.as_ref().is_some_and(|v| v.locked) => Icon::Lock,
                 PlaceKind::Home => Icon::Home,
                 PlaceKind::Trash => Icon::Trash,
                 PlaceKind::Root => Icon::Computer,
@@ -245,10 +248,21 @@ impl App {
             };
             self.icons.draw(c, ic, r.x + self.px(8.0), y + (row - icon) / 2, icon, if here { co.on_selection } else { co.muted });
             let tx = (r.x + self.px(32.0)) as f32;
-            let color = if here { co.on_selection } else { co.foreground };
-            let max = (r.right() - self.px(6.0)) as f32 - tx;
+            // A drive that's busy, or not mounted yet, is quieter than the rest.
+            let waiting = p.volume.as_ref().is_some_and(|v| v.mount.is_none() || self.drives_busy.contains(&v.block));
+            let color = if here { co.on_selection } else if waiting { co.muted } else { co.foreground };
+            let eject = ejects[i];
+            let right = eject.map_or(r.right() - self.px(6.0), |e| e.x);
+            let max = right as f32 - tx;
             let by = self.baseline(y, row);
             self.text.draw_fitted(c, &p.label, tx, by, max, color);
+            if let Some(e) = eject {
+                if self.hover == Hit::Eject(i) {
+                    c.rrect(Rect::new(e.x + self.px(2.0), e.y + self.px(3.0), e.w - self.px(4.0), e.h - self.px(6.0)), self.px(4.0), if here { co.accent } else { co.border });
+                }
+                let s = self.px(14.0);
+                self.icons.draw(c, Icon::Eject, e.x + (e.w - s) / 2, e.y + (e.h - s) / 2, s, if here { co.on_selection } else { co.muted });
+            }
         }
         self.places = places;
     }
@@ -509,6 +523,10 @@ impl App {
                 (t, "This can't be undone.".to_string(), *at)
             }
             Dialog::ConfirmQuit { at } => ("Operations are still running".to_string(), "Closing stops them. Whatever's finished stays finished.".to_string(), *at),
+            Dialog::Unlock { volume, error, waiting, at, .. } => {
+                let line = if *waiting { "Unlocking…".to_string() } else { error.clone().unwrap_or_else(|| "It's encrypted. Type its passphrase to open it.".to_string()) };
+                (format!("Unlock “{}”", App::drive_name(volume)), line, *at)
+            }
         };
         let x = (r.x + self.px(16.0)) as f32;
         let max = (r.w - self.px(32.0)) as f32;
@@ -516,7 +534,22 @@ impl App {
         let top = r.y + self.px(12.0);
         let (y1, y2) = (self.baseline(top, row), self.baseline(top + row, row));
         self.text.draw_fitted(c, &title, x, y1, max, co.foreground);
-        self.text.draw_fitted(c, &line2, x, y2, max, co.muted);
+        let line2_color = if matches!(&d, Dialog::Unlock { error: Some(_), waiting: false, .. }) { co.danger } else { co.muted };
+        self.text.draw_fitted(c, &line2, x, y2, max, line2_color);
+        if let Dialog::Unlock { field, .. } = &d {
+            // The passphrase shows as a dot for each character, never as itself.
+            let fr = self.dialog_check_rect();
+            c.rrect(fr, self.px(5.0), co.base);
+            c.frame(fr, 1, co.accent);
+            let n = field.text.chars().count();
+            let before = field.text[..field.caret].chars().count();
+            let dot = self.text.measure("•");
+            let fx = (fr.x + self.px(8.0)) as f32;
+            let by = self.baseline(fr.y, fr.h);
+            self.text.draw_fitted(c, &"•".repeat(n), fx, by, (fr.w - self.px(16.0)) as f32, co.foreground);
+            let caret_x = (fx + dot * before as f32).min((fr.right() - self.px(8.0)) as f32) as i32;
+            c.fill(Rect::new(caret_x, fr.y + self.px(5.0), self.px(1.0).max(1), fr.h - self.px(10.0)), co.foreground);
+        }
         if let Dialog::Conflict { apply_to_all, .. } = &d {
             let cr = self.dialog_check_rect();
             let s = self.px(14.0);
