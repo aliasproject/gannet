@@ -701,6 +701,9 @@ mod bench {
     fn places(a: &App) -> String {
         list(a.places.iter().map(|p| {
             let mut s = p.label.clone();
+            if p.kind == gannet_core::places::PlaceKind::Trash && a.trash_unavailable() {
+                s.push_str("|off");
+            }
             if let Some(v) = &p.volume {
                 for (on, word) in [(v.mount.is_some(), "mounted"), (v.locked, "locked"), (v.removable, "eject"), (a.drives_busy.contains(&v.block), "busy")] {
                     if on {
