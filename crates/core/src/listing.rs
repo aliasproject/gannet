@@ -736,7 +736,7 @@ fn load_recent(req: LoadRequest, watch: Option<&Arc<Watch>>, cancel: &Arc<Atomic
         }
     };
     let mut paths = Vec::new();
-    for (path, used) in found {
+    for (path, used) in found.into_iter().take(crate::recent::CHECK_LIMIT) {
         if paths.len() >= crate::recent::LIMIT || stale() {
             break;
         }

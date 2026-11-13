@@ -389,7 +389,11 @@ impl App {
                 self.icons.draw(c, icon_for(kind, name), area.x + self.px(14.0), y + (row_h - icon) / 2, icon, tint);
                 let shown = String::from_utf8_lossy(name);
                 let by = y + ((row_h as f32 + self.text.ascent - self.text.descent) / 2.0).round() as i32;
-                let is_cut = !self.cut_paths.is_empty() && self.cut_paths.iter().any(|p| p.parent() == Some(listing.dir.as_path()) && p.file_name() == Some(listing.os_name(id)));
+                // Recent's and the Trash's rows are each somewhere of their own.
+                let is_cut = !self.cut_paths.is_empty() && {
+                    let here = listing.path(id);
+                    self.cut_paths.contains(&here)
+                };
                 if let Edit::Rename { name: editing, field, .. } = &self.edit
                     && editing.as_slice() == name
                 {

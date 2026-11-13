@@ -12,12 +12,17 @@ pub const FILE: &str = "recently-used.xbel";
 /// long list would be slow to show.
 pub const LIMIT: usize = 1000;
 
+/// The most entries checked on disk to find them, so a list of mostly deleted files is still
+/// quick to show.
+pub const CHECK_LIMIT: usize = 4 * LIMIT;
+
 /// The local files in the list, newest first, each with when it was last used, in seconds
 /// since the epoch. A file listed twice keeps its newer time. Web addresses and anything
 /// that isn't a local file are left out.
 pub fn parse(xbel: &[u8]) -> Vec<(PathBuf, i64)> {
     let text = String::from_utf8_lossy(xbel);
     let mut out: Vec<(PathBuf, i64)> = Vec::new();
+    let mut seen: std::collections::HashMap<PathBuf, usize> = std::collections::HashMap::new();
     let mut rest = &*text;
     while let Some(at) = rest.find('<') {
         rest = &rest[at..];
@@ -38,9 +43,12 @@ pub fn parse(xbel: &[u8]) -> Vec<(PathBuf, i64)> {
         let get = |name: &str| attrs.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str());
         let Some(path) = get("href").and_then(from_file_uri) else { continue };
         let Some(used) = ["visited", "modified", "added"].iter().filter_map(|n| get(n).and_then(parse_utc)).max() else { continue };
-        match out.iter_mut().find(|(p, _)| *p == path) {
-            Some(seen) => seen.1 = seen.1.max(used),
-            None => out.push((path, used)),
+        match seen.get(&path) {
+            Some(&i) => out[i].1 = out[i].1.max(used),
+            None => {
+                seen.insert(path.clone(), out.len());
+                out.push((path, used));
+            }
         }
     }
     out.sort_by_key(|e| std::cmp::Reverse(e.1));

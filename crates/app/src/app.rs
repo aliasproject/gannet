@@ -480,6 +480,9 @@ pub struct App {
 
     pub engine: Engine,
     pub trash_dir: PathBuf,
+    /// The shared list of recently used files, `$XDG_DATA_HOME/recently-used.xbel`, which is
+    /// also the Recent view's place in history and the sidebar.
+    recent_file: PathBuf,
     pub jobs: Vec<JobView>,
     pub dialog: Option<Dialog>,
     pending_conflicts: Vec<Conflict>,
@@ -611,6 +614,7 @@ impl App {
             menu: None,
             notices: Vec::new(),
             engine,
+            recent_file: trash_dir.parent().and_then(Path::parent).map_or_else(PathBuf::new, |d| d.join(gannet_core::recent::FILE)),
             trash_dir,
             jobs: Vec::new(),
             dialog: None,
@@ -1433,13 +1437,7 @@ impl App {
 
     /// The Recent view, listing recently used files from wherever they are.
     pub fn is_recent_view(&self) -> bool {
-        self.dir == self.recent_file()
-    }
-
-    /// The shared list of recently used files, `$XDG_DATA_HOME/recently-used.xbel`, which is
-    /// also the Recent view's place in history and the sidebar.
-    pub fn recent_file(&self) -> PathBuf {
-        self.home_trash().parent().map_or_else(PathBuf::new, |d| d.join(gannet_core::recent::FILE))
+        self.dir == self.recent_file
     }
 
     /// The order rows are in: the one chosen, except in Recent, which is always newest first.
@@ -1663,6 +1661,12 @@ impl App {
 
     fn recent_is_read_only(&mut self) {
         self.notice("Recent only lists files. Use Show in folder to change one".into());
+    }
+
+    /// Whether what's dragged from here can only leave as copies: the Trash's items, whose two
+    /// folders have to stay paired, and Recent's, which only lists files from elsewhere.
+    fn copies_only(&self) -> bool {
+        self.in_trash() || self.is_recent_view()
     }
 
     fn in_trash(&self) -> bool {
@@ -2242,7 +2246,7 @@ impl App {
     fn context_items(&self) -> Vec<MenuItem> {
         let any = self.sel_count > 0;
         let one = self.sel_count == 1;
-        if self.listing.as_ref().is_some_and(|l| l.is_recent()) {
+        if self.is_recent_view() {
             return vec![
                 MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
                 MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
@@ -2847,7 +2851,7 @@ impl App {
         if path == self.trash_dir {
             return "Trash".into();
         }
-        if path == self.recent_file() {
+        if path == self.recent_file {
             return "Recent".into();
         }
         title_for(path)
@@ -3407,7 +3411,7 @@ impl App {
                 }
                 let trash = place.kind == PlaceKind::Trash;
                 // Ctrl asks for a copy, and trashing the originals would be the opposite.
-                if place.path == self.dir || (trash && (self.in_trash() || self.mods_now.ctrl)) {
+                if place.path == self.dir || (trash && (self.copies_only() || self.mods_now.ctrl)) {
                     return None;
                 }
                 let inside_itself = place.path.strip_prefix(&self.dir).ok().and_then(|rest| rest.components().next()).is_some_and(|first| d.paths.iter().any(|p| p.file_name() == Some(first.as_os_str())));
@@ -3425,8 +3429,8 @@ impl App {
         if t.trash {
             return DropAction::Trash;
         }
-        // The Trash's items can only leave as copies, as with cut and paste.
-        if self.in_trash() {
+        // The Trash's items can only leave as copies, as with cut and paste, and so can Recent's.
+        if self.copies_only() {
             return DropAction::Copy;
         }
         let (device, can_delete) = d.source.unzip();
@@ -3627,8 +3631,8 @@ impl App {
         // Gannet window has the marker, and uses the same rule as inside a window. The Trash's
         // items only leave as copies, because its two folders have to stay paired, so they get
         // no marker. Nor does a drag whose folder hasn't answered yet, which then just copies.
-        let move_only = self.mods_now.shift && !self.mods_now.ctrl && !self.in_trash();
-        let marker = source.filter(|_| !self.in_trash()).map(|(device, can_delete)| clipboard::DragMarker { device, can_delete, ctrl: self.mods_now.ctrl, shift: self.mods_now.shift });
+        let move_only = self.mods_now.shift && !self.mods_now.ctrl && !self.copies_only();
+        let marker = source.filter(|_| !self.copies_only()).map(|(device, can_delete)| clipboard::DragMarker { device, can_delete, ctrl: self.mods_now.ctrl, shift: self.mods_now.shift });
         let icon = self.render_drag_icon(&ghost);
         self.cmds.push(Cmd::StartDrag { formats, marker, move_only, icon });
     }
@@ -4177,7 +4181,7 @@ mod tests {
         );
         fs::create_dir_all(r.root.join("data")).unwrap();
         fs::write(r.root.join("data/recently-used.xbel"), xbel).unwrap();
-        let recent = r.app.recent_file();
+        let recent = r.app.recent_file.clone();
         assert_eq!(recent, r.root.join("data/recently-used.xbel"));
         r.open(recent.clone());
         assert!(r.app.is_recent_view());
@@ -4207,6 +4211,43 @@ mod tests {
         r.pump_until("back to Recent", |a| !a.loading && a.is_recent_view());
         let l = r.app.listing.clone().unwrap();
         assert_eq!(l.name(r.app.rows[r.app.cursor]), b"middle.txt", "on the file it left from");
+    }
+
+    #[test]
+    fn files_dragged_out_of_recent_are_only_copied_and_never_trashed() {
+        let mut r = Rig::new("recent-drag");
+        fs::write(r.work().join("a"), "x").unwrap();
+        let elsewhere = r.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let trash = r.root.join("data/Trash/files");
+        fs::create_dir_all(&trash).unwrap();
+        fs::write(r.root.join("data/recently-used.xbel"), format!("<xbel><bookmark href=\"{}\" visited=\"2026-01-01T00:00:00Z\"/></xbel>", gannet_core::uri::to_file_uri(&r.work().join("a")))).unwrap();
+        r.open(r.work());
+        // The menu is Recent's from the moment it's shown, before its list arrives.
+        r.app.go(Stop { dir: r.app.recent_file.clone(), cursor_name: None });
+        assert!(!r.app.listing.as_ref().is_some_and(|l| l.is_recent()), "Recent's list isn't here yet");
+        assert!(r.app.context_items().iter().all(|i| i.action != Action::Paste && i.action != Action::Trash));
+        r.pump_until("Recent", |a| !a.loading);
+        assert_eq!(r.app.rows.len(), 1);
+        r.app.places = vec![
+            Place { label: "Elsewhere".into(), path: elsewhere.clone(), kind: PlaceKind::Home, volume: None },
+            Place { label: "Recent".into(), path: r.app.recent_file.clone(), kind: PlaceKind::Recent, volume: None },
+            Place { label: "Trash".into(), path: trash, kind: PlaceKind::Trash, volume: None },
+        ];
+        press_on_row(&mut r, 0);
+        r.app.input(Input::Move { x: 540.0, y: 300.0 });
+        // What the drag's folder is like arrives from another thread.
+        r.pump_until("the drag's source", |a| matches!(&a.file_drag, Some(FileDrag::Active(d)) if d.source.is_some()));
+        let x = (r.app.layout().sidebar.x + r.app.px(40.0)) as f64;
+        let over = |r: &mut Rig, i: usize| {
+            r.app.input(Input::Move { x, y: (r.app.place_top(i) + r.app.px(15.0)) as f64 });
+            r.pump_until("the drag over the place", |a| matches!(&a.file_drag, Some(FileDrag::Active(d)) if d.devices.values().any(Option::is_some) || i != 0));
+            let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
+            d.target.as_ref().map(|t| r.app.drop_action(d, t))
+        };
+        assert!(matches!(over(&mut r, 0), Some(DropAction::Copy)), "a copy, even on the same disk");
+        assert!(over(&mut r, 1).is_none(), "Recent isn't somewhere to drop");
+        assert!(over(&mut r, 2).is_none(), "the Trash isn't a target");
     }
 
     #[test]
