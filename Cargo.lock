@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "gannet"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "gannet-core",
  "image",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "gannet-core"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "futures-core",
  "libc",

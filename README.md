@@ -163,6 +163,15 @@ environment D-Bus gives services; check with `systemctl --user show-environment`
 missing, have the compositor run `dbus-update-activation-environment --systemd WAYLAND_DISPLAY`
 at startup. The service's errors go to the journal.
 
+## Recent
+
+Recent in the sidebar lists the files you've used lately, newest first, with the folder each
+is in and when you last used it. It's the list GTK apps, browsers and Nautilus keep in
+`~/.local/share/recently-used.xbel`, so a download or a file saved in another app shows up
+there. Gannet only reads it, and only when you open Recent. Files that are gone are left out.
+Right-click a file and choose Show in folder to go to it. Recent only lists files: to rename,
+move or trash one, show it in its folder first.
+
 ## Trash
 
 Trash in the sidebar lists everything you've trashed on every disk, with where each item

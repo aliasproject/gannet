@@ -2744,7 +2744,7 @@ def dropping_on_the_sidebar_moves_there_and_trash_really_trashes(h):
     assert (home / "a.txt").read_text() == "A"
     # Trash goes through the real operation, so an info file goes with it.
     data = Path(a.env["XDG_DATA_HOME"])
-    press_and_carry(a, h, "b.txt", 60, BAR + 8 + SIDEBAR_HEADING + 1 * 30 + 15)
+    press_and_carry(a, h, "b.txt", 60, place_y(a.state(), "Trash"))
     a.wait(lambda s: s["drag"] == "Move “b.txt” to Trash", "over Trash")
     # Ctrl asks for a copy, so Trash stops being a target while it's held.
     held = holding(a, "ctrl")
@@ -2770,7 +2770,7 @@ def dragging_out_of_the_trash_only_copies(h):
     a.wait(lambda s: s["count"] == 0 and s["jobs"] == 0, "trashed")
     data = Path(a.env["XDG_DATA_HOME"])
     time.sleep(0.5)  # So the press below isn't a double-click on that name.
-    a.click(60, BAR + 8 + SIDEBAR_HEADING + 1 * 30 + 15)
+    a.click(60, place_y(a.state(), "Trash"))
     a.wait(lambda s: s["dir"].endswith("Trash/files") and "out-of-trash.txt" in s["names"], "in the Trash")
     press_and_carry(a, h, "out-of-trash.txt", 60, BAR + 8 + SIDEBAR_HEADING + 15)
     held = holding(a, "shift")
@@ -2881,6 +2881,49 @@ def a_picture_dragged_from_a_browser_is_saved_and_a_link_or_nothing_is_named(h):
     s = a.wait(lambda s: any("Couldn't get any files" in n for n in s["notices"]), "says nothing came")
     assert sorted(s["names"]) == ["columns (2).png", "columns.png", "keep.txt"], s["names"]
     assert a.alive()
+    a.close()
+
+
+@check
+def recent_lists_used_files_newest_first_and_shows_them_in_their_folders(h):
+    fs = fresh_fs()
+    tree(fs, {"a/old.txt": "o", "b/new.txt": "n", "a/middle.txt": "m", "keep.txt": "k"})
+    a = App(h, fs, launch=False)
+    data = Path(a.env["XDG_DATA_HOME"])
+    data.mkdir(parents=True, exist_ok=True)
+    listed = data / "recently-used.xbel"
+
+    def write_list(entries):
+        marks = "".join(f'<bookmark href="file://{p}" added="{t}" modified="{t}" visited="{t}"/>' for p, t in entries)
+        # Apps write a new list and rename it over the old one.
+        part = data / "recently-used.xbel.part"
+        part.write_text(f'<?xml version="1.0"?><xbel version="1.0">{marks}</xbel>')
+        part.rename(listed)
+
+    entries = [(fs / "a/old.txt", "2026-01-01T00:00:00Z"), (fs / "b/new.txt", "2026-03-01T00:00:00Z"), (fs / "gone.txt", "2026-04-01T00:00:00Z"), (fs / "a/middle.txt", "2026-02-01T00:00:00Z")]
+    write_list(entries)
+    a = App(h, fs)
+    s = a.wait(lambda s: s["names"] == ["keep.txt", "a", "b"] or sorted(s["names"]) == ["a", "b", "keep.txt"], "the folder")
+    assert "Recent" in s["places"], s["places"]
+    click_place(a, s, "Recent")
+    s = a.wait(lambda s: s["dir"] == str(listed) and s["names"] == ["new.txt", "middle.txt", "old.txt"], "newest first, the missing file left out")
+    a.shot("recent")
+    # Another app uses a file: Recent follows the list as it changes.
+    write_list(entries + [(fs / "keep.txt", "2026-05-01T00:00:00Z")])
+    a.wait(lambda s: s["names"] == ["keep.txt", "new.txt", "middle.txt", "old.txt"], "the newly used file on top")
+    # Show in folder goes to where the file is, with it selected; Back comes back.
+    a.click(ROW_X, row_y(2), 0x111)
+    a.wait(lambda s: s["menu"], "the menu")
+    for _ in range(3):
+        a.key("Down")
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(fs / "a") and s["selected"] == ["middle.txt"], "middle.txt in its folder")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(listed), "back in Recent")
+    # Nothing can be dropped or pasted into Recent, and a rename is refused.
+    a.key("F2")
+    a.wait(lambda s: any("Recent only lists files" in n for n in s["notices"]), "says it only lists")
+    assert (fs / "a/middle.txt").exists() and a.alive()
     a.close()
 
 
