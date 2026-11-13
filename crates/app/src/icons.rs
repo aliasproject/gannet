@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use swash::zeno::{Format, Mask, Transform};
+use swash::zeno::{Cap, Fill, Format, Join, Mask, Stroke, Transform};
 
 use crate::canvas::Canvas;
 
@@ -25,41 +25,75 @@ pub enum Icon {
     Home,
     Trash,
     Disk,
-    Computer,
     ArrowUp,
     ArrowDown,
     Close,
     Eject,
     Lock,
+    Download,
+    /// The `>` between the path bar's folders.
+    Crumb,
 }
 
-// All on a 16x16 grid.
-const FILE: &str = "M4 1.5h5.5L13 5v9.5H3V1.5ZM9 2.8V5.5h2.7L9 2.8Z";
+// Each drawn pixel by pixel on a 16x16 grid: every pixel is fully on or off, so they're sharp
+// at 16 pixels and any whole multiple of it, with no smoothing to blur them. Each fills about
+// the same 14x14 area, so none looks smaller or squashed beside the others.
 
 fn path_of(i: Icon) -> &'static str {
     match i {
-        Icon::Folder => "M1.5 3h4.8l1.5 1.8h6.7v8.7h-13V3Z",
-        Icon::FolderLink => "M1.5 3h4.8l1.5 1.8h6.7v8.7h-13V3Zm5 4v1.5H5v2.5h1.5V9.8h2V11.5L12 9 8.5 6.5V8H6.5V7Z",
-        Icon::File => FILE,
-        Icon::FileLink => "M4 1.5h5.5L13 5v9.5H3V1.5ZM6 8v1.2H5v2.6h1.2v-1.4H8v1.3L11 9.6 8 7.4v1.4H6V8Z",
-        Icon::Image => "M2 3h12v10.5H2V3Zm1.3 1.3v6.2l2.7-3 2.2 2.3 1.6-1.4 2.9 2.9V4.3H3.3ZM10.5 5.2a1.2 1.2 0 1 1 0 2.4 1.2 1.2 0 0 1 0-2.4Z",
-        Icon::Video => "M2 3h12v10.5H2V3Zm4.5 2.8v5l4.2-2.5-4.2-2.5Z",
-        Icon::Audio => "M6 2.8 13.5 1.5v9.2a2 2 0 1 1-1.3-1.9V4L7.3 4.9v7.6a2 2 0 1 1-1.3-1.9V2.8Z",
-        Icon::Archive => "M2 2.5h12v3H2v-3Zm.8 4H13.2v8H2.8v-8ZM6 8v1.3h4V8H6Z",
-        Icon::Code => "M4 1.5h5.5L13 5v9.5H3V1.5ZM6.6 7.3 4.8 9.3l1.8 2 .9-.8-1.1-1.2 1.1-1.2-.9-.8Zm2.8 0-.9.8 1.1 1.2-1.1 1.2.9.8 1.8-2-1.8-2Z",
-        Icon::Document => "M4 1.5h5.5L13 5v9.5H3V1.5ZM5 7v1.2h6V7H5Zm0 2.5v1.2h6V9.5H5Zm0 2.5v1.2h4V12H5Z",
-        Icon::Back => "M10.5 2.5 12 4 7.8 8 12 12 10.5 13.5 5 8l5.5-5.5Z",
-        Icon::Forward => "M5.5 2.5 4 4l4.2 4L4 12l1.5 1.5L11 8 5.5 2.5Z",
-        Icon::Up => "M2.5 10.5 4 12l4-4.2L12 12l1.5-1.5L8 5l-5.5 5.5Z",
-        Icon::Home => "M8 1.8 15 8h-2v6.2H9.5V10h-3v4.2H3V8H1L8 1.8Z",
-        Icon::Trash => "M6 1.5h4l.6 1.5H14v1.5H2V3h3.4L6 1.5ZM3.2 5.5h9.6l-.7 9H3.9l-.7-9Z",
-        Icon::Disk => "M2 4h12v8H2V4Zm9.5 3a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z",
-        Icon::Eject => "M8 3.5L13 9.5H3L8 3.5ZM3 11h10v1.8H3V11Z",
-        Icon::Lock => "M5 7V5.2a3 3 0 0 1 6 0V7h1.2v6.8H3.8V7H5Zm1.5 0h3V5.2a1.5 1.5 0 0 0-3 0V7Z",
-        Icon::Computer => "M1.5 2.5h13v8.5h-13V2.5ZM3 4v5.5h10V4H3Zm2.5 8.5h5v1.5h-5v-1.5Z",
-        Icon::ArrowUp => "M8 5 12 10H4L8 5Z",
-        Icon::ArrowDown => "M8 11 4 6h8L8 11Z",
-        Icon::Close => "M4 3 8 7l4-4 1 1-4 4 4 4-1 1-4-4-4 4-1-1 4-4-4-4 1-1Z",
+        Icon::Folder => "M1 3h6v1h-6ZM1 4h6v1h-6ZM1 5h14v1h-14ZM1 6h14v1h-14ZM1 7h14v1h-14ZM1 8h14v1h-14ZM1 9h14v1h-14ZM1 10h14v1h-14ZM1 11h14v1h-14ZM1 12h14v1h-14Z",
+        Icon::FolderLink => "M1 3h6v1h-6ZM1 4h6v1h-6ZM1 5h14v1h-14ZM1 6h7v1h-7ZM9 6h6v1h-6ZM1 7h7v1h-7ZM10 7h5v1h-5ZM1 8h3v1h-3ZM11 8h4v1h-4ZM1 9h3v1h-3ZM11 9h4v1h-4ZM1 10h7v1h-7ZM10 10h5v1h-5ZM1 11h7v1h-7ZM9 11h6v1h-6ZM1 12h14v1h-14Z",
+        Icon::File => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h10v1h-10ZM3 11h10v1h-10ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
+        Icon::FileLink => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h6v1h-6ZM10 8h3v1h-3ZM3 9h6v1h-6ZM11 9h2v1h-2ZM3 10h2v1h-2ZM12 10h1v1h-1ZM3 11h2v1h-2ZM12 11h1v1h-1ZM3 12h6v1h-6ZM11 12h2v1h-2ZM3 13h6v1h-6ZM10 13h3v1h-3ZM3 14h10v1h-10Z",
+        Icon::Image => "M1 2h14v1h-14ZM1 3h1v1h-1ZM14 3h1v1h-1ZM1 4h1v1h-1ZM10 4h2v1h-2ZM14 4h1v1h-1ZM1 5h1v1h-1ZM10 5h2v1h-2ZM14 5h1v1h-1ZM1 6h1v1h-1ZM14 6h1v1h-1ZM1 7h1v1h-1ZM14 7h1v1h-1ZM1 8h1v1h-1ZM5 8h1v1h-1ZM14 8h1v1h-1ZM1 9h1v1h-1ZM4 9h3v1h-3ZM10 9h1v1h-1ZM14 9h1v1h-1ZM1 10h1v1h-1ZM3 10h5v1h-5ZM9 10h3v1h-3ZM14 10h1v1h-1ZM1 11h14v1h-14ZM1 12h14v1h-14ZM1 13h14v1h-14Z",
+        Icon::Video => "M3 2h10a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2ZM6 5v6l5-3Z",
+        Icon::Audio => "M6 4.25 14 1.75v1.75L7 5.7V12.5H6V4.25ZM13 3h1v8.5h-1ZM2.25 12.5a2.25 2.25 0 0 1 4.5 0a2.25 2.25 0 0 1-4.5 0ZM9.25 11.5a2.25 2.25 0 0 1 4.5 0a2.25 2.25 0 0 1-4.5 0Z",
+        Icon::Archive => "M1 2h14v1h-14ZM1 3h14v1h-14ZM1 4h14v1h-14ZM2 6h12v1h-12ZM2 7h12v1h-12ZM2 8h4v1h-4ZM10 8h4v1h-4ZM2 9h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12ZM2 12h12v1h-12ZM2 13h12v1h-12Z",
+        Icon::Code => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h10v1h-10ZM3 8h3v1h-3ZM7 8h2v1h-2ZM10 8h3v1h-3ZM3 9h2v1h-2ZM6 9h4v1h-4ZM11 9h2v1h-2ZM3 10h1v1h-1ZM5 10h6v1h-6ZM12 10h1v1h-1ZM3 11h2v1h-2ZM6 11h4v1h-4ZM11 11h2v1h-2ZM3 12h3v1h-3ZM7 12h2v1h-2ZM10 12h3v1h-3ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
+        Icon::Document => "M3 1h6v1h-6ZM10 1h1v1h-1ZM3 2h6v1h-6ZM10 2h2v1h-2ZM3 3h6v1h-6ZM10 3h3v1h-3ZM3 4h6v1h-6ZM3 5h10v1h-10ZM3 6h10v1h-10ZM3 7h2v1h-2ZM11 7h2v1h-2ZM3 8h10v1h-10ZM3 9h2v1h-2ZM11 9h2v1h-2ZM3 10h10v1h-10ZM3 11h2v1h-2ZM9 11h4v1h-4ZM3 12h10v1h-10ZM3 13h10v1h-10ZM3 14h10v1h-10Z",
+        // Lucide's chevron-left.
+        Icon::Back => "M15 18l-6-6 6-6",
+        // Lucide's chevron-right.
+        Icon::Forward => "M9 18l6-6-6-6",
+        // Lucide's chevron-up.
+        Icon::Up => "M18 15l-6-6-6 6",
+        Icon::Home => "M7 1h2v1h-2ZM6 2h4v1h-4ZM5 3h6v1h-6ZM4 4h8v1h-8ZM3 5h10v1h-10ZM2 6h12v1h-12ZM1 7h14v1h-14ZM3 8h10v1h-10ZM3 9h10v1h-10ZM3 10h3v1h-3ZM10 10h3v1h-3ZM3 11h3v1h-3ZM10 11h3v1h-3ZM3 12h3v1h-3ZM10 12h3v1h-3ZM3 13h3v1h-3ZM10 13h3v1h-3ZM3 14h3v1h-3ZM10 14h3v1h-3Z",
+        Icon::Trash => "M6 1h4v1h4v2H2V2h4ZM3.5 5h9l-.8 8.6a1.5 1.5 0 0 1-1.5 1.4H5.8a1.5 1.5 0 0 1-1.5-1.4ZM6 7v5h1V7ZM9 7v5h1V7Z",
+        // Lucide's hard-drive.
+        Icon::Disk => "M22 12L2 12M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11zM6 16L6.01 16M10 16L10.01 16",
+        Icon::Eject => "M7 3h2v1h-2ZM6 4h4v1h-4ZM5 5h6v1h-6ZM4 6h8v1h-8ZM3 7h10v1h-10ZM2 8h12v1h-12ZM2 10h12v1h-12ZM2 11h12v1h-12Z",
+        // Lucide's lock.
+        Icon::Lock => "M5 11h14a2 2 0 0 1 2 2v7a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-7a2 2 0 0 1 2 -2ZM7 11V7a5 5 0 0 1 10 0v4",
+        // An arrow down into a tray.
+        Icon::Download => "M7 1h2v1h-2ZM7 2h2v1h-2ZM7 3h2v1h-2ZM7 4h2v1h-2ZM7 5h2v1h-2ZM7 6h2v1h-2ZM4 7h8v1h-8ZM5 8h6v1h-6ZM6 9h4v1h-4ZM1 10h2v1h-2ZM7 10h2v1h-2ZM13 10h2v1h-2ZM1 11h2v1h-2ZM13 11h2v1h-2ZM1 12h2v1h-2ZM13 12h2v1h-2ZM1 13h14v1h-14ZM1 14h14v1h-14Z",
+        // Lucide's chevron-up.
+        Icon::ArrowUp => "M18 15l-6-6-6 6",
+        // Lucide's chevron-down.
+        Icon::ArrowDown => "M6 9l6 6 6-6",
+        Icon::Close => "M2 2h2v1h-2ZM8 2h2v1h-2ZM3 3h2v1h-2ZM7 3h2v1h-2ZM4 4h4v1h-4ZM5 5h2v1h-2ZM4 6h4v1h-4ZM3 7h2v1h-2ZM7 7h2v1h-2ZM2 8h2v1h-2ZM8 8h2v1h-2Z",
+        // Lucide's chevron-right.
+        Icon::Crumb => "M9 18l6-6-6-6",
+    }
+}
+
+/// The chevrons, the drive and the lock are Lucide's (https://lucide.dev, ISC; see LICENSES/lucide.txt): outlines on a
+/// 24-unit grid, stroked 2 units wide with round ends, as Lucide draws them. The rest are solid.
+fn stroked(i: Icon) -> bool {
+    matches!(i, Icon::Back | Icon::Forward | Icon::Up | Icon::Crumb | Icon::ArrowUp | Icon::ArrowDown | Icon::Disk | Icon::Lock)
+}
+/// Lucide's grid and stroke, in its units.
+const LUCIDE_GRID: f32 = 24.0;
+const LUCIDE_STROKE: f32 = 2.0;
+/// The thinnest a chevron's stroke gets, in pixels, so those drawn at 10 or 14 pixels don't fade.
+const MIN_STROKE_PX: f32 = 1.25;
+
+/// The grid an icon is drawn on, in pixels. It's sharp drawn at that size or a whole multiple of
+/// it: the close cross is drawn smaller than the rest, so it has a grid of its own.
+pub fn grid_of(i: Icon) -> f32 {
+    match i {
+        _ if stroked(i) => LUCIDE_GRID,
+        Icon::Close => 12.0,
+        _ => 16.0,
     }
 }
 
@@ -71,8 +105,19 @@ pub struct Icons {
 impl Icons {
     pub fn draw(&mut self, canvas: &mut Canvas, icon: Icon, x: i32, y: i32, size: i32, color: u32) {
         let (mask, s) = self.cache.entry((icon, size)).or_insert_with(|| {
-            let scale = size as f32 / 16.0;
-            let (data, _) = Mask::new(path_of(icon)).size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
+            let scale = size as f32 / grid_of(icon);
+            let mut mask = Mask::new(path_of(icon));
+            let mut stroke = Stroke::new(LUCIDE_STROKE.max(MIN_STROKE_PX / scale));
+            stroke.cap(Cap::Round).join(Join::Round);
+            if stroked(icon) {
+                mask.style(stroke);
+            } else if icon != Icon::Audio {
+                // A shape inside another is a hole, like video's play button and the can's slits.
+                // Music is drawn from overlapping parts, its heads over its stems, which this
+                // would cut away, so it's filled as drawn.
+                mask.style(Fill::EvenOdd);
+            }
+            let (data, _) = mask.size(size as u32, size as u32).format(Format::Alpha).transform(Some(Transform::scale(scale, scale))).render();
             (data, size)
         });
         canvas.mask(mask, *s, *s, x, y, color);
@@ -121,11 +166,36 @@ mod tests {
     #[test]
     fn every_icon_draws_something() {
         use Icon::*;
-        for i in [Folder, FolderLink, File, FileLink, Image, Video, Audio, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, Computer, ArrowUp, ArrowDown, Close] {
+        for i in [Folder, FolderLink, File, FileLink, Image, Video, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, ArrowUp, ArrowDown, Close, Download, Crumb] {
             let mut px = vec![0u32; 32 * 32];
             let mut c = Canvas::new(&mut px, 32, 32);
             Icons::default().draw(&mut c, i, 0, 0, 32, 0xffffff);
             assert!(px.iter().any(|&p| p != 0), "{i:?} drew nothing");
         }
+    }
+
+    /// The pixel-drawn icons are sharp at the size they're drawn, and at twice it: every pixel is
+    /// fully on or fully off. (Music, video, the can and Lucide's outlines have smoothed curves.)
+    #[test]
+    fn icons_are_whole_pixels() {
+        use Icon::*;
+        for i in [Folder, FolderLink, File, FileLink, Image, Archive, Code, Document, Home, Eject, Download, Close] {
+            for times in [1, 2] {
+                let size = grid_of(i) as i32 * times;
+                let mut px = vec![0u32; (size * size) as usize];
+                let mut c = Canvas::new(&mut px, size, size);
+                Icons::default().draw(&mut c, i, 0, 0, size, 0xffffff);
+                let partial = px.iter().filter(|&&p| p != 0 && p & 0xffffff != 0xffffff).count();
+                assert_eq!(partial, 0, "{i:?} at {size} pixels has {partial} half-covered pixels");
+            }
+        }
+        // Music's one-pixel stems are whole pixels under a smooth slanted beam, and its round heads
+        // stand two pixels apart.
+        let mut px = vec![0u32; 16 * 16];
+        let mut c = Canvas::new(&mut px, 16, 16);
+        Icons::default().draw(&mut c, Audio, 0, 0, 16, 0xffffff);
+        let at = |x: usize, y: usize| px[y * 16 + x];
+        assert!(at(10, 3) != 0 && at(6, 8) == 0xffffff && at(13, 7) == 0xffffff && at(4, 12) == 0xffffff && at(11, 11) == 0xffffff, "beam, stems and both heads");
+        assert!((10..16).all(|y| at(7, y) == 0 && at(8, y) == 0), "the heads stand apart");
     }
 }

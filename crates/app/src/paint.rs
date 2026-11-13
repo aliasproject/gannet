@@ -137,7 +137,7 @@ impl App {
         let co = self.colors;
         c.fill(l.toolbar, co.surface);
         c.fill(Rect::new(0, l.toolbar.bottom() - 1, l.toolbar.w, 1), co.border);
-        let (b, pad, icon) = (self.px(36.0), self.px(6.0), self.px(18.0));
+        let (b, pad, icon) = (self.px(36.0), self.px(6.0), self.px(16.0));
         let buttons = [(Hit::Back, Icon::Back, self.history.can_go_back()), (Hit::Forward, Icon::Forward, self.history.can_go_forward()), (Hit::Up, Icon::Up, self.up_target().is_some())];
         for (i, (hit, ic, on)) in buttons.into_iter().enumerate() {
             let x = pad + i as i32 * b;
@@ -162,7 +162,7 @@ impl App {
                 let label = self.crumb_label(&path);
                 self.text.draw_str(c, &label, (x + self.px(6.0)) as f32, y, if i == last { co.foreground } else { co.muted });
                 if i != last {
-                    self.icons.draw(c, Icon::Forward, x + w + (gap - self.px(10.0)) / 2, (l.toolbar.h - self.px(10.0)) / 2, self.px(10.0), co.muted);
+                    self.icons.draw(c, Icon::Crumb, x + w + (gap - self.px(10.0)) / 2, (l.toolbar.h - self.px(10.0)) / 2, self.px(10.0), co.muted);
                 }
             }
         }
@@ -219,12 +219,17 @@ impl App {
         c.fill(Rect::new(l.sidebar.right() - 1, l.sidebar.y, 1, l.sidebar.h), co.border);
         let row = self.px(30.0);
         let icon = self.px(16.0);
-        let top = l.sidebar.y + self.px(8.0);
         // Worked out while the places are still here: they're moved out while they're drawn.
         let ejects: Vec<Option<Rect>> = (0..self.places.len()).map(|i| self.eject_rect(i)).collect();
+        let tops: Vec<i32> = (0..self.places.len()).map(|i| self.place_top(i)).collect();
+        let heading = self.px(crate::app::SIDEBAR_HEADING);
+        for (h, label) in self.sidebar_headings() {
+            let by = self.baseline(tops[h] - heading, heading);
+            self.text.draw_fitted(c, label, (l.sidebar.x + self.px(14.0)) as f32, by, (l.sidebar.w - self.px(28.0)) as f32, co.muted);
+        }
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {
-            let y = top + i as i32 * row;
+            let y = tops[i];
             let r = Rect::new(l.sidebar.x + self.px(6.0), y, l.sidebar.w - self.px(13.0), row);
             let here = p.path == self.dir;
             if self.is_drop_target(Hit::Place(i)) {
@@ -238,10 +243,9 @@ impl App {
                 PlaceKind::Disk if p.volume.as_ref().is_some_and(|v| v.locked) => Icon::Lock,
                 PlaceKind::Home => Icon::Home,
                 PlaceKind::Trash => Icon::Trash,
-                PlaceKind::Root => Icon::Computer,
                 PlaceKind::Disk => Icon::Disk,
                 PlaceKind::Documents => Icon::Document,
-                PlaceKind::Downloads => Icon::ArrowDown,
+                PlaceKind::Downloads => Icon::Download,
                 PlaceKind::Music => Icon::Audio,
                 PlaceKind::Pictures => Icon::Image,
                 PlaceKind::Videos => Icon::Video,
@@ -260,7 +264,7 @@ impl App {
                 if self.hover == Hit::Eject(i) {
                     c.rrect(Rect::new(e.x + self.px(2.0), e.y + self.px(3.0), e.w - self.px(4.0), e.h - self.px(6.0)), self.px(4.0), if here { co.accent } else { co.border });
                 }
-                let s = self.px(14.0);
+                let s = self.px(16.0);
                 self.icons.draw(c, Icon::Eject, e.x + (e.w - s) / 2, e.y + (e.h - s) / 2, s, if here { co.on_selection } else { co.muted });
             }
         }

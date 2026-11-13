@@ -913,8 +913,18 @@ def place_index(s, label):
     return names.index(label)
 
 
+SIDEBAR_HEADING, SIDEBAR_GAP = 24, 10
+
+
+def place_y(s, label):
+    """The middle of a place's row, below the headings of its section and those before it."""
+    i = place_index(s, label)
+    headings = sum(1 for h in s["headings"] if h <= i)
+    return BAR + 8 + 30 * i + headings * SIDEBAR_HEADING + max(headings - 1, 0) * SIDEBAR_GAP + 15
+
+
 def click_place(a, s, label, eject=False):
-    y = BAR + 8 + 30 * place_index(s, label) + 15
+    y = place_y(s, label)
     a.click(SIDE - 20 if eject else 60, y)
 
 
@@ -981,7 +991,7 @@ def drives_mount_unlock_and_eject_from_the_sidebar(h):
         click_place(a, s, "Home")
         s = a.wait(lambda s: not s["dir"].startswith(str(media)), "gone home")
         # The preview can cover the eject button, so it's ejected from the drive's menu.
-        a.click(60, BAR + 8 + 30 * place_index(s, "CARD") + 15, 0x111)
+        a.click(60, place_y(s, "CARD"), 0x111)
         a.wait(lambda s: s["menu"], "the drive's menu")
         a.key("Up")
         a.key("Return")
@@ -2663,7 +2673,7 @@ def another_disk_copies_unless_shift_moves(h):
     home = Path(a.env["HOME"])
     (home / "a.txt").unlink(missing_ok=True)
     time.sleep(0.5)
-    press_and_carry(a, h, "a.txt", 60, BAR + 8 + 15)
+    press_and_carry(a, h, "a.txt", 60, BAR + 8 + SIDEBAR_HEADING + 15)
     a.wait(lambda s: s["drag"].startswith("Copy “a.txt” to"), "its real disk decides")
     release(a, h)
     a.wait(lambda s: s["jobs"] == 0 and s["drag"] == "", "copied")
@@ -2725,8 +2735,8 @@ def dropping_on_the_sidebar_moves_there_and_trash_really_trashes(h):
     (home / "a.txt").unlink(missing_ok=True)
     shutil.rmtree(Path(a.env["XDG_DATA_HOME"]) / "Trash", ignore_errors=True)
     # Home is the first place.
-    place_y = BAR + 8 + 15
-    press_and_carry(a, h, "a.txt", 60, place_y)
+    home_y = BAR + 8 + SIDEBAR_HEADING + 15
+    press_and_carry(a, h, "a.txt", 60, home_y)
     a.wait(lambda s: s["drag"] == f"Move “a.txt” to {home.name}" or s["drag"] == f"Copy “a.txt” to {home.name}", "over Home")
     a.shot("drag-over-place")
     release(a, h)
@@ -2734,7 +2744,7 @@ def dropping_on_the_sidebar_moves_there_and_trash_really_trashes(h):
     assert (home / "a.txt").read_text() == "A"
     # Trash goes through the real operation, so an info file goes with it.
     data = Path(a.env["XDG_DATA_HOME"])
-    press_and_carry(a, h, "b.txt", 60, BAR + 8 + 1 * 30 + 15)
+    press_and_carry(a, h, "b.txt", 60, BAR + 8 + SIDEBAR_HEADING + 1 * 30 + 15)
     a.wait(lambda s: s["drag"] == "Move “b.txt” to Trash", "over Trash")
     # Ctrl asks for a copy, so Trash stops being a target while it's held.
     held = holding(a, "ctrl")
@@ -2760,9 +2770,9 @@ def dragging_out_of_the_trash_only_copies(h):
     a.wait(lambda s: s["count"] == 0 and s["jobs"] == 0, "trashed")
     data = Path(a.env["XDG_DATA_HOME"])
     time.sleep(0.5)  # So the press below isn't a double-click on that name.
-    a.click(60, BAR + 8 + 1 * 30 + 15)
+    a.click(60, BAR + 8 + SIDEBAR_HEADING + 1 * 30 + 15)
     a.wait(lambda s: s["dir"].endswith("Trash/files") and "out-of-trash.txt" in s["names"], "in the Trash")
-    press_and_carry(a, h, "out-of-trash.txt", 60, BAR + 8 + 15)
+    press_and_carry(a, h, "out-of-trash.txt", 60, BAR + 8 + SIDEBAR_HEADING + 15)
     held = holding(a, "shift")
     a.wait(lambda s: s["drag"].startswith("Copy “out-of-trash.txt” to"), "copies even with Shift")
     release(a, h)

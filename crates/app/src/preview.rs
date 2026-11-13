@@ -1960,6 +1960,9 @@ struct InfoLayout {
 impl App {
     fn info_layout(&self, area: Rect) -> InfoLayout {
         let side = ((area.w.min(area.h) as f64 * 0.4) as i32).clamp(self.px(48.0), self.px(256.0));
+        // A whole multiple of the icons' grid, so the file's icon is as sharp as the small ones.
+        let unit = self.px(16.0).max(1);
+        let side = (side / unit).max(1) * unit;
         let (gap, line, button) = (self.px(18.0), self.px(24.0), self.px(32.0));
         let top = area.y + (area.h - (side + gap + line * 2 + gap + button)).max(0) / 2;
         let picture = Rect::new(area.x + (area.w - side) / 2, top, side, side);

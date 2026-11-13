@@ -258,6 +258,11 @@ Elsewhere, it uses the light or dark preference from your GTK settings or `gsett
 built-in palette, and asks `gsettings` again whenever its window regains focus. With no
 preference set, it's light.
 
+Text is in your monospace font at 13 px, the one `aliasos-font-set` picks on aliasOS, so
+Gannet matches the terminal and the bar. Pick another and Gannet uses it from its next start.
+The chevrons, drive and lock icons are [Lucide](https://lucide.dev)'s (ISC, see
+`LICENSES/lucide.txt`); the rest are Gannet's own.
+
 ## Known gaps
 
 - No tabs yet.

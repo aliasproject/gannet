@@ -14,7 +14,6 @@ pub enum PlaceKind {
     Pictures,
     Videos,
     Trash,
-    Root,
     Disk,
 }
 
@@ -63,7 +62,6 @@ pub fn standard_places(home: &Path, config_home: &Path, data_home: &Path) -> Vec
         }
     }
     places.push(Place { label: "Trash".into(), path: data_home.join("Trash/files"), kind: PlaceKind::Trash, volume: None });
-    places.push(Place { label: "Computer".into(), path: PathBuf::from("/"), kind: PlaceKind::Root, volume: None });
     places
 }
 
@@ -125,7 +123,7 @@ mod tests {
         s.file("config/user-dirs.dirs", b"XDG_MUSIC_DIR=\"$HOME/Tunes\"\nXDG_VIDEOS_DIR=\"$HOME/\"\nXDG_PICTURES_DIR=\"$HOME/Gone\"\n");
         let p = standard_places(&home, &s.path().join("config"), &s.path().join("data"));
         let labels: Vec<&str> = p.iter().map(|x| x.label.as_str()).collect();
-        assert_eq!(labels, ["Home", "Documents", "Music", "Trash", "Computer"]);
+        assert_eq!(labels, ["Home", "Documents", "Music", "Trash"]);
         assert_eq!(p[2].path, home.join("Tunes"));
         assert_eq!(p[3].path, s.path().join("data/Trash/files"));
     }
