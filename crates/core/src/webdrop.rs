@@ -61,6 +61,10 @@ pub fn image_name(address: Option<&str>, mime: &str) -> OsString {
             room -= 1;
         }
         name.truncate(room);
+        // Cut just after a dot, it would get two.
+        while name.len() > 1 && name.last() == Some(&b'.') {
+            name.pop();
+        }
         name.push(b'.');
         name.extend_from_slice(ext.as_bytes());
     } else if name.len() > 255 {
@@ -141,6 +145,9 @@ mod tests {
         let long = format!("https://example.com/{}.png", "é".repeat(200));
         let n = image_name(Some(&long), "image/png");
         assert!(n.len() <= 255 && n.to_str().is_some(), "cut within the limit, at a character");
+        let at_dot = format!("https://example.com/{}.{}", "a".repeat(250), "b".repeat(20));
+        let n = image_name(Some(&at_dot), "image/png").into_string().unwrap();
+        assert!(n.len() <= 255 && !n.contains(".."), "a cut just after a dot doesn't double it: {n}");
     }
 
     #[test]

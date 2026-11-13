@@ -2256,7 +2256,13 @@ impl App {
     // ---- Input ----
 
     pub fn input(&mut self, i: Input) {
+        // Keys held, focus and drags all change whether a drag can go to the Trash, which shows
+        // dimmed when it can't, so it's repainted whenever that changes.
+        let trash_off = self.trash_unavailable();
         self.handle_input(i);
+        if self.trash_unavailable() != trash_off {
+            self.invalidate(self.layout().sidebar);
+        }
         // Whatever just happened may have opened a menu or dialog, like a close request.
         self.refresh_file_drag();
         self.preview_follow();
@@ -2265,15 +2271,9 @@ impl App {
     fn handle_input(&mut self, i: Input) {
         match i {
             Input::Mods(m) => {
-                // Keys held can change whether a drag from another Gannet window can go to the
-                // Trash, which shows dimmed when it can't.
-                let trash_off = self.trash_unavailable();
                 self.mods_now = m;
                 self.refresh_file_drag();
                 self.refresh_incoming();
-                if self.trash_unavailable() != trash_off {
-                    self.invalidate(self.layout().sidebar);
-                }
             }
             // Another program has the clipboard now, so nothing's about to move.
             Input::ClipboardLost => {
@@ -3603,8 +3603,6 @@ impl App {
             });
             probe
         });
-        // The Trash may dim for it.
-        self.invalidate(self.layout().sidebar);
         self.incoming = Some(IncomingDrag { files, picture, can_copy, can_move, marker, probe, id, devices: HashMap::new(), moved: false, target: None, label: Rect::default(), accepting: false });
         self.refresh_incoming();
     }
@@ -3632,8 +3630,6 @@ impl App {
 
     fn end_incoming(&mut self, i: &IncomingDrag) {
         self.invalidate(i.label);
-        // The Trash may have been dimmed for it.
-        self.invalidate(self.layout().sidebar);
         if let Some(t) = &i.target {
             self.invalidate_drop_target(t.hit);
         }
@@ -4803,12 +4799,13 @@ mod tests {
             r.app.dirty = Rect::default();
             r.app.input(Input::DragEnter { picture, x, y, files: true, can_copy: true, can_move: true, marker: None });
             assert_eq!(r.app.trash_unavailable(), picture, "the Trash is dimmed only when it can't be used");
-            assert!(r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), "and repainted for it");
+            assert_eq!(r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), picture, "repainted when that changes");
             r.app.input(Input::DragMove { x, y });
             let target = r.app.incoming.as_ref().unwrap().target.as_ref().map(|t| t.trash);
             r.app.dirty = Rect::default();
             r.app.input(Input::DragLeave);
-            assert!(!r.app.trash_unavailable() && r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), "back to normal when it leaves");
+            assert!(!r.app.trash_unavailable(), "back to normal when it leaves");
+            assert!(!picture || r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), "and repainted, as it was dimmed");
             target
         };
         assert_eq!(over_trash(&mut r, false), Some(true), "files can go to the Trash");
@@ -4824,6 +4821,16 @@ mod tests {
         r.app.input(Input::Mods(Mods { ctrl: true, ..Mods::default() }));
         assert!(r.app.trash_unavailable() && r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), "dimmed and repainted for Ctrl");
         r.app.input(Input::Mods(Mods::default()));
+        // Losing focus goes back to the keys the drag set out with, here Ctrl.
+        let mut ctrl_marker = marker(true, true, false);
+        ctrl_marker.device = 0;
+        r.app.input(Input::DragLeave);
+        r.app.input(Input::DragEnter { picture: false, x: lx, y: ly, files: true, can_copy: true, can_move: true, marker: Some(ctrl_marker) });
+        r.app.input(Input::DragMove { x: lx, y: ly });
+        assert!(!r.app.trash_unavailable(), "with the keyboard and no Ctrl held, it can");
+        r.app.dirty = Rect::default();
+        r.app.input(Input::Focus(false));
+        assert!(r.app.trash_unavailable() && r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), "dimmed and repainted when focus goes");
         r.app.input(Input::DragLeave);
         assert_eq!(over_trash(&mut r, true), None, "a picture can't, so nothing lights up");
     }
