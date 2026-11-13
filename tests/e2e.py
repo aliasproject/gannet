@@ -2920,7 +2920,7 @@ def recent_lists_used_files_newest_first_and_shows_them_in_their_folders(h):
     a.wait(lambda s: s["dir"] == str(fs / "a") and s["selected"] == ["middle.txt"], "middle.txt in its folder")
     a.key("Left", mods=["alt"])
     a.wait(lambda s: s["dir"] == str(listed), "back in Recent")
-    # Nothing can be dropped or pasted into Recent, and a rename is refused.
+    # A rename is refused: Recent only lists files.
     a.key("F2")
     a.wait(lambda s: any("Recent only lists files" in n for n in s["notices"]), "says it only lists")
     assert (fs / "a/middle.txt").exists() and a.alive()
