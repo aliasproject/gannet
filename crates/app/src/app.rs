@@ -3597,6 +3597,8 @@ impl App {
             });
             probe
         });
+        // The Trash may dim for it.
+        self.invalidate(self.layout().sidebar);
         self.incoming = Some(IncomingDrag { files, picture, can_copy, can_move, marker, probe, id, devices: HashMap::new(), moved: false, target: None, label: Rect::default(), accepting: false });
         self.refresh_incoming();
     }
@@ -3616,8 +3618,16 @@ impl App {
         }
     }
 
+    /// Whether a drag from elsewhere is over the window that can't go to the Trash, which then
+    /// shows dimmed.
+    pub(crate) fn trash_unavailable(&self) -> bool {
+        self.incoming.as_ref().is_some_and(|i| i.files && !self.incoming_can_trash(i))
+    }
+
     fn end_incoming(&mut self, i: &IncomingDrag) {
         self.invalidate(i.label);
+        // The Trash may have been dimmed for it.
+        self.invalidate(self.layout().sidebar);
         if let Some(t) = &i.target {
             self.invalidate_drop_target(t.hit);
         }
@@ -3677,7 +3687,7 @@ impl App {
 
     /// Whether a drop here can go to the Trash. Ctrl asks for a copy, and trashing the
     /// originals would be the opposite.
-    fn incoming_can_trash(&self, i: &IncomingDrag) -> bool {
+    pub(crate) fn incoming_can_trash(&self, i: &IncomingDrag) -> bool {
         if i.picture {
             return false;
         }
@@ -4778,10 +4788,15 @@ mod tests {
         r.app.places = vec![Place { label: "Home".into(), path: r.work(), kind: PlaceKind::Home, volume: None }, Place { label: "Trash".into(), path: trash, kind: PlaceKind::Trash, volume: None }];
         let (x, y) = ((r.app.layout().sidebar.x + r.app.px(40.0)) as f64, (r.app.place_top(1) + r.app.px(15.0)) as f64);
         let over_trash = |r: &mut Rig, picture: bool| {
+            r.app.dirty = Rect::default();
             r.app.input(Input::DragEnter { picture, x, y, files: true, can_copy: true, can_move: true, marker: None });
+            assert_eq!(r.app.trash_unavailable(), picture, "the Trash is dimmed only when it can't be used");
+            assert!(r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), "and repainted for it");
             r.app.input(Input::DragMove { x, y });
             let target = r.app.incoming.as_ref().unwrap().target.as_ref().map(|t| t.trash);
+            r.app.dirty = Rect::default();
             r.app.input(Input::DragLeave);
+            assert!(!r.app.trash_unavailable() && r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), "back to normal when it leaves");
             target
         };
         assert_eq!(over_trash(&mut r, false), Some(true), "files can go to the Trash");
