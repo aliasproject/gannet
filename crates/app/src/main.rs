@@ -426,27 +426,54 @@ fn read_clipboard(wl: &wl::Wl, hub: &Hub, purpose: app::Paste) {
 /// Reads a dropped file list off the main thread, since the other program can stall.
 fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option<app::DropAction>) {
     const MAX: u64 = 64 * 1024 * 1024;
-    let Some((fd, can_copy, can_move)) = wl.read_drop() else {
-        hub.send(Msg::Dropped(app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false }));
+    /// The largest picture taken from a browser.
+    const MAX_IMAGE: u64 = 256 * 1024 * 1024;
+    let nothing = |dest| app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false, saved: None, link: false };
+    let Some(read) = wl.read_drop() else {
+        hub.send(Msg::Dropped(nothing(dest)));
         return;
     };
+    let (can_copy, can_move) = (read.can_copy, read.can_move);
     // The other program can stall forever, and an unanswered drop would refuse every later one.
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
-    let (answer, answered) = std::sync::mpsc::channel();
-    // If this can't start, the sender goes with it, and the waiter below answers right away.
-    let _ = std::thread::Builder::new().name("gannet-drop".into()).spawn(move || {
-        let _ = answer.send(clipboard::read_limited(std::fs::File::from(fd), MAX));
-    });
+    // The list and the picture are read at once: the other program may fill one pipe and wait
+    // on it before it writes the other.
+    let read_in_thread = |fd: Option<std::os::fd::OwnedFd>, max: u64| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(fd) = fd {
+            // If this can't start, the sender goes with it, and the waiter answers right away.
+            let _ = std::thread::Builder::new().name("gannet-drop".into()).spawn(move || {
+                let _ = tx.send(clipboard::read_limited(std::fs::File::from(fd), max));
+            });
+        }
+        rx
+    };
+    let list = read_in_thread(read.list, MAX);
+    let (image_mime, image_fd) = read.image.map_or((None, None), |(m, fd)| (Some(m), Some(fd)));
+    let image = read_in_thread(image_fd, MAX_IMAGE);
     let waiter = hub.clone();
     let (wait_dest, wait_trash) = (dest.clone(), trash);
     let waiting = std::thread::Builder::new().name("gannet-drop-wait".into()).spawn(move || {
-        let data = answered.recv_timeout(PATIENCE).ok().flatten().unwrap_or_default();
+        let until = std::time::Instant::now() + PATIENCE;
+        let data = list.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).ok().flatten().unwrap_or_default();
         let (paths, _) = clipboard::parse(clipboard::URI_LIST, &data);
         let all_local = clipboard::uri_list_is_all_local(&data, &paths);
-        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local }));
+        let address = gannet_core::webdrop::web_address(&data);
+        // Files win: a picture is only kept when nothing else came.
+        let saved = image_mime.filter(|_| paths.is_empty()).map(|mime| {
+            if wait_trash {
+                return Err("only files can go to the Trash".to_string());
+            }
+            let bytes = image.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).ok().flatten();
+            let Some(bytes) = bytes.filter(|b| !b.is_empty()) else { return Err("it didn't arrive".to_string()) };
+            let name = gannet_core::webdrop::image_name(address.as_deref(), mime);
+            gannet_core::webdrop::save_new(&wait_dest, &name, &bytes).map_err(|e| gannet_core::listing::describe(&e).to_lowercase())
+        });
+        let link = paths.is_empty() && saved.is_none() && address.is_some();
+        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local, saved, link }));
     });
     if waiting.is_err() {
-        hub.send(Msg::Dropped(app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false }));
+        hub.send(Msg::Dropped(nothing(dest)));
     }
 }
 

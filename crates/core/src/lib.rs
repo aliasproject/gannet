@@ -21,6 +21,7 @@ pub mod time;
 pub mod trash;
 pub mod uri;
 pub mod watch;
+pub mod webdrop;
 
 #[cfg(test)]
 pub(crate) mod testutil;

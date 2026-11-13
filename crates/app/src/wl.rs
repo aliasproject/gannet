@@ -512,19 +512,25 @@ impl Wl {
     pub fn accept_drop(&mut self, accept: bool) {
         self.state.drag_accepting = accept;
         if let Some(offer) = &self.state.drag_offer {
-            offer.accept(self.state.drag_serial, accept.then(|| clipboard::URI_LIST.to_string()));
+            offer.accept(self.state.drag_serial, accept.then(|| drop_mime(offer)).flatten());
         }
     }
 
-    /// Asks for a dropped file list. Returns the read end, and what the other program allows.
-    pub fn read_drop(&self) -> Option<(OwnedFd, bool, bool)> {
+    /// Asks for what was dropped: its file list, and a picture if it offers one, each read
+    /// from its own pipe. Both are asked for at once, as only the list says which is wanted.
+    pub fn read_drop(&self) -> Option<DropRead> {
         let offer = self.state.dropped_offer.as_ref()?;
-        let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
-        offer.receive(clipboard::URI_LIST.to_string(), w.as_fd());
-        drop(w);
+        let mimes = offer_mimes(offer);
+        let ask = |mime: &str| -> Option<OwnedFd> {
+            let (r, w) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).ok()?;
+            offer.receive(mime.to_string(), w.as_fd());
+            Some(r)
+        };
+        let list = mimes.iter().any(|m| m == clipboard::URI_LIST).then(|| ask(clipboard::URI_LIST)).flatten();
+        let image = gannet_core::webdrop::image_mime(&mimes).and_then(|m| Some((m, ask(m)?)));
         let _ = self.conn.flush();
         let (can_copy, can_move) = offer_allows(offer);
-        Some((r, can_copy, can_move))
+        (list.is_some() || image.is_some()).then_some(DropRead { list, image, can_copy, can_move })
     }
 
     /// Tells the other program the drop has been dealt with. If it agreed to a move, it may
@@ -563,6 +569,28 @@ fn copy_into_larger(icon: &DragIcon, px: &mut [u32], bw: i32) {
 /// What this window will agree to for a drop. Move stays out unless it's all that's on offer.
 fn allowed_actions(can_copy: bool) -> DndAction {
     if can_copy { DndAction::Copy } else { DndAction::Copy | DndAction::Move }
+}
+
+/// The formats an offer has.
+fn offer_mimes(offer: &wl_data_offer::WlDataOffer) -> Vec<String> {
+    offer.data::<OfferData>().and_then(|d| d.mimes.lock().ok().map(|m| m.clone())).unwrap_or_default()
+}
+
+/// What a drop is asked for: a file list, or failing that a picture, as a browser offers.
+fn drop_mime(offer: &wl_data_offer::WlDataOffer) -> Option<String> {
+    let mimes = offer_mimes(offer);
+    if mimes.iter().any(|m| m == clipboard::URI_LIST) {
+        return Some(clipboard::URI_LIST.to_string());
+    }
+    gannet_core::webdrop::image_mime(&mimes).map(str::to_string)
+}
+
+/// A dropped offer, asked for what it has: its file list, and a picture if it offers one.
+pub struct DropRead {
+    pub list: Option<OwnedFd>,
+    pub image: Option<(&'static str, OwnedFd)>,
+    pub can_copy: bool,
+    pub can_move: bool,
 }
 
 fn offer_allows(offer: &wl_data_offer::WlDataOffer) -> (bool, bool) {
@@ -949,7 +977,8 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
             }
             wl_data_device::Event::Enter { serial, x, y, id, .. } => {
                 s.drag_serial = serial;
-                let files = id.as_ref().and_then(|o| o.data::<OfferData>()).is_some_and(|d| d.mimes.lock().is_ok_and(|m| m.iter().any(|m| m == clipboard::URI_LIST)));
+                // Files, or a picture from a browser, which is saved as a new file.
+                let files = id.as_ref().is_some_and(|o| drop_mime(o).is_some());
                 let marker = id.as_ref().and_then(|o| o.data::<OfferData>()).and_then(|d| d.mimes.lock().ok().and_then(|m| m.iter().find_map(|m| clipboard::DragMarker::parse(m))));
                 let (can_copy, can_move) = id.as_ref().map_or((false, false), offer_allows);
                 if let Some(offer) = id.as_ref().filter(|o| o.version() >= 3) {

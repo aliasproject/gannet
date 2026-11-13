@@ -106,6 +106,7 @@ pub enum Msg {
     DragDevice { drag: u64, path: PathBuf, device: Option<u64> },
 }
 
+#[derive(Clone)]
 pub struct Dropped {
     pub paths: Vec<PathBuf>,
     pub dest: PathBuf,
@@ -117,6 +118,10 @@ pub struct Dropped {
     pub decided: Option<DropAction>,
     /// Every entry was a local path.
     pub all_local: bool,
+    /// No files, but a picture, as a browser offers, saved as a new file: where, or why not.
+    pub saved: Option<Result<PathBuf, String>>,
+    /// No files and no picture, but a web address.
+    pub link: bool,
 }
 
 /// What a clipboard read is for.
@@ -3774,6 +3779,31 @@ impl App {
     /// rule inside a window applies. A drop from another program copies unless that program
     /// only offers a move, because its keys and disks can't be seen from here.
     fn on_dropped(&mut self, d: Dropped) {
+        match d.saved {
+            Some(Ok(path)) => {
+                let name = path.file_name().map(|n| std::os::unix::ffi::OsStrExt::as_bytes(n).to_vec()).unwrap_or_default();
+                if path.parent() == Some(self.dir.as_path()) {
+                    self.pending_select = vec![name];
+                    self.reload();
+                } else {
+                    let folder = d.dest.file_name().map_or_else(|| d.dest.display().to_string(), |n| n.to_string_lossy().into_owned());
+                    self.notice(format!("Saved “{}” in “{folder}”", String::from_utf8_lossy(&name)));
+                }
+                self.cmds.push(Cmd::FinishDrop);
+                return;
+            }
+            Some(Err(why)) => {
+                self.notice(format!("Couldn't save the picture: {why}"));
+                self.cmds.push(Cmd::AbandonDrop);
+                return;
+            }
+            None => {}
+        }
+        if d.paths.is_empty() && d.link {
+            self.notice("That drag held a link, not a file".into());
+            self.cmds.push(Cmd::AbandonDrop);
+            return;
+        }
         if d.paths.is_empty() {
             // No files on this computer, or the other program stalled or sent too much.
             self.notice("Couldn't get any files from that drag".into());
@@ -4690,7 +4720,27 @@ mod tests {
     }
 
     fn dropped(r: &Rig, names: &[&str], can_copy: bool, can_move: bool) -> Dropped {
-        Dropped { paths: names.iter().map(|n| r.root.join(n)).collect(), dest: r.root.join("work"), trash: false, can_copy, can_move, decided: None, all_local: true }
+        Dropped { paths: names.iter().map(|n| r.root.join(n)).collect(), dest: r.root.join("work"), trash: false, can_copy, can_move, decided: None, all_local: true, saved: None, link: false }
+    }
+
+    #[test]
+    fn a_picture_from_a_browser_is_shown_saved_and_a_link_is_named() {
+        let mut r = Rig::new("drop-picture");
+        r.open(r.work());
+        let saved = r.work().join("columns.png");
+        fs::write(&saved, b"png").unwrap();
+        let base = Dropped { paths: Vec::new(), dest: r.work(), trash: false, can_copy: true, can_move: false, decided: None, all_local: false, saved: Some(Ok(saved)), link: false };
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::Dropped(base.clone()));
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::FinishDrop)), "the browser hears it was taken");
+        r.pump_until("the new file", |a| !a.loading);
+        assert_eq!(r.selected_names(), ["columns.png"], "and it's selected");
+        r.app.on_msg(Msg::Dropped(Dropped { saved: Some(Err("no space left on device".into())), ..base.clone() }));
+        assert_eq!(r.app.notices.last().map(String::as_str), Some("Couldn't save the picture: no space left on device"));
+        r.app.on_msg(Msg::Dropped(Dropped { saved: None, link: true, ..base.clone() }));
+        assert_eq!(r.app.notices.last().map(String::as_str), Some("That drag held a link, not a file"));
+        r.app.on_msg(Msg::Dropped(Dropped { saved: None, link: false, ..base }));
+        assert_eq!(r.app.notices.last().map(String::as_str), Some("Couldn't get any files from that drag"));
     }
 
     fn outside_files(r: &Rig) {
