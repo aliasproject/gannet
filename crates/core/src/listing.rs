@@ -77,6 +77,8 @@ pub struct Listing {
     slow_stat: Option<Duration>,
     /// Set for the Trash view, whose rows come from several Trash folders.
     trash: Option<Arc<TrashRows>>,
+    /// Set for the Recent view, whose rows are files anywhere.
+    recent: Option<Arc<Vec<PathBuf>>>,
 }
 
 #[derive(Clone)]
@@ -129,16 +131,34 @@ impl Listing {
     pub fn path(&self, i: u32) -> PathBuf {
         match &self.trash {
             Some(t) => t.roots[t.root_of[i as usize] as usize].files().join(&t.file_names[i as usize]),
-            None => self.dir.join(self.os_name(i)),
+            None => match &self.recent {
+                Some(paths) => paths[i as usize].clone(),
+                None => self.dir.join(self.os_name(i)),
+            },
         }
     }
 
     /// What tells this row apart from the others, for finding it again after a reload.
-    /// It's the name, except in the Trash view, where two rows can share a name.
+    /// It's the name, except in the Trash and Recent views, where two rows can share a name.
     pub fn key(&self, i: u32) -> std::borrow::Cow<'_, [u8]> {
-        match &self.trash {
-            Some(_) => std::borrow::Cow::Owned(self.path(i).into_os_string().into_vec()),
-            None => std::borrow::Cow::Borrowed(self.name(i)),
+        if self.trash.is_some() || self.recent.is_some() {
+            std::borrow::Cow::Owned(self.path(i).into_os_string().into_vec())
+        } else {
+            std::borrow::Cow::Borrowed(self.name(i))
+        }
+    }
+
+    /// True for the Recent view.
+    pub fn is_recent(&self) -> bool {
+        self.recent.is_some()
+    }
+
+    /// The folder a row is in, for the views whose rows come from many: where a Trash item
+    /// was deleted from, if its info file could be read, or where a recent file is.
+    pub fn location(&self, i: u32) -> Option<&Path> {
+        match &self.recent {
+            Some(paths) => paths[i as usize].parent(),
+            None => self.original(i).and_then(Path::parent),
         }
     }
 
@@ -256,6 +276,7 @@ impl Listing {
             read_error: None,
             slow_stat: self.slow_stat,
             trash: self.trash.clone(),
+            recent: self.recent.clone(),
         }
     }
 }
@@ -303,7 +324,8 @@ fn sort_known(l: &Listing, spec: SortSpec) -> Vec<u32> {
     };
     let mut v: Vec<u32> = (0..l.len() as u32).collect();
     par_sort_by(&mut v, |&a, &b| {
-        let (da, db) = (l.kind(a).is_dirlike(), l.kind(b).is_dirlike());
+        // Recent is in order of use, folders among files.
+        let (da, db) = (l.kind(a).is_dirlike() && !l.is_recent(), l.kind(b).is_dirlike() && !l.is_recent());
         db.cmp(&da).then_with(|| {
             let by_key = match spec.key {
                 SortKey::Name => natural_cmp(l.name(a), l.name(b)),
@@ -373,6 +395,8 @@ pub struct LoadRequest {
     pub slow_stat: Option<Duration>,
     /// List every Trash folder instead of `dir`, which should be the home Trash's `files`.
     pub trash: Option<TrashSpec>,
+    /// List the recently used files instead, from the list at `dir`.
+    pub recent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -442,6 +466,7 @@ pub fn spawn_load_watching(req: LoadRequest, watch: Option<Arc<Watch>>, sink: im
         let (generation, dir) = (req.generation, req.dir.clone());
         let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match req.trash.clone() {
             Some(spec) => load_trash(req, &spec, watch.as_ref(), &c, &s2),
+            None if req.recent => load_recent(req, watch.as_ref(), &c, &s2),
             None => {
                 if let Some(w) = &watch {
                     w.set_dirs_unless(std::slice::from_ref(&dir), || c.load(atomic::Ordering::Relaxed));
@@ -472,7 +497,7 @@ fn load(req: LoadRequest, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
             return;
         }
     };
-    let mut l = Listing { dir: req.dir.clone(), fd: Some(file.clone()), names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None };
+    let mut l = Listing { dir: req.dir.clone(), fd: Some(file.clone()), names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None };
     // Small enough that a slow disk returns often, and big enough to be cheap on a fast one.
     let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); if req.slow_read.is_some() { 4096 } else { READ_BUFFER }];
     let mut iter = RawDir::new(file.as_fd(), &mut buf);
@@ -618,7 +643,7 @@ fn load_trash(req: LoadRequest, spec: &TrashSpec, watch: Option<&Arc<Watch>>, ca
     if let Some(w) = watch {
         w.set_dirs_unless(&[home.files()], stale);
     }
-    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None };
+    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None };
     let mut t = TrashRows { roots: Vec::new(), fds: Vec::new(), root_of: Vec::new(), file_names: Vec::new(), info: Vec::new() };
     match read_trash_root(&home, req.slow_read, cancel) {
         Ok((file, entries)) => add_trash_root(&mut l, &mut t, home, file, entries),
@@ -686,6 +711,81 @@ fn load_trash(req: LoadRequest, spec: &TrashSpec, watch: Option<&Arc<Watch>>, ca
     l.meta = l.slots.iter().map(|_| new_meta()).collect();
     l.trash = Some(Arc::new(t));
     publish_final(Arc::new(l), &req, cancel, sink);
+}
+
+/// Lists the recently used files that are still there, newest first by their dates of use.
+/// The list's folder is watched, as apps replace the list rather than write into it.
+fn load_recent(req: LoadRequest, watch: Option<&Arc<Watch>>, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
+    let stale = || cancel.load(atomic::Ordering::Relaxed);
+    if let (Some(w), Some(parent)) = (watch, req.dir.parent()) {
+        w.set_dirs_unless(&[parent], stale);
+    }
+    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None };
+    let found = match read_list(&req.dir) {
+        Ok(bytes) => crate::recent::parse(&bytes),
+        // No list yet just means nothing's been used.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            l.read_error = Some(describe(&e));
+            Vec::new()
+        }
+    };
+    let mut paths = Vec::new();
+    for (path, used) in found.into_iter().take(crate::recent::CHECK_LIMIT) {
+        if paths.len() >= crate::recent::LIMIT || stale() {
+            break;
+        }
+        if let Some(d) = req.slow_read {
+            std::thread::sleep(d);
+        }
+        let Some(name) = path.file_name().map(|n| n.as_bytes().to_vec()) else { continue };
+        if name.len() > u16::MAX as usize || l.names.len() + name.len() > u32::MAX as usize {
+            continue;
+        }
+        let flags = AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT;
+        let Ok(c) = CString::new(path.as_os_str().as_bytes()) else { continue };
+        let (kind, size) = match statx(rustix::fs::CWD, c.as_c_str(), flags, StatxFlags::TYPE | StatxFlags::SIZE) {
+            Ok(st) => {
+                let kind = match FileType::from_raw_mode(st.stx_mode as _) {
+                    FileType::RegularFile => Kind::File,
+                    FileType::Directory => Kind::Dir,
+                    FileType::Symlink => match statat(rustix::fs::CWD, c.as_c_str(), AtFlags::empty()) {
+                        Ok(t) if FileType::from_raw_mode(t.st_mode as _) == FileType::Directory => Kind::LinkDir,
+                        _ => Kind::Link,
+                    },
+                    _ => Kind::Other,
+                };
+                (kind, st.stx_size)
+            }
+            // A file that's gone, or whose folder is, isn't recent any more.
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTDIR) => continue,
+            Err(_) => (Kind::Other, SIZE_FAILED),
+        };
+        l.slots.push(Slot { off: l.names.len() as u32, len: name.len() as u16, kind });
+        l.names.extend_from_slice(&name);
+        l.meta.push(Meta { size: AtomicU64::new(size), mtime: AtomicI64::new(used) });
+        paths.push(path);
+    }
+    if stale() {
+        return;
+    }
+    l.complete = true;
+    l.recent = Some(Arc::new(paths));
+    publish_final(Arc::new(l), &req, cancel, sink);
+}
+
+/// Reads the recent list, if it's a plain file of a size a list could be.
+fn read_list(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    const MAX: u64 = 64 * 1024 * 1024;
+    let f = OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+    let m = f.metadata()?;
+    if !m.is_file() {
+        return Err(std::io::Error::other("it isn't a file"));
+    }
+    let mut buf = Vec::with_capacity(m.len().min(MAX) as usize);
+    f.take(MAX).read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 fn trash_snapshot(l: &Listing, t: &TrashRows) -> Listing {
@@ -854,7 +954,7 @@ mod tests {
     use std::path::Path;
 
     fn request(dir: &Path) -> LoadRequest {
-        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None, trash: None }
+        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None, trash: None, recent: false }
     }
 
     /// Runs a load to completion, returning every event in order.
@@ -1230,6 +1330,36 @@ mod tests {
         // The disk's Trash folder is held open too, which matters for unmounting it.
         let held = l.listing.held_dirs();
         assert!(held.iter().any(|d| d.starts_with(&disk)), "{held:?}");
+    }
+
+    #[test]
+    fn recent_lists_files_that_are_still_there_newest_first() {
+        let s = Scratch::new();
+        let (old, new, dir) = (s.file("a/old.txt", b"1"), s.file("b/new.txt", b"22"), s.dir("c/folder"));
+        let same_name = s.file("c/old.txt", b"333");
+        let uri = |p: &Path| crate::uri::to_file_uri(p);
+        let xbel = format!(
+            "<xbel>\n<bookmark href=\"{}\" visited=\"2026-01-01T00:00:00Z\"/>\n<bookmark href=\"{}\" visited=\"2026-03-01T00:00:00Z\"/>\n<bookmark href=\"{}\" visited=\"2026-02-01T00:00:00Z\"/>\n<bookmark href=\"{}\" visited=\"2026-04-01T00:00:00Z\"/>\n<bookmark href=\"{}\" visited=\"2026-05-01T00:00:00Z\"/>\n</xbel>",
+            uri(&old), uri(&new), uri(&dir), uri(&s.path().join("gone.txt")), uri(&same_name)
+        );
+        let list = s.file("data/recently-used.xbel", xbel.as_bytes());
+        let mut req = request(&list);
+        req.recent = true;
+        req.sort = SortSpec { key: SortKey::Modified, descending: true };
+        let l = last(run(req));
+        assert!(l.listing.is_recent() && l.listing.read_error.is_none());
+        assert_eq!(row_names(&l), ["old.txt", "new.txt", "folder", "old.txt"], "newest first, the missing one left out");
+        let paths: Vec<_> = l.rows.iter().map(|&i| l.listing.path(i)).collect();
+        assert_eq!(paths, [same_name.clone(), new.clone(), dir.clone(), old.clone()]);
+        assert_eq!(l.listing.location(l.rows[0]), Some(s.path().join("c").as_path()));
+        assert!(l.listing.kind(l.rows[2]).is_dirlike());
+        assert_eq!(l.listing.stat(l.rows[1]), Stat::Known { size: 2, mtime: crate::recent::parse_utc("2026-03-01T00:00:00Z").unwrap() }, "the date is when it was used");
+        assert_ne!(l.listing.key(l.rows[0]), l.listing.key(l.rows[3]), "two files of one name stay apart");
+        // No list yet is an empty Recent, not an error.
+        let mut req = request(&s.path().join("data/none.xbel"));
+        req.recent = true;
+        let l = last(run(req));
+        assert!(l.rows.is_empty() && l.listing.read_error.is_none());
     }
 
     #[test]
