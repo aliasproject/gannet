@@ -227,6 +227,8 @@ impl App {
             let by = self.baseline(tops[h] - heading, heading);
             self.text.draw_fitted(c, label, (l.sidebar.x + self.px(14.0)) as f32, by, (l.sidebar.w - self.px(28.0)) as f32, co.muted);
         }
+        // A drag that can't go to the Trash shows it dimmed, like a button that can't be pressed.
+        let trash_off = self.trash_unavailable();
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {
             let y = tops[i];
@@ -250,11 +252,12 @@ impl App {
                 PlaceKind::Pictures => Icon::Image,
                 PlaceKind::Videos => Icon::Video,
             };
-            self.icons.draw(c, ic, r.x + self.px(8.0), y + (row - icon) / 2, icon, if here { co.on_selection } else { co.muted });
+            let off = trash_off && p.kind == PlaceKind::Trash;
+            self.icons.draw(c, ic, r.x + self.px(8.0), y + (row - icon) / 2, icon, if here { co.on_selection } else if off { co.border } else { co.muted });
             let tx = (r.x + self.px(32.0)) as f32;
             // A drive that's busy, or not mounted yet, is quieter than the rest.
             let waiting = p.volume.as_ref().is_some_and(|v| v.mount.is_none() || self.drives_busy.contains(&v.block));
-            let color = if here { co.on_selection } else if waiting { co.muted } else { co.foreground };
+            let color = if here { co.on_selection } else if off { co.border } else if waiting { co.muted } else { co.foreground };
             let eject = ejects[i];
             let right = eject.map_or(r.right() - self.px(6.0), |e| e.x);
             let max = right as f32 - tx;

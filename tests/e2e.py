@@ -2823,6 +2823,67 @@ def carry_out(a, h, name, x, y):
     a.move(x, y)
 
 
+DRAGSOURCE = ROOT / "tests/dragsource.py"
+
+
+def browser_drag(h, a, fs, address, picture=None, over=None):
+    """Drags from a stand-in browser (tests/dragsource.py), on the right, into the window `a`,
+    which is on the left, holding over `over` (x, y) before letting go. Returns the state seen
+    while over it."""
+    cmd = ["python3", "-B", str(DRAGSOURCE), address] + ([str(picture)] if picture else [])
+    env = dict(a.env, GSK_RENDERER="cairo", GDK_BACKEND="wayland", GTK_A11Y="none")
+    source = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=open(SCRATCH / "stderr.log", "a"), text=True)
+    try:
+        assert source.stdout.readline().strip() == "ready", "the drag source started"
+        time.sleep(0.4)  # The window on the left has to take its new size.
+        x, y = over or (300, 400)
+        a.move(OTHER_X + 300, 400)
+        h.pointer(f"button {BTN_LEFT} 1")
+        time.sleep(0.05)
+        for step in (OTHER_X + 280, OTHER_X + 200, OTHER_X - 20, x + 20):
+            a.move(step, 400)
+            time.sleep(0.03)
+        a.move(x, y)
+        seen = a.wait(lambda s: s["drag"] != "", "the drag arrives")
+        time.sleep(0.1)
+        seen = a.state()
+        release(a, h)
+        time.sleep(0.3)
+        return seen
+    finally:
+        source.terminate()
+        source.wait(timeout=5)
+
+
+@check
+def a_picture_dragged_from_a_browser_is_saved_and_a_link_or_nothing_is_named(h):
+    fs = fresh_fs()
+    tree(fs, {"keep.txt": "k"})
+    shot = SCRATCH / "columns-source.png"
+    shot.write_bytes(png_bytes(12, 8))
+    a = App(h, fs)
+    a.wait(lambda s: s["names"] == ["keep.txt"], "the folder")
+    seen = browser_drag(h, a, fs, "https://github.com/omacom/folio/raw/main/docs/columns.png?raw=true", shot)
+    assert place_flags(seen, "Trash") == {"off"}, "the Trash is dimmed for a picture"
+    s = a.wait(lambda s: "columns.png" in s["names"], "saved", timeout=10)
+    assert (fs / "columns.png").read_bytes() == shot.read_bytes(), "the picture itself"
+    assert s["selected"] == ["columns.png"], "and selected"
+    assert place_flags(s, "Trash") == set(), "the Trash is back once it's over"
+    # Again: a new name, never over the first.
+    browser_drag(h, a, fs, "https://github.com/omacom/folio/raw/main/docs/columns.png?raw=true", shot)
+    a.wait(lambda s: "columns (2).png" in s["names"], "saved beside it", timeout=10)
+    # Only a link: nothing to save, and it says why.
+    browser_drag(h, a, fs, "https://example.com/a/page")
+    s = a.wait(lambda s: any("held a link" in n for n in s["notices"]), "says it's a link")
+    assert sorted(s["names"]) == ["columns (2).png", "columns.png", "keep.txt"], s["names"]
+    # Nothing usable: no file, no picture, no web address.
+    browser_drag(h, a, fs, "about:blank")
+    s = a.wait(lambda s: any("Couldn't get any files" in n for n in s["notices"]), "says nothing came")
+    assert sorted(s["names"]) == ["columns (2).png", "columns.png", "keep.txt"], s["names"]
+    assert a.alive()
+    a.close()
+
+
 @check
 def a_plain_drag_moves_to_another_window_on_the_same_disk(h):
     fs = fresh_fs()
