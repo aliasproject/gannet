@@ -131,6 +131,11 @@ a move, and the other app does the work. Gannet never deletes anything because o
 reports back. Dropped in, Gannet does the work and copies, unless the other app only offers a
 move.
 
+A picture dragged from a web page is saved in the folder it lands on, named from its address,
+when the browser hands over the picture itself, as Firefox and Zen do. A browser that offers
+only a link gets a message saying so. While a drag that can't go to the Trash is over the
+window, such as a picture from a browser, the Trash shows dimmed.
+
 ## Show in folder
 
 Other programs can show a file in Gannet, such as a browser's "Show in folder" for a
