@@ -40,9 +40,20 @@ pub fn image_name(address: Option<&str>, mime: &str) -> OsString {
         ok.then_some(name)
     });
     let mut name = last.unwrap_or_else(|| b"image".to_vec());
+    // A name ending in dots would get one more before the extension.
+    while name.len() > 1 && name.last() == Some(&b'.') {
+        name.pop();
+    }
     // The extension says what the file is, so it's the one for what was saved.
-    let has = name.iter().rposition(|&b| b == b'.').filter(|&i| i > 0).map(|i| name[i + 1..].to_ascii_lowercase());
+    let dot = name.iter().rposition(|&b| b == b'.').filter(|&i| i > 0);
+    let has = dot.map(|i| name[i + 1..].to_ascii_lowercase());
     let same = has.as_deref().is_some_and(|e| e == ext.as_bytes() || (ext == "jpg" && e == b"jpeg") || (ext == "tiff" && e == b"tif"));
+    // Another picture's extension, as for a JPEG the browser hands over as a PNG, is replaced
+    // rather than followed by this one.
+    let other_picture = has.as_deref().is_some_and(|e| IMAGES.iter().any(|(_, x)| x.as_bytes() == e) || e == b"jpeg" || e == b"tif");
+    if let (Some(i), true, false) = (dot, other_picture, same) {
+        name.truncate(i);
+    }
     if !same {
         // Room for the extension within the 255-byte limit, cut at a character's start.
         let mut room = 255 - ext.len() - 1;
@@ -116,7 +127,10 @@ mod tests {
         let name = |a: Option<&str>, m| image_name(a, m).into_string().unwrap();
         assert_eq!(name(Some("https://github.com/omacom/folio/raw/main/docs/columns.png?raw=true"), "image/png"), "columns.png");
         assert_eq!(name(Some("https://example.com/my%20photo.jpeg"), "image/jpeg"), "my photo.jpeg", "jpeg is a jpg");
-        assert_eq!(name(Some("https://example.com/photo.webp"), "image/png"), "photo.webp.png", "it's saved as what it is");
+        assert_eq!(name(Some("https://example.com/photo.webp"), "image/png"), "photo.png", "it's saved as what it is");
+        assert_eq!(name(Some("https://example.com/photo.jpg"), "image/png"), "photo.png");
+        assert_eq!(name(Some("https://example.com/notes.txt"), "image/png"), "notes.txt.png", "only a picture's extension is replaced");
+        assert_eq!(name(Some("https://example.com/a."), "image/png"), "a.png", "no doubled dot");
         assert_eq!(name(Some("https://example.com/render"), "image/png"), "render.png");
         assert_eq!(name(Some("https://example.com/"), "image/gif"), "image.gif");
         assert_eq!(name(Some("https://example.com"), "image/png"), "image.png");

@@ -2856,7 +2856,7 @@ def browser_drag(h, a, fs, address, picture=None, over=None):
 
 
 @check
-def a_picture_dragged_from_a_browser_is_saved_and_a_link_is_named(h):
+def a_picture_dragged_from_a_browser_is_saved_and_a_link_or_nothing_is_named(h):
     fs = fresh_fs()
     tree(fs, {"keep.txt": "k"})
     shot = SCRATCH / "columns-source.png"
@@ -2875,6 +2875,10 @@ def a_picture_dragged_from_a_browser_is_saved_and_a_link_is_named(h):
     # Only a link: nothing to save, and it says why.
     browser_drag(h, a, fs, "https://example.com/a/page")
     s = a.wait(lambda s: any("held a link" in n for n in s["notices"]), "says it's a link")
+    assert sorted(s["names"]) == ["columns (2).png", "columns.png", "keep.txt"], s["names"]
+    # Nothing usable: no file, no picture, no web address.
+    browser_drag(h, a, fs, "about:blank")
+    s = a.wait(lambda s: any("Couldn't get any files" in n for n in s["notices"]), "says nothing came")
     assert sorted(s["names"]) == ["columns (2).png", "columns.png", "keep.txt"], s["names"]
     assert a.alive()
     a.close()

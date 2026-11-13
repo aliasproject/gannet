@@ -2265,9 +2265,15 @@ impl App {
     fn handle_input(&mut self, i: Input) {
         match i {
             Input::Mods(m) => {
+                // Keys held can change whether a drag from another Gannet window can go to the
+                // Trash, which shows dimmed when it can't.
+                let trash_off = self.trash_unavailable();
                 self.mods_now = m;
                 self.refresh_file_drag();
                 self.refresh_incoming();
+                if self.trash_unavailable() != trash_off {
+                    self.invalidate(self.layout().sidebar);
+                }
             }
             // Another program has the clipboard now, so nothing's about to move.
             Input::ClipboardLost => {
@@ -3804,7 +3810,9 @@ impl App {
                     self.reload();
                 }
                 // Saved in a folder it was dropped on, it's there to see, as with a copy.
-                self.cmds.push(Cmd::FinishDrop);
+                // Hearing the drop finished, a program that only offered a move may delete its
+                // side, so that's said only to one that allows a copy, which is what was made.
+                self.cmds.push(if d.can_copy { Cmd::FinishDrop } else { Cmd::AbandonDrop });
                 return;
             }
             Some(Err(why)) => {
@@ -4750,6 +4758,10 @@ mod tests {
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::FinishDrop)), "the browser hears it was taken");
         r.pump_until("the new file", |a| !a.loading);
         assert_eq!(r.selected_names(), ["columns.png"], "and it's selected");
+        // A program that only offered a move isn't told the drop finished, so it keeps its side.
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::Dropped(Dropped { can_copy: false, can_move: true, ..base.clone() }));
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::AbandonDrop)) && !r.app.cmds.iter().any(|c| matches!(c, Cmd::FinishDrop)), "abandoned, not finished");
         r.app.on_msg(Msg::Dropped(Dropped { saved: Some(Err("no space left on device".into())), ..base.clone() }));
         assert_eq!(r.app.notices.last().map(String::as_str), Some("Couldn't save the picture: no space left on device"));
         r.app.on_msg(Msg::Dropped(Dropped { saved: None, link: true, ..base.clone() }));
@@ -4800,6 +4812,19 @@ mod tests {
             target
         };
         assert_eq!(over_trash(&mut r, false), Some(true), "files can go to the Trash");
+        // From another Gannet window, Ctrl asks for a copy, which can't go to the Trash: holding
+        // it dims the Trash at once, not only when the drag next comes or goes.
+        r.app.has_keyboard = true;
+        // Over the list, so the Trash's row isn't repainted for being under the pointer.
+        let (lx, ly) = (540.0, 500.0);
+        r.app.input(Input::DragEnter { picture: false, x: lx, y: ly, files: true, can_copy: true, can_move: true, marker: Some(marker(true, false, false)) });
+        r.app.input(Input::DragMove { x: lx, y: ly });
+        assert!(!r.app.trash_unavailable());
+        r.app.dirty = Rect::default();
+        r.app.input(Input::Mods(Mods { ctrl: true, ..Mods::default() }));
+        assert!(r.app.trash_unavailable() && r.app.dirty.contains(r.app.layout().sidebar.x, r.app.place_top(1)), "dimmed and repainted for Ctrl");
+        r.app.input(Input::Mods(Mods::default()));
+        r.app.input(Input::DragLeave);
         assert_eq!(over_trash(&mut r, true), None, "a picture can't, so nothing lights up");
     }
 

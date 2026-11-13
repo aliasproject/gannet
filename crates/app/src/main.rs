@@ -450,7 +450,21 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
     };
     let list = read_in_thread(read.list, MAX);
     let (image_mime, image_fd) = read.image.map_or((None, None), |(m, fd)| (Some(m), Some(fd)));
-    let image = read_in_thread(image_fd, MAX_IMAGE);
+    // The picture says why it didn't come: too big, or nothing.
+    let (image_tx, image) = std::sync::mpsc::channel::<Result<Vec<u8>, &'static str>>();
+    if let Some(fd) = image_fd {
+        let _ = std::thread::Builder::new().name("gannet-drop".into()).spawn(move || {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            let read = std::fs::File::from(fd).take(MAX_IMAGE + 1).read_to_end(&mut bytes);
+            let _ = image_tx.send(match read {
+                Ok(_) if bytes.len() as u64 > MAX_IMAGE => Err("it's bigger than 256 MiB"),
+                Ok(_) if bytes.is_empty() => Err("it didn't arrive"),
+                Ok(_) => Ok(bytes),
+                Err(_) => Err("it didn't arrive"),
+            });
+        });
+    }
     let waiter = hub.clone();
     let (wait_dest, wait_trash) = (dest.clone(), trash);
     let waiting = std::thread::Builder::new().name("gannet-drop-wait".into()).spawn(move || {
@@ -464,8 +478,7 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
             if wait_trash {
                 return Err("a picture from a browser can't go to the Trash".to_string());
             }
-            let bytes = image.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).ok().flatten();
-            let Some(bytes) = bytes.filter(|b| !b.is_empty()) else { return Err("it didn't arrive".to_string()) };
+            let bytes = image.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).unwrap_or(Err("it didn't arrive")).map_err(str::to_string)?;
             let name = gannet_core::webdrop::image_name(address.as_deref(), mime);
             gannet_core::webdrop::save_new(&wait_dest, &name, &bytes).map_err(|e| gannet_core::listing::describe(&e).to_lowercase())
         });
