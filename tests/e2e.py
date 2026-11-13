@@ -2903,7 +2903,7 @@ def recent_lists_used_files_newest_first_and_shows_them_in_their_folders(h):
     entries = [(fs / "a/old.txt", "2026-01-01T00:00:00Z"), (fs / "b/new.txt", "2026-03-01T00:00:00Z"), (fs / "gone.txt", "2026-04-01T00:00:00Z"), (fs / "a/middle.txt", "2026-02-01T00:00:00Z")]
     write_list(entries)
     a = App(h, fs)
-    s = a.wait(lambda s: s["names"] == ["keep.txt", "a", "b"] or sorted(s["names"]) == ["a", "b", "keep.txt"], "the folder")
+    s = a.wait(lambda s: sorted(s["names"]) == ["a", "b", "keep.txt"], "the folder")
     assert "Recent" in s["places"], s["places"]
     click_place(a, s, "Recent")
     s = a.wait(lambda s: s["dir"] == str(listed) and s["names"] == ["new.txt", "middle.txt", "old.txt"], "newest first, the missing file left out")

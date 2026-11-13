@@ -134,7 +134,8 @@ pub fn parse_utc(text: &str) -> Option<i64> {
     }
     let offset = match zone {
         "Z" | "z" | "" => 0,
-        z if z.len() == 6 && (z.starts_with('+') || z.starts_with('-')) && &z[3..4] == ":" => {
+        // ASCII first, so the cuts below fall between characters.
+        z if z.len() == 6 && z.is_ascii() && (z.starts_with('+') || z.starts_with('-')) && &z[3..4] == ":" => {
             let (oh, om) = (z[1..3].parse::<i64>().ok()?, z[4..6].parse::<i64>().ok()?);
             let o = oh * 3600 + om * 60;
             if z.starts_with('-') { -o } else { o }
@@ -165,6 +166,7 @@ mod tests {
         assert_eq!(parse_utc("2000-02-29T12:00:00+02:00"), Some(951818400));
         assert_eq!(parse_utc("2026-13-01T00:00:00Z"), None);
         assert_eq!(parse_utc("yesterday"), None);
+        assert_eq!(parse_utc("2026-01-01T00:00:00+0é:0"), None, "a garbled zone is no time, not a panic");
     }
 
     #[test]

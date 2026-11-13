@@ -210,11 +210,6 @@ impl Listing {
         if let Some(d) = self.slow_stat {
             std::thread::sleep(d);
         }
-        if self.recent.is_some() {
-            // Each recent file is stat'ed as it's read, which also gives its date of use.
-            m.size.store(SIZE_FAILED, atomic::Ordering::Relaxed);
-            return;
-        }
         let (fd, name) = match &self.trash {
             Some(t) => (Some(&t.fds[t.root_of[i as usize] as usize]), t.file_names[i as usize].as_bytes()),
             None => (self.fd.as_ref(), self.name(i)),
