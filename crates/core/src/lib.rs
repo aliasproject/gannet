@@ -13,6 +13,7 @@ pub mod mounts;
 pub mod open;
 pub mod ops;
 pub mod places;
+pub mod recent;
 pub mod sort;
 pub mod theme;
 pub mod thumbcache;

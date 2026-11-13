@@ -1,4 +1,5 @@
-//! The sidebar's places: home, the user's standard folders, Trash, and mounted disks.
+//! The sidebar's places: home, recent files, the user's standard folders, Trash, and mounted
+//! disks.
 
 use std::path::{Path, PathBuf};
 
@@ -8,6 +9,8 @@ use crate::mounts::Mount;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlaceKind {
     Home,
+    /// Recently used files, from the shared list at its path.
+    Recent,
     Documents,
     Downloads,
     Music,
@@ -51,7 +54,10 @@ pub fn parse_user_dirs(text: &str, home: &Path) -> Vec<(String, PathBuf)> {
 /// The standard places, skipping folders that don't exist or just point back at home,
 /// as aliasOS does for Desktop and Templates.
 pub fn standard_places(home: &Path, config_home: &Path, data_home: &Path) -> Vec<Place> {
-    let mut places = vec![Place { label: "Home".into(), path: home.to_path_buf(), kind: PlaceKind::Home, volume: None }];
+    let mut places = vec![
+        Place { label: "Home".into(), path: home.to_path_buf(), kind: PlaceKind::Home, volume: None },
+        Place { label: "Recent".into(), path: data_home.join(crate::recent::FILE), kind: PlaceKind::Recent, volume: None },
+    ];
     let text = std::fs::read_to_string(config_home.join("user-dirs.dirs")).unwrap_or_default();
     let dirs = parse_user_dirs(&text, home);
     let wanted = [("DOCUMENTS", "Documents", PlaceKind::Documents), ("DOWNLOAD", "Downloads", PlaceKind::Downloads), ("MUSIC", "Music", PlaceKind::Music), ("PICTURES", "Pictures", PlaceKind::Pictures), ("VIDEOS", "Videos", PlaceKind::Videos)];
@@ -123,9 +129,9 @@ mod tests {
         s.file("config/user-dirs.dirs", b"XDG_MUSIC_DIR=\"$HOME/Tunes\"\nXDG_VIDEOS_DIR=\"$HOME/\"\nXDG_PICTURES_DIR=\"$HOME/Gone\"\n");
         let p = standard_places(&home, &s.path().join("config"), &s.path().join("data"));
         let labels: Vec<&str> = p.iter().map(|x| x.label.as_str()).collect();
-        assert_eq!(labels, ["Home", "Documents", "Music", "Trash"]);
-        assert_eq!(p[2].path, home.join("Tunes"));
-        assert_eq!(p[3].path, s.path().join("data/Trash/files"));
+        assert_eq!(labels, ["Home", "Recent", "Documents", "Music", "Trash"]);
+        assert_eq!(p[3].path, home.join("Tunes"));
+        assert_eq!(p[4].path, s.path().join("data/Trash/files"));
     }
 
     #[test]

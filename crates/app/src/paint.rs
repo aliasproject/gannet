@@ -5,7 +5,7 @@ use gannet_core::places::PlaceKind;
 use gannet_core::theme::blend;
 use gannet_core::time;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use crate::app::{ActiveDrag, App, Dialog, DragGhost, Edit, FileDrag, Hit, icon_for};
@@ -244,6 +244,7 @@ impl App {
             let ic = match p.kind {
                 PlaceKind::Disk if p.volume.as_ref().is_some_and(|v| v.locked) => Icon::Lock,
                 PlaceKind::Home => Icon::Home,
+                PlaceKind::Recent => Icon::Recent,
                 PlaceKind::Trash => Icon::Trash,
                 PlaceKind::Disk => Icon::Disk,
                 PlaceKind::Documents => Icon::Document,
@@ -285,19 +286,28 @@ impl App {
         let y = self.baseline(l.header.y, l.header.h);
         let arrow = self.px(14.0);
         let trash = self.listing.as_ref().is_some_and(|l| l.is_trash());
-        if let Some((ox, _)) = self.origin_column(l.header, size_x).filter(|_| trash) {
-            self.text.draw_str(c, "Original location", ox as f32, y, co.muted);
+        let recent = self.listing.as_ref().is_some_and(|l| l.is_recent());
+        if let Some((ox, _)) = self.origin_column(l.header, size_x).filter(|_| trash || recent) {
+            self.text.draw_str(c, if trash { "Original location" } else { "Location" }, ox as f32, y, co.muted);
         }
-        let cols = [(SortKey::Name, "Name", name_x), (SortKey::Size, "Size", size_x), (SortKey::Modified, if trash { "Deleted" } else { "Modified" }, date_x)];
+        let sort = self.view_sort();
+        let date = if trash {
+            "Deleted"
+        } else if recent {
+            "Used"
+        } else {
+            "Modified"
+        };
+        let cols = [(SortKey::Name, "Name", name_x), (SortKey::Size, "Size", size_x), (SortKey::Modified, date, date_x)];
         for (key, label, x) in cols {
-            let on = self.sort.key == key;
+            let on = sort.key == key;
             let color = if on || self.hover == Hit::Header(key) { co.foreground } else { co.muted };
             // Size figures sit to the right of their column, so its label does too.
             let w = self.text.measure(label) as i32;
             let x = if key == SortKey::Size { date_x - self.px(16.0) - w - if on { arrow } else { 0 } } else { x };
             self.text.draw_str(c, label, x as f32, y, color);
             if on {
-                let ic = if self.sort.descending { Icon::ArrowDown } else { Icon::ArrowUp };
+                let ic = if sort.descending { Icon::ArrowDown } else { Icon::ArrowUp };
                 self.icons.draw(c, ic, x + w + self.px(3.0), l.header.y + (l.header.h - arrow) / 2, arrow, co.muted);
             }
         }
@@ -327,6 +337,8 @@ impl App {
                     "Nothing matches the filter"
                 } else if listing.is_trash() {
                     "The Trash is empty"
+                } else if listing.is_recent() {
+                    "No recent files"
                 } else {
                     "This folder is empty"
                 };
@@ -341,7 +353,7 @@ impl App {
         let date_x = area.right() - self.px(14.0) - l.col_date;
         let size_x = date_x - l.col_size;
         let name_x = area.x + self.px(38.0);
-        let origin = self.origin_column(area, size_x).filter(|_| listing.is_trash());
+        let origin = self.origin_column(area, size_x).filter(|_| listing.is_trash() || listing.is_recent());
         let name_max = (origin.map_or(size_x, |(ox, _)| ox) - self.px(10.0) - name_x) as f32;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let icon = self.px(16.0);
@@ -388,7 +400,7 @@ impl App {
                     self.text.draw_fitted(c, &shown, name_x as f32, by, name_max, if is_cut { dim } else { fg });
                 }
                 if let Some((ox, ow)) = origin
-                    && let Some(folder) = listing.original(id).and_then(Path::parent)
+                    && let Some(folder) = listing.location(id)
                 {
                     let shown = match home.as_deref().and_then(|h| folder.strip_prefix(h).ok()) {
                         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),

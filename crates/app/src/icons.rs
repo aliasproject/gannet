@@ -31,6 +31,8 @@ pub enum Icon {
     Eject,
     Lock,
     Download,
+    /// A clock, for recent files.
+    Recent,
     /// The `>` between the path bar's folders.
     Crumb,
 }
@@ -66,6 +68,9 @@ fn path_of(i: Icon) -> &'static str {
         Icon::Lock => "M5 11h14a2 2 0 0 1 2 2v7a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-7a2 2 0 0 1 2 -2ZM7 11V7a5 5 0 0 1 10 0v4",
         // An arrow down into a tray.
         Icon::Download => "M7 1h2v1h-2ZM7 2h2v1h-2ZM7 3h2v1h-2ZM7 4h2v1h-2ZM7 5h2v1h-2ZM7 6h2v1h-2ZM4 7h8v1h-8ZM5 8h6v1h-6ZM6 9h4v1h-4ZM1 10h2v1h-2ZM7 10h2v1h-2ZM13 10h2v1h-2ZM1 11h2v1h-2ZM13 11h2v1h-2ZM1 12h2v1h-2ZM13 12h2v1h-2ZM1 13h14v1h-14ZM1 14h14v1h-14Z",
+        // A round face with its hands cut out, pointing at three o'clock. The hands sit on whole
+        // pixels, so only the rim is smoothed.
+        Icon::Recent => "M8 1a7 7 0 0 1 0 14a7 7 0 0 1 0-14ZM7 3h2v4h3v2h-5Z",
         // Lucide's chevron-up.
         Icon::ArrowUp => "M18 15l-6-6-6 6",
         // Lucide's chevron-down.
@@ -166,7 +171,7 @@ mod tests {
     #[test]
     fn every_icon_draws_something() {
         use Icon::*;
-        for i in [Folder, FolderLink, File, FileLink, Image, Video, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, ArrowUp, ArrowDown, Close, Download, Crumb] {
+        for i in [Folder, FolderLink, File, FileLink, Image, Video, Archive, Code, Document, Back, Forward, Up, Home, Trash, Disk, ArrowUp, ArrowDown, Close, Download, Recent, Crumb] {
             let mut px = vec![0u32; 32 * 32];
             let mut c = Canvas::new(&mut px, 32, 32);
             Icons::default().draw(&mut c, i, 0, 0, 32, 0xffffff);
