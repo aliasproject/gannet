@@ -316,6 +316,9 @@ pub(crate) struct DragGhost {
 /// A Wayland drag over this window, from another program or window.
 pub(crate) struct IncomingDrag {
     files: bool,
+    /// It carries a picture, as a browser does. That's saved as a new file, so it can't go to
+    /// the Trash, which doesn't light up for it.
+    picture: bool,
     pub can_copy: bool,
     pub can_move: bool,
     /// Set when it comes from another Gannet window.
@@ -2316,7 +2319,7 @@ impl App {
                     self.cancel_file_drag();
                 }
             }
-            Input::DragEnter { x, y, files, can_copy, can_move, marker } => self.drag_entered(x, y, files, can_copy, can_move, marker),
+            Input::DragEnter { x, y, files, picture, can_copy, can_move, marker } => self.drag_entered(x, y, files, picture, can_copy, can_move, marker),
             Input::DragMove { x, y } => {
                 self.set_pointer(x, y);
                 if let Some(FileDrag::Active(d)) = &mut self.file_drag
@@ -3563,7 +3566,8 @@ impl App {
     /// The position that comes with a drag's arrival can't be believed: Hyprland always says
     /// the middle of the window. So nothing under it lights up or gets a label, and the real
     /// position comes with the first motion, right behind it.
-    fn drag_entered(&mut self, x: f64, y: f64, files: bool, can_copy: bool, can_move: bool, marker: Option<clipboard::DragMarker>) {
+    #[allow(clippy::too_many_arguments)]
+    fn drag_entered(&mut self, x: f64, y: f64, files: bool, picture: bool, can_copy: bool, can_move: bool, marker: Option<clipboard::DragMarker>) {
         // A drag arriving means the button came up without this window hearing about it.
         if matches!(self.file_drag, Some(FileDrag::Band(_) | FileDrag::Pressed { .. })) {
             self.cancel_file_drag();
@@ -3593,7 +3597,7 @@ impl App {
             });
             probe
         });
-        self.incoming = Some(IncomingDrag { files, can_copy, can_move, marker, probe, id, devices: HashMap::new(), moved: false, target: None, label: Rect::default(), accepting: false });
+        self.incoming = Some(IncomingDrag { files, picture, can_copy, can_move, marker, probe, id, devices: HashMap::new(), moved: false, target: None, label: Rect::default(), accepting: false });
         self.refresh_incoming();
     }
 
@@ -3674,6 +3678,9 @@ impl App {
     /// Whether a drop here can go to the Trash. Ctrl asks for a copy, and trashing the
     /// originals would be the opposite.
     fn incoming_can_trash(&self, i: &IncomingDrag) -> bool {
+        if i.picture {
+            return false;
+        }
         match &i.marker {
             Some(m) => !self.marker_keys(m).0,
             None => i.can_move,
@@ -3785,10 +3792,8 @@ impl App {
                 if path.parent() == Some(self.dir.as_path()) {
                     self.pending_select = vec![name];
                     self.reload();
-                } else {
-                    let folder = d.dest.file_name().map_or_else(|| d.dest.display().to_string(), |n| n.to_string_lossy().into_owned());
-                    self.notice(format!("Saved “{}” in “{folder}”", String::from_utf8_lossy(&name)));
                 }
+                // Saved in a folder it was dropped on, it's there to see, as with a copy.
                 self.cmds.push(Cmd::FinishDrop);
                 return;
             }
@@ -4372,7 +4377,7 @@ mod tests {
         let l = r.app.layout();
         r.app.cmds.clear();
         let y = (l.list.y + l.row_h / 2) as f64;
-        r.app.input(Input::DragEnter { x: 540.0, y, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y, files: true, can_copy: true, can_move: true, marker: None });
         r.app.input(Input::DragMove { x: 540.0, y });
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::AcceptDrop(true))));
         // Until the disks have been looked at, a drop would copy.
@@ -4691,13 +4696,13 @@ mod tests {
         let l = r.app.layout();
         r.app.input(Input::Move { x: band_x(&r), y: (l.list.bottom() + 40) as f64 });
         assert!(r.app.next_deadline().is_some());
-        r.app.input(Input::DragEnter { x: 540.0, y: 200.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: 200.0, files: true, can_copy: true, can_move: true, marker: None });
         assert!(r.app.file_drag.is_none());
         assert_eq!(r.app.next_deadline(), None);
         r.app.input(Input::DragLeave);
         // The same goes for a press that hasn't become anything yet.
         band_press(&mut r, 2);
-        r.app.input(Input::DragEnter { x: 540.0, y: 200.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: 200.0, files: true, can_copy: true, can_move: true, marker: None });
         assert!(r.app.file_drag.is_none());
     }
 
@@ -4755,13 +4760,32 @@ mod tests {
     /// Hovering a drag from another Gannet window, with the folder's device known.
     fn marked_drag(tag: &str, marker: clipboard::DragMarker, device: Option<u64>) -> Rig {
         let mut r = drag_rig(tag);
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: false, marker: Some(marker) });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: 500.0, files: true, can_copy: true, can_move: false, marker: Some(marker) });
         r.app.input(Input::DragMove { x: 540.0, y: 500.0 });
         let i = r.app.incoming.as_ref().unwrap();
         assert!(i.devices.contains_key(&r.root.join("work")), "it asked about this folder");
         let (drag, path) = (i.id, r.root.join("work"));
         r.app.on_msg(Msg::DragDevice { drag, path, device });
         r
+    }
+
+    #[test]
+    fn the_trash_doesnt_light_up_for_a_picture_from_a_browser() {
+        let mut r = Rig::new("drop-picture-trash");
+        r.open(r.work());
+        let trash = r.root.join("data/Trash/files");
+        fs::create_dir_all(&trash).unwrap();
+        r.app.places = vec![Place { label: "Home".into(), path: r.work(), kind: PlaceKind::Home, volume: None }, Place { label: "Trash".into(), path: trash, kind: PlaceKind::Trash, volume: None }];
+        let (x, y) = ((r.app.layout().sidebar.x + r.app.px(40.0)) as f64, (r.app.place_top(1) + r.app.px(15.0)) as f64);
+        let over_trash = |r: &mut Rig, picture: bool| {
+            r.app.input(Input::DragEnter { picture, x, y, files: true, can_copy: true, can_move: true, marker: None });
+            r.app.input(Input::DragMove { x, y });
+            let target = r.app.incoming.as_ref().unwrap().target.as_ref().map(|t| t.trash);
+            r.app.input(Input::DragLeave);
+            target
+        };
+        assert_eq!(over_trash(&mut r, false), Some(true), "files can go to the Trash");
+        assert_eq!(over_trash(&mut r, true), None, "a picture can't, so nothing lights up");
     }
 
     fn incoming_verb(r: &Rig) -> DropAction {
@@ -4804,7 +4828,7 @@ mod tests {
         // Hyprland says the middle of the window, here a folder's row, before the real position.
         let (mut r, on_folder) = rig_with_a_folder("in-first-pos");
         r.app.cmds.clear();
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
         let i = r.app.incoming.as_ref().unwrap();
         assert!(i.label.is_empty(), "no label yet");
         assert_eq!(i.target.as_ref().unwrap().hit, Hit::None, "nothing lights up");
@@ -4819,7 +4843,7 @@ mod tests {
     #[test]
     fn a_drop_before_any_motion_goes_to_the_folder_showing() {
         let (mut r, on_folder) = rig_with_a_folder("in-first-drop");
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
         r.app.cmds.clear();
         r.app.input(Input::DragDrop);
         let want = r.root.join("work");
@@ -4833,7 +4857,7 @@ mod tests {
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         r.app.input(Input::Leave);
         r.app.cmds.clear();
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
         let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
         assert!(d.target.is_none() && d.label.is_empty(), "nothing lights up");
         assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::AcceptDrop(true))));
@@ -4849,7 +4873,7 @@ mod tests {
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         r.app.input(Input::Leave);
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
         r.app.input(Input::OutDragDropped);
         assert!(r.app.file_drag.is_some(), "the drop is on its way");
         r.app.cmds.clear();
@@ -4866,10 +4890,10 @@ mod tests {
         press_on_row(&mut r, 1);
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         r.app.input(Input::Leave);
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
         r.app.input(Input::DragMove { x: 540.0, y: 500.0 });
         r.app.input(Input::DragLeave);
-        r.app.input(Input::DragEnter { x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
         let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
         assert!(d.inside && !d.moved_inside && d.target.is_none() && d.label.is_empty());
     }
@@ -4934,7 +4958,7 @@ mod tests {
     #[test]
     fn another_app_cant_cause_a_move_by_allowing_both() {
         let mut r = drag_rig("mark-foreign");
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
         assert_eq!(incoming_verb(&r), DropAction::Copy);
         r.app.cmds.clear();
         r.app.input(Input::DragDrop);
@@ -5004,7 +5028,7 @@ mod tests {
         let mut r = drag_rig("in-label");
         let l = r.app.layout();
         let y = l.list.y + l.row_h / 2;
-        r.app.input(Input::DragEnter { x: 540.0, y: y as f64, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: y as f64, files: true, can_copy: true, can_move: true, marker: None });
         r.app.input(Input::DragMove { x: 540.0, y: y as f64 });
         let label = r.app.incoming.as_ref().unwrap().label;
         assert!(label.y >= y + 64, "Nautilus draws 64 pixels down from the pointer: {} from {y}", label.y);
@@ -5076,7 +5100,7 @@ mod tests {
     #[test]
     fn a_drop_while_another_is_handled_is_refused() {
         let mut r = drag_rig("in-busy");
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
         assert!(r.app.incoming.is_some());
         r.app.input(Input::DragDropBusy);
         assert!(r.app.incoming.is_none() && r.app.jobs.is_empty());
@@ -5107,7 +5131,7 @@ mod tests {
         r.app.input(Input::Move { x: -5.0, y: 200.0 });
         let l = r.app.layout();
         let y = (l.list.y + l.row_h / 2) as f64;
-        r.app.input(Input::DragEnter { x: 540.0, y, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y, files: true, can_copy: true, can_move: true, marker: None });
         r.app.input(Input::DragMove { x: 540.0, y });
         r.app.input(Input::OutDragDropped);
         assert!(r.app.file_drag.is_some(), "the drop is on its way");
@@ -5226,7 +5250,7 @@ mod tests {
     fn something_that_isnt_files_is_refused() {
         let mut r = drag_rig("in-text");
         r.app.cmds.clear();
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: false, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: 500.0, files: false, can_copy: true, can_move: true, marker: None });
         assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::AcceptDrop(true))));
         r.app.input(Input::DragDrop);
         assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadDrop { .. })));
@@ -5242,7 +5266,7 @@ mod tests {
         let l = r.app.layout();
         let row = |i: i32| (l.list.y + i * l.row_h + l.row_h / 2) as f64;
         let dest = |a: &App| a.incoming.as_ref().and_then(|i| i.target.as_ref()).map(|t| t.dest.clone());
-        r.app.input(Input::DragEnter { x: 540.0, y: row(0), files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: row(0), files: true, can_copy: true, can_move: true, marker: None });
         r.app.input(Input::DragMove { x: 540.0, y: row(0) });
         assert_eq!(dest(&r.app), Some(r.root.join("work/d")));
         r.app.input(Input::DragMove { x: 540.0, y: row(1) });
@@ -5257,7 +5281,7 @@ mod tests {
     fn a_modal_refuses_an_incoming_drop() {
         let mut r = drag_rig("in-modal");
         r.app.dialog = Some(Dialog::ConfirmQuit { at: 0 });
-        r.app.input(Input::DragEnter { x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: 500.0, files: true, can_copy: true, can_move: true, marker: None });
         assert!(r.app.incoming.as_ref().is_some_and(|i| i.target.is_none()));
     }
 

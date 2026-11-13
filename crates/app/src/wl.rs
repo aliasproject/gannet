@@ -63,7 +63,8 @@ pub enum Input {
     /// Another program took over the clipboard from us.
     ClipboardLost,
     /// A Wayland drag over this window, from any program, this one included.
-    DragEnter { x: f64, y: f64, files: bool, can_copy: bool, can_move: bool, marker: Option<clipboard::DragMarker> },
+    /// `picture`: it carries a picture, as a browser does, which is saved as a new file.
+    DragEnter { x: f64, y: f64, files: bool, picture: bool, can_copy: bool, can_move: bool, marker: Option<clipboard::DragMarker> },
     DragMove { x: f64, y: f64 },
     DragLeave,
     DragDrop,
@@ -979,6 +980,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 s.drag_serial = serial;
                 // Files, or a picture from a browser, which is saved as a new file.
                 let files = id.as_ref().is_some_and(|o| drop_mime(o).is_some());
+                let picture = id.as_ref().is_some_and(|o| gannet_core::webdrop::image_mime(&offer_mimes(o)).is_some());
                 let marker = id.as_ref().and_then(|o| o.data::<OfferData>()).and_then(|d| d.mimes.lock().ok().and_then(|m| m.iter().find_map(|m| clipboard::DragMarker::parse(m))));
                 let (can_copy, can_move) = id.as_ref().map_or((false, false), offer_allows);
                 if let Some(offer) = id.as_ref().filter(|o| o.version() >= 3) {
@@ -994,7 +996,7 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for State {
                 if let Some(old) = std::mem::replace(&mut s.drag_offer, id) {
                     old.destroy();
                 }
-                s.inputs.push_back(Input::DragEnter { x, y, files, can_copy, can_move, marker });
+                s.inputs.push_back(Input::DragEnter { x, y, files, picture, can_copy, can_move, marker });
             }
             wl_data_device::Event::Motion { x, y, .. } => s.inputs.push_back(Input::DragMove { x, y }),
             wl_data_device::Event::Leave => {

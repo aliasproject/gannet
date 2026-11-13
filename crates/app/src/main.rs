@@ -462,7 +462,7 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
         // Files win: a picture is only kept when nothing else came.
         let saved = image_mime.filter(|_| paths.is_empty()).map(|mime| {
             if wait_trash {
-                return Err("only files can go to the Trash".to_string());
+                return Err("a picture from a browser can't go to the Trash".to_string());
             }
             let bytes = image.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).ok().flatten();
             let Some(bytes) = bytes.filter(|b| !b.is_empty()) else { return Err("it didn't arrive".to_string()) };
