@@ -198,7 +198,8 @@ impl Spec {
         .to_string()
     }
 
-    /// The folder to start in, if the request named one that's there.
+    /// The folder to start in: the one the request named, or else the current file's, if
+    /// it's there.
     pub fn start_folder(&self) -> Option<PathBuf> {
         let from_file = self.file.as_ref().and_then(|f| f.parent()).map(Path::to_path_buf);
         [self.folder.clone(), from_file].into_iter().flatten().find(|d| d.is_absolute() && d.is_dir())
@@ -440,6 +441,14 @@ impl App {
         !self.is_recent_view() && !self.is_trash_view() && !self.in_trash()
     }
 
+    /// Whether a chooser lets its list do `a` here, by menu or key alike. What changes the
+    /// folder needs one it can change: not Recent, and not the Trash, where Delete would
+    /// delete for good.
+    pub(crate) fn chooser_allows(&self, a: Action) -> bool {
+        let changes_folder = matches!(a, Action::Rename | Action::NewFolder | Action::Trash);
+        allows(a) && (!changes_folder || self.chooser_folder_ok())
+    }
+
     pub fn chooser_can_accept(&self) -> bool {
         let Some(c) = &self.chooser else { return false };
         let Some(l) = &self.listing else { return false };
@@ -594,7 +603,7 @@ impl App {
             return true;
         }
         // Shortcuts the field has no use for, like Ctrl+L, Ctrl+H or Alt+Up, still work.
-        let editing = matches!(sym, k::KEY_a | k::KEY_c | k::KEY_x | k::KEY_v | k::KEY_Left | k::KEY_Right | k::KEY_Home | k::KEY_End | k::KEY_BackSpace | k::KEY_Delete);
+        let editing = matches!(sym, k::KEY_a | k::KEY_c | k::KEY_x | k::KEY_v | k::KEY_z | k::KEY_Z | k::KEY_Left | k::KEY_Right | k::KEY_Home | k::KEY_End | k::KEY_BackSpace | k::KEY_Delete);
         if c.name_focused && (m.alt || m.logo || (m.ctrl && !editing)) {
             return false;
         }

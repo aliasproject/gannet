@@ -1377,7 +1377,7 @@ impl App {
     // ---- Doing things ----
 
     pub fn action(&mut self, a: Action) {
-        if self.chooser.is_some() && !crate::chooser::allows(a) {
+        if self.chooser.is_some() && !self.chooser_allows(a) {
             return;
         }
         match a {
@@ -5784,6 +5784,12 @@ mod tests {
         r.key(k::KEY_Delete, "");
         r.idle();
         assert!(!r.work().join("a.txt").exists() && r.root.join("data/Trash/files/a.txt").exists());
+        // In the Trash, reached by a typed path, Delete would mean delete for good.
+        r.open(r.root.join("data/Trash/files"));
+        r.select("a.txt");
+        r.key(k::KEY_Delete, "");
+        assert!(r.app.dialog.is_none() && r.root.join("data/Trash/files/a.txt").exists());
+        assert!(!r.app.context_items().iter().any(|i| i.action == Action::Trash && i.enabled));
     }
 
     #[test]

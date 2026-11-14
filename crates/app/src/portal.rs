@@ -4,14 +4,15 @@
 //! `org.freedesktop.impl.portal.desktop.gannet` and serves the portal's FileChooser backend.
 //! Each request starts a chooser window, `gannet --choose ...`, waits for it without holding
 //! up other calls, and answers with what it picked. The window belongs to the request:
-//! closing the request ends it, and so does the service ending, even by a crash. With nothing asked of it for a while the service exits, and D-Bus starts
-//! it again on the next request, from the service file in `packaging/`.
+//! closing the request ends it, and so does the service ending, even by a crash. With
+//! nothing asked of it for a while the service exits, and D-Bus starts it again on the next
+//! request, from the service file in `packaging/`.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io::Read;
-use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
