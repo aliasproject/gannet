@@ -186,7 +186,7 @@ impl App {
         }
     }
 
-    fn paint_field(&mut self, c: &mut Canvas, r: Rect, f: &Field, focused: bool) {
+    pub(crate) fn paint_field(&mut self, c: &mut Canvas, r: Rect, f: &Field, focused: bool) {
         let co = self.colors;
         c.rrect(r, self.px(5.0), co.base);
         c.frame(r, 1, if focused { co.accent } else { co.border });
@@ -545,6 +545,15 @@ impl App {
                 };
                 (t, "This can't be undone.".to_string(), *at)
             }
+            Dialog::ConfirmReplace { paths, existing, at } => {
+                let t = match existing.as_slice() {
+                    [one] => format!("Replace “{}”?", crate::chooser::shown_name(one)),
+                    many => format!("Replace {} of the {} files?", many.len(), paths.len()),
+                };
+                let folder = existing.first().and_then(|p| p.parent()).map_or_else(String::new, |d| self.crumb_label(d));
+                let body = if existing.len() == 1 { format!("It's already in “{folder}”. Replacing it overwrites what's there.") } else { format!("They're already in “{folder}”. Replacing them overwrites what's there.") };
+                (t, body, *at)
+            }
             Dialog::ConfirmQuit { at } => ("Operations are still running".to_string(), "Closing stops them. Whatever's finished stays finished.".to_string(), *at),
             Dialog::Unlock { volume, error, waiting, at, .. } => {
                 let line = if *waiting { "Unlocking…".to_string() } else { error.clone().unwrap_or_else(|| "It's encrypted. Type its passphrase to open it.".to_string()) };
@@ -599,6 +608,9 @@ impl App {
     }
 
     fn paint_status(&mut self, c: &mut Canvas) {
+        if self.chooser.is_some() {
+            return self.paint_chooser_bar(c);
+        }
         let l = self.layout();
         let co = self.colors;
         c.fill(l.status, co.surface);

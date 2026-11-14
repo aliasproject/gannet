@@ -177,6 +177,8 @@ pub enum Dialog {
     /// `empty` is for emptying the Trash, which words the question differently.
     ConfirmDelete { paths: Vec<PathBuf>, at: usize, empty: bool },
     ConfirmQuit { at: usize },
+    /// Saving from a chooser onto files that are there. `existing` are the ones that are.
+    ConfirmReplace { paths: Vec<PathBuf>, existing: Vec<PathBuf>, at: usize },
     /// The passphrase for an encrypted drive. `error` says why the last one didn't work, and
     /// `waiting` is set while udisks2 tries it.
     Unlock { volume: Volume, field: Field, at: usize, error: Option<String>, waiting: bool },
@@ -213,6 +215,11 @@ pub enum Hit {
     DialogButton(usize),
     DialogCheck,
     PreviewBody,
+    /// A chooser's bar: its name field, file-type list and buttons.
+    ChooserName,
+    ChooserFilter,
+    ChooserAccept,
+    ChooserCancel,
 }
 
 /// How far the pointer has to travel before a press on a row becomes a drag, in logical pixels.
@@ -374,6 +381,8 @@ pub enum Action {
     OpenDrive,
     Unmount,
     Eject,
+    /// In a chooser, shows the files of the filter at this place in its list.
+    ChooseFilter(usize),
 }
 
 pub struct MenuItem {
@@ -548,6 +557,8 @@ pub struct App {
     pub cache_home: Option<PathBuf>,
     pub slow_preview: Option<Duration>,
     pub(crate) key_is_repeat: bool,
+    /// Set when this window is an Open or Save dialog for another program.
+    pub chooser: Option<crate::chooser::Chooser>,
 }
 
 struct Cached {
@@ -658,6 +669,7 @@ impl App {
             cache_home: None,
             slow_preview: None,
             key_is_repeat: false,
+            chooser: None,
         }
     }
 
@@ -695,7 +707,8 @@ impl App {
     pub fn layout(&self) -> Layout {
         let (w, h) = (self.w, self.h);
         let bar = self.px(44.0);
-        let status = self.px(26.0);
+        // A chooser's bar holds a name field and buttons.
+        let status = self.px(if self.chooser.is_some() { 54.0 } else { 26.0 });
         let side = self.px(190.0).min(w / 3);
         let header = self.px(28.0);
         let notice_h = self.px(30.0) * self.panel_rows() as i32;
@@ -766,7 +779,10 @@ impl App {
         self.resort_pending = false;
         self.derive_cancel.store(true, Ordering::Relaxed);
         self.derive_gen += 1;
-        self.cmds.push(Cmd::Title(self.crumb_label(&self.dir)));
+        // A chooser keeps the title it was asked for.
+        if self.chooser.is_none() {
+            self.cmds.push(Cmd::Title(self.crumb_label(&self.dir)));
+        }
         if let Some(i) = self.cache.iter().position(|c| c.listing.dir == self.dir) {
             let c = self.cache.remove(i);
             self.show_cached(c);
@@ -785,7 +801,7 @@ impl App {
         let same_sort = c.sort == self.view_sort();
         self.listing = Some(c.listing.clone());
         self.sorted = c.sorted;
-        self.rows = visible_rows(&c.listing, &self.sorted, self.show_hidden, &self.filter);
+        self.rows = self.choosable(&c.listing, visible_rows(&c.listing, &self.sorted, self.show_hidden, &self.filter));
         self.selected = vec![0; c.listing.len().div_ceil(64)];
         self.new_stater(c.listing);
         self.place_pending_cursor(true, false);
@@ -900,7 +916,7 @@ impl App {
         let (keep_cursor, keep_anchor) = (name_at(self.cursor, &self.rows), name_at(self.anchor, &self.rows));
         self.listing = Some(l.listing.clone());
         self.sorted = Arc::new(l.sorted);
-        self.rows = l.rows;
+        self.rows = self.choosable(&l.listing, l.rows);
         self.selected = vec![0; l.listing.len().div_ceil(64)];
         self.sel_count = 0;
         if !picks.is_empty() {
@@ -1014,14 +1030,19 @@ impl App {
         let resort = resort || self.resort_pending;
         self.resort_pending = resort;
         if !resort && self.sorted.len() < SYNC_DERIVE_LIMIT {
-            let rows = visible_rows(&l, &self.sorted, self.show_hidden, &self.filter);
+            let rows = self.choosable(&l, visible_rows(&l, &self.sorted, self.show_hidden, &self.filter));
             self.apply_rows(rows);
             return;
         }
         let (hub, generation, sort, hidden, filter, cancel, sorted) = (self.hub.clone(), self.derive_gen, self.view_sort(), self.show_hidden, self.filter.clone(), self.derive_cancel.clone(), self.sorted.clone());
+        let choosing = self.chooser.as_ref().map(|c| c.rows.clone());
         let spawned = std::thread::Builder::new().name("gannet-derive".into()).spawn(move || {
             let sorted = if resort { Arc::new(sort_entries(&l, sort, &cancel)) } else { sorted };
             let rows = visible_rows(&l, &sorted, hidden, &filter);
+            let rows = match &choosing {
+                Some(only) => only.keep_rows(&l, rows),
+                None => rows,
+            };
             if !cancel.load(Ordering::Relaxed) {
                 hub.send(Msg::Derived { generation, listing: l, sorted, rows, sort });
             }
@@ -1180,7 +1201,8 @@ impl App {
     fn field_mut(&mut self) -> Option<&mut Field> {
         match &mut self.edit {
             Edit::Path(f) | Edit::Filter(f) | Edit::NewFolder(f) | Edit::Rename { field: f, .. } => Some(f),
-            Edit::None => None,
+            // A chooser's name field, when it has the keyboard.
+            Edit::None => self.chooser.as_mut().filter(|c| c.name_focused).map(|c| &mut c.name),
         }
     }
 
@@ -1355,6 +1377,9 @@ impl App {
     // ---- Doing things ----
 
     pub fn action(&mut self, a: Action) {
+        if self.chooser.is_some() && !self.chooser_allows(a) {
+            return;
+        }
         match a {
             Action::Open => self.open_selection(),
             Action::Preview => self.open_preview(),
@@ -1414,6 +1439,7 @@ impl App {
                 }
             }
             Action::Restore => self.restore_selection(),
+            Action::ChooseFilter(i) => self.choose_filter(i),
             Action::ShowInFolder => self.show_in_folder(),
             Action::EmptyTrash => self.ask_empty_trash(),
         }
@@ -1490,6 +1516,10 @@ impl App {
         }
         if ids.is_empty() {
             return;
+        }
+        // A chooser picks files rather than opening them.
+        if self.chooser.is_some() {
+            return self.chooser_open(ids);
         }
         // Opening a pile of files by accident is hard to undo.
         const MANY: usize = 20;
@@ -1669,7 +1699,7 @@ impl App {
         self.in_trash() || self.is_recent_view()
     }
 
-    fn in_trash(&self) -> bool {
+    pub(crate) fn in_trash(&self) -> bool {
         trash::is_inside_trash(&self.home_trash(), rustix::process::geteuid().as_raw(), &self.dir)
     }
 
@@ -1828,6 +1858,8 @@ impl App {
             Dialog::ConfirmDelete { empty: true, .. } => vec![b("Empty Trash", "E", true), b("Cancel", "Esc", false)],
             Dialog::ConfirmDelete { .. } => vec![b("Delete", "D", true), b("Cancel", "Esc", false)],
             Dialog::ConfirmQuit { .. } => vec![b("Stop them and close", "S", true), b("Keep working", "Esc", false)],
+            // No letter: replacing loses what's there, so it takes a deliberate choice.
+            Dialog::ConfirmReplace { .. } => vec![b("Replace", "", true), b("Cancel", "Esc", false)],
             Dialog::Unlock { .. } => vec![b("Unlock", "", false), b("Cancel", "Esc", false)],
         }
     }
@@ -1886,6 +1918,11 @@ impl App {
                 }
                 // Cancelled: if it was already being tried, the window stays where it is.
                 self.opening = None;
+            }
+            Dialog::ConfirmReplace { paths, .. } => {
+                if label == "Replace" {
+                    self.chooser_done(paths);
+                }
             }
             Dialog::ConfirmQuit { .. } => {
                 if label != "Keep working" {
@@ -1951,7 +1988,7 @@ impl App {
             }
         }
         let at = match d {
-            Dialog::Conflict { at, .. } | Dialog::ConfirmDelete { at, .. } | Dialog::ConfirmQuit { at } | Dialog::Unlock { at, .. } => at,
+            Dialog::Conflict { at, .. } | Dialog::ConfirmDelete { at, .. } | Dialog::ConfirmQuit { at } | Dialog::Unlock { at, .. } | Dialog::ConfirmReplace { at, .. } => at,
         };
         match sym {
             k::KEY_Left => *at = (*at + n - 1) % n,
@@ -2003,7 +2040,11 @@ impl App {
 
     /// Closing the window would stop what's running, so that gets asked first.
     pub(crate) fn request_close(&mut self) {
-        if self.jobs.is_empty() || self.viewer {
+        // Closing a chooser is cancelling it. What it can start, a rename, a new folder or a
+        // move to the Trash, is mostly quick, and one cut short leaves the originals in place.
+        if self.chooser.is_some() {
+            self.chooser_cancel();
+        } else if self.jobs.is_empty() || self.viewer {
             self.cmds.push(Cmd::Quit);
         } else if self.dialog.is_none() {
             self.dialog = Some(Dialog::ConfirmQuit { at: 1 });
@@ -2244,6 +2285,9 @@ impl App {
     }
 
     fn context_items(&self) -> Vec<MenuItem> {
+        if self.chooser.is_some() {
+            return self.chooser_menu_items();
+        }
         let any = self.sel_count > 0;
         let one = self.sel_count == 1;
         if self.is_recent_view() {
@@ -2458,7 +2502,8 @@ impl App {
             self.preview_key(sym, m);
         } else if !matches!(self.edit, Edit::None) {
             self.field_key(sym, utf8, m);
-        } else {
+        } else if !(self.chooser.is_some() && self.chooser_key(sym, utf8, m)) {
+            // A chooser's bar has first go at a key, and leaves the rest to the list.
             self.list_key(sym, utf8, m);
         }
     }
@@ -2483,7 +2528,7 @@ impl App {
         self.invalidate_all();
     }
 
-    fn field_key(&mut self, sym: u32, utf8: &str, m: Mods) {
+    pub(crate) fn field_key(&mut self, sym: u32, utf8: &str, m: Mods) {
         let is_filter = matches!(self.edit, Edit::Filter(_));
         let selected = self.field_mut().map(|f| {
             let (a, b) = f.selection();
@@ -2706,6 +2751,9 @@ impl App {
             }
             return Hit::Outside;
         }
+        if let Some(h) = self.chooser_hit(x, y) {
+            return h;
+        }
         let l = self.layout();
         if l.toolbar.contains(x, y) {
             let b = self.px(36.0);
@@ -2895,6 +2943,9 @@ impl App {
         self.invalidate(l.sidebar);
         self.invalidate(l.header);
         self.invalidate(l.notices);
+        if self.chooser.is_some() {
+            self.invalidate(l.status);
+        }
     }
 
     fn invalidate_row(&mut self, row: usize) {
@@ -3115,7 +3166,9 @@ impl App {
                 }
             }
             Hit::DialogButton(_) | Hit::DialogCheck | Hit::PreviewBody => {}
+            Hit::ChooserName | Hit::ChooserFilter | Hit::ChooserAccept | Hit::ChooserCancel => self.chooser_click(hit, x),
             Hit::Row(row) => {
+                self.chooser_clicked_list(Some(row));
                 // Read first: a press that opens the row changes what's listed.
                 let name = self.listing.as_ref().map_or_else(Vec::new, |l| l.key(self.rows[row]).into_owned());
                 let band = (!self.on_row_name(row, x)).then(|| (self.save_selection(), self.list_y(y)));
@@ -3124,6 +3177,7 @@ impl App {
                 }
             }
             Hit::ListEmpty => {
+                self.chooser_clicked_list(None);
                 let saved = self.save_selection();
                 if !saved.add {
                     self.selection_epoch += 1;
@@ -3393,6 +3447,10 @@ impl App {
     /// The folder a drop here would land in. Dropping on what's being dragged, on the folder
     /// it's already in, or inside itself isn't a target.
     fn drop_target_at(&mut self, d: &ActiveDrag, x: i32, y: i32) -> Option<DropTarget> {
+        // A chooser doesn't move files about, by drag any more than by cut and paste.
+        if self.chooser.is_some() {
+            return None;
+        }
         let hit = self.hit(x, y);
         match hit {
             Hit::Row(row) => {
@@ -3706,7 +3764,7 @@ impl App {
     /// Where a drop from elsewhere would land. With no motion yet, the pointer's position
     /// isn't known, so that's the folder showing, whatever row or place seems to be there.
     fn incoming_target(&mut self, i: &IncomingDrag) -> Option<DropTarget> {
-        if !i.files {
+        if !i.files || self.chooser.is_some() {
             return None;
         }
         if !i.moved {
@@ -4001,8 +4059,8 @@ fn verb_is_move(can_copy: bool, can_move: bool) -> bool {
 
 fn cursor_for(h: Hit) -> Cursor {
     match h {
-        Hit::Header(_) | Hit::Crumb(_) | Hit::Back | Hit::Forward | Hit::Up | Hit::EmptyTrash | Hit::Place(_) | Hit::Eject(_) | Hit::MenuItem(_) | Hit::NoticeClose(_) | Hit::JobCancel(_) | Hit::DialogButton(_) | Hit::DialogCheck => Cursor::Pointer,
-        Hit::PathBar | Hit::FilterBox => Cursor::Text,
+        Hit::Header(_) | Hit::Crumb(_) | Hit::Back | Hit::Forward | Hit::Up | Hit::EmptyTrash | Hit::Place(_) | Hit::Eject(_) | Hit::MenuItem(_) | Hit::NoticeClose(_) | Hit::JobCancel(_) | Hit::DialogButton(_) | Hit::DialogCheck | Hit::ChooserFilter | Hit::ChooserAccept | Hit::ChooserCancel => Cursor::Pointer,
+        Hit::PathBar | Hit::FilterBox | Hit::ChooserName => Cursor::Text,
         _ => Cursor::Default,
     }
 }
@@ -5487,6 +5545,25 @@ mod tests {
     }
 
     #[test]
+    fn a_chooser_takes_no_drops_from_outside_or_from_its_own_list() {
+        let mut r = drag_rig("chooser-drops");
+        fs::create_dir(r.root.join("work/d")).unwrap();
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.pump_until("the folder", |a| a.rows.len() == 3);
+        let l = r.app.layout();
+        let on_folder = (l.list.y + l.row_h / 2) as f64;
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragMove { x: 540.0, y: on_folder });
+        assert!(r.app.incoming.as_ref().is_some_and(|i| i.target.is_none()), "nothing from outside");
+        r.app.input(Input::DragLeave);
+        press_on_row(&mut r, 1);
+        r.app.input(Input::Move { x: 540.0, y: on_folder });
+        let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
+        assert!(d.target.is_none(), "nor from its own list onto a folder");
+    }
+
+    #[test]
     fn a_dialog_opening_after_a_press_keeps_the_selection() {
         let mut r = drag_rig("drag-dialog-press");
         r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
@@ -5686,6 +5763,49 @@ mod tests {
         // Delete asks, because there's no further Trash to go to.
         r.key(k::KEY_Delete, "");
         assert!(matches!(r.app.dialog, Some(Dialog::ConfirmDelete { .. })));
+    }
+
+    #[test]
+    fn a_chooser_doesnt_cut_paste_or_delete_for_good_by_key() {
+        let mut r = Rig::new("chooser-keys");
+        fs::write(r.work().join("a.txt"), "x").unwrap();
+        fs::write(r.work().join("b.txt"), "y").unwrap();
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        r.open(r.work());
+        r.select("a.txt");
+        r.ctrl(k::KEY_x);
+        r.ctrl(k::KEY_c);
+        r.ctrl(k::KEY_v);
+        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadClipboard(_) | Cmd::SetClipboard(_))), "no clipboard");
+        r.app.key(k::KEY_Delete, "", Mods { shift: true, ..Mods::default() });
+        assert!(r.app.dialog.is_none(), "Shift+Delete doesn't offer to delete for good");
+        // Moving to the Trash is still there, by key and in the menu.
+        assert!(r.app.context_items().iter().any(|i| i.action == Action::Trash && i.enabled));
+        r.key(k::KEY_Delete, "");
+        r.idle();
+        assert!(!r.work().join("a.txt").exists() && r.root.join("data/Trash/files/a.txt").exists());
+        // In the Trash, reached by a typed path, Delete would mean delete for good.
+        r.open(r.root.join("data/Trash/files"));
+        r.select("a.txt");
+        r.key(k::KEY_Delete, "");
+        assert!(r.app.dialog.is_none() && r.root.join("data/Trash/files/a.txt").exists());
+        assert!(!r.app.context_items().iter().any(|i| i.action == Action::Trash && i.enabled));
+    }
+
+    #[test]
+    fn saving_as_dot_dot_goes_up_a_folder_by_its_real_name() {
+        let mut r = Rig::new("chooser-dotdot");
+        fs::create_dir(r.work().join("sub")).unwrap();
+        let spec = crate::chooser::Spec { mode: crate::chooser::Mode::Save, name: Some("x.txt".into()), ..crate::chooser::Spec::default() };
+        r.app.chooser = Some(crate::chooser::Chooser::new(spec, &[], None));
+        r.open(r.work().join("sub"));
+        if let Some(c) = r.app.chooser.as_mut() {
+            c.name = Field::new("..");
+            c.name_focused = true;
+        }
+        r.key(k::KEY_Return, "");
+        r.pump_until("the folder above", |a| !a.loading);
+        assert_eq!(r.app.dir, r.work());
     }
 
     #[test]

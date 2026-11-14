@@ -1,0 +1,8 @@
+# Lets xdg-desktop-portal show Gannet for other programs' Open and Save dialogs. D-Bus starts
+# the service on the first request, and it exits again when idle. Packages install it into
+# /usr/share/dbus-1/services, beside packaging/gannet.portal in
+# /usr/share/xdg-desktop-portal/portals. Neither makes Gannet the file chooser by itself: a
+# portals.conf does that, as the README's "Open and Save dialogs" says.
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.gannet
+Exec=/usr/bin/gannet --file-chooser-service

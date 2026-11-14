@@ -163,6 +163,43 @@ environment D-Bus gives services; check with `systemctl --user show-environment`
 missing, have the compositor run `dbus-update-activation-environment --systemd WAYLAND_DISPLAY`
 at startup. The service's errors go to the journal.
 
+## Open and Save dialogs
+
+Gannet can be the Open and Save dialog other programs show, such as a browser's upload
+button or an editor's Save As. It's the usual file list, with the program's question along
+the bottom: the name to save as, a list of file types if the program gave any, and the
+buttons that finish it. Enter on a folder goes into it, and Enter or a double click on a file
+picks it. Escape or closing the window cancels. Saving over a file that's there asks first,
+and typing a folder's name goes into that folder. Gannet only hands back the paths: the
+program does the opening and saving.
+
+This goes through xdg-desktop-portal's file chooser, which GTK apps, Chromium-based browsers
+and Electron apps use. Firefox, and browsers built on it like Zen, use the portal only in
+Flatpak unless `widget.use-xdg-desktop-portal.file-picker` is set to `1` in `about:config`.
+GTK apps outside Flatpak use it with `GTK_USE_PORTAL=1` (GTK 3) or `GDK_DEBUG=portals` (GTK 4).
+
+Packages install `packaging/gannet.portal` into `/usr/share/xdg-desktop-portal/portals` and
+`packaging/org.freedesktop.impl.portal.desktop.gannet.service` into
+`/usr/share/dbus-1/services`. That makes Gannet available, but not the dialog programs get,
+as installing a file manager shouldn't change that by itself. To choose it, put this in
+`~/.config/xdg-desktop-portal/portals.conf` for yourself, or in
+`/etc/xdg/xdg-desktop-portal/portals.conf` for everyone:
+
+    [preferred]
+    org.freedesktop.impl.portal.FileChooser=gannet;gtk
+
+then restart the portal with `systemctl --user restart xdg-desktop-portal`. Other portals
+stay as your desktop's own configuration has them, as xdg-desktop-portal reads each file in
+turn for what earlier ones leave out. `gtk` after `gannet` is what's used if Gannet isn't
+installed. Older versions of xdg-desktop-portal read only the first file they find, so with
+those, copy your desktop's lines from `/usr/share/xdg-desktop-portal/*-portals.conf` into it.
+
+`gannet --file-chooser-service` is what D-Bus starts. It has no window: it opens one for
+each request, `gannet --choose ...`, and exits after ten minutes with none open. Like "Show
+in folder", it needs `WAYLAND_DISPLAY` in the environment D-Bus gives services. A dialog
+sits over the program's window as its child where the compositor supports xdg-foreign, and
+its app ID is `com.aliasproject.Gannet.Chooser` for window rules.
+
 ## Recent
 
 Recent in the sidebar lists the files you've used lately, newest first, with the folder each
