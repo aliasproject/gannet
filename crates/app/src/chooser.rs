@@ -709,13 +709,13 @@ impl App {
     pub(crate) fn chooser_menu_items(&self) -> Vec<MenuItem> {
         let any = self.sel_count > 0;
         let label = self.chooser.as_ref().map_or("Open", |c| if matches!(c.spec.mode, Mode::Open | Mode::Save) { "Open" } else { "Open folder" });
-        let writable = self.chooser_folder_ok();
+        let can = |a| self.chooser_allows(a);
         vec![
             MenuItem { label, keys: "Enter", action: Action::Open, enabled: any },
             MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
-            MenuItem { label: "Rename", keys: "F2", action: Action::Rename, enabled: self.sel_count == 1 && writable },
-            MenuItem { label: "New folder", keys: "Ctrl+Shift+N", action: Action::NewFolder, enabled: writable },
-            MenuItem { label: "Move to Trash", keys: "Delete", action: Action::Trash, enabled: any && writable },
+            MenuItem { label: "Rename", keys: "F2", action: Action::Rename, enabled: self.sel_count == 1 && can(Action::Rename) },
+            MenuItem { label: "New folder", keys: "Ctrl+Shift+N", action: Action::NewFolder, enabled: can(Action::NewFolder) },
+            MenuItem { label: "Move to Trash", keys: "Delete", action: Action::Trash, enabled: any && can(Action::Trash) },
             MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
             MenuItem { label: "Sort by name", keys: "Ctrl+1", action: Action::SortBy(gannet_core::listing::SortKey::Name), enabled: true },
             MenuItem { label: "Sort by size", keys: "Ctrl+2", action: Action::SortBy(gannet_core::listing::SortKey::Size), enabled: true },
@@ -823,7 +823,8 @@ fn without_mnemonics(label: &str) -> String {
 /// What a chooser lets its list do, by menu or key. It can tidy up where things are saved,
 /// but cutting and pasting, deleting for good or opening another window is the file manager's
 /// job, not that of a dialog a program is waiting on.
-pub fn allows(a: Action) -> bool {
+/// Asked through `App::chooser_allows`, which also checks the folder.
+fn allows(a: Action) -> bool {
     match a {
         Action::Open | Action::Preview | Action::ToggleHidden | Action::SortBy(_) | Action::Reload => true,
         Action::Rename | Action::NewFolder | Action::Trash | Action::Undo => true,
