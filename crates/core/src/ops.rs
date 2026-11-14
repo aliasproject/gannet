@@ -3,7 +3,8 @@
 //! Rules this module keeps:
 //! - A file never appears at its destination half-written. Copies go to a temporary
 //!   name and get renamed into place; cancel or failure removes the temporary file.
-//! - Nothing gets overwritten unless the user chose Replace for it.
+//! - Nothing gets overwritten. Replace first moves the item already there to the Trash,
+//!   and if it can't go there, both stay as they were.
 //! - Symlinks are copied and moved as symlinks, never followed.
 //! - One item failing doesn't stop the others. Each failure gets reported.
 //! - A move across disks removes each source only after its copy succeeded.
@@ -11,6 +12,9 @@
 //! - Delete and cross-disk move stop at mount points inside a folder: another disk's
 //!   contents are never removed because it happens to be mounted there.
 //! - A cross-disk move syncs each copy to disk before removing its source.
+//! - Undo and redo act only on the item a change left behind, told apart by its disk
+//!   and inode, never on something else that has since taken its name. Neither ever
+//!   deletes anything but an empty folder that the change made.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -42,15 +46,54 @@ pub enum Request {
     NewFolder { parent: PathBuf, name: OsString },
     /// Puts items from the Trash back where they came from. Never overwrites.
     Restore { items: Vec<Trashed> },
+    /// Reverses a finished operation. Its outcome's `undo` is how to redo it.
     Undo(Undo),
+    /// The same as `Undo`, for something undo reversed, so it's labelled as a redo.
+    Redo(Undo),
 }
 
-/// How to reverse a finished operation.
+/// How to reverse a finished operation: its steps, in the order they were done. They're
+/// reversed last first, and reversing them gives the steps that would reverse that.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Undo {
-    Rename { from: PathBuf, to: PathBuf },
-    Moves(Vec<(PathBuf, PathBuf)>),
-    Trash(Vec<Trashed>),
+pub struct Undo(pub Vec<Step>);
+
+/// One change an operation made.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Step {
+    /// Moved or renamed from `from` to where `to` is.
+    Moved { from: PathBuf, to: Stamp },
+    /// Made by a copy, a link or a restore from the Trash. Reversing it moves it to the Trash.
+    Made(Stamp),
+    /// A new folder. Reversing it removes the folder if it's still empty, and moves it to
+    /// the Trash if not.
+    NewFolder(Stamp),
+    /// An empty folder that reversing a `NewFolder` removed. Reversing this makes it again.
+    Removed(PathBuf),
+    /// Moved to the Trash, by Move to Trash or by a Replace. `at` is the item in the Trash.
+    Trashed { item: Trashed, at: Stamp },
+}
+
+/// Where a change left an item, and which item it was: its disk and inode.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stamp {
+    pub path: PathBuf,
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl Stamp {
+    pub fn of(path: &Path) -> Option<Stamp> {
+        fs::symlink_metadata(path).ok().map(|m| Stamp { path: path.to_path_buf(), dev: m.dev(), ino: m.ino() })
+    }
+
+    /// Why this item can't be undone or redone now, if it can't.
+    fn changed(&self) -> Option<&'static str> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(m) if m.dev() == self.dev && m.ino() == self.ino => None,
+            Ok(_) => Some("Something else has this name now, so it was left alone"),
+            Err(_) => Some("This isn't where the change left it any more, so it was left alone"),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -114,6 +157,8 @@ pub struct Outcome {
     /// Items left where they were because of an answer to a conflict, or part of a merge.
     pub skipped: usize,
     pub undo: Option<Undo>,
+    /// For an undo or a redo: how many of its steps were reversed, out of how many.
+    pub reversed: Option<(usize, usize)>,
     /// New top-level paths, so the UI can select them.
     pub created: Vec<PathBuf>,
     /// Folders that changed, so the UI can refresh them if inotify can't see them.
@@ -164,8 +209,12 @@ impl Engine {
             sticky_files: None,
             sticky_folders: None,
             last_merged: false,
+            last_replaced: None,
             top_dev: 0,
-            undo_moves: Vec::new(),
+            steps: Vec::new(),
+            trashed: Vec::new(),
+            mounts: MountCache::default(),
+            reversed: None,
             last_target: None,
             depth: 0,
             created: Vec::new(),
@@ -175,13 +224,17 @@ impl Engine {
         std::thread::Builder::new()
             .name("gannet-op".into())
             .spawn(move || {
-                let undo = run.execute(request);
+                run.execute(request);
+                let trashed = std::mem::take(&mut run.trashed);
+                run.sync_trash(&trashed);
+                let steps = std::mem::take(&mut run.steps);
                 let outcome = Outcome {
                     job: run.job.id,
                     cancelled: run.job.is_cancelled(),
                     errors: run.errors,
                     skipped: run.noted_leftovers,
-                    undo,
+                    undo: (!steps.is_empty()).then_some(Undo(steps)),
+                    reversed: run.reversed,
                     created: std::mem::take(&mut run.created),
                     touched: std::mem::take(&mut run.touched),
                 };
@@ -210,6 +263,7 @@ fn clean_request(r: Request) -> Request {
         Request::NewFolder { parent, name } => Request::NewFolder { parent: clean_path(parent), name },
         Request::Restore { items } => Request::Restore { items },
         Request::Undo(u) => Request::Undo(u),
+        Request::Redo(u) => Request::Redo(u),
     }
 }
 
@@ -233,6 +287,7 @@ fn label_for(r: &Request) -> String {
         Request::NewFolder { name, .. } => format!("Creating “{}”", name.to_string_lossy()),
         Request::Restore { items } => format!("Restoring {}", count(&items.iter().map(|t| t.original.clone()).collect::<Vec<_>>())),
         Request::Undo(_) => "Undoing".to_string(),
+        Request::Redo(_) => "Redoing".to_string(),
     }
 }
 
@@ -352,8 +407,16 @@ struct Run {
     sticky_files: Option<Answer>,
     sticky_folders: Option<Answer>,
     last_merged: bool,
+    /// The item a top-level Replace was to replace, so it isn't taken for the new one if
+    /// the Replace didn't happen.
+    last_replaced: Option<(u64, u64)>,
     top_dev: u64,
-    undo_moves: Vec<(PathBuf, PathBuf)>,
+    /// What this job changed, for its undo.
+    steps: Vec<Step>,
+    /// Everything this job moved to the Trash, to save to disk at the end.
+    trashed: Vec<Trashed>,
+    mounts: MountCache,
+    reversed: Option<(usize, usize)>,
     /// Where the current top-level item is going.
     last_target: Option<PathBuf>,
     depth: usize,
@@ -363,23 +426,20 @@ struct Run {
 }
 
 impl Run {
-    fn execute(&mut self, request: Request) -> Option<Undo> {
+    /// Does the request, noting each change in `steps`.
+    fn execute(&mut self, request: Request) {
         match request {
             Request::Copy { sources, dest } => {
                 self.scan(&sources);
                 self.place_all(&sources, &dest, Mode::Copy);
-                None
             }
             Request::Move { sources, dest } => {
                 self.job.progress.total_items.store(sources.len() as u64, Ordering::Relaxed);
                 self.place_all(&sources, &dest, Mode::Move);
-                let moves = std::mem::take(&mut self.undo_moves);
-                (!moves.is_empty()).then_some(Undo::Moves(moves))
             }
             Request::Link { sources, dest } => {
                 self.job.progress.total_items.store(sources.len() as u64, Ordering::Relaxed);
                 self.link_all(&sources, &dest);
-                None
             }
             Request::Trash { paths } => self.trash_all(paths),
             Request::Delete { paths } => {
@@ -399,28 +459,23 @@ impl Run {
                     }
                     self.touch_parent(p);
                 }
-                None
             }
             Request::Rename { from, to_name } => self.rename(from, to_name),
             Request::NewFolder { parent, name } => {
                 let target = parent.join(&name);
                 match validate_name(&name.to_string_lossy()).map_err(io::Error::other).and_then(|_| fs::create_dir(&target)) {
                     Ok(()) => {
+                        if let Some(stamp) = Stamp::of(&target) {
+                            self.steps.push(Step::NewFolder(stamp));
+                        }
                         self.created.push(target);
                         self.touched.push(parent);
                     }
                     Err(e) => self.fail(&target, &e),
                 }
-                None
             }
-            Request::Restore { items } => {
-                self.restore_all(items);
-                None
-            }
-            Request::Undo(u) => {
-                self.undo(u);
-                None
-            }
+            Request::Restore { items } => self.restore_all(items),
+            Request::Undo(u) | Request::Redo(u) => self.reverse(u),
         }
     }
 
@@ -432,6 +487,9 @@ impl Run {
             }
             match trash::restore(&t) {
                 Ok(()) => {
+                    if let Some(stamp) = Stamp::of(&t.original) {
+                        self.steps.push(Step::Made(stamp));
+                    }
                     self.created.push(t.original.clone());
                     self.touch_parent(&t.original);
                     self.touch_parent(&t.file);
@@ -447,45 +505,51 @@ impl Run {
         }
     }
 
-    fn rename(&mut self, from: PathBuf, to_name: OsString) -> Option<Undo> {
+    fn rename(&mut self, from: PathBuf, to_name: OsString) {
         if let Err(msg) = validate_name(&to_name.to_string_lossy()) {
             self.fail(&from, &io::Error::other(msg));
-            return None;
+            return;
         }
         let parent = from.parent().unwrap_or(Path::new("/")).to_path_buf();
         let to = parent.join(&to_name);
         match rename_noreplace(&from, &to) {
             Ok(()) => {
-                self.created.push(to.clone());
+                if let Some(stamp) = Stamp::of(&to) {
+                    self.steps.push(Step::Moved { from, to: stamp });
+                }
+                self.created.push(to);
                 self.touched.push(parent);
-                Some(Undo::Rename { from, to })
             }
-            Err(e) => {
-                self.fail(&from, &e);
-                None
-            }
+            Err(e) => self.fail(&from, &e),
         }
     }
 
-    fn trash_all(&mut self, paths: Vec<PathBuf>) -> Option<Undo> {
+    fn trash_all(&mut self, paths: Vec<PathBuf>) {
         self.job.progress.total_items.store(paths.len() as u64, Ordering::Relaxed);
-        let mut done: Vec<Trashed> = Vec::new();
-        let mut mounts = MountCache::default();
         for p in &paths {
             if self.job.is_cancelled() {
                 break;
             }
-            match trash::trash_in_batch(&self.trash, p, &mut mounts) {
-                Ok(t) => done.push(t),
-                Err(TrashError::Io(e)) => self.fail(p, &e),
-                Err(e) => self.report(p, e.to_string()),
+            if let Err(e) = self.trash_one(p) {
+                self.report(p, e);
             }
             self.touch_parent(p);
             self.job.progress.done_items.fetch_add(1, Ordering::Relaxed);
             self.tick();
         }
-        self.sync_trash(&done);
-        (!done.is_empty()).then_some(Undo::Trash(done))
+    }
+
+    /// Moves one item to the Trash and notes it as a step. The error is the message to show.
+    fn trash_one(&mut self, p: &Path) -> Result<Trashed, String> {
+        let t = trash::trash_in_batch(&self.trash, p, &mut self.mounts).map_err(|e| match e {
+            TrashError::Io(e) => describe(&e),
+            e => e.to_string(),
+        })?;
+        if let Some(at) = Stamp::of(&t.file) {
+            self.steps.push(Step::Trashed { item: t.clone(), at });
+        }
+        self.trashed.push(t.clone());
+        Ok(t)
     }
 
     /// Saves a finished batch to disk, once for each Trash folder it went to. The items
@@ -507,44 +571,92 @@ impl Run {
         }
     }
 
-    fn undo(&mut self, u: Undo) {
-        match u {
-            Undo::Rename { from, to } => match rename_noreplace(&to, &from) {
-                Ok(()) => {
-                    self.created.push(from.clone());
-                    self.touch_parent(&from);
-                }
-                Err(e) => self.fail(&to, &e),
-            },
-            Undo::Moves(moves) => {
-                self.job.progress.total_items.store(moves.len() as u64, Ordering::Relaxed);
-                for (from, to) in moves.into_iter().rev() {
-                    if self.job.is_cancelled() {
-                        break;
-                    }
-                    self.last_target = None;
-                    let flow = self.place(&to, from.clone(), Mode::Move);
-                    self.record_top_level(&to, Mode::Move);
-                    self.touch_parent(&from);
-                    self.touch_parent(&to);
-                    self.job.progress.done_items.fetch_add(1, Ordering::Relaxed);
-                    if let Flow::Stop = flow {
-                        break;
-                    }
-                }
+    /// Reverses each step, last first, checking first that the item is still the one the
+    /// step left. The steps that reverse what this did go in `steps`, for a redo.
+    fn reverse(&mut self, u: Undo) {
+        let total = u.0.len();
+        let mut done = 0;
+        self.job.progress.total_items.store(total as u64, Ordering::Relaxed);
+        for step in u.0.into_iter().rev() {
+            if self.job.is_cancelled() {
+                break;
             }
-            Undo::Trash(items) => {
-                for t in items {
-                    match trash::restore(&t) {
-                        Ok(()) => {
-                            self.created.push(t.original.clone());
-                            self.touch_parent(&t.original);
-                        }
-                        Err(e) => self.fail(&t.original, &e),
-                    }
-                }
+            let before = self.steps.len();
+            if let Flow::Stop = self.reverse_step(step) {
+                break;
             }
+            done += usize::from(self.steps.len() > before);
+            self.job.progress.done_items.fetch_add(1, Ordering::Relaxed);
+            self.tick();
         }
+        self.reversed = Some((done, total));
+    }
+
+    fn reverse_step(&mut self, step: Step) -> Flow {
+        let stamp = match &step {
+            Step::Moved { to, .. } => Some(to),
+            Step::Made(at) | Step::NewFolder(at) | Step::Trashed { at, .. } => Some(at),
+            Step::Removed(_) => None,
+        };
+        if let Some(stamp) = stamp
+            && let Some(why) = stamp.changed()
+        {
+            self.report(&stamp.path, why.into());
+            return Flow::Go;
+        }
+        match step {
+            Step::Moved { from, to } => {
+                self.last_target = None;
+                let flow = self.place(&to.path, from.clone(), Mode::Move);
+                self.record_top_level(&to.path, Mode::Move);
+                self.touch_parent(&from);
+                self.touch_parent(&to.path);
+                return flow;
+            }
+            Step::Made(at) => {
+                if self.trash_one(&at.path).map_err(|e| self.report(&at.path, e)).is_ok() {
+                    self.touch_parent(&at.path);
+                }
+            }
+            Step::NewFolder(at) => match fs::remove_dir(&at.path) {
+                Ok(()) => {
+                    self.steps.push(Step::Removed(at.path.clone()));
+                    self.touch_parent(&at.path);
+                }
+                // Something was put in it since, so it goes to the Trash with that.
+                Err(e) if e.raw_os_error() == Some(Errno::NOTEMPTY.raw_os_error()) => {
+                    if self.trash_one(&at.path).map_err(|e| self.report(&at.path, e)).is_ok() {
+                        self.touch_parent(&at.path);
+                    }
+                }
+                Err(e) => self.fail(&at.path, &e),
+            },
+            Step::Removed(path) => match fs::create_dir(&path) {
+                Ok(()) => {
+                    if let Some(stamp) = Stamp::of(&path) {
+                        self.steps.push(Step::NewFolder(stamp));
+                    }
+                    self.created.push(path.clone());
+                    self.touch_parent(&path);
+                }
+                Err(e) => self.fail(&path, &e),
+            },
+            Step::Trashed { item, .. } => match trash::restore(&item) {
+                Ok(()) => {
+                    if let Some(stamp) = Stamp::of(&item.original) {
+                        self.steps.push(Step::Made(stamp));
+                    }
+                    self.created.push(item.original.clone());
+                    self.touch_parent(&item.original);
+                    self.touch_parent(&item.file);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    self.report(&item.original, "Something else has this name now, so this stayed in the Trash".into());
+                }
+                Err(e) => self.fail(&item.original, &e),
+            },
+        }
+        Flow::Go
     }
 
     fn touch_parent(&mut self, p: &Path) {
@@ -650,7 +762,12 @@ impl Run {
             }
         }
         match std::os::unix::fs::symlink(&original, &target) {
-            Ok(()) => self.created.push(target),
+            Ok(()) => {
+                if let Some(stamp) = Stamp::of(&target) {
+                    self.steps.push(Step::Made(stamp));
+                }
+                self.created.push(target);
+            }
             Err(e) => self.fail(&target, &e),
         }
         true
@@ -687,17 +804,24 @@ impl Run {
         }
     }
 
-    /// Notes where a top-level item ended up. Only top-level items go in the undo list
-    /// and the list of things to select: undoing a folder's move brings its contents.
+    /// Notes where a top-level item ended up. Only top-level items are steps and things to
+    /// select: undoing a folder's move or copy takes its contents with it.
     fn record_top_level(&mut self, src: &Path, mode: Mode) {
         let merged = std::mem::take(&mut self.last_merged);
+        let replaced = self.last_replaced.take();
         let Some(target) = self.last_target.take() else { return };
-        if fs::symlink_metadata(&target).is_err() {
+        let Some(stamp) = Stamp::of(&target) else { return };
+        if replaced == Some((stamp.dev, stamp.ino)) {
             return;
         }
         // Undoing a merge would also take what was in the destination before, so it has no undo.
-        if mode == Mode::Move && !merged && fs::symlink_metadata(src).is_err() {
-            self.undo_moves.push((src.to_path_buf(), target.clone()));
+        if !merged {
+            match mode {
+                // A move that left its source behind went only partway, and isn't undone as a whole.
+                Mode::Move if fs::symlink_metadata(src).is_err() => self.steps.push(Step::Moved { from: src.to_path_buf(), to: stamp }),
+                Mode::Move => {}
+                Mode::Copy => self.steps.push(Step::Made(stamp)),
+            }
         }
         self.created.push(target);
     }
@@ -747,7 +871,12 @@ impl Run {
                     }
                     Choice::KeepBoth => target = unique_copy_name(&target),
                     Choice::Replace if both_dirs => merge = true,
-                    Choice::Replace if can_replace => replace = true,
+                    Choice::Replace if can_replace => {
+                        replace = true;
+                        if self.depth == 0 {
+                            self.last_replaced = Some((tmeta.dev(), tmeta.ino()));
+                        }
+                    }
                     // The UI doesn't offer this; treat a stray answer as Skip.
                     Choice::Replace => {
                         self.noted_leftovers += 1;
@@ -761,13 +890,29 @@ impl Run {
             self.last_target = Some(target.clone());
             self.last_merged = merge;
         }
-        if mode == Mode::Move && !merge {
-            match self.try_rename(src, &target, replace) {
+        // To another disk, Replace has to wait until the copy is made, so the rename isn't tried.
+        let other_disk = || self.force_exdev || target.parent().and_then(|p| fs::metadata(p).ok()).is_some_and(|m| m.dev() != smeta.dev());
+        if mode == Mode::Move && !merge && !(replace && other_disk()) {
+            let old = match replace {
+                true => match self.trash_replaced(src, &target) {
+                    Some(t) => Some(t),
+                    None => return Flow::Go,
+                },
+                false => None,
+            };
+            match self.try_rename(src, &target) {
                 Ok(()) => {
+                    if let Some(t) = old {
+                        self.kept_replaced(t);
+                    }
                     self.job.progress.done_bytes.fetch_add(if smeta.is_dir() { 0 } else { smeta.len() }, Ordering::Relaxed);
                     return Flow::Go;
                 }
                 Err(e) if e.raw_os_error() == Some(Errno::XDEV.raw_os_error()) => {
+                    // The copy below replaces it again once it's made.
+                    if let Some(t) = old {
+                        self.put_back(t);
+                    }
                     // Across disks: copy then remove, measuring what's about to move. The
                     // top item's scan covers everything below it.
                     if self.depth == 0 {
@@ -775,10 +920,15 @@ impl Run {
                     }
                 }
                 Err(e) => {
+                    if let Some(t) = old {
+                        self.put_back(t);
+                    }
                     self.fail(src, &e);
                     return Flow::Go;
                 }
             }
+        } else if mode == Mode::Move && !merge && self.depth == 0 {
+            self.scan(&[src.to_path_buf()]);
         }
         let ft = smeta.file_type();
         if ft.is_dir() {
@@ -793,23 +943,45 @@ impl Run {
         }
     }
 
-    fn try_rename(&self, src: &Path, target: &Path, replace: bool) -> io::Result<()> {
+    fn try_rename(&self, src: &Path, target: &Path) -> io::Result<()> {
         if self.force_exdev {
             return Err(Errno::XDEV.into());
         }
-        if !replace {
-            return rename_noreplace(src, target);
+        rename_noreplace(src, target)
+    }
+
+    /// Replace's first half: the item at `target` goes to the Trash, never deleted. `None`
+    /// if it couldn't, which has been reported, and then nothing has changed.
+    fn trash_replaced(&mut self, src: &Path, target: &Path) -> Option<Trashed> {
+        match trash::trash_in_batch(&self.trash, target, &mut self.mounts) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                let why = match e {
+                    TrashError::Io(e) => describe(&e),
+                    e => e.to_string(),
+                };
+                self.report(src, format!("The item it would replace couldn't go to the Trash, so both were left as they were. {why}"));
+                None
+            }
         }
-        fs::rename(src, target)?;
-        // Renaming over another hard link to the same file does nothing and reports
-        // success, leaving the source there.
-        if let (Ok(a), Ok(b)) = (fs::symlink_metadata(src), fs::symlink_metadata(target))
-            && a.dev() == b.dev()
-            && a.ino() == b.ino()
+    }
+
+    /// Once the new item is in place, the one it replaced is a step, so undo brings it back.
+    /// Inside a merge it isn't: a merge has no undo, and the item stays in the Trash.
+    fn kept_replaced(&mut self, t: Trashed) {
+        if self.depth == 0
+            && let Some(at) = Stamp::of(&t.file)
         {
-            fs::remove_file(src)?;
+            self.steps.push(Step::Trashed { item: t.clone(), at });
         }
-        Ok(())
+        self.trashed.push(t);
+    }
+
+    /// The new item couldn't go in, so the one it would have replaced comes back.
+    fn put_back(&mut self, t: Trashed) {
+        if let Err(e) = trash::restore(&t) {
+            self.report(&t.original, format!("This was moved to the Trash to be replaced, and couldn't be put back: {}", describe(&e)));
+        }
     }
 
     fn count_skipped(&self, m: &Metadata) {
@@ -912,20 +1084,43 @@ impl Run {
     }
 
     fn copy_symlink(&mut self, src: &Path, target: &Path, replace: bool, mode: Mode) -> Flow {
-        let result = fs::read_link(src).and_then(|dest| {
-            let tmp = temp_name(target);
-            std::os::unix::fs::symlink(&dest, &tmp)?;
-            let moved = if replace { fs::rename(&tmp, target) } else { rename_noreplace(&tmp, target) };
-            if moved.is_err() {
-                let _ = fs::remove_file(&tmp);
-            }
-            moved
-        });
-        match result {
-            Ok(()) => self.finish_item(src, target, mode),
-            Err(e) => self.fail(target, &e),
+        let tmp = temp_name(target);
+        if let Err(e) = fs::read_link(src).and_then(|dest| std::os::unix::fs::symlink(&dest, &tmp)) {
+            self.fail(target, &e);
+            return Flow::Go;
         }
+        self.put_in_place(src, &tmp, target, replace, mode);
         Flow::Go
+    }
+
+    /// Renames a finished copy at `tmp` to `target`, first moving what's there to the Trash
+    /// if it replaces it. Whatever goes wrong, the copy is removed and the rest is left as it was.
+    fn put_in_place(&mut self, src: &Path, tmp: &Path, target: &Path, replace: bool, mode: Mode) {
+        let old = match replace {
+            true => match self.trash_replaced(src, target) {
+                Some(t) => Some(t),
+                None => {
+                    let _ = fs::remove_file(tmp);
+                    return;
+                }
+            },
+            false => None,
+        };
+        match rename_noreplace(tmp, target) {
+            Ok(()) => {
+                if let Some(t) = old {
+                    self.kept_replaced(t);
+                }
+                self.finish_item(src, target, mode);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(tmp);
+                if let Some(t) = old {
+                    self.put_back(t);
+                }
+                self.fail(target, &e);
+            }
+        }
     }
 
     /// Bookkeeping once something is fully in place.
@@ -960,14 +1155,7 @@ impl Run {
                 return Flow::Go;
             }
         }
-        let placed = if replace { fs::rename(&tmp, target) } else { rename_noreplace(&tmp, target) };
-        match placed {
-            Ok(()) => self.finish_item(src, target, mode),
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                self.fail(target, &e);
-            }
-        }
+        self.put_in_place(src, &tmp, target, replace, mode);
         Flow::Go
     }
 
@@ -1620,7 +1808,8 @@ mod tests {
         e.start(Request::Move { sources: vec![s.path().join("src/d")], dest: d.clone() });
         let done = finish(&rx, vec![]);
         assert_eq!(done.outcome.created, vec![d.join("d")]);
-        assert_eq!(done.outcome.undo, Some(Undo::Moves(vec![(s.path().join("src/d"), d.join("d"))])));
+        let Some(Undo(steps)) = &done.outcome.undo else { panic!("no undo") };
+        assert!(matches!(&steps[..], [Step::Moved { from, to }] if *from == s.path().join("src/d") && to.path == d.join("d")), "{steps:?}");
         e.start(Request::Undo(done.outcome.undo.unwrap()));
         let undone = finish(&rx, vec![]);
         assert!(undone.errors.is_empty(), "{:?}", undone.errors);
@@ -1785,7 +1974,8 @@ mod tests {
         assert_eq!(fs::read(d.join("d/inner")).unwrap(), b"2");
         assert!(f.exists() && inner.exists());
         assert_eq!(done.outcome.created, vec![d.join("a"), d.join("d")]);
-        assert_eq!(done.outcome.undo, None);
+        let Some(Undo(steps)) = &done.outcome.undo else { panic!("no undo") };
+        assert!(matches!(&steps[..], [Step::Made(_), Step::Made(_)]), "{steps:?}");
     }
 
     #[test]
@@ -2221,5 +2411,229 @@ mod tests {
         assert_eq!(fs::read(&b.original).unwrap(), b"b");
         assert!(!b.file.exists() && !b.info.exists());
         assert!(d.outcome.touched.contains(&b.file.parent().unwrap().to_path_buf()));
+    }
+
+    /// Undoes or redoes `u`, failing the test if it asks about a conflict.
+    fn reverse(e: &Engine, rx: &Receiver<Event>, u: Option<Undo>) -> Done {
+        e.start(Request::Undo(u.expect("there should be something to undo")));
+        finish(rx, vec![])
+    }
+
+    fn in_trash(s: &Scratch, name: &str) -> Option<Vec<u8>> {
+        fs::read(s.path().join("data/Trash/files").join(name)).ok()
+    }
+
+    /// The contents of each file at the top of the Trash, sorted.
+    fn trash_contents(s: &Scratch) -> Vec<Vec<u8>> {
+        let mut v: Vec<Vec<u8>> = fs::read_dir(s.path().join("data/Trash/files")).map(|rd| rd.flatten().filter_map(|e| fs::read(e.path()).ok()).collect()).unwrap_or_default();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn replace_moves_the_old_file_to_the_trash_and_undo_and_redo_swap_them() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let (src, dst) = conflict_setup(&s);
+        e.start(Request::Copy { sources: vec![src.clone()], dest: dst.parent().unwrap().into() });
+        let done = finish(&rx, vec![answer(Choice::Replace)]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(fs::read(&dst).unwrap(), b"new");
+        assert_eq!(in_trash(&s, "a.txt").as_deref(), Some(&b"old"[..]));
+        let info = fs::read_to_string(s.path().join("data/Trash/info/a.txt.trashinfo")).unwrap();
+        assert!(info.contains("dest/a.txt"), "the Trash knows where it came from: {info}");
+        let undone = reverse(&e, &rx, done.outcome.undo);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert_eq!(fs::read(&dst).unwrap(), b"old", "undo brings the replaced file back");
+        assert_eq!(trash_contents(&s), [b"new"], "and the copy goes to the Trash");
+        assert_eq!(undone.outcome.reversed, Some((2, 2)));
+        let redone = reverse(&e, &rx, undone.outcome.undo);
+        assert!(redone.errors.is_empty(), "{:?}", redone.errors);
+        assert_eq!(fs::read(&dst).unwrap(), b"new");
+        assert_eq!(trash_contents(&s), [b"old"]);
+        assert_eq!(fs::read(&src).unwrap(), b"new");
+    }
+
+    #[test]
+    fn replace_on_a_move_keeps_the_old_file_in_the_trash_and_undo_restores_both() {
+        for exdev in [false, true] {
+            let s = Scratch::new();
+            let (mut e, rx) = engine(&s);
+            e.force_exdev = exdev;
+            let (src, dst) = conflict_setup(&s);
+            e.start(Request::Move { sources: vec![src.clone()], dest: dst.parent().unwrap().into() });
+            let done = finish(&rx, vec![answer(Choice::Replace)]);
+            assert!(done.errors.is_empty(), "{:?}", done.errors);
+            assert!(!src.exists());
+            assert_eq!(fs::read(&dst).unwrap(), b"new");
+            assert_eq!(in_trash(&s, "a.txt").as_deref(), Some(&b"old"[..]), "across disks: {exdev}");
+            no_partials(dst.parent().unwrap());
+            let undone = reverse(&e, &rx, done.outcome.undo);
+            assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+            assert_eq!(fs::read(&src).unwrap(), b"new");
+            assert_eq!(fs::read(&dst).unwrap(), b"old");
+            assert_eq!(in_trash(&s, "a.txt"), None);
+        }
+    }
+
+    #[test]
+    fn a_merge_moves_each_file_it_replaces_to_the_trash() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        s.file("src/d/f", b"incoming");
+        s.file("src/d/g", b"g");
+        s.file("dest/d/f", b"was here");
+        e.start(Request::Copy { sources: vec![s.path().join("src/d")], dest: s.path().join("dest") });
+        let done = finish(&rx, vec![answer(Choice::Replace), answer(Choice::Replace)]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(fs::read(s.path().join("dest/d/f")).unwrap(), b"incoming");
+        assert_eq!(fs::read(s.path().join("dest/d/g")).unwrap(), b"g");
+        assert_eq!(in_trash(&s, "f").as_deref(), Some(&b"was here"[..]));
+        assert_eq!(done.outcome.undo, None, "a merge still has no undo");
+    }
+
+    #[test]
+    fn replace_leaves_both_alone_when_the_old_one_cant_go_to_the_trash() {
+        for mode in ["copy", "move", "move across disks"] {
+            let s = Scratch::new();
+            let (mut e, rx) = engine(&s);
+            e.force_exdev = mode == "move across disks";
+            let (src, dst) = conflict_setup(&s);
+            // No Trash folder can be made in here.
+            fs::set_permissions(s.dir("data"), fs::Permissions::from_mode(0o500)).unwrap();
+            let dest = dst.parent().unwrap().to_path_buf();
+            e.start(if mode == "copy" { Request::Copy { sources: vec![src.clone()], dest } } else { Request::Move { sources: vec![src.clone()], dest } });
+            let done = finish(&rx, vec![answer(Choice::Replace)]);
+            fs::set_permissions(s.path().join("data"), fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(done.errors.len(), 1, "{mode}: {:?}", done.errors);
+            assert!(done.errors[0].1.contains("couldn't go to the Trash"), "{:?}", done.errors);
+            assert_eq!(fs::read(&dst).unwrap(), b"old", "{mode}: never overwritten");
+            assert_eq!(fs::read(&src).unwrap(), b"new", "{mode}");
+            assert_eq!(done.outcome.undo, None);
+            no_partials(dst.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn a_copy_is_undone_to_the_trash_and_redone_from_it() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let f = s.file("src/a", b"1");
+        s.file("src/d/inner", b"2");
+        let d = s.dir("dest");
+        e.start(Request::Copy { sources: vec![f.clone(), s.path().join("src/d")], dest: d.clone() });
+        let done = finish(&rx, vec![]);
+        let undone = reverse(&e, &rx, done.outcome.undo);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 0);
+        assert_eq!(in_trash(&s, "a").as_deref(), Some(&b"1"[..]), "copies go to the Trash, never deleted");
+        assert_eq!(in_trash(&s, "d/inner").as_deref(), Some(&b"2"[..]));
+        assert!(f.exists(), "the originals stay");
+        let redone = reverse(&e, &rx, undone.outcome.undo);
+        assert!(redone.errors.is_empty(), "{:?}", redone.errors);
+        assert_eq!(fs::read(d.join("a")).unwrap(), b"1");
+        assert_eq!(fs::read(d.join("d/inner")).unwrap(), b"2");
+        let mut created = redone.outcome.created;
+        created.sort();
+        assert_eq!(created, [d.join("a"), d.join("d")]);
+    }
+
+    #[test]
+    fn a_new_folder_is_removed_while_empty_and_trashed_once_used() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let f = s.path().join("new");
+        e.start(Request::NewFolder { parent: s.path().to_path_buf(), name: "new".into() });
+        let done = finish(&rx, vec![]);
+        let undone = reverse(&e, &rx, done.outcome.undo);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert!(!f.exists());
+        assert!(!s.path().join("data/Trash/files/new").exists(), "an empty folder is just removed");
+        let redone = reverse(&e, &rx, undone.outcome.undo);
+        assert!(f.is_dir());
+        fs::write(f.join("put in later"), b"x").unwrap();
+        let undone = reverse(&e, &rx, redone.outcome.undo);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert!(!f.exists());
+        assert_eq!(in_trash(&s, "new/put in later").as_deref(), Some(&b"x"[..]));
+        let redone = reverse(&e, &rx, undone.outcome.undo);
+        assert_eq!(fs::read(f.join("put in later")).unwrap(), b"x", "redo brings it back with what's in it");
+        assert!(redone.errors.is_empty());
+    }
+
+    #[test]
+    fn rename_move_and_trash_each_undo_and_redo() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let a = s.file("a", b"1");
+        let d = s.dir("dest");
+        let requests = [Request::Rename { from: a.clone(), to_name: "b".into() }, Request::Move { sources: vec![a.clone()], dest: d.clone() }, Request::Trash { paths: vec![a.clone()] }];
+        for r in requests {
+            let what = format!("{r:?}");
+            e.start(r);
+            let done = finish(&rx, vec![]);
+            assert!(!a.exists(), "{what}");
+            let undone = reverse(&e, &rx, done.outcome.undo);
+            assert!(undone.errors.is_empty(), "{what}: {:?}", undone.errors);
+            assert_eq!(fs::read(&a).unwrap(), b"1", "{what}");
+            let redone = reverse(&e, &rx, undone.outcome.undo);
+            assert!(redone.errors.is_empty(), "{what}: {:?}", redone.errors);
+            assert!(!a.exists(), "{what}");
+            reverse(&e, &rx, redone.outcome.undo);
+            assert_eq!(fs::read(&a).unwrap(), b"1", "{what}");
+        }
+    }
+
+    #[test]
+    fn undo_leaves_alone_an_item_that_has_taken_the_name_since() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let a = s.file("a", b"1");
+        let c = s.path().join("c");
+        e.start(Request::Rename { from: a.clone(), to_name: "c".into() });
+        let renamed = finish(&rx, vec![]);
+        let d = s.dir("dest");
+        e.start(Request::Copy { sources: vec![s.file("src/x", b"copied")], dest: d.clone() });
+        let copied = finish(&rx, vec![]);
+        // Both are replaced by other items with the same names.
+        fs::remove_file(&c).unwrap();
+        fs::write(&c, b"someone else's").unwrap();
+        fs::remove_file(d.join("x")).unwrap();
+        fs::write(d.join("x"), b"someone else's").unwrap();
+        for done in [renamed, copied] {
+            let undone = reverse(&e, &rx, done.outcome.undo);
+            assert_eq!(undone.errors.len(), 1, "{:?}", undone.errors);
+            assert!(undone.errors[0].1.contains("Something else has this name now"), "{:?}", undone.errors);
+            assert_eq!(undone.outcome.reversed, Some((0, 1)));
+            assert_eq!(undone.outcome.undo, None, "nothing was undone, so there's nothing to redo");
+        }
+        assert_eq!(fs::read(&c).unwrap(), b"someone else's");
+        assert_eq!(fs::read(d.join("x")).unwrap(), b"someone else's");
+        assert!(!a.exists());
+        assert!(!s.path().join("data/Trash/files").exists() || fs::read_dir(s.path().join("data/Trash/files")).unwrap().count() == 0);
+    }
+
+    #[test]
+    fn an_undo_that_stops_partway_says_how_far_it_got_and_can_redo_that_part() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let a = s.file("work/a", b"1");
+        let b = s.file("work/b", b"2");
+        e.start(Request::Trash { paths: vec![a.clone(), b.clone()] });
+        let done = finish(&rx, vec![]);
+        // Something new takes b's name, so b stays in the Trash.
+        fs::write(&b, b"new b").unwrap();
+        e.start(Request::Undo(done.outcome.undo.unwrap()));
+        let undone = finish(&rx, vec![]);
+        assert_eq!(undone.errors.len(), 1, "{:?}", undone.errors);
+        assert!(undone.errors[0].1.contains("stayed in the Trash"), "{:?}", undone.errors);
+        assert_eq!(undone.outcome.reversed, Some((1, 2)));
+        assert_eq!(fs::read(&a).unwrap(), b"1");
+        assert_eq!(fs::read(&b).unwrap(), b"new b");
+        assert_eq!(in_trash(&s, "b").as_deref(), Some(&b"2"[..]), "still in the Trash, where it can be found");
+        let redone = reverse(&e, &rx, undone.outcome.undo);
+        assert!(redone.errors.is_empty(), "{:?}", redone.errors);
+        assert!(!a.exists(), "redo redoes only what undo undid");
+        assert_eq!(fs::read(&b).unwrap(), b"new b");
     }
 }
