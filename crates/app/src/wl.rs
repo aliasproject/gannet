@@ -18,6 +18,8 @@ use wayland_protocols::wp::cursor_shape::v1::client::{wp_cursor_shape_device_v1 
 use wayland_protocols::wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1 as frac_mgr, wp_fractional_scale_v1 as frac};
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::client::{zxdg_decoration_manager_v1 as deco_mgr, zxdg_toplevel_decoration_v1 as deco};
+use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1, xdg_wm_dialog_v1};
+use wayland_protocols::xdg::foreign::zv2::client::{zxdg_imported_v2, zxdg_importer_v2};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use xkbcommon::xkb;
 
@@ -130,6 +132,12 @@ pub struct State {
     cursor_manager: Option<cursor_mgr::WpCursorShapeManagerV1>,
     data_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
     deco_manager: Option<deco_mgr::ZxdgDecorationManagerV1>,
+    /// For a dialog over another program's window: xdg-foreign finds that window, and
+    /// xdg-dialog says this one is a dialog.
+    importer: Option<zxdg_importer_v2::ZxdgImporterV2>,
+    dialog_manager: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
+    imported: Option<zxdg_imported_v2::ZxdgImportedV2>,
+    dialog: Option<xdg_dialog_v1::XdgDialogV1>,
 
     surface: Option<wl_surface::WlSurface>,
     xdg_surface: Option<xdg_surface::XdgSurface>,
@@ -206,6 +214,14 @@ pub struct Wl {
 impl Wl {
     /// Connects and opens the window. `Err` has a message for the terminal.
     pub fn connect(title: &str, app_id: &str, w: i32, h: i32) -> Result<Self, String> {
+        Self::connect_dialog(title, app_id, w, h, None, false)
+    }
+
+    /// As `connect`, for a dialog over another program's window. `parent` is that window's
+    /// handle as the program exported it with xdg-foreign, and `modal` asks the compositor to
+    /// keep that window from being used meanwhile. A compositor without either protocol just
+    /// opens a window of its own.
+    pub fn connect_dialog(title: &str, app_id: &str, w: i32, h: i32, parent: Option<&str>, modal: bool) -> Result<Self, String> {
         let conn = Connection::connect_to_env().map_err(|e| format!("can't connect to a Wayland compositor: {e}"))?;
         let mut queue = conn.new_event_queue();
         let qh = queue.handle();
@@ -220,6 +236,10 @@ impl Wl {
             cursor_manager: None,
             data_manager: None,
             deco_manager: None,
+            importer: None,
+            dialog_manager: None,
+            imported: None,
+            dialog: None,
             surface: None,
             xdg_surface: None,
             toplevel: None,
@@ -283,6 +303,21 @@ impl Wl {
         if let (Some(v), Some(f)) = (&state.viewporter, &state.frac_manager) {
             state.viewport = Some(v.get_viewport(&surface, &qh, ()));
             f.get_fractional_scale(&surface, &qh, ());
+        }
+        // Before the first commit, so the window maps as the dialog it is.
+        if let (Some(handle), Some(importer)) = (parent, &state.importer) {
+            let imported = importer.import_toplevel(handle.to_string(), &qh, ());
+            imported.set_parent_of(&surface);
+            state.imported = Some(imported);
+        }
+        if parent.is_some()
+            && let Some(m) = &state.dialog_manager
+        {
+            let d = m.get_xdg_dialog(&top, &qh, ());
+            if modal && state.imported.is_some() {
+                d.set_modal();
+            }
+            state.dialog = Some(d);
         }
         surface.commit();
         state.surface = Some(surface);
@@ -731,6 +766,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 s.data_manager = Some(m);
             }
             "zxdg_decoration_manager_v1" => s.deco_manager = Some(r.bind(name, 1, qh, ())),
+            "zxdg_importer_v2" => s.importer = Some(r.bind(name, 1, qh, ())),
+            "xdg_wm_dialog_v1" => s.dialog_manager = Some(r.bind(name, 1, qh, ())),
             _ => {}
         }
         if let (Some(seat), Some(m), None) = (&s.seat, &s.data_manager, &s.data_device) {
@@ -759,7 +796,20 @@ ignore_events!(
     deco_mgr::ZxdgDecorationManagerV1,
     deco::ZxdgToplevelDecorationV1,
     wl_data_device_manager::WlDataDeviceManager,
+    zxdg_importer_v2::ZxdgImporterV2,
+    xdg_wm_dialog_v1::XdgWmDialogV1,
+    xdg_dialog_v1::XdgDialogV1,
 );
+
+impl Dispatch<zxdg_imported_v2::ZxdgImportedV2, ()> for State {
+    fn event(s: &mut State, i: &zxdg_imported_v2::ZxdgImportedV2, e: zxdg_imported_v2::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
+        // The handle was wrong, or that window has gone: this one carries on by itself.
+        if let zxdg_imported_v2::Event::Destroyed = e {
+            i.destroy();
+            s.imported = None;
+        }
+    }
+}
 
 impl Dispatch<wl_surface::WlSurface, ()> for State {
     fn event(s: &mut State, surface: &wl_surface::WlSurface, e: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
