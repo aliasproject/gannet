@@ -226,7 +226,8 @@ impl RowFilter {
         for p in filter.map_or(&[][..], |f| f.patterns.as_slice()) {
             match p {
                 // Case doesn't matter, as users don't expect "*.jpg" to leave out "IMG.JPG".
-                Pattern::Glob(g) => globs.push(g.to_lowercase().into_bytes()),
+                // Lowered the same way as the names they're matched against.
+                Pattern::Glob(g) => globs.push(g.to_ascii_lowercase().into_bytes()),
                 Pattern::Mime(m) => mimes.push(m.to_ascii_lowercase()),
             }
         }
@@ -523,7 +524,7 @@ impl App {
                     let p = crate::app::expand_home(&typed, home.as_deref());
                     crate::app::clean(&if p.is_absolute() { p } else { self.dir.join(p) })
                 } else {
-                    self.dir.join(&typed)
+                    crate::app::clean(&self.dir.join(&typed))
                 };
                 if path.is_dir() {
                     // A folder's name: go into it, as other file choosers do.
@@ -892,6 +893,8 @@ mod tests {
         let r = RowFilter::new(false, Some(&f), None);
         assert!(r.keeps(b"a.png", false) && r.keeps(b"B.PNG", false) && r.keeps(b"c.jpg", false));
         assert!(!r.keeps(b"d.txt", false));
+        let accented = Filter { label: "Ñ".into(), patterns: vec![Pattern::Glob("*.Ñ".into())] };
+        assert!(RowFilter::new(false, Some(&accented), None).keeps("x.Ñ".as_bytes(), false), "lowered as the names are");
         assert!(r.keeps(b"folder.txt", true), "folders always show, to get around");
         let all = Filter { label: "All".into(), patterns: vec![Pattern::Glob("*".into())] };
         assert!(RowFilter::new(false, Some(&all), None).takes_all());

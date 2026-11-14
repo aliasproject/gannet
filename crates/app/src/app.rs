@@ -2040,7 +2040,8 @@ impl App {
 
     /// Closing the window would stop what's running, so that gets asked first.
     pub(crate) fn request_close(&mut self) {
-        // Closing a chooser is cancelling it. What it started, like a new folder, is quick.
+        // Closing a chooser is cancelling it. What it can start, a rename, a new folder or a
+        // move to the Trash, is mostly quick, and one cut short leaves the originals in place.
         if self.chooser.is_some() {
             self.chooser_cancel();
         } else if self.jobs.is_empty() || self.viewer {
@@ -3446,6 +3447,10 @@ impl App {
     /// The folder a drop here would land in. Dropping on what's being dragged, on the folder
     /// it's already in, or inside itself isn't a target.
     fn drop_target_at(&mut self, d: &ActiveDrag, x: i32, y: i32) -> Option<DropTarget> {
+        // A chooser doesn't move files about, by drag any more than by cut and paste.
+        if self.chooser.is_some() {
+            return None;
+        }
         let hit = self.hit(x, y);
         match hit {
             Hit::Row(row) => {
@@ -3759,7 +3764,7 @@ impl App {
     /// Where a drop from elsewhere would land. With no motion yet, the pointer's position
     /// isn't known, so that's the folder showing, whatever row or place seems to be there.
     fn incoming_target(&mut self, i: &IncomingDrag) -> Option<DropTarget> {
-        if !i.files {
+        if !i.files || self.chooser.is_some() {
             return None;
         }
         if !i.moved {
@@ -5540,6 +5545,25 @@ mod tests {
     }
 
     #[test]
+    fn a_chooser_takes_no_drops_from_outside_or_from_its_own_list() {
+        let mut r = drag_rig("chooser-drops");
+        fs::create_dir(r.root.join("work/d")).unwrap();
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        r.app.input(Input::Key { keysym: k::KEY_F5, utf8: String::new(), mods: Mods::default(), repeat: false });
+        r.pump_until("the folder", |a| a.rows.len() == 3);
+        let l = r.app.layout();
+        let on_folder = (l.list.y + l.row_h / 2) as f64;
+        r.app.input(Input::DragEnter { picture: false, x: 540.0, y: on_folder, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragMove { x: 540.0, y: on_folder });
+        assert!(r.app.incoming.as_ref().is_some_and(|i| i.target.is_none()), "nothing from outside");
+        r.app.input(Input::DragLeave);
+        press_on_row(&mut r, 1);
+        r.app.input(Input::Move { x: 540.0, y: on_folder });
+        let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
+        assert!(d.target.is_none(), "nor from its own list onto a folder");
+    }
+
+    #[test]
     fn a_dialog_opening_after_a_press_keeps_the_selection() {
         let mut r = drag_rig("drag-dialog-press");
         r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
@@ -5760,6 +5784,22 @@ mod tests {
         r.key(k::KEY_Delete, "");
         r.idle();
         assert!(!r.work().join("a.txt").exists() && r.root.join("data/Trash/files/a.txt").exists());
+    }
+
+    #[test]
+    fn saving_as_dot_dot_goes_up_a_folder_by_its_real_name() {
+        let mut r = Rig::new("chooser-dotdot");
+        fs::create_dir(r.work().join("sub")).unwrap();
+        let spec = crate::chooser::Spec { mode: crate::chooser::Mode::Save, name: Some("x.txt".into()), ..crate::chooser::Spec::default() };
+        r.app.chooser = Some(crate::chooser::Chooser::new(spec, &[], None));
+        r.open(r.work().join("sub"));
+        if let Some(c) = r.app.chooser.as_mut() {
+            c.name = Field::new("..");
+            c.name_focused = true;
+        }
+        r.key(k::KEY_Return, "");
+        r.pump_until("the folder above", |a| !a.loading);
+        assert_eq!(r.app.dir, r.work());
     }
 
     #[test]
