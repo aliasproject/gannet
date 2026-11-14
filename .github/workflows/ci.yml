@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Clippy warnings already on main. The clippy job fails only when there are more than
+  # this; lower it when one is fixed (the job leaves a notice when there are fewer).
+  CLIPPY_BASELINE: 1
+
+jobs:
+  # Each job runs in an archlinux container started by hand rather than with `container:`, so
+  # the steps before it can let bubblewrap (scripts/test.sh) make user namespaces:
+  # - Ubuntu's AppArmor stops unprivileged user namespaces, so that's switched off on the VM.
+  # - Docker's seccomp profile refuses them, and its masked /proc paths stop bwrap mounting
+  #   a fresh /proc, so the container runs with those relaxed. It isn't --privileged.
+  # Inside, scripts/ci.sh runs the step as an ordinary user, never root.
+  test:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .ci/cargo/registry
+            target/test
+          key: test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-
+      - name: Let bubblewrap make user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Build and run the unit tests in Arch
+        run: >-
+          docker run --rm
+          --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined
+          -e CARGO_INCREMENTAL=0 -e CARGO_TERM_COLOR=always
+          -v "$PWD:$PWD" -w "$PWD" archlinux:latest scripts/ci.sh test
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .ci/cargo/registry
+            target/debug
+          key: clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: clippy-
+      - name: Run clippy in Arch
+        run: >-
+          docker run --rm
+          -e CARGO_INCREMENTAL=0 -e CLIPPY_BASELINE
+          -v "$PWD:$PWD" -w "$PWD" archlinux:latest scripts/ci.sh clippy
