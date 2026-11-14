@@ -105,7 +105,7 @@ To add it to your app launcher:
 | Copy path as text | Ctrl+Shift+C |
 | Rename, new folder | F2, Ctrl+Shift+N |
 | Move to Trash, delete for good | Delete, Shift+Delete |
-| Undo rename, move or Trash | Ctrl+Z |
+| Undo, redo | Ctrl+Z, Ctrl+Shift+Z |
 | Stop the newest operation | Ctrl+. |
 | Context menu | Menu key or F10 |
 | Reload, new window, close | F5 or Ctrl+R, Ctrl+N, Ctrl+Q or Ctrl+W |
@@ -180,6 +180,19 @@ use Empty Trash in the toolbar. Restoring never overwrites anything: if somethin
 taken an item's place, the item stays in the Trash and Gannet says why. Network shares'
 and automounted disks' Trash folders aren't shown. A disk that stops answering is left out
 after a few seconds, and the status bar says so.
+
+When a paste or a drop meets a name that's taken, Replace moves the item already there to
+the Trash rather than overwriting it. If it can't go to the Trash, both are left as they
+were.
+
+## Undo and redo
+
+Ctrl+Z undoes a copy, move, rename, new folder, link, restore or move to the Trash, and
+Ctrl+Shift+Z redoes it. Undo never deletes anything: copies go to the Trash, and so does a
+new folder that something has been put in. An empty one is just removed. Undoing a Replace
+brings back the item it replaced. Gannet checks that each item is still the one the change
+left there, so if something else has taken its name since, that item is left alone and
+Gannet says so. A merge of two folders, and deleting for good, can't be undone.
 
 ## Drives
 

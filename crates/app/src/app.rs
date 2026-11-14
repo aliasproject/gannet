@@ -167,8 +167,21 @@ pub enum Cmd {
 pub struct JobView {
     pub job: Job,
     pub started: Instant,
-    ends_undo: bool,
+    kind: JobKind,
     selection_epoch: u64,
+}
+
+/// What a finished job means for undo and redo.
+#[derive(Clone, Copy, PartialEq)]
+enum JobKind {
+    /// Something new: what it did goes on the undo list.
+    Change,
+    /// Deleting for good can't be undone, and undoing something older right after would be a surprise.
+    EndsUndo,
+    /// What it reversed goes on the redo list.
+    Undo,
+    /// What it put back goes on the undo list again.
+    Redo,
 }
 
 /// A question that has to be answered before anything else happens.
@@ -366,6 +379,7 @@ pub enum Action {
     DeleteForGood,
     NewFolder,
     Undo,
+    Redo,
     Restore,
     EmptyTrash,
     /// Goes to the folder a recent file is in, with it selected.
@@ -487,6 +501,8 @@ pub struct App {
     pub dialog: Option<Dialog>,
     pending_conflicts: Vec<Conflict>,
     pub undo: Vec<Undo>,
+    /// What undo reversed, newest last. Anything new clears it.
+    pub redo: Vec<Undo>,
     pending_select: Vec<Vec<u8>>,
     /// Goes up whenever the user changes the selection, so a finishing job can tell.
     selection_epoch: u64,
@@ -620,6 +636,7 @@ impl App {
             dialog: None,
             pending_conflicts: Vec::new(),
             undo: Vec::new(),
+            redo: Vec::new(),
             pending_select: Vec::new(),
             selection_epoch: 0,
             edit_gen: 0,
@@ -1413,6 +1430,11 @@ impl App {
                     self.start_job(Request::Undo(u));
                 }
             }
+            Action::Redo => {
+                if let Some(u) = self.redo.pop() {
+                    self.start_job(Request::Redo(u));
+                }
+            }
             Action::Restore => self.restore_selection(),
             Action::ShowInFolder => self.show_in_folder(),
             Action::EmptyTrash => self.ask_empty_trash(),
@@ -1641,9 +1663,17 @@ impl App {
     }
 
     fn start_job(&mut self, r: Request) {
-        let ends_undo = matches!(r, Request::Copy { .. } | Request::Link { .. } | Request::Delete { .. });
+        let kind = match r {
+            Request::Undo(_) => JobKind::Undo,
+            Request::Redo(_) => JobKind::Redo,
+            Request::Delete { .. } => JobKind::EndsUndo,
+            _ => JobKind::Change,
+        };
+        if matches!(kind, JobKind::Change | JobKind::EndsUndo) {
+            self.redo.clear();
+        }
         let job = self.engine.start(r);
-        self.jobs.push(JobView { job, started: Instant::now(), ends_undo, selection_epoch: self.selection_epoch });
+        self.jobs.push(JobView { job, started: Instant::now(), kind, selection_epoch: self.selection_epoch });
     }
 
     /// Goes to the folder the row under the cursor is in, or the first one selected, with it
@@ -1781,17 +1811,23 @@ impl App {
                 {
                     self.notice(format!("Stopped: {}", v.job.label));
                 }
-                match o.undo {
-                    Some(u) => {
-                        self.undo.push(u);
-                        if self.undo.len() > UNDO_DEPTH {
-                            self.undo.remove(0);
-                        }
+                let kind = view.as_ref().map(|v| v.kind);
+                if let (Some(k @ (JobKind::Undo | JobKind::Redo)), Some((done, total))) = (kind, o.reversed)
+                    && done < total
+                    && total > 1
+                    && !o.cancelled
+                {
+                    let verb = if k == JobKind::Undo { "Undid" } else { "Redid" };
+                    self.notice(format!("{verb} {done} of {total} changes. The others were left as they were"));
+                }
+                match (kind, o.undo) {
+                    (Some(JobKind::Undo), Some(u)) => push_capped(&mut self.redo, u),
+                    (_, Some(u)) => push_capped(&mut self.undo, u),
+                    (Some(JobKind::EndsUndo), None) => {
+                        self.undo.clear();
+                        self.redo.clear();
                     }
-                    // Copying or deleting can't be undone, and undoing something older
-                    // right after would be a surprise.
-                    None if view.is_some_and(|v| v.ends_undo) => self.undo.clear(),
-                    None => {}
+                    _ => {}
                 }
                 // Another disk's Trash may not be watched, and the Trash view shows it too.
                 let trash_touched = self.is_trash_view() && o.touched.iter().any(|t| self.trash_files_root(t).is_some());
@@ -1817,7 +1853,7 @@ impl App {
             Dialog::Conflict { conflict, .. } => {
                 let mut v = Vec::new();
                 if conflict.can_replace {
-                    // No letter: this one overwrites, so it takes a deliberate choice.
+                    // No letter: this one sends the old item to the Trash, so it takes a deliberate choice.
                     v.push(b(if conflict.both_folders { "Merge" } else { "Replace" }, "", !conflict.both_folders));
                 }
                 v.push(b("Skip", "S", false));
@@ -2284,6 +2320,7 @@ impl App {
             MenuItem { label: "Delete for good", keys: "Shift+Delete", action: Action::DeleteForGood, enabled: any },
             MenuItem { label: "New folder", keys: "Ctrl+Shift+N", action: Action::NewFolder, enabled: true },
             MenuItem { label: "Undo", keys: "Ctrl+Z", action: Action::Undo, enabled: !self.undo.is_empty() },
+            MenuItem { label: "Redo", keys: "Ctrl+Shift+Z", action: Action::Redo, enabled: !self.redo.is_empty() },
             MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
             MenuItem { label: "Sort by name", keys: "Ctrl+1", action: Action::SortBy(SortKey::Name), enabled: true },
             MenuItem { label: "Sort by size", keys: "Ctrl+2", action: Action::SortBy(SortKey::Size), enabled: true },
@@ -2641,6 +2678,7 @@ impl App {
             (k::KEY_x, true, _) if !m.shift => self.action(Action::Cut),
             (k::KEY_v, true, _) if !m.shift => self.action(Action::Paste),
             (k::KEY_z, true, _) if !m.shift => self.action(Action::Undo),
+            (k::KEY_z | k::KEY_Z, true, _) if m.shift => self.action(Action::Redo),
             (k::KEY_N, true, _) | (k::KEY_n, true, _) if m.shift => self.action(Action::NewFolder),
             (k::KEY_period, true, _) => self.stop_newest_job(),
             (k::KEY_F5, _, _) | (k::KEY_r, true, _) => self.action(Action::Reload),
@@ -4059,6 +4097,14 @@ pub fn icon_for(kind: Kind, name: &[u8]) -> crate::icons::Icon {
         Kind::LinkDir => Icon::FolderLink,
         Kind::Link => Icon::FileLink,
         Kind::File | Kind::Other => icon_for_name(name),
+    }
+}
+
+/// Adds to an undo or redo list, dropping the oldest past `UNDO_DEPTH`.
+fn push_capped(list: &mut Vec<Undo>, u: Undo) {
+    list.push(u);
+    if list.len() > UNDO_DEPTH {
+        list.remove(0);
     }
 }
 
@@ -5689,7 +5735,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_copies_the_path_and_ctrl_shift_z_does_nothing() {
+    fn ctrl_shift_c_copies_the_path_and_ctrl_shift_z_doesnt_undo() {
         let mut r = Rig::new("shift-keys");
         fs::write(r.work().join("a"), "").unwrap();
         r.open(r.work());
@@ -5699,10 +5745,52 @@ mod tests {
         r.app.key(k::KEY_C, "", shift);
         let Some(Cmd::SetClipboard(offers)) = r.app.cmds.pop() else { panic!("nothing copied") };
         assert!(offers.iter().all(|(m, _)| *m != clipboard::GNOME), "text only, not a file copy");
-        r.app.undo.push(Undo::Rename { from: "/a".into(), to: "/b".into() });
+        r.app.undo.push(Undo(Vec::new()));
         r.app.key(k::KEY_Z, "", shift);
         r.app.key(k::KEY_z, "", shift);
         assert_eq!(r.app.undo.len(), 1, "Ctrl+Shift+Z must not undo");
+    }
+
+    #[test]
+    fn ctrl_shift_z_redoes_what_ctrl_z_undid_until_something_new_happens() {
+        let mut r = Rig::new("redo");
+        r.open(r.work());
+        let shift = Mods { ctrl: true, shift: true, ..Mods::default() };
+        r.app.start_job(Request::NewFolder { parent: r.work(), name: "made".into() });
+        r.idle();
+        assert_eq!((r.app.undo.len(), r.app.redo.len()), (1, 0));
+        r.ctrl(k::KEY_z);
+        r.idle();
+        assert!(!r.work().join("made").exists());
+        assert_eq!((r.app.undo.len(), r.app.redo.len()), (0, 1));
+        r.app.key(k::KEY_Z, "", shift);
+        r.idle();
+        assert!(r.work().join("made").is_dir());
+        assert_eq!((r.app.undo.len(), r.app.redo.len()), (1, 0), "a redo can be undone again");
+        r.ctrl(k::KEY_z);
+        r.idle();
+        assert_eq!(r.app.redo.len(), 1);
+        r.app.start_job(Request::NewFolder { parent: r.work(), name: "other".into() });
+        r.idle();
+        assert_eq!((r.app.undo.len(), r.app.redo.len()), (1, 0), "something new clears redo");
+        assert!(r.app.context_items().iter().any(|m| m.label == "Redo" && !m.enabled));
+    }
+
+    #[test]
+    fn an_undo_that_stops_partway_says_how_far_it_got() {
+        let mut r = Rig::new("undo-partway");
+        fs::write(r.work().join("a"), "1").unwrap();
+        fs::write(r.work().join("b"), "2").unwrap();
+        r.open(r.work());
+        r.app.start_job(Request::Trash { paths: vec![r.work().join("a"), r.work().join("b")] });
+        r.idle();
+        fs::write(r.work().join("b"), "took its name").unwrap();
+        r.ctrl(k::KEY_z);
+        r.idle();
+        let notices = r.app.notices.clone();
+        assert!(notices.iter().any(|n| n == "Undid 1 of 2 changes. The others were left as they were"), "{notices:?}");
+        assert!(notices.iter().any(|n| n.starts_with("b: ") && n.contains("stayed in the Trash")), "{notices:?}");
+        assert_eq!(r.app.redo.len(), 1, "the part that was undone can be redone");
     }
 
     #[test]

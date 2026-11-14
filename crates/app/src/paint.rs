@@ -523,7 +523,7 @@ impl App {
                 let body = if conflict.both_folders {
                     "Merge puts the contents together and asks about any clashes."
                 } else if conflict.can_replace {
-                    "Replace overwrites it. Keep both gives the new one another name."
+                    "Replace trashes the old one. Keep both renames the new one."
                 } else {
                     "One's a file and the other's a folder, so it can't be replaced."
                 };
