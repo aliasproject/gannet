@@ -6651,7 +6651,7 @@ mod tests {
         assert_eq!(r.app.up_target().map(|s| s.dir), Some(d.clone()));
         r.open(d);
         assert_eq!(r.app.up_target().map(|s| s.dir), Some(r.app.trash_dir.clone()));
-        let other = r.root.join("disk/.Trash-1000/files/x");
+        let other = r.root.join(format!("disk/.Trash-{}/files/x", rustix::process::geteuid().as_raw()));
         fs::create_dir_all(&other).unwrap();
         r.open(other);
         assert_eq!(r.app.up_target().map(|s| s.dir), Some(r.app.trash_dir.clone()), "another disk's Trash goes up to the Trash view too");
@@ -6726,11 +6726,11 @@ mod tests {
     #[test]
     fn the_path_inside_another_disks_trash_starts_at_trash() {
         let mut r = Rig::new("trash-crumbs");
-        let inner = r.root.join("disk/.Trash-1000/files/d/e");
+        let inner = r.root.join(format!("disk/.Trash-{}/files/d/e", rustix::process::geteuid().as_raw()));
         fs::create_dir_all(&inner).unwrap();
         r.open(inner.clone());
         let crumbs: Vec<PathBuf> = r.app.crumbs().into_iter().map(|(_, _, p)| p).collect();
-        assert_eq!(crumbs, [r.app.trash_dir.clone(), r.root.join("disk/.Trash-1000/files/d"), inner]);
+        assert_eq!(crumbs, [r.app.trash_dir.clone(), inner.parent().unwrap().to_path_buf(), inner]);
     }
 
     #[test]
