@@ -1377,6 +1377,9 @@ impl App {
     // ---- Doing things ----
 
     pub fn action(&mut self, a: Action) {
+        if self.chooser.is_some() && !crate::chooser::allows(a) {
+            return;
+        }
         match a {
             Action::Open => self.open_selection(),
             Action::Preview => self.open_preview(),
@@ -5736,6 +5739,27 @@ mod tests {
         // Delete asks, because there's no further Trash to go to.
         r.key(k::KEY_Delete, "");
         assert!(matches!(r.app.dialog, Some(Dialog::ConfirmDelete { .. })));
+    }
+
+    #[test]
+    fn a_chooser_doesnt_cut_paste_or_delete_for_good_by_key() {
+        let mut r = Rig::new("chooser-keys");
+        fs::write(r.work().join("a.txt"), "x").unwrap();
+        fs::write(r.work().join("b.txt"), "y").unwrap();
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        r.open(r.work());
+        r.select("a.txt");
+        r.ctrl(k::KEY_x);
+        r.ctrl(k::KEY_c);
+        r.ctrl(k::KEY_v);
+        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadClipboard(_) | Cmd::SetClipboard(_))), "no clipboard");
+        r.app.key(k::KEY_Delete, "", Mods { shift: true, ..Mods::default() });
+        assert!(r.app.dialog.is_none(), "Shift+Delete doesn't offer to delete for good");
+        // Moving to the Trash is still there, by key and in the menu.
+        assert!(r.app.context_items().iter().any(|i| i.action == Action::Trash && i.enabled));
+        r.key(k::KEY_Delete, "");
+        r.idle();
+        assert!(!r.work().join("a.txt").exists() && r.root.join("data/Trash/files/a.txt").exists());
     }
 
     #[test]

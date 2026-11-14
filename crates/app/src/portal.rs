@@ -3,15 +3,15 @@
 //! `gannet --file-chooser-service` runs without a window. It owns
 //! `org.freedesktop.impl.portal.desktop.gannet` and serves the portal's FileChooser backend.
 //! Each request starts a chooser window, `gannet --choose ...`, waits for it without holding
-//! up other calls, and answers with what it picked. The window belongs to the request, so it
-//! stays in the service's own process group: closing the request, or the service ending,
-//! takes it along. With nothing asked of it for a while the service exits, and D-Bus starts
+//! up other calls, and answers with what it picked. The window belongs to the request:
+//! closing the request ends it, and so does the service ending, even by a crash. With nothing asked of it for a while the service exits, and D-Bus starts
 //! it again on the next request, from the service file in `packaging/`.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -135,7 +135,12 @@ fn results(spec: &Spec, uris: Vec<String>, filter: Option<usize>, o: &Options) -
     // Gannet doesn't show a request's extra choices, so it answers with each one's default.
     type Choice = (String, String, Vec<(String, String)>, String);
     let choices: Vec<(String, String)> = opt::<Vec<Choice>>(o, "choices").unwrap_or_default().into_iter().map(|(id, _, options, initial)| {
-        let value = if initial.is_empty() { options.first().map(|o| o.0.clone()).unwrap_or_default() } else { initial };
+        // A choice with no options is a checkbox, answered "true" or "false".
+        let value = if !initial.is_empty() {
+            initial
+        } else {
+            options.first().map_or_else(|| "false".to_string(), |o| o.0.clone())
+        };
         (id, value)
     }).collect();
     if !choices.is_empty() {
@@ -216,6 +221,24 @@ impl Busy {
     }
 }
 
+/// Counts a dialog as open while it lives, even through a panic.
+struct Open<'a>(&'a Busy);
+
+impl<'a> Open<'a> {
+    fn new(busy: &'a Busy) -> Self {
+        busy.open.fetch_add(1, Ordering::SeqCst);
+        busy.nudge();
+        Open(busy)
+    }
+}
+
+impl Drop for Open<'_> {
+    fn drop(&mut self) {
+        self.0.open.fetch_sub(1, Ordering::SeqCst);
+        self.0.nudge();
+    }
+}
+
 /// The portal's Request object for one dialog, which the portal closes when the program that
 /// asked no longer wants an answer.
 struct Request {
@@ -240,12 +263,8 @@ struct FileChooser {
 
 impl FileChooser {
     async fn choose(&self, conn: &zbus::Connection, handle: OwnedObjectPath, method: Method, parent_window: &str, title: &str, options: Options) -> (u32, Results) {
-        self.busy.open.fetch_add(1, Ordering::SeqCst);
-        self.busy.nudge();
-        let answer = self.run(conn, handle, method, parent_window, title, &options).await;
-        self.busy.open.fetch_sub(1, Ordering::SeqCst);
-        self.busy.nudge();
-        answer
+        let _open = Open::new(&self.busy);
+        self.run(conn, handle, method, parent_window, title, &options).await
     }
 
     async fn run(&self, conn: &zbus::Connection, handle: OwnedObjectPath, method: Method, parent_window: &str, title: &str, options: &Options) -> (u32, Results) {
@@ -267,7 +286,25 @@ impl FileChooser {
 
     /// Starts the window and waits for what it says, and whether it ended well.
     async fn window(&self, spec: &Spec, window: &Mutex<Option<OwnedFd>>, closed: &AtomicBool) -> Option<(String, bool)> {
-        let mut child = match Command::new(&self.exe).args(spec.args()).stdin(Stdio::null()).stdout(Stdio::piped()).spawn() {
+        let mut command = Command::new(&self.exe);
+        command.args(spec.args()).stdin(Stdio::null()).stdout(Stdio::piped());
+        // The window goes when the service does, even if it crashes, rather than staying on
+        // with nowhere to send its answer. The signal comes when the thread that started the
+        // window ends: that's zbus's runtime thread or the main one, which both last as long
+        // as the service.
+        let service = rustix::process::getpid();
+        // SAFETY: only async-signal-safe calls, on plain integers.
+        unsafe {
+            command.pre_exec(move || {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+                // Already gone before that took hold.
+                if libc::getppid() != service.as_raw_nonzero().get() {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+        let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("gannet: couldn't open a file chooser: {e}");
@@ -342,9 +379,12 @@ fn finish(bus: &Bus, busy: &Busy) {
     if let Err(e) = bus.release_name(NAME) {
         eprintln!("gannet: couldn't let go of {NAME}: {e}");
     }
-    std::thread::sleep(Duration::from_millis(200));
-    while busy.open.load(Ordering::SeqCst) > 0 {
+    // A dialog counts as closed just before its answer goes out, so wait until none has
+    // been open for a moment, long enough for the last answer to be sent.
+    let mut quiet = 0;
+    while quiet < 3 {
         std::thread::sleep(Duration::from_millis(100));
+        quiet = if busy.open.load(Ordering::SeqCst) == 0 { quiet + 1 } else { 0 };
     }
 }
 
@@ -443,11 +483,11 @@ mod tests {
     #[test]
     fn choices_are_answered_with_their_defaults() {
         type Choice = (String, String, Vec<(String, String)>, String);
-        let c: Vec<Choice> = vec![("enc".into(), "Encoding".into(), vec![("utf8".into(), "UTF-8".into())], String::new()), ("ro".into(), "Read only".into(), vec![], "true".into())];
+        let c: Vec<Choice> = vec![("enc".into(), "Encoding".into(), vec![("utf8".into(), "UTF-8".into())], String::new()), ("ro".into(), "Read only".into(), vec![], "true".into()), ("hidden".into(), "Hidden".into(), vec![], String::new())];
         let o = options(vec![("choices", Value::from(c))]);
         let r = results(&spec_from(Method::Open, "", "", &o), vec!["file:///x".into()], None, &o);
         let got: Vec<(String, String)> = r["choices"].try_clone().unwrap().try_into().unwrap();
-        assert_eq!(got, [("enc".to_string(), "utf8".to_string()), ("ro".to_string(), "true".to_string())]);
+        assert_eq!(got, [("enc".to_string(), "utf8".to_string()), ("ro".to_string(), "true".to_string()), ("hidden".to_string(), "false".to_string())]);
         assert!(!r.contains_key("current_filter"));
     }
 

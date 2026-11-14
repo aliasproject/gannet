@@ -187,7 +187,7 @@ impl Spec {
     }
 
     pub fn accept_label(&self) -> String {
-        if let Some(l) = self.accept.as_ref().map(|l| l.replace('_', "")).filter(|l| !l.trim().is_empty()) {
+        if let Some(l) = self.accept.as_deref().map(without_mnemonics).filter(|l| !l.trim().is_empty()) {
             return l;
         }
         match self.mode {
@@ -201,7 +201,7 @@ impl Spec {
     /// The folder to start in, if the request named one that's there.
     pub fn start_folder(&self) -> Option<PathBuf> {
         let from_file = self.file.as_ref().and_then(|f| f.parent()).map(Path::to_path_buf);
-        self.folder.clone().or(from_file).filter(|d| d.is_absolute() && d.is_dir())
+        [self.folder.clone(), from_file].into_iter().flatten().find(|d| d.is_absolute() && d.is_dir())
     }
 
     /// The name the Save field starts with.
@@ -510,6 +510,9 @@ impl App {
                 let dir = folders.swap_remove(0);
                 let names = self.chooser.as_ref().map(|c| c.spec.save_names.clone()).unwrap_or_default();
                 let paths: Vec<PathBuf> = names.iter().filter_map(|n| n.file_name()).map(|n| dir.join(n)).collect();
+                if paths.is_empty() {
+                    return self.notice("The program didn't name any files to save".to_string());
+                }
                 self.chooser_save(paths);
             }
             Mode::Save => {
@@ -702,6 +705,7 @@ impl App {
             MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
             MenuItem { label: "Rename", keys: "F2", action: Action::Rename, enabled: self.sel_count == 1 && writable },
             MenuItem { label: "New folder", keys: "Ctrl+Shift+N", action: Action::NewFolder, enabled: writable },
+            MenuItem { label: "Move to Trash", keys: "Delete", action: Action::Trash, enabled: any && writable },
             MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
             MenuItem { label: "Sort by name", keys: "Ctrl+1", action: Action::SortBy(gannet_core::listing::SortKey::Name), enabled: true },
             MenuItem { label: "Sort by size", keys: "Ctrl+2", action: Action::SortBy(gannet_core::listing::SortKey::Size), enabled: true },
@@ -792,6 +796,33 @@ pub fn shown_name(p: &Path) -> String {
     String::from_utf8_lossy(p.file_name().map_or(p.as_os_str().as_bytes(), |n| n.as_bytes())).into_owned()
 }
 
+/// A GTK label as shown: `_` marks the next letter as its shortcut, and `__` is an underscore.
+fn without_mnemonics(label: &str) -> String {
+    let mut out = String::new();
+    let mut chars = label.chars();
+    while let Some(c) = chars.next() {
+        if c != '_' {
+            out.push(c);
+        } else if let Some(next) = chars.next() {
+            out.push(next);
+        }
+    }
+    out
+}
+
+/// What a chooser lets its list do, by menu or key. It can tidy up where things are saved,
+/// but cutting and pasting, deleting for good or opening another window is the file manager's
+/// job, not that of a dialog a program is waiting on.
+pub fn allows(a: Action) -> bool {
+    match a {
+        Action::Open | Action::Preview | Action::ToggleHidden | Action::SortBy(_) | Action::Reload => true,
+        Action::Rename | Action::NewFolder | Action::Trash | Action::Undo => true,
+        Action::ShowInFolder | Action::OpenDrive | Action::Unmount | Action::Eject | Action::ChooseFilter(_) => true,
+        Action::NewWindow | Action::Cut | Action::Copy | Action::Paste | Action::DeleteForGood | Action::Restore | Action::EmptyTrash => false,
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +869,7 @@ mod tests {
         assert_eq!(s(Mode::Save, false).accept_label(), "Save");
         // GTK's mnemonic underscores aren't shown.
         assert_eq!(Spec { accept: Some("_Upload".into()), ..Spec::default() }.accept_label(), "Upload");
+        assert_eq!(Spec { accept: Some("Save as my__file".into()), ..Spec::default() }.accept_label(), "Save as my_file");
         assert_eq!(Spec { accept: Some(" ".into()), ..Spec::default() }.accept_label(), "Open");
     }
 
@@ -847,10 +879,11 @@ mod tests {
         let s = Spec { mode: Mode::Save, file: Some(d.join("notes.md")), ..Spec::default() };
         assert_eq!(s.start_folder(), Some(d.clone()));
         assert_eq!(s.start_name(), "notes.md");
-        // A name given outright wins, and a folder that isn't there is ignored.
+        // A name given outright wins, and a folder that isn't there gives way to the file's.
         let s = Spec { name: Some("new.md".into()), folder: Some("/nonexistent/x".into()), ..s };
         assert_eq!(s.start_name(), "new.md");
-        assert_eq!(s.start_folder(), None);
+        assert_eq!(s.start_folder(), Some(d.clone()));
+        assert_eq!(Spec { file: None, ..s }.start_folder(), None);
     }
 
     #[test]
