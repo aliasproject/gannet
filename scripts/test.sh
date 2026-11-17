@@ -10,4 +10,6 @@ export "CARGO_TARGET_${arch}_UNKNOWN_LINUX_GNU_RUNNER=$PWD/scripts/sandbox-run.s
 # The disk tests run the stand-in udisks2 beside them. A filtered run doesn't build examples,
 # so it's built here, or a filtered run would use an old one.
 cargo build -q -p gannet-core --example udisks-standin
+# Since cargo 1.100 the test binaries no longer sit beside the examples, so say where it is.
+export GANNET_UDISKS_STANDIN=$CARGO_TARGET_DIR/debug/examples/udisks-standin
 exec cargo test "$@"
