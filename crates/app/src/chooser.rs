@@ -827,7 +827,7 @@ fn without_mnemonics(label: &str) -> String {
 fn allows(a: Action) -> bool {
     match a {
         Action::Open | Action::Preview | Action::ToggleHidden | Action::SortBy(_) | Action::Reload => true,
-        Action::Rename | Action::NewFolder | Action::Trash | Action::Undo => true,
+        Action::Rename | Action::NewFolder | Action::Trash | Action::Undo | Action::Redo => true,
         Action::ShowInFolder | Action::OpenDrive | Action::Unmount | Action::Eject | Action::ChooseFilter(_) => true,
         Action::NewWindow | Action::Cut | Action::Copy | Action::Paste | Action::DeleteForGood | Action::Restore | Action::EmptyTrash => false,
     }

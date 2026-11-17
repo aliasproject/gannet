@@ -536,6 +536,7 @@ def wl_tool(a, argv, **kw):
 @check
 def copy_paste_within_the_app(h):
     fs = fresh_fs()
+    shutil.rmtree(SCRATCH / "client/data/Trash", ignore_errors=True)
     tree(fs, {"src/a.txt": "AAA", "src/b.txt": "BBB", "dst/keep": "k"})
     a = App(h, fs / "src")
     a.wait(lambda s: s["count"] == 2)
@@ -578,6 +579,16 @@ def copy_paste_within_the_app(h):
     a.key("Left")
     a.key("Return")
     a.wait(lambda s: s["jobs"] == 0)
+    assert (fs / "dst/a.txt").read_text() == "NEW"
+    # Replace put the old one in the Trash, and undo and redo swap them back and forth.
+    trash = SCRATCH / "client/data/Trash/files"
+    assert sorted(p.read_text() for p in trash.iterdir()) == ["AAA", "BBB"], "the replaced files are in the Trash"
+    a.key("z", mods=["ctrl"])
+    a.wait(lambda s: s["jobs"] == 0 and s["redo"] == 1, "undone")
+    assert (fs / "dst/a.txt").read_text() == "AAA" and (fs / "dst/b.txt").read_text() == "BBB"
+    assert sorted(p.read_text() for p in trash.iterdir()) == ["BBB", "NEW"], "the copies went to the Trash"
+    a.key("z", mods=["ctrl", "shift"])
+    a.wait(lambda s: s["jobs"] == 0 and s["redo"] == 0, "redone")
     assert (fs / "dst/a.txt").read_text() == "NEW"
     a.close()
 
