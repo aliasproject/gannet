@@ -52,6 +52,9 @@ pub struct MimeDb {
     other: Vec<usize>,
     magic: Vec<Section>,
     generic_icons: HashMap<String, String>,
+    /// Each type's parents, from `subclasses`, and other names for types, from `aliases`.
+    parents: HashMap<String, Vec<String>>,
+    aliases: HashMap<String, String>,
     /// The `mime` folders, first wins, for looking up descriptions.
     dirs: Vec<PathBuf>,
 }
@@ -73,6 +76,16 @@ impl MimeDb {
             if let Some(bytes) = read_capped(&dir.join("magic"), MAX_DB_FILE) {
                 db.add_magic(&bytes, rank);
             }
+            if let Some(text) = read_capped(&dir.join("subclasses"), MAX_DB_FILE) {
+                db.add_subclasses(&text);
+            }
+            if let Some(text) = read_capped(&dir.join("aliases"), MAX_DB_FILE) {
+                for line in String::from_utf8_lossy(&text).lines() {
+                    if let Some((alias, mime)) = line.split_once(' ') {
+                        db.aliases.insert(alias.to_string(), mime.to_string());
+                    }
+                }
+            }
             if let Some(text) = read_capped(&dir.join("generic-icons"), MAX_DB_FILE) {
                 for line in String::from_utf8_lossy(&text).lines() {
                     if let Some((mime, icon)) = line.split_once(':') {
@@ -89,6 +102,53 @@ impl MimeDb {
 
     pub fn is_empty(&self) -> bool {
         self.globs.is_empty() && self.magic.is_empty()
+    }
+
+    /// One folder's `subclasses`: a type, then one of its parents, on each line.
+    fn add_subclasses(&mut self, text: &[u8]) {
+        for line in String::from_utf8_lossy(text).lines() {
+            if let Some((mime, parent)) = line.split_once(' ') {
+                let parents = self.parents.entry(mime.to_string()).or_default();
+                if !parents.iter().any(|p| p == parent) {
+                    parents.push(parent.to_string());
+                }
+            }
+        }
+    }
+
+    /// The type an alias stands for, or the type itself.
+    fn unalias<'a>(&'a self, mime: &'a str) -> &'a str {
+        self.aliases.get(mime).map_or(mime, String::as_str)
+    }
+
+    /// Whether `mime` is `of`, or a kind of it, as file choosers decide what a filter takes:
+    /// `of` can be a whole media type, like `image/*`, every `text/` type is plain text, and
+    /// anything is `application/octet-stream`, but folders and other `inode/` types.
+    pub fn is_a(&self, mime: &str, of: &str) -> bool {
+        let (mime, of) = (self.unalias(mime), self.unalias(of));
+        if let Some(media) = of.strip_suffix("/*") {
+            return mime.split('/').next() == Some(media);
+        }
+        if of == OCTET_STREAM {
+            return !mime.starts_with("inode/");
+        }
+        // Breadth first, with a limit, as a database could have a loop.
+        let mut seen: Vec<&str> = vec![mime];
+        let mut at = 0;
+        while at < seen.len() && seen.len() < 64 {
+            let m = seen[at];
+            at += 1;
+            if m == of || (of == PLAIN_TEXT && m.starts_with("text/")) {
+                return true;
+            }
+            for p in self.parents.get(m).into_iter().flatten() {
+                let p = self.unalias(p);
+                if !seen.contains(&p) {
+                    seen.push(p);
+                }
+            }
+        }
+        false
     }
 
     /// One folder's `globs2`. Call [`Self::index_globs`] once they're all in.
@@ -370,7 +430,7 @@ fn section_matches(tests: &[Test], head: &[u8]) -> bool {
 }
 
 /// Shell-style patterns: `*`, `?` and `[...]` classes, with `!` negating a class.
-fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
+pub fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
     let (mut p, mut n) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while n < name.len() {
@@ -499,6 +559,21 @@ mod tests {
     }
 
     const GLOBS: &str = "# comment\n50:application/pdf:*.pdf\n50:application/gzip:*.gz\n50:application/x-compressed-tar:*.tar.gz\n50:text/x-c:*.c\n50:text/x-c++src:*.C:cs\n50:text/x-makefile:makefile\n10:text/x-readme:readme*\n50:application/x-foo:*.amb\n50:application/x-bar:*.amb\n";
+
+    #[test]
+    fn a_type_is_its_parents_aliases_and_media_too() {
+        let mut d = db(GLOBS, b"");
+        d.add_subclasses(b"application/x-shellscript application/x-executable\napplication/x-shellscript text/plain\nimage/svg+xml application/xml\napplication/xml text/plain\na/loop b/loop\nb/loop a/loop\n");
+        d.aliases.insert("application/acrobat".into(), "application/pdf".into());
+        assert!(d.is_a("image/svg+xml", "text/plain"), "through a grandparent");
+        assert!(d.is_a("image/svg+xml", "image/*"));
+        assert!(!d.is_a("image/svg+xml", "video/*"));
+        assert!(d.is_a("text/x-c", "text/plain"), "every text type is plain text");
+        assert!(d.is_a("application/acrobat", "application/pdf") && d.is_a("application/pdf", "application/acrobat"));
+        assert!(d.is_a("application/pdf", OCTET_STREAM) && !d.is_a(FOLDER, OCTET_STREAM));
+        assert!(!d.is_a("a/loop", "c/none"), "a loop ends");
+        assert!(!d.is_a("application/pdf", "text/plain"));
+    }
 
     #[test]
     fn names_decide_by_weight_then_the_longest_pattern() {

@@ -2,6 +2,7 @@
 
 mod app;
 mod canvas;
+mod chooser;
 mod decode;
 mod doc;
 mod drives;
@@ -11,6 +12,7 @@ mod format;
 mod icons;
 mod media;
 mod paint;
+mod portal;
 mod preview;
 mod preview_window;
 mod service;
@@ -105,11 +107,14 @@ fn main() {
         if a == service::ARG {
             service::main();
         }
+        if a == portal::ARG {
+            portal::main();
+        }
         if a == service::CLAIM_ARG || a == service::RELEASE_ARG {
             service::claim_main(a == service::RELEASE_ARG);
         }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       gannet {} | {}\n       gannet {}", preview_window::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG);
+            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}", preview_window::USAGE, chooser::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG);
             return;
         }
         if a == "--version" {
@@ -133,10 +138,23 @@ fn main() {
             }
         },
     };
+    // `--choose MODE ...`: an Open or Save dialog for another program.
+    let choosing = match arg.as_deref().is_some_and(|a| a == chooser::ARG) {
+        false => None,
+        true => match chooser::Spec::parse(std::env::args_os().skip(2)) {
+            Some(s) => Some(s),
+            None => {
+                eprintln!("usage: {}", chooser::USAGE);
+                std::process::exit(2);
+            }
+        },
+    };
+    let mut chooser_out = choosing.as_ref().and_then(|_| chooser::take_stdout());
     // `--select PATH...`: the first path's folder, with the paths in it selected.
     let selecting = arg.as_deref().is_some_and(|a| a == service::SELECT_ARG);
     let picks: Vec<PathBuf> = if selecting { std::env::args_os().skip(2).map(|a| start_location(Some(a), &d.home)).collect() } else { Vec::new() };
     let start_dir = match (picks.first(), &viewing) {
+        _ if choosing.is_some() => choosing.as_ref().and_then(chooser::Spec::start_folder).unwrap_or_else(|| d.home.clone()),
         (_, Some(v)) => v.path.parent().map_or_else(|| v.path.clone(), Path::to_path_buf),
         (Some(first), _) => first.parent().map_or_else(|| first.clone(), Path::to_path_buf),
         (None, _) if selecting => d.home.clone(),
@@ -145,9 +163,10 @@ fn main() {
     let theme_paths = ThemePaths::for_home(&d.home, &d.config);
     let (colors, source) = theme::load(&theme_paths);
 
-    let window = match &viewing {
-        Some(_) => wl::Wl::connect("Preview", preview_window::APP_ID, 960, 720),
-        None => wl::Wl::connect("Gannet", "com.aliasproject.Gannet", 1100, 700),
+    let window = match (&viewing, &choosing) {
+        (Some(_), _) => wl::Wl::connect("Preview", preview_window::APP_ID, 960, 720),
+        (_, Some(s)) => wl::Wl::connect_dialog(&s.title(), chooser::APP_ID, chooser::SIZE.0, chooser::SIZE.1, s.parent.as_deref().and_then(|p| p.strip_prefix("wayland:")), s.modal),
+        _ => wl::Wl::connect("Gannet", "com.aliasproject.Gannet", 1100, 700),
     };
     let mut wl = match window {
         Ok(w) => w,
@@ -173,6 +192,10 @@ fn main() {
 
     let mut places = standard_places(&d.home, &d.config, &d.data);
     places.extend(disk_places(&read_mounts()));
+    // Nothing in the Trash is for opening or saving.
+    if choosing.is_some() {
+        places.retain(|p| p.kind != gannet_core::places::PlaceKind::Trash);
+    }
 
     let (w, h) = wl.physical_size();
     let op_hub = hub.clone();
@@ -190,6 +213,11 @@ fn main() {
         app.slow_read = std::env::var("GANNET_SLOW_READ_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
         app.slow_preview = std::env::var("GANNET_SLOW_PREVIEW_MS").ok().and_then(|v| v.parse().ok()).map(std::time::Duration::from_millis);
     }
+    // Saving a file again starts on it.
+    let saving_over = choosing.as_ref().and_then(|s| s.file.as_ref()).filter(|f| f.parent() == Some(start_dir.as_path()) && f.exists()).and_then(|f| f.file_name()).map(|n| n.as_encoded_bytes().to_vec());
+    if let Some(s) = choosing {
+        app.chooser = Some(chooser::Chooser::new(s, &d.mime, chooser_out.take()));
+    }
     let names: Vec<Vec<u8>> = picks.iter().filter(|p| p.parent() == Some(start_dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_encoded_bytes().to_vec()).collect();
     // The list's preview window, while one is open.
     let mut previewer: Option<preview_window::Child> = None;
@@ -201,6 +229,8 @@ fn main() {
         if v.follow {
             preview_window::listen_to_the_list(hub.clone());
         }
+    } else if let Some(name) = saving_over {
+        app.open_selecting(start_dir, vec![name]);
     } else if names.is_empty() {
         app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None });
     } else {
@@ -277,7 +307,13 @@ fn main() {
                         preview_window::tell_the_list(&path);
                     }
                 }
-                Cmd::Quit => return,
+                Cmd::Quit => {
+                    // A chooser tells the service what was picked as it goes.
+                    if let Some(c) = app.chooser.as_mut() {
+                        c.finish();
+                    }
+                    return;
+                }
             }
         }
         if wl.must_paint() || (!app.dirty.is_empty() && wl.can_paint() && app.hold_paint.is_none()) {
@@ -667,7 +703,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"chooser\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -695,6 +731,7 @@ mod bench {
                 Some(crate::app::Dialog::ConfirmDelete { empty: true, .. }) => "empty",
                 Some(crate::app::Dialog::ConfirmDelete { .. }) => "delete",
                 Some(crate::app::Dialog::ConfirmQuit { .. }) => "quit",
+                Some(crate::app::Dialog::ConfirmReplace { .. }) => "replace",
                 Some(crate::app::Dialog::Unlock { waiting: true, .. }) => "unlock-waiting",
                 Some(crate::app::Dialog::Unlock { error: Some(_), .. }) => "unlock-again",
                 Some(crate::app::Dialog::Unlock { .. }) => "unlock",
@@ -706,6 +743,24 @@ mod bench {
             esc(&drag(a)),
             places(a),
             format!("[{}]", a.sidebar_headings().iter().map(|(i, _)| i.to_string()).collect::<Vec<_>>().join(",")),
+            chooser(a),
+        )
+    }
+
+    /// A chooser's name field, whether it has the keyboard, its filter and whether it can finish.
+    fn chooser(a: &App) -> String {
+        let Some(c) = &a.chooser else { return "null".to_string() };
+        let rect = |r: crate::canvas::Rect| format!("[{},{},{},{}]", r.x, r.y, r.w, r.h);
+        let (accept, cancel, filter) = c.drawn;
+        format!(
+            "{{\"name\":{},\"name_focused\":{},\"filter\":{},\"can_accept\":{},\"accept\":{},\"cancel\":{},\"filter_box\":{}}}",
+            esc(&c.name.text),
+            c.name_focused,
+            c.filter.map_or(-1, |f| f as i64),
+            a.chooser_can_accept(),
+            rect(accept),
+            rect(cancel),
+            filter.map_or_else(|| "null".to_string(), rect)
         )
     }
 

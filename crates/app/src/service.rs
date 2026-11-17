@@ -216,7 +216,7 @@ fn in_systemd_unit() -> bool {
 
 /// This program's path. After an upgrade replaces it while the service runs, Linux
 /// reports the old file as "PATH (deleted)", and the new one is at PATH.
-fn own_path() -> PathBuf {
+pub(crate) fn own_path() -> PathBuf {
     let Ok(me) = std::env::current_exe() else { return PathBuf::from("gannet") };
     match me.as_os_str().as_encoded_bytes().strip_suffix(b" (deleted)") {
         // SAFETY: cut from an OsStr's own bytes at an ASCII boundary.

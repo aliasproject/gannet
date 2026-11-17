@@ -1035,6 +1035,190 @@ def show_in_folder_starts_the_service_and_opens_the_items_selected(h):
         bus.stop()
 
 
+PORTAL = ["org.freedesktop.impl.portal.desktop.gannet", "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser"]
+
+
+class Portal:
+    """Gannet's file chooser backend on a private bus, started by the bus from its service
+    file, as xdg-desktop-portal's calls would start it."""
+
+    def __init__(self, h):
+        self.h = h
+        self.watch = App(h, None, launch=False)
+        # Not --die-with-parent, for the same reason as the "Show in folder" service.
+        service = "[D-BUS Service]\nName=org.freedesktop.impl.portal.desktop.gannet\nExec=" + " ".join(sandboxed(["--file-chooser-service"], die_with_parent=False)) + "\n"
+        self.bus = PrivateBus({"org.freedesktop.impl.portal.desktop.gannet.service": service}, env=self.watch.env)
+        self.n = 0
+
+    def ask(self, method, title, **options):
+        """Starts a request, which is answered when the window closes, and waits for the window."""
+        self.n += 1
+        # The last window's state would otherwise pass for this one's.
+        self.watch.state_file.unlink(missing_ok=True)
+        args = []
+        for k, (sig, *v) in options.items():
+            args += [k, sig, *[str(x) for x in v]]
+        cmd = ["busctl", f"--address={self.bus.address}", "--timeout=60", "--json=short", "call", *PORTAL, method, "osssa{sv}", f"/org/freedesktop/portal/desktop/request/1_1/t{self.n}", "test.app", "", title, str(len(options)), *args]
+        self.call = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.h.wait_window(10)
+        return self.watch
+
+    def answer(self):
+        out, err = self.call.communicate(timeout=20)
+        assert self.call.returncode == 0, err
+        data = json.loads(out)["data"]
+        results = {k: v["data"] for k, v in data[1].items()}
+        return data[0], results
+
+    def stop(self):
+        if getattr(self, "call", None) and self.call.poll() is None:
+            self.call.kill()
+        self.bus.stop()
+
+
+def ay(path):
+    """A path as the portal sends it: bytes ending in a NUL."""
+    b = str(path).encode() + b"\0"
+    return ("ay", len(b), *b)
+
+
+def uri(p):
+    return f"file://{quote(str(p))}"
+
+
+def center(r):
+    return r[0] + r[2] // 2, r[1] + r[3] // 2
+
+
+def bar(a, part):
+    """The middle of a part of the chooser's bar, once it's drawn at the window's full size."""
+    s = a.wait(lambda s: s["chooser"]["accept"][0] + s["chooser"]["accept"][2] == 1280 - 14, "the bar at full size")
+    return center(s["chooser"][part])
+
+
+@check
+def open_and_save_dialogs_for_other_programs(h):
+    fs = fresh_fs()
+    tree(fs, {"docs/a.txt": "a", "docs/b.png": png_bytes(4, 4), "docs/c.PNG": png_bytes(4, 4), "docs/sub/x.png": png_bytes(4, 4), "docs/notes.md": "# hi"})
+    docs = fs / "docs"
+    p = Portal(h)
+    try:
+        # Open: the filter shows pictures and folders, and switching it shows the rest.
+        a = p.ask("OpenFile", "Open a picture", multiple=("b", "true"), current_folder=ay(docs),
+                  filters=("a(sa(us))", 2, "Pictures", 2, 0, "*.png", 1, "image/jpeg", "All files", 1, 0, "*"))
+        s = a.wait(lambda s: s["dir"] == str(docs) and not s["loading"] and s["chooser"], "the chooser on docs")
+        assert s["names"] == ["sub", "b.png", "c.PNG"], s["names"]
+        assert s["chooser"]["filter"] == 0 and not s["chooser"]["can_accept"], s["chooser"]
+        assert not any(pl.split("|")[0] == "Trash" for pl in s["places"]), "no Trash in a chooser"
+        a.shot("chooser-open")
+        a.click(*bar(a, "filter_box"))
+        a.wait(lambda s: s["menu"], "the file-type list")
+        a.shot("chooser-filter-menu")
+        a.key("Down")
+        a.key("Return")
+        s = a.wait(lambda s: s["chooser"]["filter"] == 1 and s["names"] == ["sub", "a.txt", "b.png", "c.PNG", "notes.md"], "every file")
+        a.key("Down", "Down", "Down")
+        a.key("Down", mods=["shift"])
+        s = a.wait(lambda s: s["selected"] == ["b.png", "c.PNG"] and s["chooser"]["can_accept"], "two picked")
+        a.shot("chooser-open-picked")
+        a.key("Return")
+        code, r = p.answer()
+        assert code == 0 and r["uris"] == [uri(docs / "b.png"), uri(docs / "c.PNG")], (code, r)
+        assert r["current_filter"] == ["All files", [[0, "*"]]], r
+
+        # Escape cancels.
+        a = p.ask("OpenFile", "Open", current_folder=ay(docs))
+        a.wait(lambda s: s["dir"] == str(docs) and s["chooser"], "a second chooser")
+        a.key("Escape")
+        assert p.answer() == (1, {}), "cancelled"
+
+        # A folder opens on Enter, and Enter on a file picks it.
+        a = p.ask("OpenFile", "Open", current_folder=ay(docs))
+        a.wait(lambda s: s["dir"] == str(docs) and s["names"][0] == "sub", "the folder")
+        a.key("Down")
+        a.key("Return")
+        a.wait(lambda s: s["dir"] == str(docs / "sub") and s["names"] == ["x.png"], "into sub")
+        a.key("Down")
+        a.key("Return")
+        code, r = p.answer()
+        assert code == 0 and r["uris"] == [uri(docs / "sub/x.png")], (code, r)
+
+        # Folders: only folders show, and with none picked, it's the folder showing.
+        a = p.ask("OpenFile", "Pick a folder", directory=("b", "true"), current_folder=ay(docs))
+        s = a.wait(lambda s: s["dir"] == str(docs) and not s["loading"] and s["chooser"], "a folder chooser")
+        assert s["names"] == ["sub"], s["names"]
+        a.shot("chooser-folder")
+        a.click(*bar(a, "accept"))
+        code, r = p.answer()
+        assert code == 0 and r["uris"] == [uri(docs)], (code, r)
+
+        # Save: the name is ready to type over before its extension.
+        a = p.ask("SaveFile", "Save the report", current_folder=ay(docs), current_name=("s", "report.final.txt"), accept_label=("s", "_Export"))
+        s = a.wait(lambda s: s["dir"] == str(docs) and s["chooser"] and s["chooser"]["name_focused"], "a save chooser")
+        assert s["chooser"]["name"] == "report.final.txt", s["chooser"]
+        a.shot("chooser-save")
+        a.type("summary")
+        a.wait(lambda s: s["chooser"]["name"] == "summary.txt", "typed over the stem")
+        a.key("Return")
+        code, r = p.answer()
+        assert code == 0 and r["uris"] == [uri(docs / "summary.txt")], (code, r)
+        assert not (docs / "summary.txt").exists(), "the program saves it, not Gannet"
+
+        # Saving over a file asks first, and Cancel is the default.
+        a = p.ask("SaveFile", "Save", current_folder=ay(docs), current_name=("s", "a.txt"))
+        a.wait(lambda s: s["chooser"] and s["chooser"]["name"] == "a.txt" and not s["loading"], "a save chooser on a.txt")
+        a.key("Return")
+        a.wait(lambda s: s["dialog"] == "replace", "asked about replacing")
+        a.shot("chooser-replace")
+        a.key("Return")
+        a.wait(lambda s: s["dialog"] == "" and s["chooser"], "Enter kept it")
+        a.key("Return")
+        a.wait(lambda s: s["dialog"] == "replace", "asked again")
+        a.key("Left")
+        a.key("Return")
+        code, r = p.answer()
+        assert code == 0 and r["uris"] == [uri(docs / "a.txt")], (code, r)
+        assert (docs / "a.txt").read_text() == "a", "nothing written"
+
+        # A file clicked while saving gives its name, and a folder's name goes into it.
+        a = p.ask("SaveFile", "Save", current_folder=ay(docs), current_name=("s", "new.txt"))
+        s = a.wait(lambda s: s["chooser"] and not s["loading"] and s["names"], "a save chooser")
+        a.click(ROW_X, row_y(s["names"].index("notes.md")))
+        s = a.wait(lambda s: s["chooser"]["name"] == "notes.md" and not s["chooser"]["name_focused"], "the file's name")
+        a.key("Tab")
+        a.wait(lambda s: s["chooser"]["name_focused"], "Tab goes back to the name")
+        a.key("a", mods=["ctrl"])
+        a.type("sub")
+        a.key("Return")
+        s = a.wait(lambda s: s["dir"] == str(docs / "sub") and s["chooser"]["name"] == "new.txt", "into the folder, with the name back")
+        a.key("Return")
+        code, r = p.answer()
+        assert code == 0 and r["uris"] == [uri(docs / "sub/new.txt")], (code, r)
+
+        # Several files: pick a folder, and saving over one asks first.
+        names = ("aay", 2, 6, *b"a.txt\0", 8, *b"new.bin\0")
+        a = p.ask("SaveFiles", "Save attachments", current_folder=ay(docs), files=names)
+        s = a.wait(lambda s: s["dir"] == str(docs) and s["chooser"] and not s["loading"], "a chooser for several")
+        assert s["names"] == ["sub"] and s["chooser"]["can_accept"], s
+        a.shot("chooser-save-files")
+        a.key("Return")
+        a.wait(lambda s: s["dialog"] == "replace", "asked about a.txt")
+        a.key("Left")
+        a.key("Return")
+        code, r = p.answer()
+        assert code == 0 and r["uris"] == [uri(docs / "a.txt"), uri(docs / "new.bin")], (code, r)
+
+        # Closing the request closes the window.
+        a = p.ask("OpenFile", "Open", current_folder=ay(docs))
+        a.wait(lambda s: s["chooser"], "a chooser")
+        r = p.bus.call("call", PORTAL[0], f"/org/freedesktop/portal/desktop/request/1_1/t{p.n}", "org.freedesktop.impl.portal.Request", "Close")
+        assert r.returncode == 0, r.stderr
+        code, _ = p.answer()
+        assert code == 2, code
+    finally:
+        p.stop()
+
+
 @check
 def long_copies_show_progress_and_cancel(h):
     fs = fresh_fs()
