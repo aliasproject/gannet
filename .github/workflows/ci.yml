@@ -15,7 +15,7 @@ concurrency:
 env:
   # Clippy warnings already on main. The clippy job fails only when there are more than
   # this; lower it when one is fixed (the job leaves a notice when there are fewer).
-  CLIPPY_BASELINE: 1
+  CLIPPY_BASELINE: 0
 
 jobs:
   # Each job runs in an archlinux container started by hand rather than with `container:`, so
