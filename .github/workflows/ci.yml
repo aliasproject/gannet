@@ -15,6 +15,8 @@ concurrency:
 env:
   # Clippy warnings already on main. The clippy job fails only when there are more than
   # this; lower it when one is fixed (the job leaves a notice when there are fewer).
+  # The image is archlinux:latest, as the aliasOS package is built on current Arch, so a new
+  # Rust release with new lints can fail a PR that didn't touch them. Fix those, or raise this.
   CLIPPY_BASELINE: 0
 
 jobs:
@@ -30,6 +32,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/cache@v4
         with:
           path: |
@@ -52,6 +56,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - uses: actions/cache@v4
         with:
           path: |
