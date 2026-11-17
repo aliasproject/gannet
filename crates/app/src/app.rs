@@ -169,6 +169,9 @@ pub struct JobView {
     pub started: Instant,
     kind: JobKind,
     selection_epoch: u64,
+    /// `App::change_epoch` when it started, so an undo that finishes after something new has
+    /// begun doesn't offer a redo.
+    change_epoch: u64,
 }
 
 /// What a finished job means for undo and redo.
@@ -515,6 +518,8 @@ pub struct App {
     pending_select: Vec<Vec<u8>>,
     /// Goes up whenever the user changes the selection, so a finishing job can tell.
     selection_epoch: u64,
+    /// Counts the changes started, each of which clears redo.
+    change_epoch: u64,
     edit_gen: u64,
     paste_in_flight: bool,
     /// When an unasked-for dialog appeared. Input right after that was meant for
@@ -650,6 +655,7 @@ impl App {
             redo: Vec::new(),
             pending_select: Vec::new(),
             selection_epoch: 0,
+            change_epoch: 0,
             edit_gen: 0,
             paste_in_flight: false,
             dialog_guard: None,
@@ -1701,9 +1707,10 @@ impl App {
         };
         if matches!(kind, JobKind::Change | JobKind::EndsUndo) {
             self.redo.clear();
+            self.change_epoch += 1;
         }
         let job = self.engine.start(r);
-        self.jobs.push(JobView { job, started: Instant::now(), kind, selection_epoch: self.selection_epoch });
+        self.jobs.push(JobView { job, started: Instant::now(), kind, selection_epoch: self.selection_epoch, change_epoch: self.change_epoch });
     }
 
     /// Goes to the folder the row under the cursor is in, or the first one selected, with it
@@ -1842,6 +1849,7 @@ impl App {
                     self.notice(format!("Stopped: {}", v.job.label));
                 }
                 let kind = view.as_ref().map(|v| v.kind);
+                let changed_since = view.as_ref().is_some_and(|v| v.change_epoch != self.change_epoch);
                 if let (Some(k @ (JobKind::Undo | JobKind::Redo)), Some((done, total))) = (kind, o.reversed)
                     && done < total
                     && total > 1
@@ -1851,6 +1859,8 @@ impl App {
                     self.notice(format!("{verb} {done} of {total} changes. The others were left as they were"));
                 }
                 match (kind, o.undo) {
+                    // Something new began while it ran, and that clears redo.
+                    (Some(JobKind::Undo), Some(_)) if changed_since => {}
                     (Some(JobKind::Undo), Some(u)) => push_capped(&mut self.redo, u),
                     (_, Some(u)) => push_capped(&mut self.undo, u),
                     (Some(JobKind::EndsUndo), None) => {
@@ -5909,6 +5919,12 @@ mod tests {
         r.idle();
         assert_eq!((r.app.undo.len(), r.app.redo.len()), (1, 0), "something new clears redo");
         assert!(r.app.context_items().iter().any(|m| m.label == "Redo" && !m.enabled));
+        // An undo still running when something new starts doesn't offer a redo when it ends.
+        r.ctrl(k::KEY_z);
+        r.app.start_job(Request::NewFolder { parent: r.work(), name: "third".into() });
+        r.idle();
+        assert!(!r.work().join("other").exists() && r.work().join("third").is_dir());
+        assert_eq!(r.app.redo.len(), 0, "something new started during the undo clears redo");
     }
 
     #[test]
