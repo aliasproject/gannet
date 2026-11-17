@@ -12,9 +12,9 @@
 //! - Delete and cross-disk move stop at mount points inside a folder: another disk's
 //!   contents are never removed because it happens to be mounted there.
 //! - A cross-disk move syncs each copy to disk before removing its source.
-//! - Undo and redo act only on the item a change left behind, told apart by its disk
-//!   and inode, never on something else that has since taken its name. Neither ever
-//!   deletes anything but an empty folder that the change made.
+//! - Undo and redo act only on the item a change left behind, told apart by its disk,
+//!   inode, birth time and inode generation, never on something else that has since taken
+//!   its name. Neither ever deletes anything but an empty folder that the change made.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -73,23 +73,73 @@ pub enum Step {
     Trashed { item: Trashed, at: Stamp },
 }
 
-/// Where a change left an item, and which item it was: its disk and inode.
+/// Where a change left an item, and which item it was: its disk, inode and birth time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stamp {
     pub path: PathBuf,
+    pub id: Identity,
+}
+
+/// Which item is at a path. ext4 often gives a new file the inode number of one just deleted,
+/// and its clock is coarse enough that both can have the same birth time too. The inode's
+/// generation number, which ext4 and btrfs set afresh for each new inode, tells them apart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Identity {
     pub dev: u64,
     pub ino: u64,
+    pub born: Option<(i64, u32)>,
+    pub generation: Option<u32>,
+}
+
+impl Identity {
+    /// Whether `o` is the same item. Each part is compared only where both sides have it: a
+    /// file can become unreadable after the change, and that doesn't make it another file.
+    fn same_item(&self, o: &Identity) -> bool {
+        fn same<T: PartialEq>(a: Option<T>, b: Option<T>) -> bool {
+            a.zip(b).is_none_or(|(a, b)| a == b)
+        }
+        self.dev == o.dev && self.ino == o.ino && same(self.born, o.born) && same(self.generation, o.generation)
+    }
+
+    fn of(path: &Path) -> io::Result<Identity> {
+        let st = match statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE | StatxFlags::INO | StatxFlags::BTIME) {
+            Ok(st) => st,
+            // Some sandboxes refuse statx; plain stat still says which inode it is.
+            Err(Errno::NOSYS | Errno::PERM) => {
+                let m = fs::symlink_metadata(path)?;
+                return Ok(Identity { dev: m.dev(), ino: m.ino(), born: None, generation: None });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let dev = rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor);
+        let born = StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::BTIME).then_some((st.stx_btime.tv_sec, st.stx_btime.tv_nsec));
+        // Only files and folders are opened to ask: opening a device or a pipe can do things.
+        let kind = u32::from(st.stx_mode) & libc::S_IFMT;
+        let generation = (kind == libc::S_IFREG || kind == libc::S_IFDIR).then(|| generation(path)).flatten();
+        Ok(Identity { dev, ino: st.stx_ino, born, generation })
+    }
+}
+
+/// The inode's generation number, where the filesystem has one and the item can be opened.
+fn generation(path: &Path) -> Option<u32> {
+    use rustix::fs::{Mode, OFlags, open};
+    let fd = open(path, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC, Mode::empty()).ok()?;
+    // ext4, btrfs and xfs write an int, though the request is sized for a long, which another
+    // driver might write in full. Room for either, and the int is the first.
+    let mut g: [libc::c_int; 2] = [0; 2];
+    let r = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::FS_IOC_GETVERSION, g.as_mut_ptr()) };
+    (r == 0).then_some(g[0] as u32)
 }
 
 impl Stamp {
     pub fn of(path: &Path) -> Option<Stamp> {
-        fs::symlink_metadata(path).ok().map(|m| Stamp { path: path.to_path_buf(), dev: m.dev(), ino: m.ino() })
+        Identity::of(path).ok().map(|id| Stamp { path: path.to_path_buf(), id })
     }
 
     /// Why this item can't be undone or redone now, if it can't.
     fn changed(&self) -> Option<&'static str> {
-        match fs::symlink_metadata(&self.path) {
-            Ok(m) if m.dev() == self.dev && m.ino() == self.ino => None,
+        match Identity::of(&self.path) {
+            Ok(id) if id.same_item(&self.id) => None,
             Ok(_) => Some("Something else has this name now, so it was left alone"),
             Err(_) => Some("This isn't where the change left it any more, so it was left alone"),
         }
@@ -2591,6 +2641,20 @@ mod tests {
             reverse(&e, &rx, redone.outcome.undo);
             assert_eq!(fs::read(&a).unwrap(), b"1", "{what}");
         }
+    }
+
+    #[test]
+    fn an_item_is_the_same_only_if_every_part_both_sides_know_matches() {
+        let id = Identity { dev: 1, ino: 2, born: Some((3, 4)), generation: Some(5) };
+        assert!(id.same_item(&id));
+        // A part one side doesn't know isn't compared.
+        assert!(id.same_item(&Identity { generation: None, ..id }));
+        assert!(Identity { born: None, ..id }.same_item(&id));
+        // A part both know must match: ext4 reuses inode numbers, and its clock is coarse.
+        assert!(!id.same_item(&Identity { generation: Some(6), ..id }));
+        assert!(!id.same_item(&Identity { born: Some((3, 5)), ..id }));
+        assert!(!id.same_item(&Identity { ino: 9, ..id }));
+        assert!(!id.same_item(&Identity { dev: 9, ..id }));
     }
 
     #[test]
