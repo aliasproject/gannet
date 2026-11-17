@@ -83,7 +83,7 @@ pub struct Stamp {
 /// Which item is at a path. ext4 often gives a new file the inode number of one just deleted,
 /// and its clock is coarse enough that both can have the same birth time too. The inode's
 /// generation number, which ext4 and btrfs set afresh for each new inode, tells them apart.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Identity {
     pub dev: u64,
     pub ino: u64,
@@ -91,20 +91,26 @@ pub struct Identity {
     pub generation: Option<u32>,
 }
 
-/// Each part is compared only where both sides have it: a file can become unreadable after
-/// the change, and that isn't another file.
-impl PartialEq for Identity {
-    fn eq(&self, o: &Self) -> bool {
+impl Identity {
+    /// Whether `o` is the same item. Each part is compared only where both sides have it: a
+    /// file can become unreadable after the change, and that doesn't make it another file.
+    fn same_item(&self, o: &Identity) -> bool {
         fn same<T: PartialEq>(a: Option<T>, b: Option<T>) -> bool {
             a.zip(b).is_none_or(|(a, b)| a == b)
         }
         self.dev == o.dev && self.ino == o.ino && same(self.born, o.born) && same(self.generation, o.generation)
     }
-}
 
-impl Identity {
     fn of(path: &Path) -> io::Result<Identity> {
-        let st = statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE | StatxFlags::INO | StatxFlags::BTIME)?;
+        let st = match statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE | StatxFlags::INO | StatxFlags::BTIME) {
+            Ok(st) => st,
+            // Some sandboxes refuse statx; plain stat still says which inode it is.
+            Err(e) if e == rustix::io::Errno::NOSYS || e == rustix::io::Errno::PERM => {
+                let m = fs::symlink_metadata(path)?;
+                return Ok(Identity { dev: m.dev(), ino: m.ino(), born: None, generation: None });
+            }
+            Err(e) => return Err(e.into()),
+        };
         let dev = rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor);
         let born = StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::BTIME).then_some((st.stx_btime.tv_sec, st.stx_btime.tv_nsec));
         // Only files and folders are opened to ask: opening a device or a pipe can do things.
@@ -118,10 +124,11 @@ impl Identity {
 fn generation(path: &Path) -> Option<u32> {
     use rustix::fs::{Mode, OFlags, open};
     let fd = open(path, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC, Mode::empty()).ok()?;
-    let mut g: libc::c_int = 0;
-    // The kernel writes an int, whatever the request's size says.
-    let r = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::FS_IOC_GETVERSION, &mut g) };
-    (r == 0).then_some(g as u32)
+    // ext4, btrfs and xfs write an int, though the request is sized for a long, which another
+    // driver might write in full. Room for either, and the int is the first.
+    let mut g: [libc::c_int; 2] = [0; 2];
+    let r = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::FS_IOC_GETVERSION, g.as_mut_ptr()) };
+    (r == 0).then_some(g[0] as u32)
 }
 
 impl Stamp {
@@ -132,7 +139,7 @@ impl Stamp {
     /// Why this item can't be undone or redone now, if it can't.
     fn changed(&self) -> Option<&'static str> {
         match Identity::of(&self.path) {
-            Ok(id) if id == self.id => None,
+            Ok(id) if id.same_item(&self.id) => None,
             Ok(_) => Some("Something else has this name now, so it was left alone"),
             Err(_) => Some("This isn't where the change left it any more, so it was left alone"),
         }
@@ -2634,6 +2641,20 @@ mod tests {
             reverse(&e, &rx, redone.outcome.undo);
             assert_eq!(fs::read(&a).unwrap(), b"1", "{what}");
         }
+    }
+
+    #[test]
+    fn an_item_is_the_same_only_if_every_part_both_sides_know_matches() {
+        let id = Identity { dev: 1, ino: 2, born: Some((3, 4)), generation: Some(5) };
+        assert!(id.same_item(&id));
+        // A part one side doesn't know isn't compared.
+        assert!(id.same_item(&Identity { generation: None, ..id }));
+        assert!(Identity { born: None, ..id }.same_item(&id));
+        // A part both know must match: ext4 reuses inode numbers, and its clock is coarse.
+        assert!(!id.same_item(&Identity { generation: Some(6), ..id }));
+        assert!(!id.same_item(&Identity { born: Some((3, 5)), ..id }));
+        assert!(!id.same_item(&Identity { ino: 9, ..id }));
+        assert!(!id.same_item(&Identity { dev: 9, ..id }));
     }
 
     #[test]
