@@ -179,7 +179,7 @@ pub struct JobView {
 enum JobKind {
     /// Something new: what it did goes on the undo list.
     Change,
-    /// Deleting for good, or a copy or link that left no undo (a merge, say): it can't be
+    /// Deleting for good, or a copy or link that left no undo (a copy that only merged, say): it can't be
     /// undone, and undoing something older right after would be a surprise. What a copy can
     /// undo still goes on the undo list.
     EndsUndo,
@@ -5943,8 +5943,15 @@ mod tests {
         r.app.start_job(Request::Copy { sources: vec![r.work().join("gone")], dest: r.work().join("sub") });
         r.idle();
         assert!(r.app.undo.is_empty(), "nothing older to undo after a change that can't be undone");
+        // The same for a link.
+        r.app.start_job(Request::Rename { from: r.work().join("b"), to_name: "c".into() });
+        r.idle();
+        assert_eq!(r.app.undo.len(), 1);
+        r.app.start_job(Request::Link { sources: vec![r.work().join("c")], dest: r.work().join("no-such-folder") });
+        r.idle();
+        assert!(r.app.undo.is_empty(), "a link that made nothing ends undo too");
         // A copy that can be undone goes on the list as usual.
-        r.app.start_job(Request::Copy { sources: vec![r.work().join("b")], dest: r.work().join("sub") });
+        r.app.start_job(Request::Copy { sources: vec![r.work().join("c")], dest: r.work().join("sub") });
         r.idle();
         assert_eq!(r.app.undo.len(), 1);
     }
