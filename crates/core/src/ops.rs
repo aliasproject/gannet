@@ -81,21 +81,47 @@ pub struct Stamp {
 }
 
 /// Which item is at a path. ext4 often gives a new file the inode number of one just deleted,
-/// so the birth time tells them apart, where the filesystem keeps one.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// and its clock is coarse enough that both can have the same birth time too. The inode's
+/// generation number, which ext4 and btrfs set afresh for each new inode, tells them apart.
+#[derive(Clone, Copy, Debug)]
 pub struct Identity {
     pub dev: u64,
     pub ino: u64,
     pub born: Option<(i64, u32)>,
+    pub generation: Option<u32>,
+}
+
+/// Each part is compared only where both sides have it: a file can become unreadable after
+/// the change, and that isn't another file.
+impl PartialEq for Identity {
+    fn eq(&self, o: &Self) -> bool {
+        fn same<T: PartialEq>(a: Option<T>, b: Option<T>) -> bool {
+            a.zip(b).is_none_or(|(a, b)| a == b)
+        }
+        self.dev == o.dev && self.ino == o.ino && same(self.born, o.born) && same(self.generation, o.generation)
+    }
 }
 
 impl Identity {
     fn of(path: &Path) -> io::Result<Identity> {
-        let st = statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::INO | StatxFlags::BTIME)?;
+        let st = statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE | StatxFlags::INO | StatxFlags::BTIME)?;
         let dev = rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor);
         let born = StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::BTIME).then_some((st.stx_btime.tv_sec, st.stx_btime.tv_nsec));
-        Ok(Identity { dev, ino: st.stx_ino, born })
+        // Only files and folders are opened to ask: opening a device or a pipe can do things.
+        let kind = u32::from(st.stx_mode) & libc::S_IFMT;
+        let generation = (kind == libc::S_IFREG || kind == libc::S_IFDIR).then(|| generation(path)).flatten();
+        Ok(Identity { dev, ino: st.stx_ino, born, generation })
     }
+}
+
+/// The inode's generation number, where the filesystem has one and the item can be opened.
+fn generation(path: &Path) -> Option<u32> {
+    use rustix::fs::{Mode, OFlags, open};
+    let fd = open(path, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC, Mode::empty()).ok()?;
+    let mut g: libc::c_int = 0;
+    // The kernel writes an int, whatever the request's size says.
+    let r = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&fd), libc::FS_IOC_GETVERSION, &mut g) };
+    (r == 0).then_some(g as u32)
 }
 
 impl Stamp {
