@@ -179,7 +179,9 @@ pub struct JobView {
 enum JobKind {
     /// Something new: what it did goes on the undo list.
     Change,
-    /// Deleting for good can't be undone, and undoing something older right after would be a surprise.
+    /// Deleting for good, or a copy or link that left no undo (a merge, say): it can't be
+    /// undone, and undoing something older right after would be a surprise. What a copy can
+    /// undo still goes on the undo list.
     EndsUndo,
     /// What it reversed goes on the redo list.
     Undo,
@@ -1702,7 +1704,7 @@ impl App {
         let kind = match r {
             Request::Undo(_) => JobKind::Undo,
             Request::Redo(_) => JobKind::Redo,
-            Request::Delete { .. } => JobKind::EndsUndo,
+            Request::Delete { .. } | Request::Copy { .. } | Request::Link { .. } => JobKind::EndsUndo,
             _ => JobKind::Change,
         };
         if matches!(kind, JobKind::Change | JobKind::EndsUndo) {
@@ -5925,6 +5927,26 @@ mod tests {
         r.idle();
         assert!(!r.work().join("other").exists() && r.work().join("third").is_dir());
         assert_eq!(r.app.redo.len(), 0, "something new started during the undo clears redo");
+    }
+
+    #[test]
+    fn a_copy_or_link_with_no_undo_ends_the_older_undo() {
+        let mut r = Rig::new("ends-undo");
+        fs::write(r.work().join("a"), "").unwrap();
+        fs::create_dir(r.work().join("sub")).unwrap();
+        r.open(r.work());
+        r.app.start_job(Request::Rename { from: r.work().join("a"), to_name: "b".into() });
+        r.idle();
+        assert_eq!(r.app.undo.len(), 1);
+        // A copy that made nothing (here its source is gone) leaves no undo, so Ctrl+Z right
+        // after mustn't rename b back. A merge is the same.
+        r.app.start_job(Request::Copy { sources: vec![r.work().join("gone")], dest: r.work().join("sub") });
+        r.idle();
+        assert!(r.app.undo.is_empty(), "nothing older to undo after a change that can't be undone");
+        // A copy that can be undone goes on the list as usual.
+        r.app.start_job(Request::Copy { sources: vec![r.work().join("b")], dest: r.work().join("sub") });
+        r.idle();
+        assert_eq!(r.app.undo.len(), 1);
     }
 
     #[test]
