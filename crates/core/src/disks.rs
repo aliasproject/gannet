@@ -578,8 +578,8 @@ mod tests {
         assert_eq!(disk_error(err("org.freedesktop.DBus.Error.UnknownObject", ""), false), DiskError::Changed);
     }
 
-    /// The stand-in udisks2 (`examples/udisks-standin.rs`) on a bus of its own, which `cargo
-    /// test` builds beside the tests.
+    /// The stand-in udisks2 (`examples/udisks-standin.rs`) on a bus of its own, which
+    /// scripts/test.sh builds before the tests.
     struct StandIn {
         child: std::process::Child,
         input: std::process::ChildStdin,
@@ -591,7 +591,9 @@ mod tests {
     impl StandIn {
         fn start() -> Self {
             use std::io::BufRead;
-            let exe = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples/udisks-standin");
+            // scripts/test.sh says where it built it. Without that, it's beside the tests, where
+            // cargo before 1.100 put them.
+            let exe = std::env::var_os("GANNET_UDISKS_STANDIN").map_or_else(|| std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples/udisks-standin"), std::path::PathBuf::from);
             let bus = crate::testutil::PrivateBus::start();
             let root = crate::testutil::Scratch::new();
             let mut child = std::process::Command::new(&exe).args([&bus.address, root.path().to_str().unwrap()]).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap_or_else(|e| panic!("{}: {e}", exe.display()));

@@ -4,3 +4,4 @@
 /.tmp
 bench/bakeoff/rawshm/Cargo.lock
 /bench/harness/vptr/Cargo.lock
+/.ci

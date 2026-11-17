@@ -484,7 +484,7 @@ impl Wl {
             self.state.inputs.push_back(Input::OutDragEnded);
             return;
         };
-        let icon_surface = icon.as_ref().and_then(|_| self.state.compositor.as_ref()).map(|c| c.create_surface(&self.qh, ()));
+        let icon_surface = icon.as_ref().and(self.state.compositor.as_ref()).map(|c| c.create_surface(&self.qh, ()));
         let source = m.create_data_source(&self.qh, ());
         for (mime, _) in &offer.mimes {
             source.offer(mime.clone());
