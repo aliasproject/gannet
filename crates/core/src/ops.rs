@@ -73,23 +73,40 @@ pub enum Step {
     Trashed { item: Trashed, at: Stamp },
 }
 
-/// Where a change left an item, and which item it was: its disk and inode.
+/// Where a change left an item, and which item it was: its disk, inode and birth time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stamp {
     pub path: PathBuf,
+    pub id: Identity,
+}
+
+/// Which item is at a path. ext4 often gives a new file the inode number of one just deleted,
+/// so the birth time tells them apart, where the filesystem keeps one.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Identity {
     pub dev: u64,
     pub ino: u64,
+    pub born: Option<(i64, u32)>,
+}
+
+impl Identity {
+    fn of(path: &Path) -> io::Result<Identity> {
+        let st = statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::INO | StatxFlags::BTIME)?;
+        let dev = rustix::fs::makedev(st.stx_dev_major, st.stx_dev_minor);
+        let born = StatxFlags::from_bits_retain(st.stx_mask).contains(StatxFlags::BTIME).then_some((st.stx_btime.tv_sec, st.stx_btime.tv_nsec));
+        Ok(Identity { dev, ino: st.stx_ino, born })
+    }
 }
 
 impl Stamp {
     pub fn of(path: &Path) -> Option<Stamp> {
-        fs::symlink_metadata(path).ok().map(|m| Stamp { path: path.to_path_buf(), dev: m.dev(), ino: m.ino() })
+        Identity::of(path).ok().map(|id| Stamp { path: path.to_path_buf(), id })
     }
 
     /// Why this item can't be undone or redone now, if it can't.
     fn changed(&self) -> Option<&'static str> {
-        match fs::symlink_metadata(&self.path) {
-            Ok(m) if m.dev() == self.dev && m.ino() == self.ino => None,
+        match Identity::of(&self.path) {
+            Ok(id) if id == self.id => None,
             Ok(_) => Some("Something else has this name now, so it was left alone"),
             Err(_) => Some("This isn't where the change left it any more, so it was left alone"),
         }
