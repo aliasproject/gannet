@@ -12,9 +12,9 @@
 //! - Delete and cross-disk move stop at mount points inside a folder: another disk's
 //!   contents are never removed because it happens to be mounted there.
 //! - A cross-disk move syncs each copy to disk before removing its source.
-//! - Undo and redo act only on the item a change left behind, told apart by its disk
-//!   and inode, never on something else that has since taken its name. Neither ever
-//!   deletes anything but an empty folder that the change made.
+//! - Undo and redo act only on the item a change left behind, told apart by its disk,
+//!   inode, birth time and inode generation, never on something else that has since taken
+//!   its name. Neither ever deletes anything but an empty folder that the change made.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -105,7 +105,7 @@ impl Identity {
         let st = match statx(CWD, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE | StatxFlags::INO | StatxFlags::BTIME) {
             Ok(st) => st,
             // Some sandboxes refuse statx; plain stat still says which inode it is.
-            Err(e) if e == rustix::io::Errno::NOSYS || e == rustix::io::Errno::PERM => {
+            Err(Errno::NOSYS | Errno::PERM) => {
                 let m = fs::symlink_metadata(path)?;
                 return Ok(Identity { dev: m.dev(), ino: m.ino(), born: None, generation: None });
             }
