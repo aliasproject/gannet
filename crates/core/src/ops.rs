@@ -407,9 +407,10 @@ struct Run {
     sticky_files: Option<Answer>,
     sticky_folders: Option<Answer>,
     last_merged: bool,
-    /// The item a top-level Replace was to replace, so it isn't taken for the new one if
-    /// the Replace didn't happen.
-    last_replaced: Option<(u64, u64)>,
+    /// Whether a top-level Replace was asked for (`Some`) and went through (`Some(true)`), so
+    /// the item it was to replace isn't taken for the new one when it didn't. Not by inode:
+    /// a hard link of the same file can be what it replaces.
+    last_replaced: Option<bool>,
     top_dev: u64,
     /// What this job changed, for its undo.
     steps: Vec<Step>,
@@ -811,7 +812,7 @@ impl Run {
         let replaced = self.last_replaced.take();
         let Some(target) = self.last_target.take() else { return };
         let Some(stamp) = Stamp::of(&target) else { return };
-        if replaced == Some((stamp.dev, stamp.ino)) {
+        if replaced == Some(false) {
             return;
         }
         // Undoing a merge would also take what was in the destination before, so it has no undo.
@@ -874,7 +875,7 @@ impl Run {
                     Choice::Replace if can_replace => {
                         replace = true;
                         if self.depth == 0 {
-                            self.last_replaced = Some((tmeta.dev(), tmeta.ino()));
+                            self.last_replaced = Some(false);
                         }
                     }
                     // The UI doesn't offer this; treat a stray answer as Skip.
@@ -969,10 +970,11 @@ impl Run {
     /// Once the new item is in place, the one it replaced is a step, so undo brings it back.
     /// Inside a merge it isn't: a merge has no undo, and the item stays in the Trash.
     fn kept_replaced(&mut self, t: Trashed) {
-        if self.depth == 0
-            && let Some(at) = Stamp::of(&t.file)
-        {
-            self.steps.push(Step::Trashed { item: t.clone(), at });
+        if self.depth == 0 {
+            self.last_replaced = Some(true);
+            if let Some(at) = Stamp::of(&t.file) {
+                self.steps.push(Step::Trashed { item: t.clone(), at });
+            }
         }
         self.trashed.push(t);
     }
@@ -2313,6 +2315,13 @@ mod tests {
         assert!(done.errors.is_empty());
         assert!(!a.exists());
         assert!(d.join("a").exists());
+        // The new link is in place, and undo moves it back and brings the old one back, though
+        // both are the same file.
+        assert_eq!(done.outcome.created, vec![d.join("a")]);
+        let back = reverse(&e, &rx, done.outcome.undo);
+        assert!(back.errors.is_empty(), "{:?}", back.errors);
+        assert!(a.exists() && d.join("a").exists());
+        assert_eq!(back.outcome.reversed, Some((2, 2)));
     }
 
     #[test]
