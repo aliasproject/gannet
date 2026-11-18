@@ -200,6 +200,15 @@ in folder", it needs `WAYLAND_DISPLAY` in the environment D-Bus gives services. 
 sits over the program's window as its child where the compositor supports xdg-foreign, and
 its app ID is `com.aliasproject.Gannet.Chooser` for window rules.
 
+## Set as background
+
+Right-click a picture and choose Set as background. Gannet asks xdg-desktop-portal's
+Wallpaper portal, so the desktop sets it its own way, and the first time the portal may ask
+whether Gannet is allowed to. The item only shows where the portal can do it: GNOME's and KDE's
+portals can, and so can aliasOS's once it has its Wallpaper portal backend. Elsewhere, such as
+on sway with only the GTK and wlr portals, it stays hidden rather than doing nothing. It shows
+up without restarting Gannet once the portal starts with one that can.
+
 ## Recent
 
 Recent in the sidebar lists the files you've used lately, newest first, with the folder each

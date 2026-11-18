@@ -18,6 +18,7 @@ mod preview_window;
 mod service;
 mod text;
 mod tools;
+mod wallpaper;
 mod wl;
 
 use std::ffi::OsString;
@@ -333,6 +334,14 @@ fn main() {
                     let address = gannet_core::bus::system_address(std::env::var("DBUS_SYSTEM_BUS_ADDRESS").ok().as_deref());
                     app.system_bus = Some(address.clone());
                     drives::watch(hub.clone(), address);
+                }
+                // Only a file manager window offers "Set as background".
+                if !app.viewer && app.chooser.is_none() {
+                    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+                    if let Some(address) = gannet_core::bus::session_address(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(), runtime.as_deref()) {
+                        app.session_bus = Some(address.clone());
+                        wallpaper::watch(hub.clone(), address);
+                    }
                 }
             }
             let mut missing = app.text.take_missing();
@@ -703,7 +712,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"chooser\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"chooser\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -719,6 +728,7 @@ mod bench {
             a.scroll,
             list(a.notices.iter().cloned()),
             a.menu.is_some(),
+            list(a.menu.iter().flat_map(|m| m.items.iter().map(|i| i.label.to_string()))),
             a.load_error.as_ref().map_or_else(|| "null".to_string(), |e| esc(e)),
             a.colors.base,
             a.history.can_go_back(),
