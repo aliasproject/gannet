@@ -205,9 +205,9 @@ its app ID is `com.aliasproject.Gannet.Chooser` for window rules.
 Right-click a picture and choose Set as background. Gannet asks xdg-desktop-portal's
 Wallpaper portal, so the desktop sets it its own way, and the first time the portal may ask
 whether Gannet is allowed to. The item only shows where the portal can do it: GNOME's and KDE's
-portals can, and so can aliasOS's once it has its Wallpaper portal backend. Elsewhere, such as on sway with only the GTK and wlr portals,
-it stays hidden rather than doing nothing. It shows up without restarting Gannet once the portal
-starts with one that can.
+portals can, and so can aliasOS's once it has its Wallpaper portal backend. Elsewhere, such as
+on sway with only the GTK and wlr portals, it stays hidden rather than doing nothing. It shows
+up without restarting Gannet once the portal starts with one that can.
 
 ## Recent
 
