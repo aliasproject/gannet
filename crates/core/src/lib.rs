@@ -21,6 +21,7 @@ pub mod thumbnailers;
 pub mod time;
 pub mod trash;
 pub mod uri;
+pub mod wallpaper;
 pub mod watch;
 pub mod webdrop;
 

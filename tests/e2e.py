@@ -1046,6 +1046,49 @@ def show_in_folder_starts_the_service_and_opens_the_items_selected(h):
         bus.stop()
 
 
+@check
+def set_as_background_goes_through_the_desktop_portal(h):
+    fs = fresh_fs()
+    (fs / "dl").mkdir()
+    for name in ("sunset.png", "fail.png"):
+        (fs / "dl" / name).write_bytes(png_bytes(8, 8))
+    (fs / "dl/notes.txt").write_text("x")
+    log = SCRATCH / "wallpaper.log"
+    log.unlink(missing_ok=True)
+    # The bus starts the stand-in portal when Gannet first asks it, as a desktop's starts the real one.
+    service = f"[D-BUS Service]\nName=org.freedesktop.portal.Desktop\nExec=/usr/bin/python3 -B {ROOT / 'tests/wallpaper_portal.py'} {log}\n"
+    bus = PrivateBus({"org.freedesktop.portal.Desktop.service": service})
+    try:
+        a = App(h, fs / "dl", extra_env={"DBUS_SESSION_BUS_ADDRESS": bus.address})
+        a.wait(lambda s: s["names"] == ["fail.png", "notes.txt", "sunset.png"], "listed")
+
+        def menu_on(row):
+            a.click(ROW_X, row_y(row), 0x111)
+            return a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+
+        # Only a picture has it, and only once the portal has said it can.
+        deadline = time.monotonic() + 10
+        while "Set as background" not in (items := menu_on(2)):
+            assert time.monotonic() < deadline, f"never offered for a picture: {items}"
+            a.key("Escape")
+            a.wait(lambda s: not s["menu"], "the menu closes")
+            time.sleep(0.2)
+        assert items.index("Set as background") == items.index("Preview") + 1, items
+        a.shot("set-as-background-menu")
+        a.key("Down", "Down", "Down", "Return")
+        a.wait(lambda s: not s["menu"], "chosen")
+        a.wait(lambda s: log.exists() and log.read_text().splitlines() == [str(fs / "dl/sunset.png")], "the portal was handed the picture")
+        assert a.state()["notices"] == []
+        assert "Set as background" not in menu_on(1), "not for a text file"
+        a.key("Escape")
+        menu_on(0)
+        a.key("Down", "Down", "Down", "Return")
+        a.wait(lambda s: s["notices"] == ["Couldn't set “fail.png” as the background"], "a refusal is shown")
+        a.close()
+    finally:
+        bus.stop()
+
+
 PORTAL = ["org.freedesktop.impl.portal.desktop.gannet", "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser"]
 
 

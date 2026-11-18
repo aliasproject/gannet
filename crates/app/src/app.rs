@@ -81,6 +81,8 @@ pub enum Msg {
     /// A mount, unlock, unmount or eject has finished: where it's mounted, for the first two.
     DiskDone { volume: Volume, doing: Doing, result: Result<Option<PathBuf>, DiskError> },
     DesktopDark(bool),
+    /// Whether the desktop portal can set the background now.
+    CanSetBackground(bool),
     Notice(String),
     Op(ops::Event),
     /// `data` is `None` if it was too big to trust.
@@ -396,6 +398,8 @@ pub enum Action {
     EmptyTrash,
     /// Goes to the folder a recent file is in, with it selected.
     ShowInFolder,
+    /// Makes the one picture selected the desktop background.
+    SetBackground,
     /// For the drive whose menu it is.
     OpenDrive,
     Unmount,
@@ -489,6 +493,10 @@ pub struct App {
     standard_places: Vec<Place>,
     /// Where the system bus is, for udisks2. `None` until drives are being watched.
     pub system_bus: Option<String>,
+    /// Where the session bus is, for the desktop portal. `None` until it's being watched.
+    pub session_bus: Option<String>,
+    /// Whether the desktop portal can set the background, which "Set as background" needs.
+    pub can_set_background: bool,
     /// The drives udisks2 reported last.
     pub volumes: Vec<Volume>,
     /// The drive a sidebar menu is open for.
@@ -639,6 +647,8 @@ impl App {
             standard_places: places.iter().filter(|p| p.kind != PlaceKind::Disk).cloned().collect(),
             places,
             system_bus: None,
+            session_bus: None,
+            can_set_background: false,
             volumes: Vec::new(),
             drive_menu: None,
             eject_pressed: None,
@@ -1193,6 +1203,7 @@ impl App {
                     self.set_colors(gannet_core::theme::builtin(dark), Source::Desktop);
                 }
             }
+            Msg::CanSetBackground(can) => self.can_set_background = can,
             Msg::Notice(text) => self.notice(text),
             Msg::Op(e) => self.on_op(e),
             Msg::Clipboard(data, mime, Paste::Files { dest }) => {
@@ -1471,6 +1482,7 @@ impl App {
             Action::Restore => self.restore_selection(),
             Action::ChooseFilter(i) => self.choose_filter(i),
             Action::ShowInFolder => self.show_in_folder(),
+            Action::SetBackground => self.set_background(),
             Action::EmptyTrash => self.ask_empty_trash(),
         }
     }
@@ -2332,7 +2344,35 @@ impl App {
         Some(Rect::new(l.sidebar.right() - self.px(7.0) - w, self.place_top(i), w, self.px(30.0)))
     }
 
+    /// The list's menu, with "Set as background" after Preview when it applies.
     fn context_items(&self) -> Vec<MenuItem> {
+        let mut items = self.view_menu_items();
+        if self.background_picture().is_some() {
+            let at = items.iter().position(|m| m.action == Action::Preview).map_or(items.len(), |p| p + 1);
+            items.insert(at, MenuItem { label: "Set as background", keys: "", action: Action::SetBackground, enabled: true });
+        }
+        items
+    }
+
+    /// The picture "Set as background" would use: the one file selected, if it's a picture, in
+    /// a folder or Recent, and only where the desktop portal can set the background. Never in a
+    /// chooser, or the Trash, whose files have to be restored first.
+    fn background_picture(&self) -> Option<PathBuf> {
+        if !self.can_set_background || self.session_bus.is_none() || self.chooser.is_some() || self.sel_count != 1 || self.in_trash() {
+            return None;
+        }
+        let l = self.listing.as_ref()?;
+        let id = *self.selected_ids().first()?;
+        let picture = matches!(l.kind(id), Kind::File | Kind::Link) && crate::icons::icon_for_name(l.name(id)) == crate::icons::Icon::Image;
+        picture.then(|| l.path(id))
+    }
+
+    fn set_background(&mut self) {
+        let (Some(path), Some(address)) = (self.background_picture(), self.session_bus.clone()) else { return };
+        crate::wallpaper::set(self.hub.clone(), address, path);
+    }
+
+    fn view_menu_items(&self) -> Vec<MenuItem> {
         if self.chooser.is_some() {
             return self.chooser_menu_items();
         }
@@ -6830,6 +6870,70 @@ mod tests {
             r.key(k::KEY_Delete, "");
             r.idle();
         }
+    }
+
+    fn menu_has_set_as_background(r: &mut Rig) -> bool {
+        r.app.context_items().iter().any(|m| m.action == Action::SetBackground)
+    }
+
+    #[test]
+    fn set_as_background_is_offered_for_one_picture_where_the_portal_can_do_it() {
+        let mut r = Rig::new("set-background");
+        fs::write(r.work().join("sunset.PNG"), "x").unwrap();
+        fs::write(r.work().join("notes.txt"), "x").unwrap();
+        fs::create_dir(r.work().join("pictures.png")).unwrap();
+        std::os::unix::fs::symlink("sunset.PNG", r.work().join("linked.png")).unwrap();
+        let w = r.work();
+        r.open(w);
+        r.select("sunset.PNG");
+        assert!(!menu_has_set_as_background(&mut r), "not until the portal is known to offer it");
+        r.app.session_bus = Some("unix:path=/nonexistent".into());
+        r.app.on_msg(Msg::CanSetBackground(true));
+        let items = r.app.context_items();
+        let labels: Vec<_> = items.iter().map(|m| m.label).collect();
+        let at = labels.iter().position(|&l| l == "Set as background").expect("offered for a picture");
+        assert_eq!(labels[at - 1], "Preview", "right after Preview");
+        r.select("linked.png");
+        assert!(menu_has_set_as_background(&mut r), "a link to a picture is a picture too");
+        for not_a_picture in ["notes.txt", "pictures.png"] {
+            r.select(not_a_picture);
+            assert!(!menu_has_set_as_background(&mut r), "{not_a_picture}");
+        }
+        r.app.select_all();
+        assert!(!menu_has_set_as_background(&mut r), "not for several files");
+        r.select("sunset.PNG");
+        r.app.on_msg(Msg::CanSetBackground(false));
+        assert!(!menu_has_set_as_background(&mut r), "the portal stopped offering it");
+        r.app.on_msg(Msg::CanSetBackground(true));
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        assert!(!menu_has_set_as_background(&mut r), "never in an Open or Save dialog");
+        assert!(!r.app.chooser_allows(Action::SetBackground));
+    }
+
+    #[test]
+    fn set_as_background_is_not_offered_in_the_trash() {
+        let mut r = Rig::new("set-background-trash");
+        trash_names(&mut r, &["sunset.png"]);
+        open_trash(&mut r);
+        r.app.session_bus = Some("unix:path=/nonexistent".into());
+        r.app.on_msg(Msg::CanSetBackground(true));
+        r.select("sunset.png");
+        assert!(!menu_has_set_as_background(&mut r));
+    }
+
+    #[test]
+    fn a_background_that_cant_be_set_says_so() {
+        let mut r = Rig::new("set-background-fails");
+        fs::write(r.work().join("sunset.png"), "x").unwrap();
+        let w = r.work();
+        r.open(w);
+        r.select("sunset.png");
+        // Nothing is listening there, so the portal can't be reached.
+        r.app.session_bus = Some(format!("unix:path={}", r.root.join("no-bus").display()));
+        r.app.on_msg(Msg::CanSetBackground(true));
+        r.app.action(Action::SetBackground);
+        r.pump_until("the notice", |a| !a.notices.is_empty());
+        assert_eq!(r.app.notices, ["Couldn't set “sunset.png” as the background"]);
     }
 
     fn open_trash(r: &mut Rig) {
