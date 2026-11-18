@@ -2363,7 +2363,7 @@ impl App {
         }
         let l = self.listing.as_ref()?;
         let id = *self.selected_ids().first()?;
-        let picture = matches!(l.kind(id), Kind::File | Kind::Link) && crate::icons::icon_for_name(l.name(id)) == crate::icons::Icon::Image;
+        let picture = matches!(l.kind(id), Kind::File | Kind::Link) && crate::icons::icon_for_name(l.name(id)) == crate::icons::Icon::Image && !is_raw_or_icon(l.name(id));
         picture.then(|| l.path(id))
     }
 
@@ -4197,6 +4197,12 @@ pub fn clean(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// Camera raw files and icons show as pictures, but desktops don't take them as a background.
+fn is_raw_or_icon(name: &[u8]) -> bool {
+    let ext = name.rsplit(|&b| b == b'.').next().unwrap_or_default().to_ascii_lowercase();
+    matches!(&ext[..], b"raw" | b"cr2" | b"nef" | b"ico")
 }
 
 /// Kind and name to an icon.
@@ -6881,6 +6887,8 @@ mod tests {
         let mut r = Rig::new("set-background");
         fs::write(r.work().join("sunset.PNG"), "x").unwrap();
         fs::write(r.work().join("notes.txt"), "x").unwrap();
+        fs::write(r.work().join("photo.CR2"), "x").unwrap();
+        fs::write(r.work().join("favicon.ico"), "x").unwrap();
         fs::create_dir(r.work().join("pictures.png")).unwrap();
         std::os::unix::fs::symlink("sunset.PNG", r.work().join("linked.png")).unwrap();
         let w = r.work();
@@ -6895,7 +6903,7 @@ mod tests {
         assert_eq!(labels[at - 1], "Preview", "right after Preview");
         r.select("linked.png");
         assert!(menu_has_set_as_background(&mut r), "a link to a picture is a picture too");
-        for not_a_picture in ["notes.txt", "pictures.png"] {
+        for not_a_picture in ["notes.txt", "pictures.png", "photo.CR2", "favicon.ico"] {
             r.select(not_a_picture);
             assert!(!menu_has_set_as_background(&mut r), "{not_a_picture}");
         }
