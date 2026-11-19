@@ -597,7 +597,10 @@ impl Ctx {
                 state(&path, "enabled", n.enabled);
                 state(&path, "sensitive", n.enabled);
             }
-            if o.selected != n.selected {
+            // A place is "selected" while the window is in it, which only marks it: announcing
+            // that would read out the sidebar each time the folder changes, while the keyboard
+            // is in the list. A screen reader asking still hears it.
+            if o.selected != n.selected && n.parent != a11y::SIDEBAR {
                 state(&path, "selected", n.selected);
             }
         }
@@ -608,10 +611,6 @@ impl Ctx {
             }
             for (i, id) in n.children.iter().enumerate().filter(|(_, id)| !o.children.contains(id)) {
                 self.event(&sidebar, OBJECT_EVENT, "ChildrenChanged", ("add", i as i32), Variant::from(self.fixed_ref(*id)));
-            }
-            let picked = |s: &Snapshot, kids: &[u64]| kids.iter().filter(|&&c| s.get(c).is_some_and(|c| c.selected)).copied().collect::<Vec<_>>();
-            if picked(old, &o.children) != picked(new, &n.children) {
-                self.event(&sidebar, OBJECT_EVENT, "SelectionChanged", ("", 0), Variant::from(0i32));
             }
         }
 

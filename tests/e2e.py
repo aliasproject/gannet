@@ -1212,6 +1212,17 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         assert sr.ask(f"select_place {places.index('Home')}") is True
         a.wait(lambda s: s["dir"] == str(SCRATCH / "client/home"), "home")
 
+        # Leaving a place moves the sidebar's mark, which isn't announced: the keyboard is in
+        # the list, and a screen reader would read out the sidebar on every Back.
+        sr.until("tree", lambda t: t["frame"] == "home - Gannet", "home's name")
+        sr.ask("events")
+        a.key("Left", mods=("alt",))
+        a.wait(lambda s: s["dir"] == str(fs / "docs"), "back from home")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:property-change:accessible-name" for x in e), "the window's new name is heard")
+        time.sleep(0.3)
+        heard += sr.ask("events")
+        assert not [x for x in heard if x["source"] in places], f"the sidebar was announced: {heard}"
+
         # The registry starting again forgets every app: the window joins it again.
         sr.stop_registry()
         sr.start_registry()
