@@ -106,6 +106,8 @@ pub enum Msg {
     Dropped(Dropped),
     DragSource { drag: u64, facts: Option<(u64, bool)> },
     DragDevice { drag: u64, path: PathBuf, device: Option<u64> },
+    /// A screen reader asked for something.
+    A11y(crate::a11y::Act),
 }
 
 #[derive(Clone)]
@@ -555,7 +557,7 @@ pub struct App {
     pub mods_now: Mods,
     /// Whether this window has the keyboard, so `mods_now` is worth believing during a drag
     /// from another window. Many compositors keep the keyboard from a window during one.
-    has_keyboard: bool,
+    pub(crate) has_keyboard: bool,
     pub watch: Option<Arc<Watch>>,
     /// A re-sort is on its way, so a lighter request mustn't replace it.
     resort_pending: bool,
@@ -1187,6 +1189,7 @@ impl App {
             }
             Msg::Volumes(volumes) => self.set_volumes(volumes, true),
             Msg::NoUdisks => self.set_volumes(Vec::new(), false),
+            Msg::A11y(act) => self.a11y_act(act),
             Msg::DiskDone { volume, doing, result } => self.drive_done(volume, doing, result),
             Msg::DocFont(role, path, index) => {
                 if self.doc_fonts.as_mut().is_some_and(|f| f.set_role(role, &path, index)) {
@@ -1272,6 +1275,40 @@ impl App {
     }
 
     // ---- Selection and scrolling ----
+
+    /// The selection, one bit for each listing entry.
+    pub(crate) fn selected_bits(&self) -> &[u64] {
+        &self.selected
+    }
+
+    /// Does what a screen reader asked. A request about a row in a folder the window has
+    /// since left is dropped: the screen reader is about to hear of the new one.
+    fn a11y_act(&mut self, act: crate::a11y::Act) {
+        use crate::a11y::{Act, BACK};
+        let row = |app: &Self, dir: &Path, name: &[u8]| {
+            let l = app.listing.as_ref().filter(|_| app.dir == dir)?;
+            app.rows.iter().position(|&e| l.name(e) == name)
+        };
+        match act {
+            Act::Press(BACK) => self.go_back(),
+            Act::Press(_) | Act::Wake => {}
+            Act::OpenPlace(i) => self.open_place(i),
+            Act::FocusRow(dir, name) => {
+                if let Some(at) = row(self, &dir, &name) {
+                    self.move_cursor(at, Mods::default());
+                }
+            }
+            Act::ShowRow(dir, name) => {
+                if let Some(at) = row(self, &dir, &name) {
+                    let l = self.layout();
+                    let top = at as f64 * l.row_h as f64;
+                    if top < self.scroll || top + l.row_h as f64 > self.scroll + l.list.h as f64 {
+                        self.scroll_to(top);
+                    }
+                }
+            }
+        }
+    }
 
     pub fn is_selected(&self, id: u32) -> bool {
         self.selected.get(id as usize / 64).is_some_and(|w| w >> (id % 64) & 1 == 1)

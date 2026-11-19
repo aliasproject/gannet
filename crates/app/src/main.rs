@@ -1,5 +1,7 @@
 //! Gannet: a very fast file manager for Wayland.
 
+mod a11y;
+mod a11y_atspi;
 mod app;
 mod canvas;
 mod chooser;
@@ -15,6 +17,7 @@ mod paint;
 mod portal;
 mod preview;
 mod preview_window;
+mod session;
 mod service;
 mod text;
 mod tools;
@@ -238,6 +241,8 @@ fn main() {
         app.open_selecting(start_dir, names);
     }
     let mut first_frame = true;
+    // What screen readers see, while one is running. Only a file manager window has it yet.
+    let mut a11y = a11y::Link::new();
     #[cfg(feature = "bench")]
     let mut bench = bench::Bench::new(app.viewer);
 
@@ -317,6 +322,7 @@ fn main() {
                 }
             }
         }
+        a11y.update(&app);
         if wl.must_paint() || (!app.dirty.is_empty() && wl.can_paint() && app.hold_paint.is_none()) {
             let damage = if wl.must_paint() { canvas::Rect::new(0, 0, i32::MAX / 2, i32::MAX / 2) } else { std::mem::take(&mut app.dirty) };
             app.dirty = canvas::Rect::default();
@@ -335,12 +341,13 @@ fn main() {
                     app.system_bus = Some(address.clone());
                     drives::watch(hub.clone(), address);
                 }
-                // Only a file manager window offers "Set as background".
+                // Only a file manager window offers "Set as background", and is served to screen
+                // readers so far.
                 if !app.viewer && app.chooser.is_none() {
                     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
                     if let Some(address) = gannet_core::bus::session_address(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(), runtime.as_deref()) {
                         app.session_bus = Some(address.clone());
-                        wallpaper::watch(hub.clone(), address);
+                        session::watch(hub.clone(), address, a11y.shared.clone(), std::env::var("AT_SPI_BUS_ADDRESS").ok());
                     }
                 }
             }
