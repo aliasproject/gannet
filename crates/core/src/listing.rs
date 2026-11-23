@@ -298,6 +298,13 @@ pub struct SortSpec {
     pub descending: bool,
 }
 
+impl SortKey {
+    /// The order a first click gives: names A to Z, but the newest and the biggest first.
+    pub fn first_order(self) -> SortSpec {
+        SortSpec { key: self, descending: self != SortKey::Name }
+    }
+}
+
 impl Default for SortSpec {
     fn default() -> Self {
         Self { key: SortKey::Name, descending: false }

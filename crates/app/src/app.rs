@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use gannet_core::clipboard;
 use gannet_core::history::{History, Stop, parent_stop};
 use gannet_core::listing::{Kind, LoadEvent, LoadHandle, LoadRequest, Listing, Loaded, SortKey, SortSpec, Stat, Stater, DISKS_GIVE_UP, TrashSpec, sort_entries, spawn_load_watching, visible_rows};
+use gannet_core::folder_sorts::FolderSorts;
 use gannet_core::mounts::Mount;
 use gannet_core::trash;
 use gannet_core::ops::{self, Answer, Choice, Conflict, Engine, Job, Request, Undo};
@@ -461,6 +462,8 @@ pub struct App {
     pub sorted: Arc<Vec<u32>>,
     pub rows: Vec<u32>,
     pub sort: SortSpec,
+    /// The order each folder was last sorted in.
+    pub folder_sorts: FolderSorts,
     pub show_hidden: bool,
     pub filter: String,
     pub loading: bool,
@@ -619,6 +622,7 @@ impl App {
             sorted: Arc::new(Vec::new()),
             rows: Vec::new(),
             sort: SortSpec::default(),
+            folder_sorts: FolderSorts::in_memory(),
             show_hidden: false,
             filter: String::new(),
             loading: false,
@@ -797,6 +801,10 @@ impl App {
     pub fn go(&mut self, stop: Stop) {
         self.rows_changing();
         self.dir = stop.dir;
+        // The preview window is told the list's order instead.
+        if !self.viewer {
+            self.sort = self.folder_sorts.for_dir(&self.dir);
+        }
         self.pending_cursor = stop.cursor_name;
         self.filter.clear();
         self.edit = Edit::None;
@@ -1427,7 +1435,11 @@ impl App {
             // Recent is always newest first.
             Action::SortBy(_) if self.is_recent_view() => {}
             Action::SortBy(key) => {
-                self.sort = if self.sort.key == key { SortSpec { key, descending: !self.sort.descending } } else { SortSpec { key, descending: false } };
+                self.sort = if self.sort.key == key { SortSpec { key, descending: !self.sort.descending } } else { key.first_order() };
+                // The preview window shows the list's order and keeps none of its own.
+                if !self.viewer {
+                    self.folder_sorts.set(&self.dir, self.sort);
+                }
                 self.rederive(true);
                 self.invalidate(self.layout().header);
             }
@@ -6083,6 +6095,41 @@ mod tests {
         r.key(k::KEY_Escape, "");
         assert_eq!(sent(&mut r), ["open a", "close"]);
         assert_eq!(r.selected_names(), ["a"], "Escape closes the preview first, and nothing else");
+    }
+
+    #[test]
+    fn each_folder_opens_in_the_order_it_was_last_sorted() {
+        let mut r = Rig::new("folder-sorts");
+        r.app.folder_sorts = FolderSorts::new(r.root.join("state/gannet/sorts"), vec![r.work().join("dl")]);
+        for d in ["a/inner", "b", "dl/inner"] {
+            fs::create_dir_all(r.work().join(d)).unwrap();
+        }
+        let newest = SortSpec { key: SortKey::Modified, descending: true };
+        let biggest = SortSpec { key: SortKey::Size, descending: true };
+        r.open(r.work().join("a"));
+        assert_eq!(r.app.sort, SortSpec::default());
+        // The first press is newest first, the next reverses it, and the next newest first again.
+        r.ctrl(k::KEY_3);
+        assert_eq!(r.app.sort, newest);
+        r.ctrl(k::KEY_3);
+        assert_eq!(r.app.sort, SortSpec { key: SortKey::Modified, descending: false });
+        r.ctrl(k::KEY_2);
+        assert_eq!(r.app.sort, biggest);
+        r.ctrl(k::KEY_1);
+        r.ctrl(k::KEY_2);
+        r.open(r.work().join("b"));
+        assert_eq!(r.app.sort, SortSpec::default());
+        r.open(r.work().join("a/inner"));
+        assert_eq!(r.app.sort, biggest, "inherited from the folder above");
+        r.open(r.work().join("dl/inner"));
+        assert_eq!(r.app.sort, newest, "under Downloads");
+        // The Recent view neither changes nor saves an order.
+        let recent = r.app.recent_file.clone();
+        r.open(recent);
+        r.ctrl(k::KEY_1);
+        assert_eq!(r.app.view_sort(), newest);
+        r.open(r.work().join("a"));
+        assert_eq!(r.app.sort, biggest);
     }
 
     #[test]

@@ -45,6 +45,7 @@ struct Dirs {
     config: PathBuf,
     cache: PathBuf,
     data: PathBuf,
+    state: PathBuf,
     /// The shared-mime-info folders, first wins.
     mime: Vec<PathBuf>,
     /// Where thumbnailers are described, first wins.
@@ -59,7 +60,7 @@ fn dirs() -> Dirs {
     let data_dirs = std::env::var_os("XDG_DATA_DIRS").filter(|d| !d.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
     let in_data = |name: &str| std::iter::once(data.join(name)).chain(std::env::split_paths(&data_dirs).filter(|p| p.is_absolute()).map(|p| p.join(name))).collect::<Vec<_>>();
     let (mime, thumbnailers) = (in_data("mime"), in_data("thumbnailers"));
-    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data, home, mime, thumbnailers }
+    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), state: var("XDG_STATE_HOME", ".local/state"), data, home, mime, thumbnailers }
 }
 
 /// The language messages are in, as GLib chooses it for GTK apps: the first of `LANGUAGE`, then
@@ -203,6 +204,7 @@ fn main() {
     let trash = TrashConfig::new(&d.data, rustix::process::geteuid().as_raw());
     let engine = Engine::new(trash, Arc::new(move |e| op_hub.send(Msg::Op(e))));
     let mut app = App::new(hub.clone(), engine, d.data.join("Trash/files"), colors, source, text, places, start_dir.clone(), w, h, wl.scale());
+    app.folder_sorts = gannet_core::folder_sorts::FolderSorts::new(d.state.join("gannet/sorts"), gannet_core::places::newest_first_dirs(&d.home, &d.config));
     let dir_watch = Watch::new().ok().map(Arc::new);
     app.watch = dir_watch.clone();
     app.cache_home = Some(d.cache.clone());

@@ -233,11 +233,11 @@ def browse_sort_and_history(h):
     assert ".hidden" in s["names"] and s["hidden"]
     a.key("h", mods=["ctrl"])
     a.wait(lambda s: s["count"] == 5, "hidden hidden")
-    # Sort by size, both ways
+    # Sort by size, biggest first, then the other way
     a.key("2", mods=["ctrl"])
-    s = a.wait(lambda s: s["sort"] == "Size" and s["names"][2:] == ["b10.txt", "A.TXT", "b9.txt"], "size ascending")
+    a.wait(lambda s: s["sort"] == "Size" and s["desc"] and s["names"][2:] == ["b9.txt", "A.TXT", "b10.txt"], "size descending")
     a.key("2", mods=["ctrl"])
-    a.wait(lambda s: s["desc"] and s["names"][2:] == ["b9.txt", "A.TXT", "b10.txt"], "size descending")
+    a.wait(lambda s: not s["desc"] and s["names"][2:] == ["b10.txt", "A.TXT", "b9.txt"], "size ascending")
     a.key("1", mods=["ctrl"])
     a.wait(lambda s: s["sort"] == "Name" and s["names"][2] == "A.TXT", "name again")
     # Into a folder with the keyboard, back, forward, up
@@ -254,6 +254,50 @@ def browse_sort_and_history(h):
     a.key("BackSpace")
     a.wait(lambda s: s["dir"] == str(fs) and s["selected"] == ["adir"], "up lands on the folder it came from")
     a.close()
+
+
+@check
+def each_folder_keeps_its_sort_after_a_restart(h):
+    fs = fresh_fs()
+    tree(fs, {"old.txt": "x", "new.txt": "xx", "mid.txt": "xxx", "sub/a.txt": "", "sub/bb.txt": "x"})
+    now = time.time()
+    for name, age in (("old.txt", 300), ("mid.txt", 200), ("new.txt", 100)):
+        os.utime(fs / name, (now - age, now - age))
+    a = App(h, fs)
+    a.wait(lambda s: not s["loading"] and s["names"] == ["sub", "mid.txt", "new.txt", "old.txt"], "by name at first")
+    # One press of Ctrl+3 puts the newest at the top.
+    a.key("3", mods=["ctrl"])
+    a.wait(lambda s: s["sort"] == "Modified" and s["desc"] and s["names"] == ["sub", "new.txt", "mid.txt", "old.txt"], "newest first")
+    a.shot("sort-newest-first")
+    # The folder inside takes it too, until it's sorted on its own.
+    a.key("Down")
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(fs / "sub") and s["sort"] == "Modified" and s["desc"], "the folder inside inherits")
+    a.key("2", mods=["ctrl"])
+    a.wait(lambda s: s["sort"] == "Size" and s["names"] == ["bb.txt", "a.txt"], "sub biggest first")
+    a.close()
+    a = App(h, fs)
+    a.wait(lambda s: not s["loading"] and s["sort"] == "Modified" and s["names"] == ["sub", "new.txt", "mid.txt", "old.txt"], "still newest first after a restart")
+    a.key("Down")
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(fs / "sub") and s["sort"] == "Size" and s["desc"], "sub kept its own")
+    a.close()
+    # Downloads starts newest first; a folder beside it doesn't.
+    home = Path(a.env["HOME"])
+    for d in ("Downloads", "Documents"):
+        shutil.rmtree(home / d, ignore_errors=True)
+        tree(home / d, {"older.zip": "", "newer.zip": ""})
+        os.utime(home / d / "older.zip", (now - 100, now - 100))
+    a = App(h, home / "Downloads")
+    a.wait(lambda s: not s["loading"] and s["sort"] == "Modified" and s["desc"] and s["names"] == ["newer.zip", "older.zip"], "Downloads newest first")
+    a.shot("sort-downloads")
+    a.key("l", mods=["ctrl"])
+    a.type(str(home / "Documents"))
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(home / "Documents") and s["sort"] == "Name" and s["names"] == ["newer.zip", "older.zip"], "Documents by name")
+    a.close()
+    for d in ("Downloads", "Documents"):
+        shutil.rmtree(home / d, ignore_errors=True)
 
 
 @check
@@ -3380,6 +3424,8 @@ def main():
         for t in TESTS:
             if want not in t.__name__:
                 continue
+            # The scratch folders are reused, so every check starts with no folder sorts saved.
+            shutil.rmtree(SCRATCH / "client/state/gannet", ignore_errors=True)
             try:
                 t(h)
                 print(f"ok    {t.__name__}", flush=True)
