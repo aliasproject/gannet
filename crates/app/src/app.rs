@@ -99,8 +99,8 @@ pub enum Msg {
         generation: u64,
         crashed: bool,
     },
-    /// In the preview window: the list's cursor is on another file.
-    PreviewShow(PathBuf),
+    /// In the preview window: the list's cursor is on another file, or its order has changed.
+    PreviewShow(PathBuf, SortSpec),
     /// In the preview window: the list that opened it has gone.
     ListGone,
     /// A file list dropped from a Wayland drag, read and looked at off the main thread.
@@ -159,8 +159,8 @@ pub enum Cmd {
         sort: SortSpec,
     },
     ClosePreview,
-    /// Tells the preview window to show another file.
-    PreviewShow(PathBuf),
+    /// Tells the preview window to show another file, in the list's order.
+    PreviewShow(PathBuf, SortSpec),
     /// In the preview window: tells the list which file is showing now.
     PreviewStepped(PathBuf),
     Quit,
@@ -575,6 +575,9 @@ pub struct App {
     pub(crate) preview_gen: u64,
     /// This app is the preview window rather than a file manager.
     pub viewer: bool,
+    /// The order was given, by the list or by `--sort`, so going to a folder doesn't look up the
+    /// one saved for it.
+    pub fixed_sort: bool,
     /// The file the other side last heard about. In the list, `Some` while a preview window is
     /// open.
     pub previewer: Option<PathBuf>,
@@ -700,6 +703,7 @@ impl App {
             preview: None,
             preview_gen: 0,
             viewer: false,
+            fixed_sort: false,
             previewer: None,
             previewer_cursor: None,
             previewer_gen: 0,
@@ -801,8 +805,8 @@ impl App {
     pub fn go(&mut self, stop: Stop) {
         self.rows_changing();
         self.dir = stop.dir;
-        // The preview window is told the list's order instead.
-        if !self.viewer {
+        // A preview window opened by the list is told the list's order instead.
+        if !self.fixed_sort {
             self.sort = self.folder_sorts.for_dir(&self.dir);
         }
         self.pending_cursor = stop.cursor_name;
@@ -1128,7 +1132,7 @@ impl App {
             Msg::Preview(e) => self.on_preview(e),
             Msg::PreviewStepped { generation, path } => self.on_preview_stepped(generation, path),
             Msg::PreviewEnded { generation, crashed } => self.on_preview_ended(generation, crashed),
-            Msg::PreviewShow(path) => self.on_preview_show(path),
+            Msg::PreviewShow(path, sort) => self.on_preview_show(path, sort),
             Msg::ListGone => self.cmds.push(Cmd::Quit),
             Msg::Dropped(d) => self.on_dropped(d),
             Msg::DragSource { drag, facts } => {
@@ -1439,6 +1443,10 @@ impl App {
                 // The preview window shows the list's order and keeps none of its own.
                 if !self.viewer {
                     self.folder_sorts.set(&self.dir, self.sort);
+                }
+                // An open preview window walks the folder in the list's order.
+                if let Some(p) = self.previewer.clone().filter(|_| !self.viewer) {
+                    self.cmds.push(Cmd::PreviewShow(p, self.view_sort()));
                 }
                 self.rederive(true);
                 self.invalidate(self.layout().header);
@@ -6070,7 +6078,7 @@ mod tests {
             .drain(..)
             .filter_map(|c| match c {
                 Cmd::OpenPreview { path, .. } => Some(format!("open {}", name(&path))),
-                Cmd::PreviewShow(path) => Some(format!("show {}", name(&path))),
+                Cmd::PreviewShow(path, _) => Some(format!("show {}", name(&path))),
                 Cmd::ClosePreview => Some("close".to_string()),
                 Cmd::PreviewStepped(path) => Some(format!("stepped {}", name(&path))),
                 Cmd::Quit => Some("quit".to_string()),
@@ -6359,11 +6367,64 @@ mod tests {
         assert_eq!(sent(&mut r), ["stepped c", "stepped b", "stepped a"], "each step is told to the list, and the ends stay put");
     }
 
+    fn row_names(r: &Rig) -> Vec<String> {
+        let l = r.app.listing.as_ref().unwrap();
+        r.app.rows.iter().map(|&i| String::from_utf8_lossy(l.name(i)).into_owned()).collect()
+    }
+
+    #[test]
+    fn the_window_walks_in_the_lists_order() {
+        let z_a = SortSpec { key: SortKey::Name, descending: true };
+        let mut r = viewer_rig("viewer-order", "a");
+        r.app.fixed_sort = true;
+        // The list went to a folder sorted Z to A, on the same file.
+        r.app.on_msg(Msg::PreviewShow(r.work().join("a"), z_a));
+        r.pump_until("sorted again", |a| !a.loading && a.sort == z_a && a.rows.len() == 3);
+        r.idle();
+        assert_eq!(row_names(&r), ["c", "b", "a"]);
+        assert_eq!(r.app.cursor, 2, "still on its file");
+        // The list's order wins over anything saved for the folder.
+        r.app.folder_sorts.set(&r.work(), SortSpec::default());
+        r.app.on_msg(Msg::PreviewShow(r.work().join("b"), z_a));
+        r.idle();
+        assert_eq!(r.app.sort, z_a);
+        assert_eq!(showing(&r).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn a_window_on_its_own_takes_the_folders_saved_order() {
+        let z_a = SortSpec { key: SortKey::Name, descending: true };
+        let mut r = Rig::new("viewer-own-order");
+        for name in ["a", "b", "c"] {
+            fs::write(r.work().join(name), "x").unwrap();
+        }
+        r.app.folder_sorts.set(&r.work(), z_a);
+        r.app.start_viewer(r.work().join("a"));
+        r.pump_until("folder loaded", |a| !a.loading);
+        r.idle();
+        assert_eq!(r.app.sort, z_a);
+        assert_eq!(row_names(&r), ["c", "b", "a"]);
+    }
+
+    #[test]
+    fn sorting_the_list_tells_an_open_window() {
+        let mut r = Rig::new("list-sort-tells");
+        for name in ["a", "b"] {
+            fs::write(r.work().join(name), "x").unwrap();
+        }
+        r.app.go(Stop { dir: r.work(), cursor_name: None });
+        r.pump_until("loaded", |a| !a.loading);
+        r.app.previewer = Some(r.work().join("a"));
+        r.app.cmds.clear();
+        r.app.action(Action::SortBy(SortKey::Modified));
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::PreviewShow(p, s) if p.ends_with("a") && *s == SortKey::Modified.first_order())));
+    }
+
     #[test]
     fn the_window_follows_the_list_without_echoing() {
         let mut r = viewer_rig("viewer-follow", "a");
         r.app.cmds.clear();
-        r.app.on_msg(Msg::PreviewShow(r.work().join("c")));
+        r.app.on_msg(Msg::PreviewShow(r.work().join("c"), SortSpec::default()));
         assert_eq!(showing(&r).as_deref(), Some("c"));
         assert_eq!(r.app.cursor, 2, "its own cursor moves too, for the arrows to go on from");
         assert!(sent(&mut r).is_empty(), "the list already knows");
@@ -6371,7 +6432,7 @@ mod tests {
         let other = r.root.join("other");
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join("z"), "x").unwrap();
-        r.app.on_msg(Msg::PreviewShow(other.join("z")));
+        r.app.on_msg(Msg::PreviewShow(other.join("z"), SortSpec::default()));
         assert_eq!(showing(&r).as_deref(), Some("z"));
         let generation = r.app.preview_gen;
         r.pump_until("the other folder", |a| !a.loading && a.dir == other);

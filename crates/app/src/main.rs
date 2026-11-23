@@ -227,7 +227,11 @@ fn main() {
     let following = viewing.as_ref().is_some_and(|v| v.follow);
     if let Some(v) = viewing {
         app.show_hidden = v.hidden;
-        app.sort = v.sort;
+        // Opened by the list, it's told the list's order; on its own, the folder's own.
+        if let Some(sort) = v.sort {
+            app.sort = sort;
+            app.fixed_sort = true;
+        }
         app.start_viewer(v.path);
         if v.follow {
             preview_window::listen_to_the_list(hub.clone());
@@ -300,9 +304,9 @@ fn main() {
                     }
                 }
                 Cmd::ClosePreview => previewer = None,
-                Cmd::PreviewShow(path) => {
+                Cmd::PreviewShow(path, sort) => {
                     if let Some(p) = previewer.as_mut() {
-                        p.show(&path);
+                        p.show(&path, sort);
                     }
                 }
                 Cmd::PreviewStepped(path) => {

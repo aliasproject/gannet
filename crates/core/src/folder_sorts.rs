@@ -11,7 +11,9 @@
 //! sorted longest ago are dropped.
 
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -29,9 +31,10 @@ pub struct FolderSorts {
     newest_first: Vec<PathBuf>,
     /// Oldest first.
     saved: Vec<(PathBuf, SortSpec)>,
-    /// The file's modification time and length when it was last read, to notice another
-    /// window's changes.
-    seen: Option<(SystemTime, u64)>,
+    /// The file's inode, modification time and length when it was last read, to notice another
+    /// window's changes. Every save renames a new file into place, so the inode changes even
+    /// when two saves land within one tick of the clock with the same length.
+    seen: Option<(u64, SystemTime, u64)>,
 }
 
 impl FolderSorts {
@@ -55,6 +58,8 @@ impl FolderSorts {
     /// Remembers that `dir` was sorted in `spec`. Errors are ignored: the sort still applies,
     /// it just won't be there next time.
     pub fn set(&mut self, dir: &Path, spec: SortSpec) {
+        // Held from reading to renaming, so two windows saving at once can't drop each other's.
+        let _lock = self.lock();
         // Another window may have saved since this one last looked.
         self.refresh();
         self.saved.retain(|(p, _)| p != dir);
@@ -80,9 +85,24 @@ impl FolderSorts {
         SortSpec::default()
     }
 
-    fn stamp(&self) -> Option<(SystemTime, u64)> {
+    fn stamp(&self) -> Option<(u64, SystemTime, u64)> {
         let m = std::fs::metadata(self.file.as_ref()?).ok()?;
-        Some((m.modified().ok()?, m.len()))
+        Some((m.ino(), m.modified().ok()?, m.len()))
+    }
+
+    /// An exclusive lock on a file beside the sorts, released when it's dropped. `None` if it
+    /// can't be had, in which case saving goes ahead without it.
+    fn lock(&self) -> Option<std::fs::File> {
+        let dir = self.file.as_ref()?.parent()?;
+        let _ = std::fs::create_dir_all(dir);
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(".sorts.lock")).ok()?;
+        // SAFETY: the descriptor is open for as long as `f` lives.
+        while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return None;
+            }
+        }
+        Some(f)
     }
 
     fn refresh(&mut self) {
@@ -92,7 +112,13 @@ impl FolderSorts {
         if stamp == self.seen {
             return;
         }
-        self.saved = std::fs::read(file).map(|b| parse(&b)).unwrap_or_default();
+        match std::fs::read(file) {
+            Ok(b) => self.saved = parse(&b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.saved.clear(),
+            // A read that fails for another reason says nothing about what's saved, so keep what's
+            // known and try again next time; clearing it would make the next save forget the rest.
+            Err(_) => return,
+        }
         self.seen = stamp;
     }
 
@@ -278,6 +304,43 @@ mod tests {
         two.set(Path::new("/b"), NEWEST);
         assert_eq!(one.for_dir(Path::new("/a")), BIGGEST);
         assert_eq!(one.for_dir(Path::new("/b")), NEWEST);
+    }
+
+    #[test]
+    fn a_failed_read_keeps_what_was_saved() {
+        let s = Scratch::new();
+        let file = s.path().join("sorts");
+        let mut f = FolderSorts::new(file.clone(), Vec::new());
+        f.set(Path::new("/a"), BIGGEST);
+        // Something that can't be read where the file was: reading it fails, but not as missing.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert_eq!(f.for_dir(Path::new("/a")), BIGGEST);
+        // Once it reads again, the file is what counts.
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, format(&[(PathBuf::from("/a"), NEWEST)])).unwrap();
+        assert_eq!(f.for_dir(Path::new("/a")), NEWEST);
+    }
+
+    #[test]
+    fn windows_saving_at_once_keep_each_others_folders() {
+        let s = Scratch::new();
+        let file = s.path().join("sorts");
+        let threads: Vec<_> = (0..2)
+            .map(|t| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    let mut f = FolderSorts::new(file, Vec::new());
+                    for i in 0..150 {
+                        f.set(&PathBuf::from(format!("/t{t}/d{i}")), BIGGEST);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(parse(&std::fs::read(&file).unwrap()).len(), 300);
     }
 
     #[test]
