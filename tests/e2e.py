@@ -1708,21 +1708,29 @@ def any_file_says_what_it_is_and_opens_in_its_app(h):
     a.key("Down")
     s = a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "unknown bytes")
     assert preview_of(s)["kind"] == "application/octet-stream", s["preview"]
-    # Enter, or the Open button, opens it in its app and leaves the preview up.
+    # An archive is extracted from the list, not opened from here, so Enter only says so.
     a.key("Up", "Up")
     a.wait(lambda s: preview_of(s).get("name") == "a-archive.zip", "back to the archive")
+    a.key("Return")
+    a.wait(lambda s: any("from the list" in n for n in json.loads(a.preview_file.read_text())["notices"]), "says to open it from the list", timeout=5)
+    assert not log.exists(), log.read_text()
+    assert not (fs / "a-archive").exists(), "nothing extracted"
+    # Enter, or the Open button, opens anything else in its app and leaves the preview up. A zip
+    # without the ending isn't one Gannet unpacks.
+    a.key("Down")
+    a.wait(lambda s: preview_of(s).get("name") == "b-no-extension", "the unnamed zip")
     a.key("Return")
     end = time.monotonic() + 5
     while time.monotonic() < end and not log.exists():
         time.sleep(0.02)
-    assert log.read_text().strip() == str(fs / "a-archive.zip"), log.read_text()
+    assert log.read_text().strip() == str(fs / "b-no-extension"), log.read_text()
     assert a.state()["preview"], "still previewing"
-    a.key("Down", "Down")
+    a.key("Down")
     a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "the blob")
     x, y, w, h_ = a.preview_window()
     # The button sits below the picture and two lines of words, in the middle.
     a.click(x + w // 2, y + 533)
-    a.wait(lambda s: json.loads(a.preview_file.read_text())["notices"], "a failure shows in the window", timeout=5)
+    a.wait(lambda s: any("c-blob.xyz" in n for n in json.loads(a.preview_file.read_text())["notices"]), "a failure shows in the window", timeout=5)
     assert "c-blob.xyz" in log.read_text()
     a.shot("preview-open-failed")
     a.close()

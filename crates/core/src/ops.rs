@@ -608,8 +608,9 @@ impl Run {
                 }
             },
             |at| {
-                // Zip and 7z jump about to read their tables, so it only ever moves forward.
-                progress.done_bytes.fetch_max(before + at.min(size), Ordering::Relaxed);
+                // Zip and 7z read their tables at the end first, then go back for the entries, so
+                // this follows where it's reading now rather than the furthest it has been.
+                progress.done_bytes.store(before + at.min(size), Ordering::Relaxed);
                 if last.elapsed() >= Duration::from_millis(50) {
                     last = Instant::now();
                     sink(Event::Progress(job));
@@ -2973,6 +2974,34 @@ mod tests {
         assert!(done.outcome.created.is_empty() && done.outcome.undo.is_none());
         assert!(!s.path().join("escaped.txt").exists() && !s.path().join("through.txt").exists());
         assert_eq!(names_in(&work), ["evil.tar", "links.tar"]);
+    }
+
+    #[test]
+    fn extract_refuses_symlinks_pointing_outside_but_keeps_those_inside() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        let up = work.join("up.tar");
+        crafted_tar(&up, &[("ok.txt", b"ok", None), ("ln", b"", Some("../../secret"))]);
+        let absolute = work.join("absolute.tar");
+        crafted_tar(&absolute, &[("ln", b"", Some("/etc"))]);
+        // A link to `.` makes `x/..` the folder above, though it reads as the folder itself.
+        let dot = work.join("dot.tar");
+        crafted_tar(&dot, &[("x", b"", Some(".")), ("y", b"", Some("x/.."))]);
+        e.start(Request::Extract { archives: vec![up, absolute, dot] });
+        let done = finish(&rx, vec![]);
+        assert_eq!(done.errors.len(), 3, "{:?}", done.errors);
+        assert!(done.errors.iter().all(|(_, m)| m.contains("outside its folder")), "{:?}", done.errors);
+        assert!(done.outcome.created.is_empty() && done.outcome.undo.is_none());
+        assert_eq!(names_in(&work), ["absolute.tar", "dot.tar", "up.tar"]);
+
+        let fine = work.join("fine.tar");
+        crafted_tar(&fine, &[("b", b"bee", None), ("a/ln", b"", Some("../b")), ("a/here", b"", Some("."))]);
+        e.start(Request::Extract { archives: vec![fine] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(fs::read(work.join("fine/a/ln")).unwrap(), b"bee");
+        assert_eq!(fs::read_link(work.join("fine/a/here")).unwrap(), Path::new("."));
     }
 
     #[test]

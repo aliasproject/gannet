@@ -218,7 +218,7 @@ The folder is named after the archive, or `photos (2)` and so on if that name is
 everything in the archive is inside one folder, that folder comes out as itself, not wrapped in
 another one. Extract is also in the right-click menu. It runs as a job you can stop, and Undo
 moves the folder to the Trash. A damaged archive, one with a password, or one with items that
-would land outside its folder leaves nothing behind and says why. In Open and Save dialogs,
+would land outside its folder or links that point outside it leaves nothing behind and says why. In Open and Save dialogs,
 opening an archive picks it, as any other file.
 
 ## Recent

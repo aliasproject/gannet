@@ -4,13 +4,16 @@
 //!
 //! `bsdtar` refuses, by default, any entry whose path has a `..` in it, and any entry that
 //! would be written through a symlink, so nothing lands outside the folder it's given. It takes
-//! a leading `/` off an absolute path, which keeps that inside the folder too. Any refusal makes
-//! the whole archive fail, and the caller removes what was unpacked.
+//! a leading `/` off an absolute path, which keeps that inside the folder too. It does make
+//! symlinks that point outside, so once it's done every symlink is checked, and one that points
+//! anywhere but inside the folder is refused too. Any refusal makes the whole archive fail, and
+//! the caller removes what was unpacked.
 
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -93,14 +96,25 @@ pub fn unpack(tool: &OsStr, archive: &File, into: &Path, mut on_entry: impl FnMu
     let input = archive.try_clone().map_err(Failed::Io)?;
     let mut reading = archive.try_clone().map_err(Failed::Io)?;
     reading.rewind().map_err(Failed::Io)?;
-    let mut child = Command::new(tool)
+    let mut command = Command::new(tool);
+    command
         // A password is never asked for: there's nowhere to type it, and this one fails at once.
         .args(["-x", "-v", "--no-same-owner", "--no-same-permissions", "--passphrase", "gannet", "-f", "-", "-C"])
         .arg(into)
         .env("LC_ALL", "C")
         .stdin(input)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // If Gannet is killed, bsdtar goes with it rather than unpacking on into a hidden folder. That
+    // follows the thread that started it, which is this one, waiting below until it ends.
+    // SAFETY: prctl is async-signal-safe and touches no memory.
+    unsafe {
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| if e.kind() == io::ErrorKind::NotFound { Failed::NoTool } else { Failed::Io(e) })?;
     // Read on its own thread, so a long list of names can never fill the pipe and stall it.
@@ -142,7 +156,61 @@ pub fn unpack(tool: &OsStr, archive: &File, into: &Path, mut on_entry: impl FnMu
     while let Ok(line) = rx.try_recv() {
         sort(line, &mut problems);
     }
-    if status.success() { Ok(()) } else { Err(Failed::from_messages(&problems)) }
+    if !status.success() {
+        return Err(Failed::from_messages(&problems));
+    }
+    let root = into.canonicalize().map_err(Failed::Io)?;
+    if links_stay_inside(&root, &root).map_err(Failed::Io)? { Ok(()) } else { Err(Failed::Unsafe) }
+}
+
+/// Whether every symlink under `dir` points somewhere inside `root`. Folders are walked without
+/// following links, so `dir` is always a real folder inside `root`.
+fn links_stay_inside(root: &Path, dir: &Path) -> io::Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let inside = if kind.is_symlink() {
+            resolve(root, dir.to_path_buf(), &std::fs::read_link(entry.path())?, 40).is_some()
+        } else if kind.is_dir() {
+            links_stay_inside(root, &entry.path())?
+        } else {
+            true
+        };
+        if !inside {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Where `target`, read as a link in the folder `at`, leads, or None if it leaves `root` at any
+/// step. Links on the way are followed, as the kernel would, up to `hops` of them, so a link to
+/// `.` can't make a later `..` look shallower than it is. A part that doesn't exist yet is taken
+/// as written. An absolute target is refused outright, even one that names a place inside.
+fn resolve(root: &Path, mut at: PathBuf, target: &Path, hops: u32) -> Option<PathBuf> {
+    for part in target.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if at == root {
+                    return None;
+                }
+                at.pop();
+            }
+            Component::Normal(name) => {
+                let next = at.join(name);
+                match std::fs::symlink_metadata(&next) {
+                    Ok(m) if m.file_type().is_symlink() => {
+                        let further = std::fs::read_link(&next).ok()?;
+                        at = resolve(root, at, &further, hops.checked_sub(1)?)?;
+                    }
+                    _ => at = next,
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(at)
 }
 
 #[cfg(test)]

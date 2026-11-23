@@ -4236,12 +4236,12 @@ pub fn clean(p: &Path) -> PathBuf {
     out
 }
 
-/// Camera raw files and icons show as pictures, but desktops don't take them as a background.
 /// Whether row `i` is a file Gannet unpacks when it's opened.
 fn is_archive(l: &Listing, i: u32) -> bool {
     matches!(l.kind(i), Kind::File | Kind::Link) && gannet_core::archive::is_archive(l.name(i))
 }
 
+/// Camera raw files and icons show as pictures, but desktops don't take them as a background.
 fn is_raw_or_icon(name: &[u8]) -> bool {
     let ext = name.rsplit(|&b| b == b'.').next().unwrap_or_default().to_ascii_lowercase();
     matches!(&ext[..], b"raw" | b"cr2" | b"nef" | b"ico")
