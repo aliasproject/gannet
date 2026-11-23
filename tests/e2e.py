@@ -393,6 +393,51 @@ def opening_uses_the_default_app(h):
 
 
 @check
+def opening_an_archive_extracts_it_in_gannet(h):
+    fs = fresh_fs()
+    tree(fs, {"src/a.txt": "a", "src/b.txt": "b", "pack/project/readme": "r"})
+    subprocess.run(["bsdtar", "-a", "-cf", str(fs / "photos.zip"), "-C", str(fs / "src"), "a.txt", "b.txt"], check=True)
+    subprocess.run(["bsdtar", "-a", "-cf", str(fs / "project-1.0.tar.gz"), "-C", str(fs / "pack"), "project"], check=True)
+    shutil.rmtree(fs / "src")
+    shutil.rmtree(fs / "pack")
+    # Anything handed to the default app would land here, as Nautilus did.
+    bin_dir = SCRATCH / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    log = SCRATCH / "opened.log"
+    log.unlink(missing_ok=True)
+    opener = bin_dir / "xdg-open"
+    opener.write_text(f'#!/bin/sh\necho "$1" >> {log}\nexit 0\n')
+    opener.chmod(0o755)
+    a = App(h, fs, path_prefix=str(bin_dir))
+    a.wait(lambda s: s["names"] == ["photos.zip", "project-1.0.tar.gz"], "listed")
+    a.type("photos")
+    a.wait(lambda s: s["selected"] == ["photos.zip"])
+    a.key("Return")
+    s = a.wait(lambda s: s["names"] == ["photos", "photos.zip", "project-1.0.tar.gz"] and s["selected"] == ["photos"] and not s["jobs"], "the folder appears, selected")
+    assert s["notices"] == [], s["notices"]
+    assert sorted(os.listdir(fs / "photos")) == ["a.txt", "b.txt"]
+    a.shot("extract-opened")
+    # From the menu: one folder inside comes out as itself, not wrapped in another.
+    a.click(ROW_X, row_y(2), 0x111)
+    items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+    assert items.index("Extract") == items.index("Preview") + 1, items
+    a.shot("extract-menu")
+    a.key("Down", "Down", "Down", "Return")
+    s = a.wait(lambda s: "project" in s["names"] and s["selected"] == ["project"] and not s["jobs"], "extracted from the menu")
+    assert (fs / "project/readme").read_text() == "r"
+    a.click(ROW_X, row_y(0), 0x111)
+    assert "Extract" not in a.wait(lambda s: s["menu"], "the menu")["menu_items"], "not for a folder"
+    a.key("Escape")
+    # Undo sends the last one to the Trash.
+    a.key("z", mods=("ctrl",))
+    a.wait(lambda s: "project" not in s["names"], "undone")
+    a.shot("extract-undone")
+    time.sleep(0.5)
+    assert not log.exists(), f"handed to another app: {log.read_text()}"
+    a.close()
+
+
+@check
 def live_refresh_keeps_selection(h):
     fs = fresh_fs()
     tree(fs, {"a": "", "b": "", "c": ""})

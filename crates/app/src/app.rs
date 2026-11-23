@@ -400,6 +400,8 @@ pub enum Action {
     ShowInFolder,
     /// Makes the one picture selected the desktop background.
     SetBackground,
+    /// Unpacks the archives selected, each into a folder beside it.
+    Extract,
     /// For the drive whose menu it is.
     OpenDrive,
     Unmount,
@@ -1483,6 +1485,11 @@ impl App {
             Action::ChooseFilter(i) => self.choose_filter(i),
             Action::ShowInFolder => self.show_in_folder(),
             Action::SetBackground => self.set_background(),
+            Action::Extract => {
+                if let Some(archives) = self.selected_archives() {
+                    self.extract(archives);
+                }
+            }
             Action::EmptyTrash => self.ask_empty_trash(),
         }
     }
@@ -1571,7 +1578,12 @@ impl App {
             return;
         }
         let first_dir = ids.iter().copied().find(|&i| l.kind(i).is_dirlike());
-        for &i in ids.iter().filter(|&&i| !l.kind(i).is_dirlike()) {
+        // Archives are unpacked here rather than handed to whatever app claims them.
+        let archives: Vec<PathBuf> = ids.iter().filter(|&&i| is_archive(&l, i)).map(|&i| l.path(i)).collect();
+        if !archives.is_empty() {
+            self.extract(archives);
+        }
+        for &i in ids.iter().filter(|&&i| !l.kind(i).is_dirlike() && !is_archive(&l, i)) {
             let hub = self.hub.clone();
             gannet_core::open::open_with_default(&l.path(i), move |p, why| {
                 hub.send(Msg::Notice(format!("Couldn't open {}: {why}", p.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()))));
@@ -2347,6 +2359,10 @@ impl App {
     /// The list's menu, with "Set as background" after Preview when it applies.
     fn context_items(&self) -> Vec<MenuItem> {
         let mut items = self.view_menu_items();
+        if self.selected_archives().is_some() {
+            let at = items.iter().position(|m| m.action == Action::Preview).map_or(items.len(), |p| p + 1);
+            items.insert(at, MenuItem { label: "Extract", keys: "", action: Action::Extract, enabled: true });
+        }
         if self.background_picture().is_some() {
             let at = items.iter().position(|m| m.action == Action::Preview).map_or(items.len(), |p| p + 1);
             items.insert(at, MenuItem { label: "Set as background", keys: "", action: Action::SetBackground, enabled: true });
@@ -2365,6 +2381,27 @@ impl App {
         let id = *self.selected_ids().first()?;
         let picture = matches!(l.kind(id), Kind::File | Kind::Link) && crate::icons::icon_for_name(l.name(id)) == crate::icons::Icon::Image && !is_raw_or_icon(l.name(id));
         picture.then(|| l.path(id))
+    }
+
+    /// The archives selected, when that's all that's selected. Never in a chooser, where
+    /// opening one picks it, or the Trash, whose files have to be restored first.
+    fn selected_archives(&self) -> Option<Vec<PathBuf>> {
+        if self.chooser.is_some() || self.sel_count == 0 || self.in_trash() {
+            return None;
+        }
+        let l = self.listing.as_ref()?;
+        let ids = self.selected_ids();
+        ids.iter().all(|&i| is_archive(l, i)).then(|| ids.iter().map(|&i| l.path(i)).collect())
+    }
+
+    /// Unpacks each archive into a new folder beside it, which is selected when it's done.
+    fn extract(&mut self, archives: Vec<PathBuf>) {
+        // A folder made in the Trash's files would have no info to go with it.
+        if self.in_trash() {
+            self.notice("Restore it from the Trash first, then extract it".into());
+            return;
+        }
+        self.start_job(Request::Extract { archives });
     }
 
     fn set_background(&mut self) {
@@ -4200,6 +4237,11 @@ pub fn clean(p: &Path) -> PathBuf {
 }
 
 /// Camera raw files and icons show as pictures, but desktops don't take them as a background.
+/// Whether row `i` is a file Gannet unpacks when it's opened.
+fn is_archive(l: &Listing, i: u32) -> bool {
+    matches!(l.kind(i), Kind::File | Kind::Link) && gannet_core::archive::is_archive(l.name(i))
+}
+
 fn is_raw_or_icon(name: &[u8]) -> bool {
     let ext = name.rsplit(|&b| b == b'.').next().unwrap_or_default().to_ascii_lowercase();
     matches!(&ext[..], b"raw" | b"cr2" | b"nef" | b"ico")
@@ -6942,6 +6984,95 @@ mod tests {
         r.app.action(Action::SetBackground);
         r.pump_until("the notice", |a| !a.notices.is_empty());
         assert_eq!(r.app.notices, ["Couldn't set “sunset.png” as the background"]);
+    }
+
+    /// Packs the files named in `work/src` into `work/<archive>`, its format from its ending.
+    fn pack(r: &Rig, archive: &str, names: &[&str]) {
+        let ok = std::process::Command::new("bsdtar").arg("-a").arg("-cf").arg(r.work().join(archive)).arg("-C").arg(r.work().join("src")).args(names).status().unwrap().success();
+        assert!(ok);
+    }
+
+    fn menu_has_extract(r: &Rig) -> bool {
+        r.app.context_items().iter().any(|m| m.action == Action::Extract)
+    }
+
+    #[test]
+    fn opening_an_archive_extracts_it_beside_itself_and_selects_the_folder() {
+        let mut r = Rig::new("extract-open");
+        fs::create_dir_all(r.work().join("src")).unwrap();
+        fs::write(r.work().join("src/a.txt"), "a").unwrap();
+        pack(&r, "photos.zip", &["a.txt"]);
+        let w = r.work();
+        r.open(w);
+        r.select("photos.zip");
+        r.key(k::KEY_Return, "");
+        assert_eq!(r.app.jobs.len(), 1, "it runs as a job");
+        r.pump_until("extracted and selected", |a| a.jobs.is_empty() && !a.loading && a.pending_select.is_empty() && a.listing.as_ref().is_some_and(|l| l.len() == 3));
+        assert_eq!(r.selected_names(), ["photos"]);
+        assert_eq!(fs::read(r.work().join("photos/a.txt")).unwrap(), b"a");
+        assert!(r.app.notices.is_empty(), "{:?}", r.app.notices);
+        // Undo sends the folder to the Trash.
+        r.ctrl(k::KEY_z);
+        r.idle();
+        assert!(!r.work().join("photos").exists());
+        assert!(r.root.join("data/Trash/files/photos/a.txt").exists());
+    }
+
+    #[test]
+    fn extract_is_offered_only_when_every_item_selected_is_an_archive() {
+        let mut r = Rig::new("extract-menu");
+        fs::create_dir_all(r.work().join("src")).unwrap();
+        fs::write(r.work().join("src/a.txt"), "a").unwrap();
+        pack(&r, "one.tar.gz", &["a.txt"]);
+        pack(&r, "one.zip", &["a.txt"]);
+        fs::write(r.work().join("report.docx"), "x").unwrap();
+        let w = r.work();
+        r.open(w);
+        r.select("one.tar.gz");
+        let labels: Vec<_> = r.app.context_items().iter().map(|m| m.label).collect();
+        let at = labels.iter().position(|&l| l == "Extract").expect("offered for an archive");
+        assert_eq!(labels[at - 1], "Preview", "right after Preview");
+        r.app.key(k::KEY_Down, "", Mods { shift: true, ..Mods::default() });
+        assert_eq!(r.selected_names(), ["one.tar.gz", "one.zip"]);
+        assert!(menu_has_extract(&r), "for several archives");
+        r.app.action(Action::Extract);
+        r.idle();
+        assert!(r.work().join("one/a.txt").exists() && r.work().join("one (2)/a.txt").exists());
+        for not_an_archive in ["report.docx", "src"] {
+            r.select(not_an_archive);
+            assert!(!menu_has_extract(&r), "{not_an_archive}");
+        }
+        r.app.select_all();
+        assert!(!menu_has_extract(&r), "not with other things selected");
+    }
+
+    #[test]
+    fn an_open_dialog_picks_an_archive_rather_than_extracting_it() {
+        let mut r = Rig::new("extract-chooser");
+        fs::create_dir_all(r.work().join("src")).unwrap();
+        fs::write(r.work().join("src/a.txt"), "a").unwrap();
+        pack(&r, "photos.zip", &["a.txt"]);
+        let w = r.work();
+        r.open(w);
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        r.select("photos.zip");
+        assert!(!menu_has_extract(&r));
+        assert!(!r.app.chooser_allows(Action::Extract));
+        r.key(k::KEY_Return, "");
+        assert!(r.app.jobs.is_empty(), "nothing extracted");
+        assert!(!r.work().join("photos").exists());
+    }
+
+    #[test]
+    fn an_archive_in_the_trash_is_restored_before_extracting() {
+        let mut r = Rig::new("extract-trash");
+        trash_names(&mut r, &["photos.zip"]);
+        open_trash(&mut r);
+        r.select("photos.zip");
+        assert!(!menu_has_extract(&r));
+        r.key(k::KEY_Return, "");
+        assert!(r.app.jobs.is_empty());
+        assert_eq!(r.app.notices, ["Restore it from the Trash first, then extract it"]);
     }
 
     fn open_trash(r: &mut Rig) {

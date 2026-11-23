@@ -73,6 +73,7 @@ At run time, Gannet uses these:
 |---|---|---|
 | `fc-match` (fontconfig) | Finding fonts | Gannet can't find a font, so install this |
 | `xdg-open` | Opening files in other apps | Opening files fails |
+| `bsdtar` (libarchive) | Extracting archives | Extracting says it's missing |
 | `libmpv` (part of `mpv` on many systems) and `bubblewrap` | Video and sound previews | Videos show a message saying what's needed |
 | `udisks2` | Mounting, unlocking and ejecting drives | Only drives that are already mounted show |
 | `shared-mime-info` | Saying what a file is, like "PDF document" | Previews name types like `application/pdf` |
@@ -209,6 +210,17 @@ portals can, and so can aliasOS's once it has its Wallpaper portal backend. Else
 on sway with only the GTK and wlr portals, it stays hidden rather than doing nothing. It shows
 up without restarting Gannet once the portal starts with one that can.
 
+## Archives
+
+Opening a zip, tar (`.tar.gz`, `.tar.zst` and the others), 7z, rar or cpio archive extracts it
+into a new folder beside it, rather than handing it to another app, and selects that folder.
+The folder is named after the archive, or `photos (2)` and so on if that name is taken. When
+everything in the archive is inside one folder, that folder comes out as itself, not wrapped in
+another one. Extract is also in the right-click menu. It runs as a job you can stop, and Undo
+moves the folder to the Trash. A damaged archive, one with a password, or one with items that
+would land outside its folder leaves nothing behind and says why. In Open and Save dialogs,
+opening an archive picks it, as any other file.
+
 ## Recent
 
 Recent in the sidebar lists the files you've used lately, newest first, with the folder each
@@ -233,7 +245,7 @@ were.
 
 ## Undo and redo
 
-Ctrl+Z undoes a copy, move, rename, new folder, link, restore or move to the Trash, and
+Ctrl+Z undoes a copy, move, rename, new folder, link, restore, extract or move to the Trash, and
 Ctrl+Shift+Z redoes it. Undo never deletes anything: copies go to the Trash, and so does a
 new folder that something has been put in. An empty one is just removed. Undoing a Replace
 brings back the item it replaced. Gannet checks that each item is still the one the change
