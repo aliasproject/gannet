@@ -3,6 +3,7 @@
 //! as an argument, so tests can't reach real user data by accident.
 
 pub mod archive;
+pub mod bookmarks;
 pub mod bus;
 pub mod cli;
 pub mod clipboard;

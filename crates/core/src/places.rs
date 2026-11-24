@@ -1,5 +1,5 @@
-//! The sidebar's places: home, recent files, the user's standard folders, Trash, and mounted
-//! disks.
+//! The sidebar's places: home, recent files, the user's standard folders, Trash, folders the
+//! user pinned, and mounted disks.
 
 use std::path::{Path, PathBuf};
 
@@ -17,6 +17,8 @@ pub enum PlaceKind {
     Pictures,
     Videos,
     Trash,
+    /// A folder the user pinned, kept in GTK's bookmarks (see `bookmarks`).
+    Pinned,
     Disk,
 }
 
@@ -84,6 +86,11 @@ fn read_user_dirs(home: &Path, config_home: &Path) -> Vec<(String, PathBuf)> {
 /// Where `user-dirs.dirs` puts a folder, or its usual name in home.
 fn user_dir(dirs: &[(String, PathBuf)], key: &str, label: &str, home: &Path) -> PathBuf {
     dirs.iter().find(|(k, _)| k == key).map(|(_, p)| p.clone()).unwrap_or_else(|| home.join(label))
+}
+
+/// The sidebar's rows for pinned folders.
+pub fn pinned_places(pins: &[crate::bookmarks::Pin]) -> Vec<Place> {
+    pins.iter().map(|p| Place { label: p.name(), path: p.path.clone(), kind: PlaceKind::Pinned, volume: None }).collect()
 }
 
 const NETWORK_FS: [&str; 5] = ["nfs", "nfs4", "cifs", "smb3", "sshfs"];

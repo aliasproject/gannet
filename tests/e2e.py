@@ -3681,6 +3681,112 @@ def a_conflict_from_another_window_asks_in_the_window_doing_the_work(h):
     assert (fs / "dst/a.txt").read_text() == "old" and (fs / "src/a.txt").read_text() == "new"
 
 
+def bookmarks_file(a):
+    return Path(a.env["XDG_CONFIG_HOME"]) / "gtk-3.0/bookmarks"
+
+
+def press(a, h, x, y):
+    a.move(x, y)
+    h.pointer(f"button {BTN_LEFT} 1")
+    time.sleep(0.03)
+
+
+@check
+def folders_pin_to_the_sidebar_by_dragging_and_reorder_there(h):
+    fs = fresh_fs()
+    tree(fs, {"work/Projects/p": "p", "work/Notes/n": "n", "work/a.txt": "A"})
+    shutil.rmtree(SCRATCH / "client/config/gtk-3.0", ignore_errors=True)
+    a = App(h, fs / "work")
+    a.wait(lambda s: s["count"] == 3)
+    # After a check with two windows, this one has to take the whole screen first.
+    time.sleep(0.3)
+    # A remote bookmark another app wrote, which Gannet doesn't show and has to keep.
+    conf = bookmarks_file(a)
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("sftp://server/srv Server\n")
+    s = a.wait(lambda s: "Trash" in [p.split("|")[0] for p in s["places"]])
+    below_trash = place_y(s, "Trash") + 15 + SIDEBAR_GAP // 2
+    # A file has nowhere to go between places.
+    press_and_carry(a, h, "a.txt", 60, below_trash)
+    a.wait(lambda s: s["drag"] == "“a.txt”", "a file isn't pinned")
+    release(a, h)
+    # A folder dropped just below Trash is pinned there.
+    press_and_carry(a, h, "Projects", 60, below_trash)
+    a.wait(lambda s: s["drag"] == "Pin “Projects”", "says it will pin")
+    a.shot("pin-a-folder")
+    release(a, h)
+    s = a.wait(lambda s: "Projects" in s["places"] and s["drag"] == "", "pinned")
+    assert s["headings"][1] == place_index(s, "Projects"), "under a heading of its own"
+    assert (fs / "work/Projects/p").exists(), "the folder stays where it is"
+    # The next one lands below it: near the bottom edge of the pin, not on it.
+    press_and_carry(a, h, "Notes", 60, place_y(s, "Projects") + 12)
+    a.wait(lambda s: s["drag"] == "Pin “Notes”", "says it will pin below")
+    release(a, h)
+    s = a.wait(lambda s: "Notes" in s["places"], "pinned second")
+    assert place_index(s, "Notes") == place_index(s, "Projects") + 1
+    text = conf.read_text()
+    assert text.startswith("sftp://server/srv Server\n") and text.count("file://") == 2, text
+    a.shot("pins-in-the-sidebar")
+    # Alt and a number follow the sidebar, pins included.
+    a.key(str(place_index(s, "Notes") + 1), mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work/Notes"), "Alt opens the pin")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work"), "back")
+    # Escape puts a carried pin back.
+    press(a, h, 60, place_y(s, "Projects"))
+    a.move(60, place_y(s, "Projects") + 10)
+    a.move(60, place_y(s, "Notes") + 12)
+    a.wait(lambda s: s["drag"] == "pin to 2", "carrying the first pin below the second")
+    a.shot("pin-reorder")
+    a.key("Escape")
+    a.wait(lambda s: s["drag"] == "", "Escape ends it")
+    release(a, h)
+    assert conf.read_text() == text, "nothing changed"
+    assert a.state()["dir"] == str(fs / "work"), "and the release doesn't open it"
+    # A click opens a pin.
+    a.click(60, place_y(s, "Projects"))
+    a.wait(lambda s: s["dir"] == str(fs / "work/Projects"), "a click opens it")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work"), "back")
+    a.close()
+
+    # Two windows share the pins, and one that changes them changes the other.
+    tree(fs, {"src/Extra/e": "e", "dst/keep": "k"})
+    a, b = two_windows(h, fs)
+    s = b.wait(lambda s: "Projects" in s["places"] and "Notes" in s["places"], "the other window has the pins")
+    sa = a.wait(lambda s: "Notes" in s["places"])
+    press(a, h, 60, place_y(sa, "Notes"))
+    a.move(60, place_y(sa, "Notes") - 10)
+    a.move(60, place_y(sa, "Projects") - 5)
+    a.wait(lambda s: s["drag"] == "pin to 0", "carrying the second pin above the first")
+    release(a, h)
+    reordered = lambda s: place_index(s, "Notes") < place_index(s, "Projects")
+    a.wait(reordered, "reordered here")
+    b.wait(reordered, "and in the other window")
+    assert conf.read_text().startswith("sftp://server/srv Server\n")
+    # A folder dragged from one window to between the other's places is pinned there.
+    sb = b.state()
+    carry_out(a, h, "Extra", OTHER_X + 60, place_y(sb, "Projects") + 12)
+    b.wait(lambda s: s["drag"] == "Pin to the sidebar", "the other window says it will pin")
+    b.shot("pin-from-another-window")
+    release(a, h)
+    b.wait(lambda s: "Extra" in s["places"], "pinned in the other window")
+    a.wait(lambda s: "Extra" in s["places"] and s["drag"] == "", "and in this one")
+    assert (fs / "src/Extra/e").exists(), "the folder stays where it was"
+    # Unpinning from a pin's menu leaves its folder and the other bookmarks alone.
+    sa = a.state()
+    y = place_y(sa, "Projects")
+    a.click(60, y, button=BTN_LEFT + 1)
+    assert a.wait(lambda s: s["menu"], "the pin's menu")["menu_items"] == ["Open", "Unpin"]
+    a.shot("pin-menu")
+    a.click(80, y + 4 + 28 + 14)
+    b.wait(lambda s: "Projects" not in s["places"], "unpinned in the other window too")
+    assert (fs / "work/Projects/p").exists()
+    assert conf.read_text().startswith("sftp://server/srv Server\n")
+    a.close()
+    b.close()
+
+
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else ""
     assert BIN.exists(), "run: CARGO_TARGET_DIR=target/bench cargo build --release -p gannet --features bench"
@@ -3694,6 +3800,8 @@ def main():
                 continue
             # The scratch folders are reused, so every check starts with no folder sorts saved.
             shutil.rmtree(SCRATCH / "client/state/gannet", ignore_errors=True)
+            # Nor any pins: they're in GTK's bookmarks file, which every window shares.
+            shutil.rmtree(SCRATCH / "client/config/gtk-3.0", ignore_errors=True)
             try:
                 t(h)
                 print(f"ok    {t.__name__}", flush=True)
