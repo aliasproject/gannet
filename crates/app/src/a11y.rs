@@ -15,16 +15,23 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use gannet_core::listing::Listing;
+use gannet_core::listing::{Kind, Listing, SortKey, Stat};
 
-use crate::app::App;
+use crate::app::{App, Edit, Layout};
 use crate::canvas::Rect;
+use crate::field::Field;
 
 /// Ids of the window's fixed parts. Places are by their place in the sidebar.
 pub const FRAME: u64 = 1;
 pub const SIDEBAR: u64 = 2;
 pub const LIST: u64 = 3;
 pub const BACK: u64 = 4;
+/// The typed path, while it's open.
+pub const PATH_FIELD: u64 = 5;
+/// The box that filters the list or searches below, while it's showing.
+pub const FILTER: u64 = 6;
+/// The field a row is renamed in, or a new folder named in.
+pub const NAME_FIELD: u64 = 7;
 pub const PLACE0: u64 = 100;
 // The Open and Save dialog's bar. Its file types are by their place among the request's.
 pub const CHOOSER_ACCEPT: u64 = 20;
@@ -49,6 +56,24 @@ pub const OPEN_WITH_ALWAYS: u64 = 62;
 pub const OPEN_WITH_CANCEL: u64 = 63;
 pub const OPEN_WITH_OPEN: u64 = 64;
 pub const OPEN_WITH_ROW0: u64 = 1 << 20;
+// The list's column headings, the path bar, the sidebar's headings, and the panel of jobs and
+// notices. A part of the path is by its place in the path, an eject button by its drive's place
+// in the sidebar, a notice by its place among the notices, and a job by its number.
+pub const COLUMN_NAME: u64 = 80;
+pub const COLUMN_LOCATION: u64 = 81;
+pub const COLUMN_SIZE: u64 = 82;
+pub const COLUMN_MODIFIED: u64 = 83;
+pub const PATH: u64 = 84;
+pub const HEADING_PLACES: u64 = 85;
+pub const HEADING_PINNED: u64 = 86;
+pub const HEADING_DEVICES: u64 = 87;
+pub const NOTICES: u64 = 88;
+pub const CRUMB0: u64 = 1 << 12;
+pub const EJECT0: u64 = 1 << 13;
+pub const NOTICE0: u64 = 1 << 14;
+pub const DISMISS0: u64 = 1 << 15;
+pub const JOB0: u64 = 1 << 32;
+pub const STOP0: u64 = 1 << 33;
 // A menu or dialog open over the window, and the dialog's parts. A menu's items and a dialog's
 // buttons are by their place in it, and the rename dialog's names by theirs.
 pub const MENU: u64 = 30;
@@ -78,6 +103,14 @@ pub enum Role {
     Heading,
     /// What the preview window shows.
     Document,
+    /// The file list, whose rows are table rows of cells.
+    Table,
+    ColumnHeader,
+    /// A part of the path.
+    Link,
+    /// A job under way. Its value is in `News::jobs`.
+    ProgressBar,
+    Panel,
     /// A dialog that asks before going on, like whether to delete for good.
     Alert,
     /// A passphrase being typed. Its `field` has a dot for each character, never the text.
@@ -167,6 +200,65 @@ pub const fn click(description: &'static str, keys: &'static str) -> Action {
     Action::new("click", description, keys)
 }
 
+/// Where a field's characters are drawn, for a screen reader that shows or magnifies them.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TextGeometry {
+    /// The text, its width, and how far from its start each character's left edge is, and the
+    /// last one's right edge. Measured once for each text and size: the field scrolling with
+    /// its caret only moves it.
+    measured: Arc<(String, f32, Vec<f32>)>,
+    /// The left edge of each character, and the right edge of the last.
+    pub edges: Vec<i32>,
+    /// The line the text is on.
+    pub line: Rect,
+}
+
+impl TextGeometry {
+    /// Where a field's characters are, its text starting at `x0` on `line`. The measuring is
+    /// kept from `prev` while the text and its width are the same, so a field scrolling with its
+    /// caret only moves them, and a new scale or font measures them again. Measuring up to each
+    /// character, as the caret is placed, takes time in proportion to the square of the length,
+    /// so a longer text, such as a deep path, is measured a character at a time. That can be a
+    /// pixel or two off where letters kern.
+    pub fn measure(text: &mut crate::text::Text, f: &Field, x0: f32, line: Rect, prev: Option<&TextGeometry>) -> Self {
+        let width = text.measure(&f.text);
+        let measured = match prev.map(|g| &g.measured).filter(|m| m.0 == f.text && m.1 == width) {
+            Some(m) => m.clone(),
+            None => {
+                let s = &f.text;
+                let mut offsets = vec![0.0];
+                if s.len() <= 128 {
+                    offsets.extend(s.char_indices().map(|(i, c)| text.measure(&s[..i + c.len_utf8()])));
+                } else {
+                    let mut x = 0.0;
+                    for c in s.chars() {
+                        x += text.measure(c.encode_utf8(&mut [0; 4]));
+                        offsets.push(x);
+                    }
+                }
+                Arc::new((s.clone(), width, offsets))
+            }
+        };
+        let edges = measured.2.iter().map(|o| (x0 + o).round() as i32).collect();
+        TextGeometry { measured, edges, line }
+    }
+
+    /// A character's box, or an empty box at the end, past the last one.
+    pub fn char_rect(&self, at: usize) -> Rect {
+        let last = self.edges.len().saturating_sub(1);
+        let (a, b) = (self.edges.get(at.min(last)).copied().unwrap_or(0), self.edges.get((at + 1).min(last)).copied().unwrap_or(0));
+        Rect::new(a, self.line.y, b - a, self.line.h)
+    }
+
+    /// The character at a point on the line, if there's one there.
+    pub fn char_at(&self, x: i32, y: i32) -> Option<usize> {
+        if y < self.line.y || y >= self.line.y + self.line.h {
+            return None;
+        }
+        self.edges.windows(2).position(|e| x >= e[0] && x < e[1])
+    }
+}
+
 /// The folder shown, and what's needed to say where a row of Recent, the Trash or a search is.
 #[derive(Default, Debug)]
 pub struct Here {
@@ -199,6 +291,43 @@ pub struct Rows {
     pub scroll: f64,
     /// Changes only with `era`.
     pub here: Arc<Here>,
+    /// The columns, in the order shown, and where each is across a row.
+    pub columns: Vec<Col>,
+    /// The column the list is sorted by, and whether it's in descending order.
+    pub sort: (Column, bool),
+}
+
+/// One of the file list's columns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Column {
+    #[default]
+    Name,
+    /// Where a row of Recent, the Trash or a search is.
+    Location,
+    Size,
+    Modified,
+}
+
+impl Column {
+    /// Its heading's id.
+    pub fn heading(self) -> u64 {
+        match self {
+            Column::Name => COLUMN_NAME,
+            Column::Location => COLUMN_LOCATION,
+            Column::Size => COLUMN_SIZE,
+            Column::Modified => COLUMN_MODIFIED,
+        }
+    }
+}
+
+/// A column as it's shown: what it is, what its heading says, and where it is across the list.
+/// A column too narrow to be drawn has no width.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Col {
+    pub column: Column,
+    pub name: &'static str,
+    pub x: i32,
+    pub w: i32,
 }
 
 impl std::fmt::Debug for Rows {
@@ -214,7 +343,7 @@ impl PartialEq for Rows {
             (None, None) => true,
             _ => false,
         };
-        self.era == o.era && same_listing && Arc::ptr_eq(&self.order, &o.order) && Arc::ptr_eq(&self.selected, &o.selected) && self.area == o.area && self.row_h == o.row_h && self.scroll == o.scroll
+        self.era == o.era && same_listing && Arc::ptr_eq(&self.order, &o.order) && Arc::ptr_eq(&self.selected, &o.selected) && self.area == o.area && self.row_h == o.row_h && self.scroll == o.scroll && self.columns == o.columns && self.sort == o.sort
     }
 }
 
@@ -243,6 +372,33 @@ impl Rows {
         let l = self.listing.as_deref().filter(|l| (entry as usize) < l.len())?;
         let folder = l.location(entry)?;
         Some(if l.search().is_some() { crate::app::search_location(folder, &self.here.dir, &self.here.title) } else { crate::app::home_location(folder, self.here.home.as_deref()) })
+    }
+
+    /// What a row's cell in a column says, as the list shows it. A folder has no size, and a
+    /// file not looked at yet has none of either.
+    pub fn cell(&self, entry: u32, column: Column, now: i64) -> String {
+        let Some(l) = self.listing.as_deref().filter(|l| (entry as usize) < l.len()) else { return String::new() };
+        match (column, l.stat(entry)) {
+            (Column::Name, _) => self.name(entry),
+            (Column::Location, _) => self.location(entry).unwrap_or_default(),
+            (Column::Size, Stat::Known { size, .. }) if !matches!(l.kind(entry), Kind::Dir | Kind::LinkDir) => crate::format::size(size),
+            (Column::Modified, Stat::Known { mtime, .. }) => crate::format::date(mtime, now),
+            (Column::Modified, Stat::Failed) => "unknown".into(),
+            _ => String::new(),
+        }
+    }
+
+    /// What a row says besides its name: its other cells, in the order shown, so the row read
+    /// out as the cursor moves to it sounds as it looks.
+    pub fn summary(&self, entry: u32, now: i64) -> String {
+        let cells: Vec<String> = self.columns.iter().filter(|c| c.column != Column::Name).map(|c| self.cell(entry, c.column, now)).filter(|t| !t.is_empty()).collect();
+        cells.join(", ")
+    }
+
+    /// Where a cell is: its column across the row's area.
+    pub fn cell_rect(&self, at: usize, col: usize) -> Rect {
+        let r = self.rect(at);
+        self.columns.get(col).map_or(Rect::new(r.x, r.y, 0, r.h), |c| Rect::new(c.x, r.y, c.w, r.h))
     }
 
     /// What tells a listing entry's row apart from the others: `Listing::key`.
@@ -310,6 +466,12 @@ pub struct Snapshot {
     pub window_focused: bool,
     /// The folder shown.
     pub dir: Arc<PathBuf>,
+    /// Where each field's characters are, by the field's id. A field with none has no boxes.
+    pub text_geometry: Vec<(u64, Arc<TextGeometry>)>,
+    /// Which field is open, as `App::edit_gen` counts them: a request about one since closed
+    /// is dropped.
+    pub edit_gen: u64,
+    pub news: News,
     /// The menu or dialog open over the window, if one is.
     pub modal: Option<Modal>,
 }
@@ -327,11 +489,57 @@ pub struct Modal {
     pub asked: Option<std::time::Instant>,
 }
 
+/// What the window has to tell, besides its parts: its notices and the jobs under way. A
+/// screen reader hears what's new in it as it comes.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct News {
+    /// How many notices have been posted since the window opened, so a new one can be told
+    /// from an old one that says the same.
+    pub posted: u64,
+    pub notices: Vec<String>,
+    pub jobs: Vec<JobNews>,
+    /// The last few jobs to end, each with whether it did all it was asked.
+    pub ended: Vec<(u64, bool)>,
+}
+
+/// A job as the panel shows it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct JobNews {
+    pub id: u64,
+    pub label: String,
+    /// How far along it is, while that's known.
+    pub percent: Option<u8>,
+    /// What the panel says of its progress: "4.1 MB of 10 MB", or that it's measuring or stopping.
+    pub progress: String,
+    pub stopping: bool,
+}
+
 impl Snapshot {
     pub fn get(&self, id: u64) -> Option<&Node> {
         self.fixed.iter().find(|n| n.id == id)
     }
 
+    /// What to announce on going from `old` to this, each with whether it's urgent: notices
+    /// posted, which are, and jobs that finished and the list sorted another way, which aren't.
+    /// A job stopped, or one with errors, isn't finished: it posts a notice of its own.
+    pub fn news_since(&self, old: &Snapshot) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        if old.rows.era == self.rows.era && old.rows.sort != self.rows.sort {
+            let (column, descending) = self.rows.sort;
+            if let Some(c) = self.rows.columns.iter().find(|c| c.column == column) {
+                out.push((format!("Sorted by {}, {}", c.name.to_lowercase(), if descending { "descending" } else { "ascending" }), false));
+            }
+        }
+        let (was, is) = (&old.news, &self.news);
+        let clean = |id: u64| is.ended.iter().any(|&(e, ok)| e == id && ok);
+        for j in was.jobs.iter().filter(|j| !is.jobs.iter().any(|n| n.id == j.id) && clean(j.id)) {
+            out.push((format!("Finished: {}", j.label), false));
+        }
+        // Notices are added at the end, so the new ones are the last.
+        let fresh = is.posted.saturating_sub(was.posted).min(is.notices.len() as u64) as usize;
+        out.extend(is.notices[is.notices.len() - fresh..].iter().map(|t| (t.clone(), true)));
+        out
+    }
     /// Whether a part is behind the menu or dialog that's open, so it can't be used. What's in
     /// the menu or dialog isn't, nor is the window around it.
     pub fn behind(&self, id: u64) -> bool {
@@ -349,11 +557,33 @@ impl Snapshot {
     pub fn rows_behind(&self) -> bool {
         self.modal.is_some()
     }
+
+    pub fn geometry(&self, id: u64) -> Option<&TextGeometry> {
+        self.text_geometry.iter().find(|(i, _)| *i == id).map(|(_, g)| &**g)
+    }
+}
+
+/// A change a screen reader asks of a field. Offsets are in characters, as AT-SPI counts.
+#[derive(Clone, PartialEq, Debug)]
+pub enum TextEdit {
+    /// Move the caret, leaving nothing selected.
+    Caret(usize),
+    /// Select from the first to the second.
+    Select(usize, usize),
+    /// Put the text in place of the characters between the two, as typing over them does.
+    Replace(usize, usize, String),
+    /// Copy the characters between the two to the clipboard.
+    Copy(usize, usize),
+    /// Copy them, then delete them.
+    Cut(usize, usize),
+    /// Paste the clipboard at a place.
+    Paste(usize),
 }
 
 /// Something a screen reader asked for.
 pub enum Act {
-    /// Do a part's action: press a button, tick a box, or open with an app.
+    /// Do a part's action: press a button, tick a box, open with an app, sort by a column, or
+    /// stop a job.
     Press(u64),
     /// Give a part the keyboard: an entry, or an item of a list other than the file list, which
     /// picks it, as moving to it does with the keyboard.
@@ -366,6 +596,12 @@ pub enum Act {
     OpenPlace(usize),
     /// Scroll the sidebar to show a place.
     ShowPlace(usize),
+    /// Go to a part of the path, by its place in it, if the window is still in that folder.
+    OpenCrumb(Arc<PathBuf>, usize),
+    /// Eject the drive at that place in the sidebar, if it's still the one of that name.
+    Eject(usize, String),
+    /// Dismiss the notice at that place among them, if it still says that.
+    Dismiss(usize, String),
     /// Put the cursor on a row without changing the selection: the row of that key
     /// (`Listing::key`) in that folder. A request about a folder the window has left is dropped,
     /// here and for each request about a row.
@@ -374,6 +610,9 @@ pub enum Act {
     SelectRow(Arc<PathBuf>, Vec<u8>, bool),
     /// Scroll a row into view without moving the cursor.
     ShowRow(Arc<PathBuf>, Vec<u8>),
+    /// Change a field's text, caret or selection, through what typing in it does. The number
+    /// is the snapshot's `edit_gen`.
+    EditText(u64, u64, TextEdit),
     /// Someone started listening: hand over a snapshot.
     Wake,
 }
@@ -381,7 +620,7 @@ pub enum Act {
 /// What the server is told.
 pub enum ToServer {
     /// The window as it is now.
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     /// The registry restarted: introduce the app again.
     Embed,
     /// Stop serving: the screen reader has gone.
@@ -494,9 +733,15 @@ impl Link {
             return;
         }
         if let Some((_, tx)) = self.shared.to_server.lock().unwrap().as_ref() {
-            let _ = tx.send(ToServer::Snapshot(snap.clone()));
+            let _ = tx.send(ToServer::Snapshot(Box::new(snap.clone())));
         }
         self.last = Some(snap);
+    }
+
+    /// Where a field's characters were in the last snapshot handed over, so a window building
+    /// its own needn't measure them again while its text is the same.
+    pub fn geometry(&self, id: u64) -> Option<&TextGeometry> {
+        self.last.as_ref().and_then(|s| s.geometry(id))
     }
 
     /// No rows, the same each time, so a window without a file list compares as unchanged.
@@ -535,7 +780,13 @@ impl Link {
             _ => Arc::new(app.selected_bits().to_vec()),
         };
         let l = app.layout();
-        let rows = Rows { era: self.era, listing: app.listing.clone(), order, index, selected, area: l.list, row_h: l.row_h.max(1), scroll: app.scroll, here: self.here.clone() };
+        let sort = app.view_sort();
+        let column = match sort.key {
+            SortKey::Name => Column::Name,
+            SortKey::Size => Column::Size,
+            SortKey::Modified => Column::Modified,
+        };
+        let rows = Rows { era: self.era, listing: app.listing.clone(), order, index, selected, area: l.list, row_h: l.row_h.max(1), scroll: app.scroll, here: self.here.clone(), columns: columns(app, &l), sort: (column, sort.descending) };
 
         let place_h = app.px(30.0);
         let places: Vec<Node> = app.places.iter().enumerate().map(|(i, p)| {
@@ -548,15 +799,44 @@ impl Link {
         let b = app.px(36.0);
         // As the window's title says it, so Recent and the Trash are called that.
         let title = app.crumb_label(&app.dir);
+        let (side, sidebar) = sidebar(app, &l, places);
+        let headings: Vec<Node> = rows.columns.iter().map(|c| heading(app, &l, c)).collect();
+        let (path, crumbs) = path_bar(app, &l);
+        let (panel, panel_parts, news) = panel(app, &l);
+        let fields = Self::fields(app);
+        let field = |id: u64| fields.iter().any(|n| n.id == id).then_some(id);
+        // In the order they're drawn: the toolbar, with the typed path in the path bar's place,
+        // the sidebar, the list's headings, the list, the panel below it, and last, as it's on
+        // top of the list, the field a row is renamed in.
+        let mut frame_kids = vec![BACK];
+        frame_kids.extend(field(PATH_FIELD));
+        frame_kids.push(PATH);
+        frame_kids.extend(field(FILTER));
+        frame_kids.push(SIDEBAR);
+        frame_kids.extend(headings.iter().map(|n| n.id));
+        frame_kids.extend([LIST, NOTICES]);
+        frame_kids.extend(field(NAME_FIELD));
         let mut fixed = vec![
-            Node::new(FRAME, Role::Frame, format!("{title} - Gannet"), Rect::new(0, 0, app.w, app.h), 0).with_children(vec![BACK, SIDEBAR, LIST]),
+            Node::new(FRAME, Role::Frame, format!("{title} - Gannet"), Rect::new(0, 0, app.w, app.h), 0).with_children(frame_kids),
             Node::new(BACK, Role::PushButton, "Back", Rect::new(app.px(6.0), 0, b, l.toolbar.h), FRAME).enabled(app.history.can_go_back()).doing(click("Go back", "<Alt>Left")),
-            Node::new(SIDEBAR, Role::List, "Places", l.sidebar, FRAME).with_children(places.iter().map(|n| n.id).collect()),
-            Node::new(LIST, Role::List, "Files", l.list, FRAME),
+            Node::new(SIDEBAR, Role::List, "Places", l.sidebar, FRAME).with_children(side),
+            // What the list says when it has no rows: that the folder's empty, or why it can't be shown.
+            // Not while a new folder is being named in it, which takes that message's place.
+            Node::new(LIST, Role::Table, "Files", l.list, FRAME).described(app.list_message().filter(|_| !matches!(app.edit, Edit::NewFolder(_))).map(|m| m.0).unwrap_or_default()),
+            path,
+            panel,
         ];
-        fixed.extend(places);
-        let mut focus = match rows.entry(app.cursor) {
-            Some(e) if app.cursor_shown => Focus::Row(e),
+        fixed.extend(sidebar);
+        fixed.extend(headings);
+        fixed.extend(crumbs);
+        fixed.extend(panel_parts);
+        // The filter box can show what it filters by without being typed in.
+        let typing = fields.iter().map(|n| n.id).find(|&id| id != FILTER || matches!(app.edit, Edit::Filter(_)));
+        fixed.extend(fields);
+        let mut focus = match (typing, rows.entry(app.cursor)) {
+            // A field being typed in has the keyboard.
+            (Some(id), _) => Focus::Node(id),
+            (None, Some(e)) if app.cursor_shown => Focus::Row(e),
             _ => Focus::Node(LIST),
         };
         if let Some(c) = app.chooser.as_ref() {
@@ -579,7 +859,54 @@ impl Link {
             focus = Focus::Node(has);
             modal = Some(m);
         }
-        Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone(), modal }
+        // Where every field's characters are, the Save dialog's name among them. Each is drawn by
+        // `paint_field` in its node's box.
+        let mut text_geometry = Vec::new();
+        for n in &fixed {
+            let Some(f) = n.field.as_ref() else { continue };
+            let prev = self.last.as_ref().and_then(|s| s.geometry(n.id));
+            let x0 = app.field_text_x(n.rect, f);
+            let line = app.field_line(n.rect);
+            text_geometry.push((n.id, Arc::new(TextGeometry::measure(&mut app.text, f, x0, line, prev))));
+        }
+        Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry, edit_gen: app.edit_gen(), news, modal }
+    }
+
+    /// The text fields of the file manager's own window showing.
+    fn fields(app: &mut App) -> Vec<Node> {
+        let mut out = Vec::new();
+        let list = app.layout().list;
+        let mut add = |id, name: String, description: &str, rect: Rect, f: Field| {
+            // The row being renamed can be scrolled out of view.
+            let showing = id != NAME_FIELD || rect.intersects(list);
+            let mut n = Node::new(id, Role::Entry, name, rect, FRAME).described(description).showing(showing);
+            n.field = Some(f);
+            out.push(n);
+        };
+        if let Edit::Path(f) = &app.edit {
+            let f = f.clone();
+            add(PATH_FIELD, "Path".into(), "Enter a full path, starting with / or ~", app.path_box(), f);
+        }
+        if let Some(r) = app.filter_rect() {
+            let f = match &app.edit {
+                Edit::Filter(f) => f.clone(),
+                _ => Field::new(&app.filter),
+            };
+            // Named for what it does, and described as its empty box says it.
+            let (name, hint) = if app.search_below { ("Search", "Search here and below") } else { ("Filter", "Filter this folder") };
+            add(FILTER, name.into(), hint, r, f);
+        }
+        let named = match &app.edit {
+            Edit::Rename { field, name, .. } => Some((field.clone(), format!("Rename {}", String::from_utf8_lossy(name)))),
+            Edit::NewFolder(field) => Some((field.clone(), "New folder name".to_string())),
+            _ => None,
+        };
+        if let Some((f, name)) = named
+            && let Some(r) = app.name_field_rect()
+        {
+            add(NAME_FIELD, name, "", r, f);
+        }
+        out
     }
 
     /// The preview window: the file's name, its kind and what's shown of it, and buttons to
@@ -600,7 +927,7 @@ impl Link {
             Node::new(PREVIEW_NEXT, Role::PushButton, "Next file", Rect::default(), FRAME).enabled(s.can_step.1).doing(click("Show the next file in the folder", "Right")),
             Node::new(PREVIEW_CLOSE, Role::PushButton, "Close", Rect::default(), FRAME).doing(click("Close the preview", "Escape")),
         ];
-        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone(), modal: None }
+        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry: Vec::new(), edit_gen: 0, news: News::default(), modal: None }
     }
 }
 
@@ -706,13 +1033,149 @@ fn dialog(app: &mut App) -> Option<(Vec<Node>, Modal, u64)> {
     Some((parts, Modal { id: DIALOG, default: Some(default), asked }, has))
 }
 
+/// The list's columns, placed as `paint_header` draws them. Recent, the Trash and search
+/// results say where each row is, in a column that's left out of the drawing when the window is
+/// too narrow for it, but not out of what a screen reader hears.
+fn columns(app: &App, l: &Layout) -> Vec<Col> {
+    let area = l.list;
+    let date_x = area.right() - app.px(14.0) - l.col_date;
+    let size_x = date_x - l.col_size;
+    let name_x = area.x + app.px(38.0);
+    let listing = app.listing.as_deref();
+    let trash = listing.is_some_and(|l| l.is_trash());
+    let recent = listing.is_some_and(|l| l.is_recent());
+    let search = listing.is_some_and(|l| l.search().is_some());
+    let origin = (trash || recent || search).then(|| app.origin_column(area, size_x));
+    let name_end = origin.flatten().map_or(size_x, |(ox, _)| ox) - app.px(10.0);
+    let mut out = vec![Col { column: Column::Name, name: "Name", x: name_x, w: (name_end - name_x).max(0) }];
+    if let Some(o) = origin {
+        let (x, w) = o.unwrap_or((size_x, 0));
+        out.push(Col { column: Column::Location, name: if trash { "Original location" } else { "Location" }, x, w });
+    }
+    let date = if trash {
+        "Deleted"
+    } else if recent {
+        "Used"
+    } else {
+        "Modified"
+    };
+    out.push(Col { column: Column::Size, name: "Size", x: size_x, w: l.col_size });
+    out.push(Col { column: Column::Modified, name: date, x: date_x, w: l.col_date });
+    out
+}
+
+/// A column's heading, which sorts the list by it, as clicking it does. Recent's order is fixed,
+/// and nothing sorts by where a row is.
+fn heading(app: &App, l: &Layout, c: &Col) -> Node {
+    // The Name heading starts left of the names, over their icons, as it's drawn.
+    let x = if c.column == Column::Name { l.header.x + app.px(14.0) } else { c.x };
+    let n = Node::new(c.column.heading(), Role::ColumnHeader, c.name, Rect::new(x, l.header.y, c.x + c.w - x, l.header.h), FRAME).showing(c.w > 0);
+    let action = match c.column {
+        Column::Name => click("Sort by name", "<Control>1"),
+        Column::Size => click("Sort by size", "<Control>2"),
+        Column::Modified => click("Sort by date", "<Control>3"),
+        Column::Location => return n,
+    };
+    if app.is_recent_view() { n } else { n.doing(action) }
+}
+
+/// The sidebar's children, its headings among its places, and the parts in it: the places,
+/// the headings, and the eject buttons of drives that can be taken out, each inside its drive.
+fn sidebar(app: &App, l: &Layout, mut places: Vec<Node>) -> (Vec<u64>, Vec<Node>) {
+    let heads = app.sidebar_headings();
+    let heading_h = app.px(crate::app::SIDEBAR_HEADING);
+    let in_view = |r: Rect| r.y + r.h > l.sidebar.y && r.y < l.sidebar.y + l.sidebar.h;
+    let mut side = Vec::new();
+    let mut extra = Vec::new();
+    for (i, n) in places.iter_mut().enumerate() {
+        if let Some(&(_, label)) = heads.iter().find(|(at, _)| *at == i) {
+            let id = match label {
+                "Pinned" => HEADING_PINNED,
+                "Devices" => HEADING_DEVICES,
+                _ => HEADING_PLACES,
+            };
+            let r = Rect::new(l.sidebar.x, app.place_top(i) - heading_h, l.sidebar.w, heading_h);
+            side.push(id);
+            extra.push(Node::new(id, Role::Heading, label, r, SIDEBAR).showing(in_view(r)));
+        }
+        side.push(n.id);
+        let Some(r) = app.eject_rect(i) else { continue };
+        let Some(v) = app.places.get(i).and_then(|p| p.volume.as_ref()) else { continue };
+        let id = EJECT0 + i as u64;
+        n.children = vec![id];
+        extra.push(Node::new(id, Role::PushButton, format!("Eject {}", n.name), r, n.id).showing(n.showing).enabled(!app.drives_busy.contains(&v.block)).doing(click("Eject the drive", "")));
+    }
+    places.extend(extra);
+    (side, places)
+}
+
+/// The path bar: a list of links, one for each folder of the path, and the parts in it. The
+/// parts cut off its left aren't showing, and nor is any while the path is being typed.
+fn path_bar(app: &mut App, l: &Layout) -> (Node, Vec<Node>) {
+    let typing = matches!(app.edit, Edit::Path(_));
+    let laid = if typing { Vec::new() } else { app.crumbs() };
+    let h = (l.toolbar.h - app.px(16.0)).max(0);
+    let crumbs: Vec<Node> = app.crumb_parts().into_iter().enumerate().map(|(i, (_, path))| {
+            let at = laid.iter().find(|(_, _, p)| *p == path).map(|&(x, w, _)| Rect::new(x, app.px(8.0), w, h));
+            Node::new(CRUMB0 + i as u64, Role::Link, app.crumb_label(&path), at.unwrap_or_default(), PATH).selected(path == app.dir).showing(at.is_some() && !typing).doing(Action::new("jump", "Go to this folder", ""))
+        })
+        .collect();
+    let x = laid.first().map_or(l.toolbar.x, |c| c.0);
+    let right = laid.last().map_or(x, |c| c.0 + c.1);
+    let bar = Node::new(PATH, Role::List, "Path", Rect::new(x, 0, right - x, l.toolbar.h), FRAME).showing(!typing).with_children(crumbs.iter().map(|n| n.id).collect());
+    (bar, crumbs)
+}
+
+/// The panel above the status bar, its parts, and the news a screen reader hears of: each job
+/// under way, with its Stop button, then each notice, with its Dismiss button. Only the first
+/// four of each are drawn.
+fn panel(app: &App, l: &Layout) -> (Node, Vec<Node>, News) {
+    let row = app.px(30.0);
+    let mut parts = Vec::new();
+    let mut jobs = Vec::new();
+    let place = |k: usize| Rect::new(l.notices.x, l.notices.y + k as i32 * row, l.notices.w, row);
+    let close = |k: usize| Rect::new(l.notices.right() - row, l.notices.y + k as i32 * row, row, row);
+    for (k, j) in app.visible_jobs().enumerate() {
+        let p = &j.job.progress;
+        let (total, done) = (p.total_bytes.load(Ordering::Relaxed), p.done_bytes.load(Ordering::Relaxed));
+        let (items, done_items) = (p.total_items.load(Ordering::Relaxed), p.done_items.load(Ordering::Relaxed));
+        let scanning = p.scanning.load(Ordering::Relaxed);
+        let stopping = j.job.is_cancelled();
+        // By bytes, or by items when there are no bytes to count.
+        let percent = if scanning { None } else { (done.min(total) * 100).checked_div(total).or_else(|| (done_items.min(items) * 100).checked_div(items)).map(|p| p as u8) };
+        // As the panel says it.
+        let progress = if stopping {
+            "stopping".to_string()
+        } else if scanning {
+            "measuring".to_string()
+        } else if total > 0 {
+            format!("{} of {}", crate::format::size(done), crate::format::size(total))
+        } else {
+            String::new()
+        };
+        let shown = k < 4;
+        parts.push(Node::new(JOB0 + j.job.id, Role::ProgressBar, j.job.label.clone(), place(k), NOTICES).showing(shown));
+        parts.push(Node::new(STOP0 + j.job.id, Role::PushButton, "Stop", close(k), NOTICES).described(j.job.label.clone()).showing(shown).enabled(!stopping).doing(click("Stop the job", "")));
+        jobs.push(JobNews { id: j.job.id, label: j.job.label.clone(), percent, progress, stopping });
+    }
+    let first = jobs.len().min(4);
+    for (i, text) in app.notices.iter().enumerate() {
+        let shown = i < 4;
+        parts.push(Node::new(NOTICE0 + i as u64, Role::Label, text.clone(), place(first + i), NOTICES).showing(shown));
+        parts.push(Node::new(DISMISS0 + i as u64, Role::PushButton, "Dismiss", close(first + i), NOTICES).described(text.clone()).showing(shown).doing(click("Dismiss the notice", "")));
+    }
+    let panel = Node::new(NOTICES, Role::Panel, "Notices", l.notices, FRAME).showing(l.notices.h > 0).with_children(parts.iter().map(|n| n.id).collect());
+    let news = News { posted: app.notices_posted, notices: app.notices.clone(), jobs, ended: app.jobs_ended.clone() };
+    (panel, parts, news)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rows(n: usize, scroll: f64) -> Rows {
         let order: Vec<u32> = (0..n as u32).rev().collect();
-        Rows { era: 1, listing: None, order: Arc::new(order), index: Arc::default(), selected: Arc::new(vec![0b100]), area: Rect::new(10, 100, 300, 200), row_h: 20, scroll, here: Arc::default() }
+        Rows { era: 1, listing: None, order: Arc::new(order), index: Arc::default(), selected: Arc::new(vec![0b100]), area: Rect::new(10, 100, 300, 200), row_h: 20, scroll, ..Rows::default() }
     }
 
     #[test]
@@ -730,12 +1193,22 @@ mod tests {
     fn only_whats_open_over_the_window_can_be_used() {
         let n = |id, parent| Node::new(id, Role::PushButton, "", Rect::default(), parent);
         let fixed = vec![n(FRAME, 0).with_children(vec![BACK, DIALOG]), n(BACK, FRAME), n(DIALOG, FRAME).with_children(vec![DIALOG_BUTTON0]), n(DIALOG_BUTTON0, DIALOG)];
-        let mut s = Snapshot { fixed, rows: rows(3, 0.0), focus: Focus::Node(BACK), window_focused: true, dir: Arc::default(), modal: None };
+        let mut s = Snapshot { fixed, rows: rows(3, 0.0), focus: Focus::Node(BACK), window_focused: true, dir: Arc::default(), text_geometry: Vec::new(), edit_gen: 0, news: News::default(), modal: None };
         assert!(!s.behind(BACK) && !s.rows_behind(), "nothing's open");
         s.modal = Some(Modal { id: DIALOG, default: Some(DIALOG_BUTTON0), asked: None });
         assert!(s.behind(BACK) && s.rows_behind());
         assert!(!s.behind(DIALOG) && !s.behind(DIALOG_BUTTON0), "the dialog and what's in it");
         assert!(!s.behind(FRAME), "nor the window around it");
+    }
+
+    #[test]
+    fn a_fields_characters_are_found_by_place() {
+        let g = TextGeometry { measured: Arc::default(), edges: vec![10, 17, 25, 31], line: Rect::new(0, 20, 100, 16) };
+        assert_eq!(g.char_rect(1), Rect::new(17, 20, 8, 16));
+        assert_eq!(g.char_rect(3), Rect::new(31, 20, 0, 16), "past the end, an empty box");
+        assert_eq!(g.char_at(17, 20), Some(1));
+        assert_eq!(g.char_at(30, 35), Some(2));
+        assert_eq!((g.char_at(31, 25), g.char_at(9, 25), g.char_at(12, 36)), (None, None, None), "beside the text, or below the line");
     }
 
     #[test]

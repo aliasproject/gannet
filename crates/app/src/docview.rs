@@ -4,10 +4,11 @@
 //! A plain text file is set in a monospaced font and wrapped by counting columns, so even a long
 //! one lays out without measuring a word. Markdown is measured word by word.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use crate::canvas::{Canvas, Rect};
-use crate::doc::{self, Block, Doc, Kind};
+use crate::doc::{self, Align, Block, Doc, Kind, Starts};
 use crate::text::{self, Text};
 
 const BODY_PX: f32 = 15.0;
@@ -192,6 +193,9 @@ pub enum Mark {
     Rule,
     /// Part of a code block, whose background runs between these.
     Code(i32, i32),
+    /// Part of a table row, which runs between `left` and `right`. The header row is washed, and
+    /// rules go above the table and below each row.
+    Table { left: i32, right: i32, wash: bool, above: bool, below: bool },
 }
 
 #[derive(Debug, PartialEq)]
@@ -275,7 +279,8 @@ pub fn lay_out(doc: &Doc, width: i32, fonts: &mut Fonts) -> Layout {
     let gap = fonts.body.line_height() as i32;
     let mut out = Layout { width, generation: fonts.generation(), height: 0, lines: Vec::new() };
     let mut y = fonts.px(16.0);
-    for (i, block) in doc.blocks.iter().enumerate() {
+    let mut i = 0;
+    while let Some(block) = doc.blocks.get(i) {
         let left = pad + block.indent as i32 * indent_w + block.quote as i32 * quote_w;
         let right = (width - pad).max(left + 1);
         // Space above, by what the block is and what came before.
@@ -286,6 +291,7 @@ pub fn lay_out(doc: &Doc, width: i32, fonts: &mut Fonts) -> Layout {
             _ => gap * 3 / 5,
         };
         y += before;
+        i += 1;
         match &block.kind {
             Kind::Plain | Kind::Code => {
                 let code = block.kind == Kind::Code;
@@ -324,6 +330,11 @@ pub fn lay_out(doc: &Doc, width: i32, fonts: &mut Fonts) -> Layout {
             }
             Kind::Paragraph | Kind::Heading(_) | Kind::Item(_) => {
                 y = flow(block, left, right, y, fonts, &mut out.lines);
+            }
+            Kind::Cell { .. } => {
+                let cells = 1 + doc.blocks[i..].iter().take_while(|b| matches!(b.kind, Kind::Cell { starts, .. } if starts != Starts::Table)).count();
+                y = table(&doc.blocks[i - 1..i - 1 + cells], left, right, y, fonts, &mut out.lines);
+                i += cells - 1;
             }
         }
     }
@@ -435,6 +446,134 @@ fn flow(block: &Block, left: i32, right: i32, mut y: i32, fonts: &mut Fonts, lin
     y
 }
 
+/// Lays out a table's cells from `y`, returning where the next block starts. Its columns are as
+/// wide as their words when there's room, and share what room there is when there isn't.
+fn table(cells: &[Block], left: i32, right: i32, mut y: i32, fonts: &mut Fonts, lines: &mut Vec<Line>) -> i32 {
+    let (pad, vpad) = (fonts.px(10.0), fonts.px(6.0));
+    let mut rows: Vec<Vec<Cow<Block>>> = Vec::new();
+    for cell in cells {
+        if rows.is_empty() || matches!(cell.kind, Kind::Cell { starts: Starts::Row, .. }) {
+            rows.push(Vec::new());
+        }
+        // The header's words are bold.
+        let cell = if rows.len() == 1 {
+            let mut bold = cell.clone();
+            bold.spans.iter_mut().for_each(|s| s.style |= doc::BOLD);
+            Cow::Owned(bold)
+        } else {
+            Cow::Borrowed(cell)
+        };
+        if let Some(row) = rows.last_mut() {
+            row.push(cell);
+        }
+    }
+    let quote = cells.first().map_or(0, |c| c.quote);
+    // How wide each column's words are all on one line, and its longest word.
+    let count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let (mut natural, mut longest) = (vec![0; count], vec![0; count]);
+    for row in &rows {
+        for (c, cell) in row.iter().enumerate() {
+            let (w, word) = measure_cell(cell, fonts);
+            natural[c] = natural[c].max(w + pad * 2);
+            longest[c] = longest[c].max(word + pad * 2);
+        }
+    }
+    let widths = share(&natural, &longest, right - left);
+    let table_right = left + widths.iter().sum::<i32>();
+    for (r, row) in rows.iter().enumerate() {
+        // Each cell's lines, side by side: a row's nth line is every cell's nth line.
+        let mut merged: Vec<Line> = Vec::new();
+        let mut x = left;
+        for (cell, &w) in row.iter().zip(&widths) {
+            // A column narrower than its padding gives up some of it, so its words stay inside.
+            let inset = pad.min(w / 4);
+            let (from, to) = (x + inset, (x + w - inset).max(x + inset + 1));
+            x += w;
+            let mut own = Vec::new();
+            flow(cell, from, to, 0, fonts, &mut own);
+            for (k, mut line) in own.into_iter().enumerate() {
+                let shift = match cell.kind {
+                    Kind::Cell { align: Align::Left, .. } => 0.0,
+                    Kind::Cell { align, .. } => {
+                        let ink = line.pieces.iter().map(|p| p.x + fonts.get(p.face).measure(p.text.trim_end_matches(' '))).fold(from as f32, f32::max);
+                        let spare = (to as f32 - ink).max(0.0);
+                        if align == Align::Center { (spare / 2.0).floor() } else { spare }
+                    }
+                    _ => 0.0,
+                };
+                line.pieces.iter_mut().for_each(|p| p.x += shift);
+                match merged.get_mut(k) {
+                    Some(m) => {
+                        m.h = m.h.max(line.h);
+                        m.baseline = m.baseline.max(line.baseline);
+                        m.pieces.append(&mut line.pieces);
+                    }
+                    None => merged.push(line),
+                }
+            }
+        }
+        // A row of empty cells is still a row.
+        if merged.is_empty() {
+            let t = fonts.get(Face::Body);
+            merged.push(Line { y: 0, h: t.line_height().ceil() as i32, baseline: t.ascent.round() as i32, quote, mark: Mark::None, marker: None, pieces: Vec::new() });
+        }
+        let last = merged.len() - 1;
+        for (k, mut line) in merged.into_iter().enumerate() {
+            // The row's padding goes to its first and last lines, as a code block's does.
+            if k == 0 {
+                line.h += vpad;
+                line.baseline += vpad;
+            }
+            if k == last {
+                line.h += vpad;
+            }
+            line.y = y;
+            line.quote = quote;
+            line.mark = Mark::Table { left, right: table_right, wash: r == 0, above: r == 0 && k == 0, below: k == last };
+            y += line.h;
+            lines.push(line);
+        }
+    }
+    y
+}
+
+/// How wide a cell's words are on one line, and its widest word, in pixels.
+fn measure_cell(cell: &Block, fonts: &mut Fonts) -> (i32, i32) {
+    let (mut line, mut widest, mut word_most) = (0.0f32, 0.0f32, 0.0f32);
+    for span in &cell.spans {
+        let t = fonts.get(face_for(&cell.kind, span.style));
+        for word in words(&span.text) {
+            if word == "\n" {
+                line = 0.0;
+                continue;
+            }
+            let ink = t.measure(word.trim_end_matches(' '));
+            widest = widest.max(line + ink);
+            word_most = word_most.max(ink);
+            line += t.measure(word);
+        }
+    }
+    (widest.ceil() as i32, word_most.ceil() as i32)
+}
+
+/// Columns' widths in `room`: as wide as their words when they all fit. Otherwise each keeps its
+/// longest word whole and the rest of the room goes to the columns that wanted more, by how much
+/// more. If even the longest words don't fit, every column gives up room alike, and words break.
+fn share(natural: &[i32], longest: &[i32], room: i32) -> Vec<i32> {
+    let room = room.max(natural.len() as i32);
+    let want: i64 = natural.iter().map(|&w| w as i64).sum();
+    if want <= room as i64 {
+        return natural.to_vec();
+    }
+    let least: Vec<i64> = natural.iter().zip(longest).map(|(&n, &l)| l.min(n).max(1) as i64).collect();
+    let floor: i64 = least.iter().sum();
+    if floor >= room as i64 {
+        return least.iter().map(|&l| (l * room as i64 / floor).max(1) as i32).collect();
+    }
+    let (spare, extra) = (room as i64 - floor, want - floor);
+    natural.iter().zip(&least).map(|(&n, &l)| (l + (n as i64 - l) * spare / extra.max(1)) as i32).collect()
+}
+
 /// What the document is drawn with.
 #[derive(Clone, Copy)]
 pub struct Ink {
@@ -459,6 +598,18 @@ pub fn paint(c: &mut Canvas, area: Rect, scroll: i32, layout: &Layout, fonts: &m
         match line.mark {
             Mark::Rule => c.fill(Rect::new(area.x + pad, y + line.h / 2, area.w - pad * 2, fonts.px(1.0).max(1)), ink.rule),
             Mark::Code(l, r) => c.fill(Rect::new(area.x + l, y, r - l, line.h), ink.code),
+            Mark::Table { left, right, wash, above, below } => {
+                let (x, w, thin) = (area.x + left, right - left, fonts.px(1.0).max(1));
+                if wash {
+                    c.fill(Rect::new(x, y, w, line.h), ink.code);
+                }
+                if above {
+                    c.fill(Rect::new(x, y, w, thin), ink.rule);
+                }
+                if below {
+                    c.fill(Rect::new(x, y + line.h - thin, w, thin), ink.rule);
+                }
+            }
             Mark::None => {}
         }
         for q in 0..line.quote as i32 {
@@ -472,11 +623,19 @@ pub fn paint(c: &mut Canvas, area: Rect, scroll: i32, layout: &Layout, fonts: &m
             let color = if piece.style & doc::LINK != 0 { ink.link } else if line.quote > 0 { ink.muted } else { ink.text };
             let x = area.x as f32 + piece.x;
             let t = fonts.get(piece.face);
-            // Code among words gets a little box of its own.
-            if piece.style & doc::CODE != 0 && line.mark == Mark::None && piece.face == Face::Mono && line.pieces.len() > 1 {
+            // Code among words gets a little box of its own, as does code in a table cell, whose
+            // line holds the other cells' words too.
+            let among = match line.mark {
+                Mark::Code(..) => false,
+                Mark::Table { .. } => true,
+                _ => line.pieces.len() > 1,
+            };
+            if piece.style & doc::CODE != 0 && among && piece.face == Face::Mono {
                 let w = t.measure(piece.text.trim_end_matches(' ')).ceil() as i32;
                 let h = t.line_height().ceil() as i32;
-                c.rrect(Rect::new(x as i32 - 3, baseline - t.ascent.round() as i32 - 1, w + 6, h + 2), 4, ink.code);
+                // On the header's wash, which is the code colour already, it takes the rules' colour.
+                let fill = if matches!(line.mark, Mark::Table { wash: true, .. }) { ink.rule } else { ink.code };
+                c.rrect(Rect::new(x as i32 - 3, baseline - t.ascent.round() as i32 - 1, w + 6, h + 2), 4, fill);
             }
             t.draw_str(c, &piece.text, x, baseline, color);
             if piece.style & (doc::STRUCK | doc::LINK) != 0 {
@@ -538,6 +697,83 @@ mod tests {
                 assert!(p.x + fonts.get(p.face).measure(&p.text) <= (width - fonts.px(20.0)) as f32 + 1.0, "inside the line");
             }
         }
+    }
+
+    #[test]
+    fn columns_share_the_room_when_there_isnt_enough() {
+        assert_eq!(share(&[100, 50], &[40, 50], 400), [100, 50], "as wide as their words when there's room");
+        // Each keeps its longest word, and the rest goes by how much more each wanted.
+        assert_eq!(share(&[300, 100], &[50, 50], 200), [133, 66]);
+        let tight = share(&[300, 100], &[200, 100], 150);
+        assert_eq!(tight, [100, 50], "even the longest words don't fit: both give up alike");
+        assert!(share(&[10; 50], &[10; 50], 0).iter().all(|&w| w >= 1), "no column vanishes");
+        assert_eq!(share(&[], &[], 100), Vec::<i32>::new());
+    }
+
+    /// Where the words in a laid-out line are: (x, text), left to right.
+    fn pieces(line: &Line) -> Vec<(f32, &str)> {
+        line.pieces.iter().map(|p| (p.x, p.text.as_str())).collect()
+    }
+
+    #[test]
+    fn a_table_lays_out_as_a_grid_with_its_header_bold() {
+        let Some(mut fonts) = fonts() else { return };
+        let doc = doc::markdown("# Dinner\n\n| Course | |\n|---|---|\n| Starter | Soup |\n| Main | Fish |\n\nAfter.\n", false);
+        let layout = lay_out(&doc, 800, &mut fonts);
+        let rows: Vec<&Line> = layout.lines.iter().filter(|l| matches!(l.mark, Mark::Table { .. })).collect();
+        assert_eq!(rows.len(), 3, "a line for each row");
+        assert!(rows.windows(2).all(|w| w[0].y + w[0].h == w[1].y), "rows follow one another");
+        assert!(rows[0].pieces.iter().all(|p| p.face == Face::Bold), "the header is bold");
+        assert!(rows[1].pieces.iter().all(|p| p.face == Face::Body));
+        assert_eq!(rows[1].pieces.len(), 2, "both cells of a row are on its line");
+        // The second column starts in the same place on every row, past the first column's words.
+        let (starter, soup) = (rows[1].pieces[0].x, rows[1].pieces[1].x);
+        assert_eq!(rows[2].pieces[1].x, soup);
+        assert!(soup > starter + fonts.get(Face::Body).measure("Starter"));
+        let Mark::Table { left, right, .. } = rows[0].mark else { unreachable!() };
+        assert!(right - left < 400, "as wide as its words, not the window");
+        let marks: Vec<(bool, bool, bool)> = rows.iter().map(|l| match l.mark {
+            Mark::Table { wash, above, below, .. } => (wash, above, below),
+            _ => unreachable!(),
+        }).collect();
+        assert_eq!(marks, [(true, true, true), (false, false, true), (false, false, true)], "the header's washed, with rules above and between");
+        assert_eq!(pieces(layout.lines.last().unwrap()), [(left as f32, "After.")], "what follows is back to a paragraph");
+    }
+
+    #[test]
+    fn a_narrow_table_wraps_within_its_columns_and_follows_alignment() {
+        let Some(mut fonts) = fonts() else { return };
+        let long = "a long description of the dish that goes on for some while ".repeat(4);
+        let doc = doc::markdown(&format!("| Dish | Price |\n|---|--:|\n| {long} | 12 |\n| x | 1234 |\n"), false);
+        let width = 360;
+        let layout = lay_out(&doc, width, &mut fonts);
+        let right_edge = (width - fonts.px(20.0)) as f32 + 1.0;
+        for line in &layout.lines {
+            for p in &line.pieces {
+                assert!(p.x + fonts.get(p.face).measure(p.text.trim_end()) <= right_edge, "{:?} is inside the window", p.text);
+            }
+            let Mark::Table { right, .. } = line.mark else { panic!("not in the table") };
+            assert!(right <= width - fonts.px(20.0), "the table fits");
+        }
+        assert!(layout.lines.len() > 4, "the long cell wraps over lines");
+        // The price column is right-aligned: its numbers end in the same place.
+        let ends: Vec<f32> = layout.lines.iter().filter_map(|l| l.pieces.iter().find(|p| p.text.trim().chars().all(|c| c.is_ascii_digit()))).map(|p| p.x + fonts.get(p.face).measure(&p.text)).collect();
+        assert_eq!(ends.len(), 2);
+        assert!((ends[0] - ends[1]).abs() < 1.0, "{ends:?}");
+    }
+
+    #[test]
+    fn empty_and_ragged_tables_still_lay_out() {
+        let Some(mut fonts) = fonts() else { return };
+        // A header with nothing in it, and cells a hostile decoder might send in any order.
+        let doc = doc::markdown("| | |\n|---|---|\n", false);
+        let layout = lay_out(&doc, 600, &mut fonts);
+        assert_eq!(layout.lines.len(), 1, "an empty row is still a row");
+        assert!(layout.lines[0].h > 0);
+        let cell = |starts| Block { kind: Kind::Cell { starts, align: doc::Align::Center }, quote: 0, indent: 0, spans: vec![doc::Span { style: 0, text: "x".into() }] };
+        let odd = Doc { blocks: vec![cell(Starts::Nothing), cell(Starts::Row), cell(Starts::Nothing), cell(Starts::Nothing), cell(Starts::Table)], cut: false };
+        let layout = lay_out(&odd, 10, &mut fonts);
+        assert_eq!(layout.lines.len(), 3, "two tables, the first of two rows");
     }
 
     #[test]

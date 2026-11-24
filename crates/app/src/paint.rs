@@ -200,13 +200,10 @@ impl App {
         let inner = Rect::new(r.x + self.px(8.0), r.y, r.w - self.px(16.0), r.h);
         let y = self.baseline(r.y, r.h);
         let caret_x = self.text.measure(&f.text[..f.caret]);
-        // Keep the caret in view when the text is longer than the box.
-        let shift = (caret_x - inner.w as f32 + 2.0).max(0.0);
-        let x0 = inner.x as f32 - shift;
+        let x0 = self.field_text_x(r, f);
         let (a, b) = f.selection();
         let (sa, sb) = (self.text.measure(&f.text[..a]), self.text.measure(&f.text[..b]));
-        let line = self.text.line_height() as i32;
-        let line_y = r.y + (r.h - line) / 2;
+        let Rect { y: line_y, h: line, .. } = self.field_line(r);
         let text = &mut self.text;
         Self::with_clip(c, inner, |c| {
             if focused && a != b {
@@ -217,6 +214,48 @@ impl App {
                 c.fill(Rect::new((x0 + caret_x) as i32, line_y, 1, line), co.foreground);
             }
         });
+    }
+
+    /// Where a field's text starts: scrolled left to keep the caret in view when the text is
+    /// longer than the box.
+    pub(crate) fn field_text_x(&mut self, r: Rect, f: &Field) -> f32 {
+        let inner_w = r.w - self.px(16.0);
+        let shift = (self.text.measure(&f.text[..f.caret]) - inner_w as f32 + 2.0).max(0.0);
+        (r.x + self.px(8.0)) as f32 - shift
+    }
+
+    /// The line a field's text is drawn on.
+    pub(crate) fn field_line(&self, r: Rect) -> Rect {
+        let line = self.text.line_height() as i32;
+        Rect::new(r.x, r.y + (r.h - line) / 2, r.w, line)
+    }
+
+    /// Where the rename or new folder field is drawn, as `paint_list` draws it.
+    pub(crate) fn name_field_rect(&self) -> Option<Rect> {
+        let l = self.layout();
+        let area = l.list;
+        let name_x = area.x + self.px(38.0);
+        let name_max = |app: &Self| {
+            let date_x = area.right() - app.px(14.0) - l.col_date;
+            let size_x = date_x - l.col_size;
+            let many = app.listing.as_ref().is_some_and(|li| li.is_trash() || li.is_recent() || li.search().is_some());
+            let origin = app.origin_column(area, size_x).filter(|_| many);
+            origin.map_or(size_x, |(ox, _)| ox) - app.px(10.0) - name_x
+        };
+        let box_h = (l.row_h - self.px(2.0)).max(1);
+        match &self.edit {
+            Edit::NewFolder(_) if self.rows.is_empty() => Some(Rect::new(name_x - self.px(4.0), area.y + 1, self.px(300.0), l.row_h - self.px(2.0))),
+            Edit::NewFolder(_) => Some(Rect::new(name_x - self.px(4.0), area.y + 1, name_max(self) + self.px(8.0), l.row_h - self.px(2.0))),
+            Edit::Rename { name, path, .. } => {
+                let li = self.listing.as_ref()?;
+                let row = self.rows.iter().position(|&id| li.name(id) == name.as_slice() && (li.search().is_none() || li.path(id) == *path))?;
+                let first = (self.scroll / l.row_h.max(1) as f64) as usize;
+                let offset = (self.scroll - first as f64 * l.row_h as f64) as i32;
+                let y = area.y + (row as i32 - first as i32) * l.row_h - offset;
+                Some(Rect::new(name_x - self.px(4.0), y + 1, name_max(self) + self.px(8.0), box_h))
+            }
+            _ => None,
+        }
     }
 
     /// A pane's scroll bar thumb, with its right edge at `right`.
@@ -363,36 +402,10 @@ impl App {
             self.paint_field(c, r, &f, true);
             return;
         }
-        let Some(listing) = self.listing.clone() else {
-            if let Some(e) = self.load_error.clone() {
-                self.paint_center(c, area, &format!("Can't open this folder: {e}"), co.danger);
-            } else if self.loading && self.hold_paint.is_none() && self.search_query().is_some() {
-                self.paint_center(c, area, "Searching…", co.muted);
-            }
-            return;
-        };
-        if self.rows.is_empty() {
-            let searching = self.search_query().is_some();
-            if searching && self.loading {
-                self.paint_center(c, area, "Searching…", co.muted);
-            } else if !self.loading {
-                let msg = if searching {
-                    format!("Nothing found in {} or the folders in it", self.crumb_label(&self.dir))
-                } else if !self.filter.is_empty() && self.can_search() {
-                    "Nothing here matches. Ctrl+F searches the folders inside too".to_string()
-                } else if !self.filter.is_empty() {
-                    "Nothing matches the filter".to_string()
-                } else if listing.is_trash() {
-                    "The Trash is empty".to_string()
-                } else if listing.is_recent() {
-                    "No recent files".to_string()
-                } else {
-                    "This folder is empty".to_string()
-                };
-                self.paint_center(c, area, &msg, co.muted);
-            }
-            return;
+        if let Some((msg, error)) = self.list_message() {
+            self.paint_center(c, area, &msg, if error { co.danger } else { co.muted });
         }
+        let Some(listing) = self.listing.clone().filter(|_| !self.rows.is_empty()) else { return };
         let row_h = l.row_h;
         let first = (self.scroll / row_h as f64) as usize;
         let offset = (self.scroll - first as f64 * row_h as f64) as i32;

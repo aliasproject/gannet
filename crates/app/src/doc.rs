@@ -3,15 +3,19 @@
 //! so parsing whatever a file holds happens in its sandbox. The app reads it back (`decode`),
 //! believing nothing it hasn't checked, and lays it out (see `docview`).
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 
 pub const MAGIC: &[u8; 4] = b"GNPD";
 /// How much of a file is shown. A file that's longer is cut at the end of a line before this.
 pub const TEXT_LIMIT: usize = 128 * 1024;
 /// A zero byte this near the start means it isn't text, as git decides.
 const BINARY_WITHIN: usize = 8000;
-/// More than the decoder could ever write for `TEXT_LIMIT` of text, so anything bigger is refused.
-pub const MAX_ENCODED: usize = 8 * TEXT_LIMIT + 1024;
+/// The most table cells a document keeps. Short rows are filled out to the header's width, so a
+/// few bytes of text can make many cells, and each takes more room written out than it did as text.
+const MAX_CELLS: usize = TEXT_LIMIT / 4;
+/// More than the decoder could ever write for `TEXT_LIMIT` of text, so anything bigger is refused:
+/// eight times the text, and room for every cell with a span, whatever the text was.
+pub const MAX_ENCODED: usize = 8 * TEXT_LIMIT + MAX_CELLS * 16 + 1024;
 
 /// How a run of words looks. These combine.
 pub const BOLD: u8 = 1;
@@ -32,6 +36,26 @@ pub enum Kind {
     /// A list item's first block, with its bullet or number.
     Item(String),
     Rule,
+    /// One cell of a table. A table is a run of these, row by row, and its first row is the
+    /// header.
+    Cell { starts: Starts, align: Align },
+}
+
+/// What a table cell is the first of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Starts {
+    Nothing = 0,
+    Row = 1,
+    Table = 2,
+}
+
+/// Where words go across a table column, as its separator row says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    Left = 0,
+    Center = 1,
+    Right = 2,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -118,7 +142,7 @@ pub fn plain(text: String, cut: bool) -> Doc {
 /// Markdown as a document. HTML in it is left out, as there's no way to show it as it means.
 pub fn markdown(text: &str, cut: bool) -> Doc {
     let mut out = Builder::default();
-    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES;
     // Each list being in, with the next item's number for a numbered one.
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut quote = 0u8;
@@ -127,7 +151,19 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
     // An item whose first block hasn't started yet.
     let mut item: Option<String> = None;
     let indent = |lists: &Vec<Option<u64>>| lists.len().min(u8::MAX as usize) as u8;
+    // The table being in: its columns' alignments, the next cell's column, and what that cell starts.
+    let mut aligns: Vec<Align> = Vec::new();
+    let mut column = 0usize;
+    let mut starts = Starts::Nothing;
+    // A row that would take the cells past `MAX_CELLS` is left out, words and all, and so is every
+    // row after it. pulldown-cmark stops filling out rows after a while too, and then gives the
+    // rest of the table's lines as paragraphs, which are kept.
+    let (mut cells, mut dropping, mut row_left_out) = (0usize, false, false);
+    let mut cut = cut;
     for event in Parser::new_ext(text, options) {
+        if dropping && matches!(event, Event::Text(_) | Event::Code(_) | Event::SoftBreak | Event::HardBreak) {
+            continue;
+        }
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => out.open(item.take().map_or(Kind::Paragraph, Kind::Item), quote, indent(&lists)),
@@ -168,6 +204,37 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
                     };
                     item = Some(marker);
                 }
+                Tag::Table(columns) => {
+                    // A table in an item that hasn't said anything yet has the bullet above it.
+                    if let Some(marker) = item.take() {
+                        out.open(Kind::Item(marker), quote, indent(&lists));
+                    }
+                    out.close();
+                    aligns = columns
+                        .iter()
+                        .map(|a| match a {
+                            Alignment::Center => Align::Center,
+                            Alignment::Right => Align::Right,
+                            Alignment::None | Alignment::Left => Align::Left,
+                        })
+                        .collect();
+                    starts = Starts::Table;
+                }
+                Tag::TableHead | Tag::TableRow => {
+                    column = 0;
+                    row_left_out = cells + aligns.len().max(1) > MAX_CELLS;
+                    if starts == Starts::Nothing {
+                        starts = Starts::Row;
+                    }
+                }
+                Tag::TableCell if row_left_out || cells == MAX_CELLS => (dropping, cut) = (true, true),
+                Tag::TableCell => {
+                    cells += 1;
+                    let align = aligns.get(column).copied().unwrap_or_default();
+                    column += 1;
+                    out.open(Kind::Cell { starts, align }, quote, indent(&lists));
+                    starts = Starts::Nothing;
+                }
                 Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. } => {
                     styles.push(style);
                     style |= match tag {
@@ -181,6 +248,10 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
             },
             Event::End(tag) => match tag {
                 TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => out.close(),
+                TagEnd::TableCell => {
+                    out.close();
+                    dropping = false;
+                }
                 TagEnd::BlockQuote(_) => {
                     out.close();
                     quote = quote.saturating_sub(1);
@@ -256,10 +327,10 @@ impl Builder {
         self.open = Some(Block { kind, quote, indent, spans: Vec::new() });
     }
 
-    /// A block with nothing in it is dropped, unless it's a rule or a bullet.
+    /// A block with nothing in it is dropped, unless it's a rule, a bullet or a table cell.
     fn close(&mut self) {
         if let Some(block) = self.open.take()
-            && (!block.spans.is_empty() || matches!(block.kind, Kind::Rule | Kind::Item(_)))
+            && (!block.spans.is_empty() || matches!(block.kind, Kind::Rule | Kind::Item(_) | Kind::Cell { .. }))
         {
             self.doc.blocks.push(block);
         }
@@ -290,6 +361,10 @@ impl Builder {
 
 // ---- Between the processes ----
 
+/// The first of the kinds that are table cells, and the last.
+const CELL: u8 = 11;
+const CELL_LAST: u8 = CELL + 3 * 3 - 1;
+
 pub fn encode(doc: &Doc) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     out.push(u8::from(doc.cut));
@@ -302,6 +377,8 @@ pub fn encode(doc: &Doc) -> Vec<u8> {
             Kind::Code => (8, ""),
             Kind::Item(marker) => (9, marker.as_str()),
             Kind::Rule => (10, ""),
+            // What the cell starts and its alignment, in the one byte.
+            Kind::Cell { starts, align } => (CELL + *starts as u8 * 3 + *align as u8, ""),
         };
         out.extend_from_slice(&[kind, block.quote, block.indent]);
         put(&mut out, marker);
@@ -346,6 +423,12 @@ pub fn decode(bytes: &[u8]) -> Option<Doc> {
             8 => Kind::Code,
             9 if marker.chars().count() <= 24 => Kind::Item(marker),
             10 => Kind::Rule,
+            CELL..=CELL_LAST => {
+                let n = kind - CELL;
+                let starts = [Starts::Nothing, Starts::Row, Starts::Table][(n / 3) as usize];
+                let align = [Align::Left, Align::Center, Align::Right][(n % 3) as usize];
+                Kind::Cell { starts, align }
+            }
             _ => return None,
         };
         let mut spans = Vec::new();
@@ -468,6 +551,106 @@ mod tests {
         assert_eq!(doc.blocks[1].spans, [span(CODE, "code")]);
     }
 
+    fn cell(starts: Starts, align: Align, spans: Vec<Span>) -> Block {
+        block(Kind::Cell { starts, align }, spans)
+    }
+
+    #[test]
+    fn a_table_becomes_cells_row_by_row() {
+        // A menu as it's often written: an empty header over the second column.
+        let doc = markdown("# Dinner\n\n| Course | |\n|---|---|\n| Starter | Soup |\n| Main | Fish |\n\nAfter.\n", false);
+        use {Align::Left, Starts::*};
+        assert_eq!(
+            doc.blocks,
+            [
+                block(Kind::Heading(1), vec![span(0, "Dinner")]),
+                cell(Table, Left, vec![span(0, "Course")]),
+                cell(Nothing, Left, vec![]),
+                cell(Row, Left, vec![span(0, "Starter")]),
+                cell(Nothing, Left, vec![span(0, "Soup")]),
+                cell(Row, Left, vec![span(0, "Main")]),
+                cell(Nothing, Left, vec![span(0, "Fish")]),
+                block(Kind::Paragraph, vec![span(0, "After.")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn table_cells_keep_their_alignment_and_styles() {
+        let doc = markdown("| a | b | c | d |\n|:--|:-:|--:|---|\n| **bold** *it* | `code` | [link](x) | ~~gone~~ |\n", false);
+        let aligns: Vec<Align> = doc
+            .blocks
+            .iter()
+            .map(|b| match b.kind {
+                Kind::Cell { align, .. } => align,
+                _ => panic!("not a cell: {b:?}"),
+            })
+            .collect();
+        use Align::*;
+        assert_eq!(aligns, [Left, Center, Right, Left, Left, Center, Right, Left]);
+        assert_eq!(doc.blocks[4].spans, [span(BOLD, "bold"), span(0, " "), span(ITALIC, "it")]);
+        assert_eq!(doc.blocks[5].spans, [span(CODE, "code")]);
+        assert_eq!(doc.blocks[6].spans, [span(LINK, "link")]);
+        assert_eq!(doc.blocks[7].spans, [span(STRUCK, "gone")]);
+    }
+
+    #[test]
+    fn ragged_rows_are_squared_to_the_header() {
+        // A short row gets empty cells, and a long one loses what's past the header's columns.
+        let doc = markdown("| a | b | c |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |\n\n| next |\n|---|\n| x |\n", false);
+        let summary: Vec<(Starts, String)> = doc
+            .blocks
+            .iter()
+            .map(|b| match b.kind {
+                Kind::Cell { starts, .. } => (starts, b.spans.iter().map(|s| s.text.as_str()).collect()),
+                _ => panic!("not a cell: {b:?}"),
+            })
+            .collect();
+        use Starts::*;
+        let want = [(Table, "a"), (Nothing, "b"), (Nothing, "c"), (Row, "1"), (Nothing, ""), (Nothing, ""), (Row, "1"), (Nothing, "2"), (Nothing, "3"), (Table, "next"), (Row, "x")];
+        assert_eq!(summary, want.map(|(s, t)| (s, t.to_string())), "a second table starts its own");
+    }
+
+    #[test]
+    fn a_wide_header_over_many_short_rows_cant_make_endless_cells() {
+        // Every short row is filled out to the header's 1000 columns.
+        let mut text = format!("{}|\n{}|\n", "| h ".repeat(1000), "|---".repeat(1000));
+        while text.len() < TEXT_LIMIT - 10 {
+            text.push_str("| x |\n");
+        }
+        let cells = |doc: &Doc| doc.blocks.iter().filter(|b| matches!(b.kind, Kind::Cell { .. })).count();
+        let doc = markdown(&text, false);
+        // Whole rows, as many as fit.
+        assert_eq!(cells(&doc), MAX_CELLS / 1000 * 1000);
+        assert!(doc.cut, "said to go on past what's shown");
+        assert!(encode(&doc).len() <= MAX_ENCODED, "and it goes between the processes");
+        // The words of cells left out don't turn up anywhere else, and what follows is still there.
+        let doc = markdown(&format!("{text}\nafter\n"), false);
+        assert_eq!(cells(&doc), MAX_CELLS / 1000 * 1000);
+        assert!(doc.blocks.iter().all(|b| b.kind == Kind::Paragraph || matches!(b.kind, Kind::Cell { .. }) && b.spans.iter().all(|s| s.text == "h" || s.text == "x")), "{:?}", &doc.blocks[MAX_CELLS - 2..]);
+        assert_eq!(doc.blocks.last().unwrap().spans, [span(0, "after")]);
+        // As many cells as can be, then the rest of the text as what writes out biggest for its
+        // size: empty bullets.
+        let mut text = format!("{}|\n{}|\n", "|".repeat(1000), "|-".repeat(1000));
+        for _ in 0..40 {
+            text.push_str("|x\n");
+        }
+        while text.len() < TEXT_LIMIT - 2 {
+            text.push_str("-\n");
+        }
+        let doc = markdown(&text, false);
+        assert_eq!(cells(&doc), MAX_CELLS / 1000 * 1000);
+        assert!(encode(&doc).len() <= MAX_ENCODED, "{} bytes", encode(&doc).len());
+    }
+
+    #[test]
+    fn a_table_in_a_list_or_a_quote_is_in_it() {
+        let doc = markdown("> | q |\n> |---|\n> | 1 |\n\n- | i |\n  |---|\n", false);
+        let summary: Vec<(Kind, u8, u8)> = doc.blocks.iter().map(|b| (b.kind.clone(), b.quote, b.indent)).collect();
+        let cell = |starts| Kind::Cell { starts, align: Align::Left };
+        assert_eq!(summary, [(cell(Starts::Table), 1, 0), (cell(Starts::Row), 1, 0), (Kind::Item("•".into()), 0, 1), (cell(Starts::Table), 0, 1)]);
+    }
+
     #[test]
     fn html_is_left_out_and_breaks_are_kept() {
         let doc = markdown("<div align=\"center\">\n<img src=\"x\">\n</div>\n\nline one  \nline two\nsame line\n", false);
@@ -476,7 +659,7 @@ mod tests {
 
     #[test]
     fn a_document_goes_between_the_processes_whole() {
-        let doc = Doc { blocks: markdown("# Hi\n\n- *a* `b`\n\n> c\n\n---\n", true).blocks, cut: true };
+        let doc = Doc { blocks: markdown("# Hi\n\n- *a* `b`\n\n> c\n\n---\n\n| x | |\n|:-:|--:|\n| **1** | 2 |\n", true).blocks, cut: true };
         assert_eq!(decode(&encode(&doc)), Some(doc.clone()));
         let text = plain("x\ny".to_string(), false);
         assert_eq!(decode(&encode(&text)).unwrap().lines(), 2);
@@ -509,5 +692,16 @@ mod tests {
         let mut odd_kind = good;
         odd_kind[9] = 99;
         assert!(decode(&odd_kind).is_none());
+        // Every kind of cell there is reads back, and none past them.
+        let one = |kind: u8| [MAGIC.as_slice(), &[0], &1u32.to_le_bytes(), &[kind, 0, 0], &0u32.to_le_bytes(), &0u32.to_le_bytes()].concat();
+        assert!((CELL..=CELL_LAST).all(|k| decode(&one(k)).is_some_and(|d| matches!(d.blocks[0].kind, Kind::Cell { .. }))));
+        assert!(decode(&one(CELL_LAST + 1)).is_none());
+        // And each one is the cell it was.
+        for starts in [Starts::Nothing, Starts::Row, Starts::Table] {
+            for align in [Align::Left, Align::Center, Align::Right] {
+                let doc = Doc { blocks: vec![block(Kind::Cell { starts, align }, vec![])], cut: false };
+                assert_eq!(decode(&encode(&doc)), Some(doc));
+            }
+        }
     }
 }

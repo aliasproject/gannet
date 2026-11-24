@@ -370,7 +370,6 @@ fn main() {
                 }
             }
         }
-        a11y.update(&mut app);
         if wl.must_paint() || (!app.dirty.is_empty() && wl.can_paint() && app.hold_paint.is_none()) {
             let damage = if wl.must_paint() { canvas::Rect::new(0, 0, i32::MAX / 2, i32::MAX / 2) } else { std::mem::take(&mut app.dirty) };
             app.dirty = canvas::Rect::default();
@@ -406,6 +405,8 @@ fn main() {
                 find_fallback_fonts(&hub, missing);
             }
         }
+        // After painting, so what a screen reader is told is placed as it's drawn.
+        a11y.update(&mut app);
         #[cfg(feature = "bench")]
         bench.idle(&app);
         #[cfg(feature = "bench")]
@@ -984,12 +985,15 @@ mod bench {
         };
         let doc = match (&p.content, &p.doc_layout) {
             (Content::Doc { doc, .. }, layout) => format!(
-                "{{\"blocks\":{},\"cut\":{},\"lines\":{},\"scroll\":{:.0},\"height\":{},\"text\":{}}}",
+                "{{\"blocks\":{},\"cut\":{},\"lines\":{},\"scroll\":{:.0},\"height\":{},\"width\":{},\"table_lines\":{},\"table_right\":{},\"text\":{}}}",
                 doc.blocks.len(),
                 doc.cut,
                 layout.as_ref().map_or(0, |l| l.lines.len()),
                 p.scroll,
                 layout.as_ref().map_or(0, |l| l.height),
+                layout.as_ref().map_or(0, |l| l.width),
+                layout.as_ref().map_or(0, |l| l.lines.iter().filter(|l| matches!(l.mark, crate::docview::Mark::Table { .. })).count()),
+                layout.as_ref().and_then(|l| l.lines.iter().find_map(|l| match l.mark { crate::docview::Mark::Table { right, .. } => Some(right), _ => None })).unwrap_or(0),
                 esc(&doc.blocks.iter().take(3).flat_map(|b| b.spans.iter().map(|s| s.text.as_str())).collect::<String>().chars().take(200).collect::<String>()),
             ),
             _ => "null".to_string(),

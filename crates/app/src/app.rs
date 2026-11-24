@@ -603,6 +603,11 @@ pub struct App {
     pub edit: Edit,
     pub menu: Option<Menu>,
     pub notices: Vec<String>,
+    /// How many notices have been posted, so a screen reader can tell which are new.
+    pub notices_posted: u64,
+    /// The last few jobs to end, each with whether it did all it was asked: not stopped, and
+    /// without errors. A screen reader announces only those as finished.
+    pub jobs_ended: Vec<(u64, bool)>,
 
     pub engine: Engine,
     pub trash_dir: PathBuf,
@@ -620,6 +625,8 @@ pub struct App {
     selection_epoch: u64,
     /// Counts the changes started, each of which clears redo.
     change_epoch: u64,
+    /// Which field is open: each one opened or closed, and each rename or new folder, is a new
+    /// one, so a late paste or screen reader request about an earlier one is dropped.
     edit_gen: u64,
     paste_in_flight: bool,
     /// When an unasked-for dialog appeared. Input right after that was meant for
@@ -764,6 +771,8 @@ impl App {
             edit: Edit::None,
             menu: None,
             notices: Vec::new(),
+            notices_posted: 0,
+            jobs_ended: Vec::new(),
             engine,
             recent_file: trash_dir.parent().and_then(Path::parent).map_or_else(PathBuf::new, |d| d.join(gannet_core::recent::FILE)),
             trash_dir,
@@ -1139,7 +1148,7 @@ impl App {
             _ => false,
         };
         if l.settled && renaming_gone {
-            self.edit = Edit::None;
+            self.set_edit(Edit::None);
         }
         // Settings changed while this was loading: it was built for the old ones.
         if l.sort != self.view_sort() {
@@ -1230,7 +1239,7 @@ impl App {
             }
         });
         if spawned.is_err() {
-            self.notices.push("Couldn't start a thread to sort this folder".into());
+            self.notice("Couldn't start a thread to sort this folder".into());
             self.invalidate_all();
         }
     }
@@ -1389,17 +1398,14 @@ impl App {
                 }
                 if let Some(f) = self.field_mut() {
                     f.insert(&line);
-                    self.apply_filter_field();
-                    if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
-                        d.update();
-                    }
-                    self.invalidate_all();
+                    self.field_edited();
                 }
             }
         }
     }
 
     pub fn notice(&mut self, text: String) {
+        self.notices_posted += 1;
         self.notices.push(text);
         self.clamp_scroll();
         self.invalidate_all();
@@ -1503,7 +1509,7 @@ impl App {
     /// Does what a screen reader asked. A request about a row in a folder the window has
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
-        use crate::a11y::{Act, BACK};
+        use crate::a11y::{Act, BACK, CHOOSER_SAVE_NAME, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, FILTER, NAME_FIELD, PATH_FIELD, STOP0};
         if matches!(act, Act::Wake) {
             return;
         }
@@ -1522,12 +1528,87 @@ impl App {
             let l = app.listing.as_ref().filter(|_| app.dir == dir)?;
             app.rows.iter().position(|&e| *l.key(e) == *key)
         };
+        // Pressing something, or moving to a row, ends an edit as clicking there would. A request
+        // about a row of a folder the window has left is dropped, and leaves the edit alone.
+        let clicks = match &act {
+            Act::Press(_) | Act::OpenPlace(_) | Act::OpenCrumb(..) | Act::Eject(..) | Act::Dismiss(..) => true,
+            Act::FocusRow(dir, key) | Act::SelectRow(dir, key, _) => row(self, dir, key).is_some(),
+            _ => false,
+        };
+        if clicks {
+            self.leave_field();
+        }
         match act {
+            Act::Focus(FILTER) => {
+                if !matches!(self.edit, Edit::Filter(_)) && self.filter_rect().is_some() {
+                    self.leave_field();
+                    self.start_filter("");
+                }
+            }
+            // The other fields show only while they have the keyboard.
+            Act::Focus(_) => {}
+            Act::EditText(id, edit_gen, op) => {
+                // A request about a field since closed, or opened again, is dropped.
+                if edit_gen != self.edit_gen {
+                    return;
+                }
+                let ours = matches!((&self.edit, id), (Edit::Path(_), PATH_FIELD) | (Edit::Filter(_), FILTER) | (Edit::Rename { .. } | Edit::NewFolder(_), NAME_FIELD)) || (id == CHOOSER_SAVE_NAME && self.a11y_name_has_keyboard());
+                let saving = self.chooser.as_ref().is_some_and(|c| c.spec.mode == crate::chooser::Mode::Save);
+                // Changing the text of a field that shows but isn't typed in gives it the
+                // keyboard first, as clicking it does: the filter box, or the Save dialog's name.
+                if !ours && id == FILTER && matches!(self.edit, Edit::None) && self.filter_rect().is_some() {
+                    self.leave_field();
+                    self.start_filter("");
+                } else if !ours && id == CHOOSER_SAVE_NAME && saving {
+                    self.leave_field();
+                    if let Some(c) = self.chooser.as_mut() {
+                        c.name_focused = true;
+                    }
+                } else if !ours {
+                    return;
+                }
+                self.a11y_edit(op);
+            }
             Act::Press(BACK) if !self.viewer => self.go_back(),
             Act::Press(crate::a11y::PREVIEW_PREVIOUS) if self.viewer => self.preview_move(-1),
             Act::Press(crate::a11y::PREVIEW_NEXT) if self.viewer => self.preview_move(1),
             Act::Press(crate::a11y::PREVIEW_CLOSE) if self.viewer => self.close_preview(),
-            Act::Press(_) | Act::Focus(_) | Act::Choose(..) | Act::Wake => {}
+            // A column's heading sorts by it, as clicking it does, except in Recent.
+            Act::Press(id @ (COLUMN_NAME | COLUMN_SIZE | COLUMN_MODIFIED)) if !self.is_recent_view() => {
+                self.action(Action::SortBy(match id {
+                    COLUMN_NAME => SortKey::Name,
+                    COLUMN_SIZE => SortKey::Size,
+                    _ => SortKey::Modified,
+                }));
+            }
+            // Checked by what it says, as the notices may have moved since.
+            Act::Dismiss(i, text) => {
+                if self.notices.get(i) == Some(&text) {
+                    self.notices.remove(i);
+                    self.clamp_scroll();
+                    self.invalidate_all();
+                }
+            }
+            Act::Press(id) if id >= STOP0 => {
+                if let Some(j) = self.jobs.iter().find(|j| j.job.id == id - STOP0) {
+                    j.job.cancel();
+                    self.invalidate(self.layout().notices);
+                }
+            }
+            Act::Press(_) | Act::Choose(..) | Act::Wake => {}
+            Act::OpenCrumb(dir, i) => {
+                if *dir == self.dir
+                    && let Some((_, path)) = self.crumb_parts().into_iter().nth(i)
+                {
+                    self.open_crumb(path);
+                }
+            }
+            // The drive is checked by name, as the sidebar may have changed since.
+            Act::Eject(i, name) => {
+                if let Some(v) = self.places.get(i).filter(|p| p.label == name && self.eject_rect(i).is_some()).and_then(|p| p.volume.clone()) {
+                    self.drive_act(v, Doing::Eject);
+                }
+            }
             Act::OpenPlace(i) => {
                 self.reveal_place(i);
                 self.open_place(i);
@@ -1608,6 +1689,42 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// A screen reader's change to the field with the keyboard, made as the keys making it
+    /// would be.
+    fn a11y_edit(&mut self, op: crate::a11y::TextEdit) {
+        use crate::a11y::TextEdit;
+        let edit_gen = self.edit_gen;
+        let Some(f) = self.field_mut() else { return };
+        match op {
+            TextEdit::Caret(at) => f.select_chars(at, at),
+            TextEdit::Select(from, to) => f.select_chars(from, to),
+            TextEdit::Replace(from, to, with) => f.replace_chars(from, to, &with),
+            TextEdit::Copy(from, to) | TextEdit::Cut(from, to) => {
+                let (a, b) = (f.byte_of(from.min(to)), f.byte_of(from.max(to)));
+                let text = f.text[a..b].to_string();
+                if matches!(op, TextEdit::Cut(..)) {
+                    f.replace_chars(from, to, "");
+                }
+                if !text.is_empty() {
+                    self.copy_text(text);
+                }
+                if matches!(op, TextEdit::Copy(..)) {
+                    return;
+                }
+            }
+            TextEdit::Paste(at) => {
+                f.select_chars(at, at);
+                self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: edit_gen }));
+            }
+        }
+        self.field_edited();
+    }
+
+    /// Which field is open: each opened or closed, and each rename or new folder, is a new one.
+    pub fn edit_gen(&self) -> u64 {
+        self.edit_gen
     }
 
     pub fn is_selected(&self, id: u32) -> bool {
@@ -1932,7 +2049,7 @@ impl App {
         for id in self.selected_ids() {
             match l.trashed(id) {
                 Some(t) => items.push(t),
-                None => self.notices.push(format!("“{}” can't be restored: the Trash has no record of where it came from", String::from_utf8_lossy(l.name(id)))),
+                None => self.notice(format!("“{}” can't be restored: the Trash has no record of where it came from", String::from_utf8_lossy(l.name(id)))),
             }
         }
         if !items.is_empty() {
@@ -1975,7 +2092,7 @@ impl App {
         // Opening a pile of files by accident is hard to undo.
         const MANY: usize = 20;
         if ids.len() > MANY {
-            self.notices.push(format!("Select {MANY} items or fewer to open them at once"));
+            self.notice(format!("Select {MANY} items or fewer to open them at once"));
             self.invalidate_all();
             return;
         }
@@ -2048,6 +2165,11 @@ impl App {
     }
 
     fn set_edit(&mut self, e: Edit) {
+        // Each field opened or closed is a new one, so a late paste or a screen reader's request
+        // about the last can't land in it.
+        if e != self.edit {
+            self.edit_gen += 1;
+        }
         self.edit = e;
         self.invalidate(self.layout().toolbar);
     }
@@ -2144,7 +2266,7 @@ impl App {
         let expanded = expand_home(text, self.places.first().map(|p| p.path.as_path()));
         self.set_edit(Edit::None);
         if !expanded.is_absolute() {
-            self.notices.push("Enter a full path, starting with / or ~".to_string());
+            self.notice("Enter a full path, starting with / or ~".to_string());
             self.invalidate_all();
             return;
         }
@@ -2349,6 +2471,10 @@ impl App {
             ops::Event::Finished(o) => {
                 self.answer_drop(&o);
                 let view = self.jobs.iter().position(|j| j.job.id == o.job).map(|i| self.jobs.remove(i));
+                if self.jobs_ended.len() >= 16 {
+                    self.jobs_ended.remove(0);
+                }
+                self.jobs_ended.push((o.job, !o.cancelled && o.errors == 0));
                 let selection_untouched = view.as_ref().is_some_and(|v| v.selection_epoch == self.selection_epoch);
                 if o.cancelled
                     && let Some(v) = &view
@@ -3735,14 +3861,12 @@ impl App {
             f.text[a..b].to_string()
         });
         if m.ctrl && matches!(sym, k::KEY_c | k::KEY_x) && selected.as_ref().is_some_and(|t| !t.is_empty()) {
-            let t = selected.unwrap_or_default().into_bytes();
-            self.cmds.push(Cmd::SetClipboard(vec![(clipboard::TEXT, t.clone()), (clipboard::TEXT_PLAIN, t.clone()), (clipboard::UTF8_STRING, t)]));
+            self.copy_text(selected.unwrap_or_default());
             if sym == k::KEY_x
                 && let Some(f) = self.field_mut()
             {
                 f.backspace(false);
-                self.apply_filter_field();
-                self.invalidate_all();
+                self.field_edited();
             }
             return;
         }
@@ -3782,8 +3906,34 @@ impl App {
                 }
             }
         }
+        self.field_edited();
+    }
+
+    /// Puts a field's text on the clipboard, as Ctrl+C in one does.
+    fn copy_text(&mut self, t: String) {
+        let t = t.into_bytes();
+        self.cmds.push(Cmd::SetClipboard(vec![(clipboard::TEXT, t.clone()), (clipboard::TEXT_PLAIN, t.clone()), (clipboard::UTF8_STRING, t)]));
+    }
+
+    /// Follows a change to the text, caret or selection of the field with the keyboard,
+    /// whatever made it: the filter narrows the list, and the rename dialog shows the new names.
+    fn field_edited(&mut self) {
         self.apply_filter_field();
+        if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
+            d.update();
+        }
         self.invalidate_all();
+    }
+
+    /// Ends an edit as a click elsewhere does. That commits a rename or new folder, as other
+    /// file managers do, drops a typed path, and keeps what was typed for a filter.
+    fn leave_field(&mut self) {
+        match self.edit {
+            Edit::None => {}
+            Edit::Path(_) => self.field_cancel(),
+            Edit::Rename { .. } | Edit::NewFolder(_) => self.field_commit(),
+            Edit::Filter(_) => self.set_edit(Edit::None),
+        }
     }
 
     fn field_cancel(&mut self) {
@@ -4073,6 +4223,27 @@ impl App {
         let start = self.px(6.0) + self.px(36.0) * 3 + self.px(8.0);
         let end = self.filter_rect().map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
         let end = self.empty_trash_rect().map_or(end, |r| r.x - self.px(8.0));
+        let parts = self.crumb_parts();
+        let gap = self.px(14.0) as f32;
+        let widths: Vec<f32> = parts.iter().map(|(s, _)| self.text.measure(s) + self.px(12.0) as f32).collect();
+        let room = (end - start) as f32;
+        let mut first = 0;
+        let mut total: f32 = widths.iter().sum::<f32>() + gap * parts.len().saturating_sub(1) as f32;
+        while total > room && first + 1 < parts.len() {
+            total -= widths[first] + gap;
+            first += 1;
+        }
+        let mut x = start as f32;
+        let mut out = Vec::new();
+        for (i, (_, path)) in parts.into_iter().enumerate().skip(first) {
+            out.push((x as i32, widths[i] as i32, path));
+            x += widths[i] + gap;
+        }
+        out
+    }
+
+    /// Every part of the path, from the top, as its label and folder, whether or not it fits.
+    pub fn crumb_parts(&self) -> Vec<(String, PathBuf)> {
         let mut parts: Vec<(String, PathBuf)> = Vec::new();
         let mut acc = PathBuf::new();
         // Recent has no folders above it.
@@ -4097,22 +4268,7 @@ impl App {
             };
             parts.push((label, acc.clone()));
         }
-        let gap = self.px(14.0) as f32;
-        let widths: Vec<f32> = parts.iter().map(|(s, _)| self.text.measure(s) + self.px(12.0) as f32).collect();
-        let room = (end - start) as f32;
-        let mut first = 0;
-        let mut total: f32 = widths.iter().sum::<f32>() + gap * parts.len().saturating_sub(1) as f32;
-        while total > room && first + 1 < parts.len() {
-            total -= widths[first] + gap;
-            first += 1;
-        }
-        let mut x = start as f32;
-        let mut out = Vec::new();
-        for (i, (_, path)) in parts.into_iter().enumerate().skip(first) {
-            out.push((x as i32, widths[i] as i32, path));
-            x += widths[i] + gap;
-        }
-        out
+        parts
     }
 
     /// What a folder is called in the path bar and the window title.
@@ -4130,6 +4286,55 @@ impl App {
     /// in ~/Documents/photos when ~/Documents was searched, and "Documents" for one in it.
     pub fn search_location(&self, folder: &Path) -> String {
         search_location(folder, &self.dir, &self.crumb_label(&self.dir))
+    }
+
+    /// What the list says in place of rows when it has none: why the folder can't be shown,
+    /// that it's being searched, or that nothing's there. The second is whether it's an error.
+    pub fn list_message(&self) -> Option<(String, bool)> {
+        let searching = self.search_query().is_some();
+        let Some(listing) = self.listing.as_deref() else {
+            if let Some(e) = &self.load_error {
+                return Some((format!("Can't open this folder: {e}"), true));
+            }
+            return (self.loading && self.hold_paint.is_none() && searching).then(|| ("Searching…".to_string(), false));
+        };
+        if !self.rows.is_empty() {
+            return None;
+        }
+        if searching && self.loading {
+            return Some(("Searching…".to_string(), false));
+        }
+        if self.loading {
+            return None;
+        }
+        let msg = if searching {
+            format!("Nothing found in {} or the folders in it", self.crumb_label(&self.dir))
+        } else if !self.filter.is_empty() && self.can_search() {
+            "Nothing here matches. Ctrl+F searches the folders inside too".to_string()
+        } else if !self.filter.is_empty() {
+            "Nothing matches the filter".to_string()
+        } else if listing.is_trash() {
+            "The Trash is empty".to_string()
+        } else if listing.is_recent() {
+            "No recent files".to_string()
+        } else {
+            "This folder is empty".to_string()
+        };
+        Some((msg, false))
+    }
+
+    /// Goes up the path to one of its folders, with the cursor on the folder come from.
+    fn open_crumb(&mut self, path: PathBuf) {
+        if path == self.dir {
+            return;
+        }
+        let name = if path == self.trash_dir && let Some(files) = self.trash_files_root(&self.dir) {
+            // The Trash view finds rows by their real path, not their name.
+            self.dir.strip_prefix(&files).ok().and_then(|r| r.components().next()).map(|c| files.join(c).into_os_string().into_vec())
+        } else {
+            self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec())
+        };
+        self.navigate(path, name);
     }
 
     fn crumb_at(&mut self, x: i32) -> Option<usize> {
@@ -4301,13 +4506,8 @@ impl App {
             _ => {}
         }
         // A click anywhere else ends an edit and keeps what was typed for a filter.
-        if !matches!(hit, Hit::PathBar | Hit::FilterBox) && !matches!(self.edit, Edit::None) {
-            // A click away commits a rename or new folder, as other file managers do.
-            match self.edit {
-                Edit::Path(_) => self.field_cancel(),
-                Edit::Rename { .. } | Edit::NewFolder(_) => self.field_commit(),
-                _ => self.set_edit(Edit::None),
-            }
+        if !matches!(hit, Hit::PathBar | Hit::FilterBox) {
+            self.leave_field();
         }
         if button == BTN_RIGHT {
             if self.menu.is_some() {
@@ -4350,16 +4550,8 @@ impl App {
             Hit::Up => self.go_up(),
             Hit::EmptyTrash => self.action(Action::EmptyTrash),
             Hit::Crumb(i) => {
-                if let Some((_, _, path)) = self.crumbs().into_iter().nth(i)
-                    && path != self.dir
-                {
-                    let name = if path == self.trash_dir && let Some(files) = self.trash_files_root(&self.dir) {
-                        // The Trash view finds rows by their real path, not their name.
-                        self.dir.strip_prefix(&files).ok().and_then(|r| r.components().next()).map(|c| files.join(c).into_os_string().into_vec())
-                    } else {
-                        self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec())
-                    };
-                    self.navigate(path, name);
+                if let Some((_, _, path)) = self.crumbs().into_iter().nth(i) {
+                    self.open_crumb(path);
                 }
             }
             Hit::PathBar => {
@@ -4443,12 +4635,10 @@ impl App {
 
     fn click_in_field(&mut self, x: i32) {
         let r = if matches!(self.edit, Edit::Filter(_)) { self.filter_rect().unwrap_or_default() } else { self.path_box() };
-        let text = self.field_mut().map(|f| (f.text.clone(), f.caret));
-        let Some((text, caret)) = text else { return };
+        let Some(f) = self.field_mut().map(|f| f.clone()) else { return };
         // The same scroll the painter applies when the text is longer than the box.
-        let inner = r.w - self.px(16.0);
-        let shift = (self.text.measure(&text[..caret]) - inner as f32 + 2.0).max(0.0);
-        let at = self.text.offset_at(&text, (x - r.x - self.px(8.0)) as f32 + shift);
+        let x0 = self.field_text_x(r, &f);
+        let at = self.text.offset_at(&f.text, x as f32 - x0);
         if let Some(f) = self.field_mut() {
             f.move_to(at, false);
         }
@@ -5992,6 +6182,146 @@ mod tests {
         r.app.on_msg(Msg::Clipboard(Some(b"junk".to_vec()), clipboard::TEXT.to_string(), asked));
         let Edit::Rename { field, .. } = &r.app.edit else { panic!() };
         assert_eq!(field.text, "a");
+    }
+
+    // ---- Screen readers and text fields ----
+
+    fn a11y_edit(r: &mut Rig, id: u64, op: crate::a11y::TextEdit) {
+        let edit_gen = r.app.edit_gen;
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(id, edit_gen, op)));
+    }
+
+    fn field_text(r: &Rig) -> (String, usize, usize) {
+        let f = match &r.app.edit {
+            Edit::Path(f) | Edit::Filter(f) | Edit::NewFolder(f) | Edit::Rename { field: f, .. } => f,
+            Edit::None => panic!("no field open"),
+        };
+        (f.text.clone(), f.anchor, f.caret)
+    }
+
+    #[test]
+    fn a_screen_reader_edits_a_rename_as_typing_would() {
+        use crate::a11y::{NAME_FIELD, TextEdit};
+        let mut r = Rig::new("a11y-rename");
+        fs::write(r.work().join("café.txt"), "x").unwrap();
+        r.open(r.work());
+        r.select("café.txt");
+        r.key(k::KEY_F2, "");
+        // Counted in characters: é is two bytes.
+        assert_eq!(field_text(&r), ("café.txt".into(), 0, 5), "the stem selected, as for typing");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Replace(0, 4, "tea\n".into()));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 3, 3), "the stem replaced, and no line break in a name");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Select(4, 7));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 4, 7));
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Copy(4, 7));
+        assert!(matches!(r.app.cmds.last(), Some(Cmd::SetClipboard(offers)) if offers[0].1 == b"txt"), "copied as Ctrl+C copies");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Caret(99));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 7, 7), "a caret past the end stays at the end");
+        // A request about an earlier rename is dropped.
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(NAME_FIELD, r.app.edit_gen - 1, TextEdit::Replace(0, 7, "no".into()))));
+        assert_eq!(field_text(&r).0, "tea.txt");
+        // A request about a row of another folder is dropped, and leaves the rename alone.
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::FocusRow(Arc::new(r.root.clone()), b"work".to_vec())));
+        assert_eq!(field_text(&r).0, "tea.txt");
+        // Moving to a row ends the rename as clicking there does: it's made.
+        let key = r.app.listing.as_ref().unwrap().key(r.app.rows[0]).into_owned();
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::FocusRow(Arc::new(r.work()), key)));
+        assert!(matches!(r.app.edit, Edit::None));
+        r.idle();
+        assert!(r.work().join("tea.txt").exists());
+    }
+
+    #[test]
+    fn a_screen_reader_types_in_the_filter_box() {
+        use crate::a11y::{FILTER, PATH_FIELD, TextEdit};
+        let mut r = Rig::new("a11y-filter");
+        for n in ["apple", "apricot", "banana"] {
+            fs::write(r.work().join(n), "x").unwrap();
+        }
+        r.open(r.work());
+        // No box showing: nothing to type in.
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "ap".into()));
+        assert!(matches!(r.app.edit, Edit::None) && r.app.filter.is_empty());
+        r.key(0, "/");
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "ap".into()));
+        assert_eq!(r.row_names(), ["apple", "apricot"], "the list narrows as it does for typing");
+        // Left showing with what it filters by, the box opens again when it's changed.
+        r.key(k::KEY_Down, "");
+        assert!(matches!(r.app.edit, Edit::None));
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(1, 2, "".into()));
+        assert_eq!((field_text(&r).0.as_str(), r.row_names().len()), ("a", 3));
+        // A path request goes nowhere while the path isn't being typed.
+        a11y_edit(&mut r, PATH_FIELD, TextEdit::Replace(0, 1, "/".into()));
+        assert_eq!(field_text(&r).0, "a");
+        // Moving to the box opens it, as clicking it does.
+        r.key(k::KEY_Tab, "");
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::Focus(FILTER)));
+        assert!(matches!(r.app.edit, Edit::Filter(_)));
+    }
+
+    #[test]
+    fn a_late_paste_or_request_doesnt_land_in_a_field_opened_since() {
+        use crate::a11y::{FILTER, TextEdit};
+        let mut r = Rig::new("a11y-late");
+        fs::write(r.work().join("a"), "x").unwrap();
+        r.open(r.work());
+        r.key(0, "/");
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        let stale = r.app.edit_gen;
+        // The box closes and opens again before the answers come.
+        r.key(k::KEY_Escape, "");
+        r.key(0, "/");
+        r.app.on_msg(Msg::Clipboard(Some(b"junk".to_vec()), clipboard::TEXT.to_string(), asked));
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(FILTER, stale, TextEdit::Replace(0, 0, "old".into()))));
+        assert_eq!(field_text(&r).0, "");
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "new".into()));
+        assert_eq!(field_text(&r).0, "new");
+    }
+
+    #[test]
+    fn the_snapshot_has_the_fields_and_where_their_characters_are() {
+        use crate::a11y::{FILTER, FRAME, Focus, Link, NAME_FIELD, PATH_FIELD, Role};
+        let mut r = Rig::new("a11y-fields");
+        fs::write(r.work().join("notes.txt"), "x").unwrap();
+        r.open(r.work());
+        let mut link = Link::new();
+        let s = link.build(&mut r.app);
+        assert!(s.get(PATH_FIELD).is_none() && s.get(FILTER).is_none() && s.get(NAME_FIELD).is_none());
+
+        r.ctrl(k::KEY_f);
+        let s = link.build(&mut r.app);
+        let n = s.get(FILTER).expect("the search box");
+        assert_eq!((n.role, n.name.as_str(), n.description.as_str()), (Role::Entry, "Search", "Search here and below"));
+        assert_eq!(s.focus, Focus::Node(FILTER));
+        r.ctrl(k::KEY_f);
+        let s = link.build(&mut r.app);
+        let n = s.get(FILTER).unwrap();
+        assert_eq!((n.name.as_str(), n.description.as_str()), ("Filter", "Filter this folder"), "Ctrl+F in the box turns it to a filter");
+        r.key(k::KEY_Escape, "");
+
+        r.select("notes.txt");
+        r.key(k::KEY_F2, "");
+        let s = link.build(&mut r.app);
+        let n = s.get(NAME_FIELD).expect("the rename field");
+        assert_eq!((n.name.as_str(), n.field.as_ref().unwrap().text.as_str()), ("Rename notes.txt", "notes.txt"));
+        assert_eq!(s.focus, Focus::Node(NAME_FIELD));
+        assert_eq!(s.get(FRAME).unwrap().children.last(), Some(&NAME_FIELD));
+        // Its characters are on its row. Tests have no fonts to measure them with: the e2e
+        // check sees them left to right.
+        let g = s.geometry(NAME_FIELD).unwrap();
+        assert_eq!(g.edges.len(), "notes.txt".len() + 1);
+        let row = r.app.layout().list;
+        assert!(n.rect.y >= row.y && n.rect.bottom() <= row.y + r.app.layout().row_h + 1, "{:?}", n.rect);
+        assert!(g.edges[0] >= n.rect.x && *g.edges.last().unwrap() <= n.rect.right());
+        r.key(k::KEY_Escape, "");
+
+        r.ctrl(k::KEY_l);
+        let s = link.build(&mut r.app);
+        let n = s.get(PATH_FIELD).expect("the typed path");
+        assert_eq!(n.field.as_ref().unwrap().text, r.work().to_string_lossy());
+        assert_eq!(s.focus, Focus::Node(PATH_FIELD));
+        assert_eq!(&s.get(FRAME).unwrap().children[..2], &[crate::a11y::BACK, PATH_FIELD]);
     }
 
     fn type_in(r: &mut Rig, text: &str) {
@@ -9714,6 +10044,189 @@ mod tests {
         assert!(!r.app.scrollbar_visible(Pane::Sidebar));
     }
 
+    /// What a screen reader would be handed now, as a server that just started gets it.
+    fn a11y_snapshot(app: &mut App) -> crate::a11y::Snapshot {
+        let mut link = crate::a11y::Link::new();
+        let (tx, rx) = channel();
+        assert!(link.shared.connect(link.shared.next_epoch(), tx));
+        link.update(app);
+        match rx.try_recv() {
+            Ok(crate::a11y::ToServer::Snapshot(s)) => *s,
+            _ => panic!("no snapshot"),
+        }
+    }
+
+    fn paint_once(app: &mut App) {
+        let mut px = vec![0u32; (app.w * app.h) as usize];
+        app.paint(&mut crate::canvas::Canvas::new(&mut px, app.w, app.h));
+    }
+
+    #[test]
+    fn a_screen_reader_reads_the_list_as_a_table_and_sorts_by_its_headings() {
+        use crate::a11y::{Act, Column, Role, COLUMN_LOCATION, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, FRAME, LIST};
+        let mut r = Rig::new("a11y-columns");
+        fs::write(r.work().join("a.txt"), "aaaa").unwrap();
+        fs::create_dir(r.work().join("sub")).unwrap();
+        r.open(r.work());
+        r.pump_until("sizes known", |a| a.listing.as_ref().is_some_and(|l| a.rows.iter().all(|&e| matches!(l.stat(e), Stat::Known { .. }))));
+        let s = a11y_snapshot(&mut r.app);
+        assert_eq!(s.get(LIST).map(|n| n.role), Some(Role::Table));
+        assert_eq!(s.rows.columns.iter().map(|c| c.name).collect::<Vec<_>>(), ["Name", "Size", "Modified"]);
+        let frame = &s.get(FRAME).unwrap().children;
+        assert!([COLUMN_NAME, COLUMN_SIZE, COLUMN_MODIFIED].iter().all(|h| frame.contains(h)) && !frame.contains(&COLUMN_LOCATION), "{frame:?}");
+        let size = s.get(COLUMN_SIZE).unwrap();
+        assert_eq!((size.role, size.action.map(|a| a.keys)), (Role::ColumnHeader, Some("<Control>2")));
+        assert_eq!(s.rows.sort, (Column::Name, false));
+        // Each row's cells read as the list shows them: a folder has no size.
+        let now = gannet_core::time::now();
+        let (sub, a) = (s.rows.entry(0).unwrap(), s.rows.entry(1).unwrap());
+        assert_eq!((s.rows.name(a), s.rows.cell(a, Column::Size, now)), ("a.txt".to_string(), "4 B".to_string()));
+        assert_eq!(s.rows.cell(sub, Column::Size, now), "");
+        let date = s.rows.cell(a, Column::Modified, now);
+        assert!(!date.is_empty());
+        assert_eq!(s.rows.summary(a, now), format!("4 B, {date}"), "the row says its other cells");
+        assert_eq!(s.rows.summary(sub, now), date);
+        // A heading sorts by its column, as a click does, and the new order is news.
+        r.app.on_msg(Msg::A11y(Act::Press(COLUMN_SIZE)));
+        r.pump_until("sorted by size", |a| a.sort.key == SortKey::Size && !a.rows.is_empty());
+        let t = a11y_snapshot(&mut r.app);
+        assert_eq!(t.rows.sort, (Column::Size, SortKey::Size.first_order().descending));
+        let said = if t.rows.sort.1 { "Sorted by size, descending" } else { "Sorted by size, ascending" };
+        assert_eq!(t.news_since(&s), [(said.to_string(), false)]);
+        // Where search results are has a column of its own, which nothing sorts by.
+        r.search("a.txt");
+        let s = a11y_snapshot(&mut r.app);
+        assert_eq!(s.rows.columns.iter().map(|c| c.name).collect::<Vec<_>>(), ["Name", "Location", "Size", "Modified"]);
+        assert!(s.get(COLUMN_LOCATION).is_some_and(|n| n.action.is_none()));
+        let e = s.rows.entry(0).unwrap();
+        assert_eq!(s.rows.cell(e, Column::Location, now), "work");
+    }
+
+    #[test]
+    fn a_screen_reader_goes_up_the_path_bar() {
+        use crate::a11y::{Act, Role, PATH};
+        let mut r = Rig::new("a11y-path");
+        fs::create_dir_all(r.work().join("x/y")).unwrap();
+        r.open(r.work().join("x/y"));
+        paint_once(&mut r.app);
+        let s = a11y_snapshot(&mut r.app);
+        let links: Vec<_> = s.get(PATH).unwrap().children.iter().map(|&c| s.get(c).unwrap()).collect();
+        assert!(links.iter().all(|n| n.role == Role::Link && n.parent == PATH));
+        let names: Vec<&str> = links.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names[names.len() - 3..], ["work", "x", "y"]);
+        assert!(links.last().is_some_and(|n| n.selected && n.showing), "the folder shown is the current part, and in view");
+        assert!(links.iter().filter(|n| n.showing).all(|n| !n.rect.is_empty()), "placed as drawn");
+        let x = links.len() - 2;
+        // A request about a folder the window has left does nothing.
+        r.app.on_msg(Msg::A11y(Act::OpenCrumb(Arc::new(r.work()), x)));
+        assert_eq!(r.app.dir, r.work().join("x/y"));
+        r.app.on_msg(Msg::A11y(Act::OpenCrumb(Arc::new(r.work().join("x/y")), x)));
+        r.pump_until("up to x", |a| !a.loading && a.dir.ends_with("x"));
+        assert_eq!(r.row_names(), ["y"]);
+        assert!(r.app.cursor_shown && r.app.cursor == 0, "the cursor on the folder come from");
+        // While the path is typed, the links aren't showing.
+        r.app.start_path_edit();
+        let s = a11y_snapshot(&mut r.app);
+        assert!(!s.get(PATH).unwrap().showing);
+    }
+
+    #[test]
+    fn a_screen_reader_hears_the_sidebars_headings_and_ejects_a_drive_by_name() {
+        use crate::a11y::{Act, Role, EJECT0, HEADING_DEVICES, HEADING_PLACES, PLACE0, SIDEBAR};
+        let mut r = drive_rig("a11y-eject");
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        let s = a11y_snapshot(&mut r.app);
+        let side = &s.get(SIDEBAR).unwrap().children;
+        assert_eq!(side[..4], [HEADING_PLACES, PLACE0, HEADING_DEVICES, PLACE0 + 1], "each heading before its section's first place");
+        let devices = s.get(HEADING_DEVICES).unwrap();
+        assert_eq!((devices.role, devices.name.as_str()), (Role::Heading, "Devices"));
+        assert!(s.get(PLACE0).unwrap().children.is_empty(), "Home has no eject button");
+        assert_eq!(s.get(PLACE0 + 1).unwrap().children, [EJECT0 + 1]);
+        let eject = s.get(EJECT0 + 1).unwrap();
+        assert_eq!((eject.role, eject.name.as_str(), eject.parent, eject.enabled), (Role::PushButton, "Eject PHOTOS", PLACE0 + 1, true));
+        assert_eq!(Some(eject.rect), r.app.eject_rect(1));
+        // A drive that took the place of the one asked about isn't ejected.
+        r.app.on_msg(Msg::A11y(Act::Eject(1, "OTHER".into())));
+        assert!(r.app.notices.is_empty());
+        r.app.on_msg(Msg::A11y(Act::Eject(1, "PHOTOS".into())));
+        assert!(r.app.notices.iter().any(|n| n.starts_with("Couldn't eject “PHOTOS”")), "the drive was asked to eject: {:?}", r.app.notices);
+    }
+
+    #[test]
+    fn notices_and_jobs_are_news_to_a_screen_reader() {
+        use crate::a11y::{Act, Role, DISMISS0, JOB0, LIST, NOTICE0, NOTICES, STOP0};
+        let mut r = Rig::new("a11y-news");
+        r.open(r.work());
+        let s = a11y_snapshot(&mut r.app);
+        assert_eq!(s.get(LIST).unwrap().description, "This folder is empty");
+        // Not while a folder is being named in it.
+        r.app.action(Action::NewFolder);
+        assert!(matches!(r.app.edit, Edit::NewFolder(_)));
+        assert_eq!(a11y_snapshot(&mut r.app).get(LIST).unwrap().description, "");
+        r.key(k::KEY_Escape, "");
+        // The same notice twice is two notices.
+        r.app.notice("Something broke".into());
+        r.app.notice("Something broke".into());
+        let t = a11y_snapshot(&mut r.app);
+        assert_eq!(t.news_since(&s), [("Something broke".to_string(), true), ("Something broke".to_string(), true)]);
+        assert_eq!(t.get(NOTICES).unwrap().children, [NOTICE0, DISMISS0, NOTICE0 + 1, DISMISS0 + 1]);
+        assert_eq!(t.get(DISMISS0 + 1).unwrap().description, "Something broke");
+        // A request for a notice that has moved since does nothing.
+        r.app.on_msg(Msg::A11y(Act::Dismiss(0, "Something else".into())));
+        assert_eq!(r.app.notices.len(), 2);
+        r.app.on_msg(Msg::A11y(Act::Dismiss(0, "Something broke".into())));
+        let u = a11y_snapshot(&mut r.app);
+        assert_eq!(r.app.notices.len(), 1);
+        assert!(u.news_since(&t).is_empty(), "dismissing one isn't news");
+        r.app.notices.clear();
+
+        // A copy waiting on a question has lasted long enough to show, with a Stop button.
+        fs::create_dir(r.work().join("dest")).unwrap();
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        fs::write(r.work().join("dest/a.txt"), "old").unwrap();
+        r.app.start_job(Request::Copy { sources: vec![r.work().join("a.txt")], dest: r.work().join("dest") });
+        r.pump_until("the question", |a| matches!(a.dialog, Some(Dialog::Conflict { .. })));
+        std::thread::sleep(JOB_SHOW_AFTER);
+        let s = a11y_snapshot(&mut r.app);
+        let job = s.news.jobs.first().expect("the job").clone();
+        assert_eq!(job.label, "Copying “a.txt” to dest");
+        let bar = s.get(JOB0 + job.id).unwrap();
+        assert_eq!((bar.role, bar.name.as_str(), bar.parent), (Role::ProgressBar, "Copying “a.txt” to dest", NOTICES));
+        assert!(s.get(STOP0 + job.id).is_some_and(|b| b.enabled && b.description == job.label));
+        // Answered, it finishes, and that's news.
+        // Skip.
+        r.app.press_dialog_button(1);
+        r.pump_until("copied", |a| a.jobs.is_empty());
+        let t = a11y_snapshot(&mut r.app);
+        assert_eq!(t.news_since(&s), [("Finished: Copying “a.txt” to dest".to_string(), false)]);
+        // Had it ended with errors, which post notices of their own, it wouldn't be finished.
+        let mut failed = t.clone();
+        failed.news.ended = vec![(job.id, false)];
+        assert!(failed.news_since(&s).is_empty(), "a job with errors announced as finished");
+
+        // A job stopped through its button posts a notice that it stopped, not that it finished.
+        r.app.start_job(Request::Copy { sources: vec![r.work().join("a.txt")], dest: r.work().join("dest") });
+        r.pump_until("the question again", |a| matches!(a.dialog, Some(Dialog::Conflict { .. })));
+        std::thread::sleep(JOB_SHOW_AFTER);
+        let s = a11y_snapshot(&mut r.app);
+        let id = s.news.jobs.first().expect("the job").id;
+        // Nothing behind the question can be used, so it's set aside for the button.
+        r.app.on_msg(Msg::A11y(Act::Press(STOP0 + id)));
+        assert!(!r.app.jobs[0].job.is_cancelled(), "stopped from behind the question");
+        let question = r.app.dialog.take();
+        r.app.on_msg(Msg::A11y(Act::Press(STOP0 + id)));
+        r.app.dialog = question;
+        let s = a11y_snapshot(&mut r.app);
+        assert!(s.news.jobs.first().is_some_and(|j| j.stopping && j.progress == "stopping"));
+        assert!(!s.get(STOP0 + id).unwrap().enabled, "stopping already");
+        // Skip.
+        r.app.press_dialog_button(1);
+        r.pump_until("stopped", |a| a.jobs.is_empty());
+        assert_eq!(a11y_snapshot(&mut r.app).news_since(&s), [("Stopped: Copying “a.txt” to dest".to_string(), true)]);
+    }
+
     #[test]
     fn a_screen_reader_hears_the_preview_and_walks_it() {
         use crate::a11y::{Act, BACK, PREVIEW_CLOSE, PREVIEW_NEXT, PREVIEW_PREVIOUS};
@@ -9922,5 +10435,38 @@ mod tests {
         }
         let s = snapshot(&mut r);
         assert!(!s.get(PASSPHRASE).unwrap().enabled && s.get(DIALOG).unwrap().description == "Unlocking…", "left alone while it's tried");
+    }
+
+    #[test]
+    fn a_screen_reader_types_the_name_to_save_as() {
+        use crate::a11y::{Act, CHOOSER_SAVE_NAME, Focus, Link, TextEdit};
+        let mut r = Rig::new("a11y-save-name");
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        let spec = crate::chooser::Spec { mode: crate::chooser::Mode::Save, name: Some("new.txt".into()), ..crate::chooser::Spec::default() };
+        r.app.chooser = Some(crate::chooser::Chooser::new(spec, &[], None));
+        r.open(r.work());
+        let mut px = vec![0u32; (r.app.w * r.app.h) as usize];
+        r.app.paint(&mut crate::canvas::Canvas::new(&mut px, r.app.w, r.app.h));
+        let name = |r: &Rig| r.app.chooser.as_ref().unwrap().name.text.clone();
+        // The snapshot has where its characters are, and the number its requests carry.
+        let s = Link::new().build(&mut r.app);
+        assert_eq!(s.focus, Focus::Node(CHOOSER_SAVE_NAME));
+        assert_eq!(s.geometry(CHOOSER_SAVE_NAME).map(|g| g.edges.len()), Some("new.txt".len() + 1));
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, s.edit_gen, TextEdit::Replace(0, 3, "report".into()))));
+        assert_eq!(name(&r), "report.txt");
+        // With the keyboard in the list, typing in the name gives it the keyboard first, as a
+        // click on it does.
+        r.app.on_msg(Msg::A11y(Act::FocusRow(Arc::new(r.work()), b"a.txt".to_vec())));
+        assert!(!r.app.a11y_name_has_keyboard());
+        let edit_gen = r.app.edit_gen;
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, edit_gen, TextEdit::Replace(0, usize::MAX, "b.txt".into()))));
+        assert!(r.app.a11y_name_has_keyboard());
+        assert_eq!(name(&r), "b.txt");
+        // A request from before the filter box opened is dropped.
+        r.key(k::KEY_Tab, "");
+        r.key(0, "/");
+        assert!(matches!(r.app.edit, Edit::Filter(_)));
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, edit_gen, TextEdit::Replace(0, 0, "x".into()))));
+        assert_eq!(name(&r), "b.txt");
     }
 }

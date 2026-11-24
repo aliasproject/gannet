@@ -1539,7 +1539,7 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         heard = sr.until("events", lambda e: any(x["type"].startswith("object:children-changed:add") for x in e), "the new row is heard")
         assert [x["source"] for x in heard if x["type"].startswith("object:children-changed:add")] == ["Files"], heard
         assert not any(x["type"] == "object:state-changed:focused" for x in heard), f"the row with focus was announced again: {heard}"
-        assert sr.ask("kept") == {"role": "list item", "name": "b.txt"}
+        assert sr.ask("kept") == {"role": "table row", "name": "b.txt"}
 
         # While a dialog is open, what's behind it can't be used, as with the pointer: a request
         # about it answers false and does nothing.
@@ -1661,11 +1661,273 @@ def a_screen_reader_hears_pins_scrolled_places_and_search_results(h):
         a.type("README")
         a.wait(lambda s: s["found"] and s["found"]["complete"] and s["names"] == ["README.md", "README.md"], "found")
         t = sr.until("tree", lambda t: t["rows"] == ["README.md", "README.md"], "the results")
-        assert t["descriptions"] == ["docs/one", "docs/two"], t["descriptions"]
+        # Each says where it is first, as the Location column comes first.
+        assert [d.split(", ")[0] for d in t["descriptions"]] == ["docs/one", "docs/two"], t["descriptions"]
         assert sr.ask("select_row 1") is True and sr.ask("focus_row 1") is True
         a.wait(lambda s: s["cursor"] == 1 and s["selected"] == ["README.md"], "the second result")
         t = sr.until("tree", lambda t: t["focus_at"] == [1], "focus on the second result")
         assert t["selected_at"] == [1], t
+        a.close()
+    finally:
+        sr.stop()
+
+
+@check
+def a_screen_reader_reads_columns_the_path_and_drives_and_hears_the_news(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"docs/a.txt": "aaaa", "docs/bb.txt": "b" * 2000, "docs/sub/x.txt": "x", "docs/dest/a.txt": "old"})
+    media = SCRATCH / "media"
+    shutil.rmtree(media, ignore_errors=True)
+    tree(media, {"PHOTOS/beach.png": png_bytes(10, 10)})
+    disks = StandIn(media)
+    sr = ScreenReader()
+    try:
+        disks.say("drive Stick Kingston-1234", "fs sdb1 Stick PHOTOS")
+        a = App(h, fs / "docs", extra_env={"DBUS_SESSION_BUS_ADDRESS": sr.session.address, "DBUS_SYSTEM_BUS_ADDRESS": disks.bus.address})
+        a.wait(lambda s: s["names"] == ["dest", "sub", "a.txt", "bb.txt"] and place_flags(s, "PHOTOS") == {"eject"}, "listed, with the drive")
+        time.sleep(0.5)
+        assert sr.ask("apps") == [], "registered with no screen reader on"
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered once a screen reader is on")
+
+        # The list is a table: its headings say which sorts it, and each row's cells read as shown.
+        t = sr.until("table", lambda t: len(t["rows"]) == 4 and t["rows"][2][1] == "4 B", "the table, sizes known")
+        assert (t["role"], t["row_role"]) == ("table", "table row"), t
+        assert [(c["name"], c["role"], c["sort"], c["actions"]) for c in t["columns"]] == [("Name", "column header", "ascending", 1), ("Size", "column header", "none", 1), ("Modified", "column header", "none", 1)], t["columns"]
+        assert [r[:2] for r in t["rows"]] == [["dest", ""], ["sub", ""], ["a.txt", "4 B"], ["bb.txt", "2.0 kB"]], t["rows"]
+        assert all(r[2] for r in t["rows"]), "every row has a date"
+        assert t["cell"] == {"role": "table cell", "position": [0, 2], "headings": ["Modified"], "parent": "dest"}, t["cell"]
+        # A row says its other cells after its name.
+        assert sr.ask("tree")["descriptions"][2] == f"4 B, {t['rows'][2][2]}"
+        # Moving to a cell puts the cursor on its row.
+        assert sr.ask("focus_cell 3 1") is True
+        a.wait(lambda s: s["cursor"] == 3 and s["cursor_shown"], "the cursor on bb.txt")
+
+        # A heading's action sorts by it, and the new order is announced.
+        sr.ask("events")
+        assert sr.ask("heading 1") is True
+        a.wait(lambda s: s["sort"] == "Size" and s["desc"], "sorted by size, biggest first")
+        t = sr.until("table", lambda t: t["columns"][1]["sort"] == "descending", "the Size heading says so")
+        assert t["columns"][0]["sort"] == "none" and [r[0] for r in t["rows"]][2:] == ["bb.txt", "a.txt"], t
+        heard = sr.until("events", lambda e: any(x["type"] == "object:announcement" for x in e), "the sort announced")
+        assert [x["said"] for x in heard if x["type"] == "object:announcement"] == ["Sorted by size, descending"], heard
+        a.key("1", mods=["ctrl"])
+        a.wait(lambda s: s["sort"] == "Name" and not s["desc"], "back to by name")
+
+        # The path bar is a list of links, the folder shown the current one, and a link goes there.
+        p = sr.until("path", lambda p: p and p[-1]["name"] == "docs", "the path")
+        assert all(x["role"] == "link" for x in p) and [x["current"] for x in p][-2:] == [None, "location"], p
+        assert p[-1]["showing"] and p[-2]["name"] == fs.name, p
+        assert sr.ask(f"crumb {len(p) - 2}") is True
+        a.wait(lambda s: s["dir"] == str(fs) and s["selected"] == ["docs"], "up to the folder above, on the one come from")
+        sr.until("path", lambda p: p[-1]["name"] == fs.name and p[-1]["current"] == "location" and p[-1]["showing"], "the path says where it is now, placed as drawn")
+        a.key("Return")
+        a.wait(lambda s: s["dir"] == str(fs / "docs") and s["count"] == 4, "back in docs")
+
+        # The sidebar's sections have headings, and a drive's eject button is in it, named for it.
+        side = sr.until("tree", lambda t: "PHOTOS" in t["places"], "the drive")["sidebar"]
+        assert side[0] == ["heading", "Places", []] and ["heading", "Devices", []] in side, side
+        assert side.index(["heading", "Devices", []]) < side.index(["list item", "PHOTOS", ["Eject PHOTOS"]]), side
+        assert all(kids == [] for role, name, kids in side if name not in ("PHOTOS",)), "only drives that come out have one"
+        assert sr.ask('do ["docs", "Places", "PHOTOS", "Eject PHOTOS"]') is True
+        a.wait(lambda s: place_flags(s, "PHOTOS") is None, "ejected", timeout=10)
+        sr.until("tree", lambda t: "PHOTOS" not in t["places"], "gone")
+
+        # A notice is announced, and can be dismissed.
+        sr.ask("events")
+        a.key("l", mods=["ctrl"])
+        a.type("nowhere")
+        a.key("Return")
+        a.wait(lambda s: s["notices"] == ["Enter a full path, starting with / or ~"], "the notice")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:announcement" for x in e), "the notice announced")
+        assert [x["said"] for x in heard if x["type"] == "object:announcement"] == ["Enter a full path, starting with / or ~"], heard
+        n = sr.until("notices", lambda n: n, "the notice in the panel")
+        assert n == [{"role": "label", "name": "Enter a full path, starting with / or ~", "description": ""}, {"role": "button", "name": "Dismiss", "description": "Enter a full path, starting with / or ~"}], n
+        a.shot("a11y-notice")
+        assert sr.ask('do ["docs", "Notices", "Dismiss"]') is True
+        a.wait(lambda s: s["notices"] == [], "dismissed")
+
+        # A job that lasts long enough to show is a progress bar with a Stop button, and its end
+        # is announced. This one waits on a question, as a big copy would on its bytes.
+        go_to(a, "a.txt")
+        a.key("c", mods=["ctrl"])
+        time.sleep(0.1)
+        a.key("l", mods=["ctrl"])
+        a.type(str(fs / "docs/dest"))
+        a.key("Return")
+        a.wait(lambda s: s["dir"] == str(fs / "docs/dest"), "in dest")
+        a.key("v", mods=["ctrl"])
+        a.wait(lambda s: s["dialog"] == "conflict" and s["visible_jobs"] == 1, "the question, and the job showing")
+        n = sr.until("notices", lambda n: len(n) == 2, "the job in the panel")
+        assert [(x["role"], x["name"], x["description"]) for x in n] == [("progress bar", "Copying “a.txt” to dest", ""), ("button", "Stop", "Copying “a.txt” to dest")], n
+        assert n[0]["value"][0] == 0.0, n
+        a.shot("a11y-job")
+        sr.ask("events")
+        time.sleep(0.45)  # A new question ignores input for a moment.
+        a.type("s")
+        a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0, "skipped, and done")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:announcement" for x in e), "the end announced")
+        assert [x["said"] for x in heard if x["type"] == "object:announcement"] == ["Finished: Copying “a.txt” to dest"], heard
+        assert sr.ask("notices") == []
+
+        # An empty folder says so.
+        go_to(a, "a.txt")
+        a.key("Delete")
+        a.wait(lambda s: s["count"] == 0 and s["jobs"] == 0, "dest emptied")
+        assert sr.until("tree", lambda t: t["files_description"] == "This folder is empty", "the list says it's empty")
+        a.close()
+    finally:
+        sr.stop()
+        disks.stop()
+
+
+@check
+def a_screen_reader_reads_and_edits_the_text_fields(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"docs/apple.txt": "a", "docs/apricot.txt": "a", "docs/banana.txt": "b", "other/x.txt": "x"})
+    sr = ScreenReader()
+
+    def heard(kind, timeout=8):
+        got = sr.until("events", lambda e: any(x["type"].startswith(kind) for x in e), f"{kind} heard", timeout)
+        time.sleep(0.2)
+        return got + sr.ask("events")
+
+    def one(name):
+        return next(f for f in sr.ask("fields") if f["name"].startswith(name))
+
+    try:
+        env = {"DBUS_SESSION_BUS_ADDRESS": sr.session.address}
+        a = App(h, fs / "docs", extra_env=env)
+        a.wait(lambda s: s["names"] == ["apple.txt", "apricot.txt", "banana.txt"], "listed")
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered")
+        assert sr.ask("fields") == [], "no field shows until one's opened"
+
+        # The filter box: its role, what it does, and focus moving into it.
+        sr.ask("events")
+        a.key("slash")
+        a.wait(lambda s: s["edit"] == "filter:", "the filter box")
+        e = heard("object:state-changed:focused")
+        assert [x["source"] for x in e if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Filter"], e
+        assert any(x["type"].startswith("object:children-changed:add") and x["source"] == "docs - Gannet" for x in e), e
+        f = one("Filter")
+        assert (f["role"], f["description"], f["text"], f["editable"], f["single_line"], f["focused"]) == ("entry", "Filter this folder", "", True, True, True), f
+        assert "Text" in f["interfaces"] and "EditableText" in f["interfaces"], f["interfaces"]
+
+        # Typing is heard as text going in, and the caret moving after it.
+        a.type("ap")
+        a.wait(lambda s: s["names"] == ["apple.txt", "apricot.txt"], "filtered")
+        e = heard("object:text-caret-moved")
+        assert [x["text"] for x in e if x["type"].startswith("object:text-changed:insert")] == ["a", "p"], e
+        assert [x["detail1"] for x in e if x["type"] == "object:text-caret-moved"][-1] == 2, e
+        f = one("Filter")
+        assert (f["text"], f["count"], f["caret"], f["selections"]) == ("ap", 2, 2, []), f
+        # Each character has its box, left to right on the box's line.
+        boxes, (fx, fy, fw, fh) = f["boxes"], f["rect"]
+        assert len(boxes) == 2 and boxes[0][0] >= fx and boxes[0][0] + boxes[0][2] <= boxes[1][0] and boxes[1][0] + boxes[1][2] <= fx + fw, (boxes, f["rect"])
+        assert all(b[2] > 0 and fy <= b[1] and b[1] + b[3] <= fy + fh for b in boxes), (boxes, f["rect"])
+
+        # Changing it through AT-SPI is as typing: the list follows, and the change is heard.
+        sr.ask("events")
+        assert sr.ask("insert Filter 2 r") is True
+        a.wait(lambda s: s["edit"] == "filter:apr" and s["names"] == ["apricot.txt"], "the filter typed into through AT-SPI")
+        e = heard("object:text-changed:insert")
+        assert [(x["text"], x["detail1"], x["detail2"]) for x in e if x["type"].startswith("object:text-changed:insert")] == [("r", 2, 1)], e
+        assert sr.ask("delete Filter 0 3") is True
+        a.wait(lambda s: s["edit"] == "filter:" and len(s["names"]) == 3, "the filter emptied through AT-SPI")
+        e = heard("object:text-changed:delete")
+        assert [(x["text"], x["detail1"]) for x in e if x["type"].startswith("object:text-changed:delete")] == [("apr", 0)], e
+
+        # Ctrl+F in the box makes it a search: its name and description say so.
+        sr.ask("events")
+        a.key("f", mods=["ctrl"])
+        e = heard("object:property-change:accessible-description")
+        f = one("Search")
+        assert (f["name"], f["description"]) == ("Search", "Search here and below"), f
+        a.key("f", mods=["ctrl"])
+        sr.until("fields", lambda fs: [x["name"] for x in fs] == ["Filter"], "a filter again")
+
+        # Leaving the box with Down leaves it showing what it filters by, and moves focus out;
+        # moving a screen reader to it opens it again.
+        a.type("b")
+        a.wait(lambda s: s["names"] == ["banana.txt"], "filtered to b")
+        sr.ask("events")
+        a.key("Down")
+        a.wait(lambda s: s["edit"] == "none" and s["cursor_shown"], "in the list")
+        e = heard("object:state-changed:focused")
+        focus = [(x["source"], x["detail1"]) for x in e if x["type"] == "object:state-changed:focused"]
+        assert ("banana.txt", 1) in focus and ("Filter", 0) in focus, focus
+        f = one("Filter")
+        assert (f["text"], f["focused"]) == ("b", False), f
+        assert sr.ask("focus_field Filter") is True
+        a.wait(lambda s: s["edit"] == "filter:b", "the box opened through AT-SPI")
+        sr.until("fields", lambda fs: fs[0]["focused"], "the box focused")
+        a.key("Escape")
+        a.wait(lambda s: s["edit"] == "none" and len(s["names"]) == 3, "the filter ended")
+        sr.until("fields", lambda fs: fs == [], "the box gone")
+
+        # Renaming: the field says what's renamed, starts with the name's stem selected, and
+        # reads by word.
+        a.key("Home")
+        a.wait(lambda s: s["cursor"] == 0 and s["cursor_shown"], "on apple.txt")
+        sr.ask("events")
+        a.key("F2")
+        a.wait(lambda s: s["edit"] == "rename:apple.txt", "renaming")
+        e = heard("object:state-changed:focused")
+        assert [x["source"] for x in e if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Rename apple.txt"], e
+        f = one("Rename")
+        assert (f["text"], f["selections"], f["caret"]) == ("apple.txt", [[0, 5]], 5), f
+        assert sr.ask("word Rename 1") == ["apple.", 0, 6], "a word and what follows it up to the next"
+        # A row's field is on its row, where it's drawn, and its characters are in it.
+        (rx, ry, rw, rh) = f["rect"]
+        assert row_y(0) - 20 < ry < row_y(0) < ry + rh and rx < ROW_X < rx + rw, (f["rect"], row_y(0))
+        assert all(rx < b[0] and b[0] + b[2] < rx + rw and ry <= b[1] and b[1] + b[3] <= ry + rh for b in f["boxes"]), f
+        # Pointing at it finds the field, on top of the list; beside it, the list.
+        assert sr.ask(f"at {ROW_X} {row_y(0)}") == "Rename apple.txt"
+        assert sr.ask(f"at {ROW_X} {row_y(1)}") == "Files"
+        a.shot("a11y-rename-field")
+
+        # Moving the caret and selecting through AT-SPI is heard, and typing then replaces
+        # what's selected, as on the keyboard.
+        sr.ask("events")
+        assert sr.ask("caret Rename 0") is True
+        e = heard("object:text-caret-moved")
+        assert [x["detail1"] for x in e if x["type"] == "object:text-caret-moved"] == [0], e
+        assert any(x["type"] == "object:text-selection-changed" for x in e), e
+        assert sr.ask("select_text Rename 0 5") is True
+        sr.until("fields", lambda fs: fs[0]["selections"] == [[0, 5]], "selected through AT-SPI")
+        a.type("pear")
+        a.wait(lambda s: s["edit"] == "rename:pear.txt", "typed over the selection")
+        assert one("Rename")["text"] == "pear.txt"
+        a.key("Return")
+        a.wait(lambda s: "pear.txt" in s["names"], "renamed")
+        sr.until("fields", lambda fs: fs == [], "the field gone")
+
+        # A new folder's name, set whole through AT-SPI, then made with Enter.
+        a.key("n", mods=["ctrl", "shift"])
+        a.wait(lambda s: s["edit"] == "newfolder:New Folder", "naming a new folder")
+        assert one("New folder")["selections"] == [[0, 10]]
+        assert sr.ask("set_text New Report") is True
+        a.wait(lambda s: s["edit"] == "newfolder:Report", "named through AT-SPI")
+        a.key("Return")
+        a.wait(lambda s: "Report" in s["names"], "the folder made")
+
+        # The typed path: all of it selected to start with, and replaced through AT-SPI.
+        a.key("l", mods=["ctrl"])
+        a.wait(lambda s: s["edit"].startswith("path:"), "typing a path")
+        f = one("Path")
+        assert (f["text"], f["selections"], f["focused"]) == (str(fs / "docs"), [[0, len(str(fs / "docs"))]], True), f
+        assert f["description"] == "Enter a full path, starting with / or ~", f
+        assert sr.ask(f"set_text Path {fs / 'other'}") is True
+        a.wait(lambda s: s["edit"] == f"path:{fs / 'other'}", "the path set through AT-SPI")
+        sr.ask("events")
+        a.key("Return")
+        a.wait(lambda s: s["names"] == ["x.txt"], "went there")
+        e = heard("object:children-changed:remove")
+        assert any(x["source"] == "other - Gannet" or x["source"] == "docs - Gannet" for x in e if x["type"].startswith("object:children-changed:remove")), e
+        assert sr.ask("fields") == []
         a.close()
     finally:
         sr.stop()
@@ -1762,7 +2024,7 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         # Save: a dialog named for the request and the folder, with the name to save as where
         # the keyboard is, the file types, the file list as in the main window, and the buttons.
         a = a11y_window(h, sr, ["--choose", "save", "--title", "Save the report", "--folder", str(docs), "--name", "report.txt", "--filter", "Text", "--glob", "*.txt", "--filter", "All files", "--glob", "*"])
-        w = sr.until("dump [\"Save the report\"]", lambda w: [r["name"] for r in a11y_find(w, "Files", "list")["children"]] == ["sub", "a.txt"], "the rows")
+        w = sr.until("dump [\"Save the report\"]", lambda w: [r["name"] for r in a11y_find(w, "Files", "table")["children"]] == ["sub", "a.txt"], "the rows")
         assert w["role"] == "dialog" and w["name"] == "Save the report - docs", w
         name = a11y_find(w, "Name", "entry")
         assert name and "editable" in name["states"] and a11y_focus(w) == ["Name"], (name, a11y_focus(w))
@@ -1779,7 +2041,8 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         assert sr.ask("grab [\"Save the report\", \"Files\", \"a.txt\"]") is True
         a.wait(lambda s: not s["chooser"]["name_focused"] and s["cursor"] == 1, "the keyboard in the list")
         sr.until("dump [\"Save the report\"]", lambda w: a11y_focus(w) == ["a.txt"], "focus on a.txt")
-        assert sr.ask("grab [\"Save the report\", \"Name\"]") is True
+        # The list's Name heading shares its name.
+        assert sr.ask("grab [\"Save the report\", \"Name@entry\"]") is True
         a.wait(lambda s: s["chooser"]["name_focused"], "the keyboard back in the name")
         sr.until("dump [\"Save the report\"]", lambda w: a11y_focus(w) == ["Name"], "focus back on the name")
         # Saving onto a file that's there asks first, in an alert the screen reader hears, and
@@ -1801,10 +2064,20 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         a.wait(lambda s: s["dialog"] == "" and s["chooser"], "kept the dialog open")
         a.key("a", mods=("ctrl",))
         a.type("report.txt")
+        # The name reads and edits as the main window's fields do: typing through AT-SPI
+        # changes it, and the change is heard.
+        f = sr.ask("fields")
+        assert [(x["name"], x["text"], x["editable"], "EditableText" in x["interfaces"], len(x["boxes"])) for x in f] == [("Name", "report.txt", True, True, 10)], f
+        assert all(b[2] > 0 for b in f[0]["boxes"]), f[0]["boxes"]
+        sr.ask("events")
+        assert sr.ask("insert Name 6 -final") is True
+        a.wait(lambda s: s["chooser"]["name"] == "report-final.txt", "the name typed into through AT-SPI")
+        heard = sr.until("events", lambda e: any(x["type"].startswith("object:text-changed:insert") for x in e), "the typing heard")
+        assert [(x["text"], x["detail1"], x["source"]) for x in heard if x["type"].startswith("object:text-changed:insert")] == [("-final", 6, "Name")], heard
         # Save, through its action.
         assert sr.ask("do [\"Save the report\", \"Save\"]") is True
         out = said(a)
-        assert out.startswith("accept\n") and f"uri {uri(docs / 'report.txt')}" in out, out
+        assert out.startswith("accept\n") and f"uri {uri(docs / 'report-final.txt')}" in out, out
 
         # Open: what's picked is said, and Cancel cancels.
         sr.screen_reader(False)
@@ -1864,6 +2137,19 @@ def a_screen_reader_can_pick_an_app_in_open_with(h):
         heard = sr.until("events", lambda e: any(x["type"].startswith("object:children-changed:remove") for x in e), "the apps going heard")
         a.key("Escape")
         wait_open_with(lambda s: s["search"] == "", "the search cleared")
+        # Typing in the search through AT-SPI narrows the list as typing does, and is heard.
+        sr.ask("events")
+        assert sr.ask("set_text Search pai") is True
+        wait_open_with(lambda s: s["search"] == "pai" and s["picked"] == "paint.desktop", "searched through AT-SPI")
+        heard = sr.until("events", lambda e: any(x["type"].startswith("object:text-changed:insert") for x in e), "the typing heard")
+        assert [x["text"] for x in heard if x["type"].startswith("object:text-changed:insert")] == ["pai"], heard
+        f = sr.ask("fields")
+        assert [(x["name"], x["text"], x["caret"], len(x["boxes"])) for x in f] == [("Search apps", "pai", 3, 3)], f
+        assert all(b[2] > 0 for b in f[0]["boxes"]), f[0]["boxes"]
+        assert sr.ask("delete Search 0 3") is True
+        wait_open_with(lambda s: s["search"] == "", "the search emptied through AT-SPI")
+        assert sr.ask(f"grab {json.dumps([title, 'Apps', 'Writer'])}") is True
+        wait_open_with(lambda s: s["picked"] == "writer.desktop", "Writer picked again")
         # Always use it, then Open, through their actions.
         assert sr.ask(f"do {json.dumps([title, 'Always use for Markdown document files'])}") is True
         wait_open_with(lambda s: s["always"], "ticked")
@@ -1919,7 +2205,7 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         assert items["Copy"]["role"] == "menu item" and items["Copy"]["description"] == "Ctrl+C" and items["Copy"]["action"] == "click", items["Copy"]
         assert "enabled" not in items["Undo"]["states"], "nothing to undo"
         assert "focused" in items["Open"]["states"], "the keyboard is on the first item"
-        files = find(d, "list", "Files")
+        files = find(d, "table", "Files")
         assert "enabled" not in files["states"] and all("enabled" not in r["states"] for r in files["children"]), "the list is behind the menu"
         heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "focus moves into the menu")
         assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Open"], heard
@@ -2857,6 +3143,43 @@ def text_and_markdown_show_as_documents(h):
     s = a.wait(lambda s: preview_of(s).get("name") == "d-binary.dat" and preview_of(s)["state"] == "info", "binary isn't text")
     a.key("Down")
     s = a.wait(lambda s: preview_of(s).get("name") == "e-late-zero.txt" and preview_of(s)["state"] == "text", "a zero far in is still text")
+    assert a.alive()
+    a.close()
+
+
+@check
+def markdown_tables_show_as_tables(h):
+    fs = fresh_fs()
+    # A menu as one is often written, with nothing over its second column, and a table with
+    # aligned columns.
+    (fs / "menu.md").write_text(
+        "# Dinner Menu\n\n"
+        "| Course | |\n|---|---|\n"
+        "| Starter | Roasted tomato soup with basil oil and grilled sourdough |\n"
+        "| Main | Pan-seared salmon with lemon butter, crushed new potatoes and green beans |\n"
+        "| Side | Garden salad |\n"
+        "| Dessert | Dark chocolate tart with *salted* caramel and **vanilla** cream |\n"
+        "| Drinks | `Sparkling water`, [house wine](https://example.com), ~~beer~~ |\n\n"
+        "## Shopping\n\n"
+        "| Item | Qty | Price |\n|:--|:-:|--:|\n| Salmon fillets | 4 | 23.80 |\n| Potatoes | 1 kg | 2.10 |\n| Dark chocolate | 2 | 5.00 |\n\n"
+        "That's everything.\n"
+    )
+    a = App(h, fs, extra_env={"LANG": "C.UTF-8"})
+    a.wait(lambda s: s["count"] == 1, "listing")
+    a.key("space")
+    s = a.wait(lambda s: preview_of(s).get("state") == "markdown" and doc_of(s).get("lines", 0) > 0, "the Markdown, laid out")
+    a.shot("preview-table")
+    d = doc_of(s)
+    # Both tables: six rows and four, each cell's words on its row's line when there's room.
+    assert d["table_lines"] == 10, d
+    assert 0 < d["table_right"] < d["width"], d
+    # Narrow, the long cells wrap inside their column rather than run past the window.
+    a.resize_preview(380, 600)
+    s = a.wait(lambda s: 0 < doc_of(s).get("width", 0) < 400, "laid out narrow")
+    a.shot("preview-table-narrow")
+    d = doc_of(s)
+    assert d["table_lines"] > 10, f"long cells wrap: {d}"
+    assert d["table_right"] <= d["width"], f"the table fits the window: {d}"
     assert a.alive()
     a.close()
 

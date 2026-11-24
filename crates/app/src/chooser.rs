@@ -608,8 +608,8 @@ impl App {
         let mut out = Vec::new();
         match c.drawn_name.filter(|_| c.spec.mode == Mode::Save) {
             Some(r) => {
-                // Its text is the field itself, for typing through a screen reader as in the
-                // other text fields, once they take that.
+                // Its text is the field itself, read and typed in through a screen reader as
+                // the other text fields are.
                 let mut name = Node::new(a11y::CHOOSER_SAVE_NAME, Role::Entry, "Name", r, FRAME).doing(a11y::Action::new("activate", "Save with this name", "Return"));
                 name.field = Some(c.name.clone());
                 out.push(name);
