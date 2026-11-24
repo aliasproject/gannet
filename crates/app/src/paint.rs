@@ -8,7 +8,7 @@ use gannet_core::time;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use crate::app::{ActiveDrag, App, Dialog, DragGhost, Edit, FileDrag, Hit, icon_for};
+use crate::app::{ActiveDrag, App, Dialog, DragGhost, Edit, FileDrag, Hit, Pane, icon_for};
 use crate::canvas::{Canvas, Rect};
 use crate::field::Field;
 use crate::format;
@@ -213,11 +213,33 @@ impl App {
         });
     }
 
+    /// A pane's scroll bar thumb, with its right edge at `right`.
+    fn paint_scrollbar(&mut self, c: &mut Canvas, pane: Pane, right: i32) {
+        let area = self.pane_rect(pane);
+        let (ty, th) = self.scrollbar_thumb(pane);
+        let w = self.px(5.0);
+        let co = self.colors;
+        let color = if self.hover == Hit::Scrollbar(pane) { co.muted } else { co.border };
+        c.rrect(Rect::new(right - w - self.px(3.0), area.y + ty, w, th), w / 2, color);
+    }
+
     fn paint_sidebar(&mut self, c: &mut Canvas) {
         let l = self.layout();
         let co = self.colors;
         c.fill(l.sidebar, co.surface);
         c.fill(Rect::new(l.sidebar.right() - 1, l.sidebar.y, 1, l.sidebar.h), co.border);
+        // Places scrolled out of view mustn't spill over the toolbar or the status bar.
+        Self::with_clip(c, l.sidebar, |c| self.paint_places(c));
+        if self.scrollbar_visible(Pane::Sidebar) {
+            self.paint_scrollbar(c, Pane::Sidebar, l.sidebar.right() - 1);
+        }
+    }
+
+    fn paint_places(&mut self, c: &mut Canvas) {
+        let l = self.layout();
+        let co = self.colors;
+        // The scroll bar's room, when there is one, comes off the rows' right.
+        let room = self.side_bar_room();
         let row = self.px(30.0);
         let icon = self.px(16.0);
         // Worked out while the places are still here: they're moved out while they're drawn.
@@ -226,7 +248,7 @@ impl App {
         let heading = self.px(crate::app::SIDEBAR_HEADING);
         for (h, label) in self.sidebar_headings() {
             let by = self.baseline(tops[h] - heading, heading);
-            self.text.draw_fitted(c, label, (l.sidebar.x + self.px(14.0)) as f32, by, (l.sidebar.w - self.px(28.0)) as f32, co.muted);
+            self.text.draw_fitted(c, label, (l.sidebar.x + self.px(14.0)) as f32, by, (l.sidebar.w - self.px(28.0) - room) as f32, co.muted);
         }
         // A drag that can't go to the Trash shows it dimmed, like a button that can't be pressed.
         let trash_off = self.trash_unavailable();
@@ -234,7 +256,7 @@ impl App {
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {
             let y = tops[i];
-            let r = Rect::new(l.sidebar.x + self.px(6.0), y, l.sidebar.w - self.px(13.0), row);
+            let r = Rect::new(l.sidebar.x + self.px(6.0), y, l.sidebar.w - self.px(13.0) - room, row);
             let here = p.path == self.dir;
             if self.is_drop_target(Hit::Place(i)) {
                 c.rrect(r, self.px(5.0), blend(co.accent, co.surface, 0.45));
@@ -280,7 +302,7 @@ impl App {
         // Where a pin or a dragged folder would land among the pins.
         if let Some(y) = self.pin_bar() {
             let h = self.px(2.0).max(2);
-            c.rrect(Rect::new(l.sidebar.x + self.px(8.0), y - h / 2, l.sidebar.w - self.px(17.0), h), h / 2, co.accent);
+            c.rrect(Rect::new(l.sidebar.x + self.px(8.0), y - h / 2, l.sidebar.w - self.px(17.0) - room, h), h / 2, co.accent);
         }
     }
 
@@ -368,7 +390,7 @@ impl App {
         let icon = self.px(16.0);
         let now = time::now();
         let hover_row = if let Hit::Row(r) = self.hover { Some(r) } else { None };
-        let thumb_room = if self.scrollbar_visible() { self.px(12.0) } else { 0 };
+        let thumb_room = if self.scrollbar_visible(Pane::List) { self.px(12.0) } else { 0 };
         Self::with_clip(c, area, |c| {
             let visible = (area.h + offset) / row_h.max(1) + 1;
             for vis in 0..visible as usize {
@@ -451,10 +473,7 @@ impl App {
                 self.paint_field(c, Rect::new(name_x - self.px(4.0), area.y + 1, name_max as i32 + self.px(8.0), row_h - self.px(2.0)), &f, true);
             }
             if thumb_room > 0 {
-                let (ty, th) = self.scrollbar_thumb();
-                let w = self.px(5.0);
-                let color = if self.hover == Hit::Scrollbar { co.muted } else { co.border };
-                c.rrect(Rect::new(area.right() - w - self.px(3.0), area.y + ty, w, th), w / 2, color);
+                self.paint_scrollbar(c, Pane::List, area.right());
             }
         });
     }

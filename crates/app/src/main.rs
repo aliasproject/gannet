@@ -777,7 +777,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"chooser\":{},\"thumbs\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"side_scroll\":{},\"side_max\":{},\"chooser\":{},\"thumbs\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -821,6 +821,8 @@ mod bench {
             esc(&drag(a)),
             places(a),
             format!("[{}]", a.sidebar_headings().iter().map(|(i, _)| i.to_string()).collect::<Vec<_>>().join(",")),
+            a.side_scroll,
+            a.max_scroll_in(crate::app::Pane::Sidebar),
             chooser(a),
             thumbs(a),
         )
