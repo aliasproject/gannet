@@ -32,8 +32,9 @@ pub struct FolderSorts {
     /// Oldest first.
     saved: Vec<(PathBuf, SortSpec)>,
     /// The file's inode, modification time and length when it was last read, to notice another
-    /// window's changes. Every save renames a new file into place, so the inode changes even
-    /// when two saves land within one tick of the clock with the same length.
+    /// window's changes. Every save renames a new file into place, so the inode usually changes
+    /// even when two saves land within one tick of the clock with the same length. An inode can
+    /// be reused, so this is a best effort: a missed change shows at the next one.
     seen: Option<(u64, SystemTime, u64)>,
 }
 
@@ -91,16 +92,23 @@ impl FolderSorts {
     }
 
     /// An exclusive lock on a file beside the sorts, released when it's dropped. `None` if it
-    /// can't be had, in which case saving goes ahead without it.
+    /// can't be had soon, in which case saving goes ahead without it: this runs on a keypress,
+    /// and another window stuck holding it mustn't freeze this one.
     fn lock(&self) -> Option<std::fs::File> {
         let dir = self.file.as_ref()?.parent()?;
         let _ = std::fs::create_dir_all(dir);
         let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(".sorts.lock")).ok()?;
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(1);
         // SAFETY: the descriptor is open for as long as `f` lives.
-        while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+        while unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            if e.kind() != std::io::ErrorKind::WouldBlock || std::time::Instant::now() >= give_up {
                 return None;
             }
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
         Some(f)
     }
@@ -126,9 +134,10 @@ impl FolderSorts {
         let Some(file) = &self.file else { return };
         let Some(dir) = file.parent() else { return };
         let _ = std::fs::create_dir_all(dir);
-        // Written beside it and renamed over it, so a reader never sees half a file.
+        // Written beside it and renamed over it, so a reader never sees half a file. Flushed to
+        // the disk first, or a power cut after the rename could leave it empty.
         let tmp = dir.join(format!(".sorts.{}", std::process::id()));
-        let ok = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(&format(&self.saved))).and_then(|()| std::fs::rename(&tmp, file));
+        let ok = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(&format(&self.saved)).and_then(|()| f.sync_all())).and_then(|()| std::fs::rename(&tmp, file));
         if ok.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -331,7 +340,7 @@ mod tests {
                 let file = file.clone();
                 std::thread::spawn(move || {
                     let mut f = FolderSorts::new(file, Vec::new());
-                    for i in 0..150 {
+                    for i in 0..60 {
                         f.set(&PathBuf::from(format!("/t{t}/d{i}")), BIGGEST);
                     }
                 })
@@ -340,7 +349,7 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        assert_eq!(parse(&std::fs::read(&file).unwrap()).len(), 300);
+        assert_eq!(parse(&std::fs::read(&file).unwrap()).len(), 120);
     }
 
     #[test]

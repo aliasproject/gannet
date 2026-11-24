@@ -230,8 +230,9 @@ fn main() {
         // Opened by the list, it's told the list's order; on its own, the folder's own.
         if let Some(sort) = v.sort {
             app.sort = sort;
-            app.fixed_sort = true;
         }
+        // Following the list, the order always comes from the list, never from what's saved.
+        app.fixed_sort = v.sort.is_some() || v.follow;
         app.start_viewer(v.path);
         if v.follow {
             preview_window::listen_to_the_list(hub.clone());

@@ -3,9 +3,10 @@
 //! the preview, and the list says so.
 //!
 //! With `--follow`, the two talk over the child's stdin and stdout: each sends a path, ended by a
-//! NUL as a name can hold a newline, whenever its cursor moves. The list's paths start with two
-//! bytes for its order, so the window walks the folder in the order the list shows it. The list closes the window by
-//! closing the child's stdin, and the child takes the end of its stdin to mean the list has gone.
+//! NUL as a name can hold a newline, whenever its cursor moves. Only the list's messages start
+//! with two bytes for its order, so the window walks the folder in the order the list shows it;
+//! the window sends back just the path. The list closes the window by closing the child's stdin,
+//! and the child takes the end of its stdin to mean the list has gone.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};

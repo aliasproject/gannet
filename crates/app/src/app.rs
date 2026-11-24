@@ -1444,8 +1444,9 @@ impl App {
                 if !self.viewer {
                     self.folder_sorts.set(&self.dir, self.sort);
                 }
-                // An open preview window walks the folder in the list's order.
-                if let Some(p) = self.previewer.clone().filter(|_| !self.viewer) {
+                // An open preview window on a file here walks the folder in the list's order.
+                // One left on a file in another folder keeps that folder's order.
+                if let Some(p) = self.previewer.clone().filter(|p| !self.viewer && p.parent() == Some(self.dir.as_path())) {
                     self.cmds.push(Cmd::PreviewShow(p, self.view_sort()));
                 }
                 self.rederive(true);
@@ -6418,6 +6419,19 @@ mod tests {
         r.app.cmds.clear();
         r.app.action(Action::SortBy(SortKey::Modified));
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::PreviewShow(p, s) if p.ends_with("a") && *s == SortKey::Modified.first_order())));
+    }
+
+    #[test]
+    fn sorting_the_list_leaves_a_window_on_another_folder_alone() {
+        let mut r = Rig::new("list-sort-elsewhere");
+        fs::create_dir(r.work().join("other")).unwrap();
+        fs::write(r.work().join("other/a"), "x").unwrap();
+        r.app.go(Stop { dir: r.work(), cursor_name: None });
+        r.pump_until("loaded", |a| !a.loading);
+        r.app.previewer = Some(r.work().join("other/a"));
+        r.app.cmds.clear();
+        r.app.action(Action::SortBy(SortKey::Size));
+        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::PreviewShow(..))), "the window's folder isn't the one sorted");
     }
 
     #[test]
