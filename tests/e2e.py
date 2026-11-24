@@ -1143,10 +1143,11 @@ SIDEBAR_HEADING, SIDEBAR_GAP = 24, 10
 
 
 def place_y(s, label):
-    """The middle of a place's row, below the headings of its section and those before it."""
+    """The middle of a place's row, below the headings of its section and those before it, in
+    the sidebar as it's scrolled."""
     i = place_index(s, label)
     headings = sum(1 for h in s["headings"] if h <= i)
-    return BAR + 8 + 30 * i + headings * SIDEBAR_HEADING + max(headings - 1, 0) * SIDEBAR_GAP + 15
+    return BAR + 8 + 30 * i + headings * SIDEBAR_HEADING + max(headings - 1, 0) * SIDEBAR_GAP + 15 - int(s["side_scroll"])
 
 
 def click_place(a, s, label, eject=False):
@@ -3694,6 +3695,83 @@ def folders_pin_to_the_sidebar_by_dragging_and_reorder_there(h):
     b.wait(lambda s: "Projects" not in s["places"], "unpinned in the other window too")
     assert (fs / "work/Projects/p").exists()
     assert conf.read_text().startswith("sftp://server/srv Server\n")
+    a.close()
+    b.close()
+
+
+@check
+def a_long_sidebar_scrolls_and_drags_near_its_edges_scroll_it(h):
+    fs = fresh_fs()
+    pins = [f"Pin{i:02}" for i in range(1, 26)]
+    tree(fs, {f"pins/{n}/x": "x" for n in pins} | {"work/Late/l": "l", "work/a.txt": "A"})
+    a = App(h, fs / "work")
+    a.wait(lambda s: s["count"] == 2)
+    # After a check with two windows, this one has to take the whole screen first.
+    time.sleep(0.3)
+    conf = bookmarks_file(a)
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("".join((fs / "pins" / n).as_uri() + "\n" for n in pins))
+    s = a.wait(lambda s: "Pin25" in [p.split("|")[0] for p in s["places"]] and s["side_max"] > 0, "the pins don't fit")
+    bottom = 800 - 26
+    assert place_y(s, "Pin25") > bottom, "the last pin is below the window's edge"
+    a.shot("sidebar-long-top")
+    # The wheel over the sidebar scrolls it, and not the list.
+    a.move(60, 400)
+    a.scroll(2)
+    s = a.wait(lambda s: s["side_scroll"] > 0, "the wheel scrolls the sidebar")
+    assert s["scroll"] == 0
+    a.scroll(50)
+    s = a.wait(lambda s: s["side_scroll"] == s["side_max"], "to the end")
+    assert place_y(s, "Pin25") + 15 <= bottom, "the last pin is in full view"
+    a.shot("sidebar-long-bottom")
+    # A click lands on the place drawn there, scrolled.
+    a.click(60, place_y(s, "Pin25"))
+    a.wait(lambda s: s["dir"] == str(fs / "pins/Pin25"), "a click opens the pin scrolled to")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work"), "back")
+    # Alt and a number bring a place scrolled out of view back into it.
+    digit = place_index(s, "Pin01") + 1
+    assert digit <= 9, digit
+    a.key(str(digit), mods=["alt"])
+    s = a.wait(lambda s: s["dir"] == str(fs / "pins/Pin01"), "Alt opens the first pin")
+    assert place_y(s, "Pin01") - 15 - SIDEBAR_HEADING >= BAR, "with it and its heading in view"
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work"), "back")
+    a.move(60, 400)
+    a.scroll(-50)
+    a.wait(lambda s: s["side_scroll"] == 0, "back at the top")
+    # A folder held near the bottom edge scrolls the sidebar to the end. Just below the last
+    # pin, which was out of view, it's pinned.
+    press_and_carry(a, h, "Late", 60, bottom - 4)
+    s = a.wait(lambda s: s["side_scroll"] == s["side_max"], "the drag scrolled it to the end")
+    a.move(60, place_y(s, "Pin25") + 12)
+    a.wait(lambda s: s["drag"] == "Pin “Late”", "says it will pin below the last")
+    a.shot("sidebar-drag-scrolled")
+    release(a, h)
+    s = a.wait(lambda s: "Late" in [p.split("|")[0] for p in s["places"]] and s["drag"] == "", "pinned")
+    assert place_index(s, "Late") == place_index(s, "Pin25") + 1, s["places"]
+    # A pin carried up to the top edge scrolls it back, and goes first.
+    press(a, h, 60, place_y(s, "Late"))
+    a.move(60, place_y(s, "Late") - 10)
+    a.move(60, BAR + 4)
+    a.wait(lambda s: s["side_scroll"] == 0 and s["drag"] == "pin to 0", "carried to the top")
+    a.shot("sidebar-pin-carried-up")
+    release(a, h)
+    s = a.wait(lambda s: place_index(s, "Late") == place_index(s, "Pin01") - 1, "it's the first pin")
+    a.close()
+
+    # A drag from another window, held still at the edge, scrolls the sidebar it's over.
+    tree(fs, {"src/Extra/e": "e", "dst/keep": "k"})
+    a, b = two_windows(h, fs)
+    b.wait(lambda s: s["side_max"] > 0 and s["side_scroll"] == 0, "the other window's sidebar doesn't fit either")
+    carry_out(a, h, "Extra", OTHER_X + 60, bottom - 4)
+    s = b.wait(lambda s: s["side_scroll"] == s["side_max"], "the drag scrolled the other window's sidebar")
+    a.move(OTHER_X + 60, place_y(s, "Pin25") + 12)
+    b.wait(lambda s: s["drag"] == "Pin to the sidebar", "says it will pin below the last")
+    b.shot("sidebar-drag-from-another-window")
+    release(a, h)
+    s = b.wait(lambda s: "Extra" in [p.split("|")[0] for p in s["places"]], "pinned there")
+    assert place_index(s, "Extra") == place_index(s, "Pin25") + 1, s["places"]
     a.close()
     b.close()
 

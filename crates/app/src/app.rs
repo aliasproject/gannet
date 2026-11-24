@@ -230,6 +230,14 @@ pub struct DialogButton {
     pub danger: bool,
 }
 
+/// A part of the window that scrolls when what's in it doesn't fit: the list of names, or the
+/// sidebar's places. Both scroll by the same rules and show the same scroll bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pane {
+    List,
+    Sidebar,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     None,
@@ -249,7 +257,7 @@ pub enum Hit {
     Header(SortKey),
     Row(usize),
     ListEmpty,
-    Scrollbar,
+    Scrollbar(Pane),
     NoticeClose(usize),
     MenuItem(usize),
     Outside,
@@ -334,6 +342,8 @@ pub(crate) struct Band {
 }
 
 const BAND_SCROLL_EVERY: Duration = Duration::from_millis(16);
+/// How near the sidebar's top or bottom a drag has to be to scroll it, in logical pixels.
+const SIDE_SCROLL_EDGE: f64 = 20.0;
 
 pub(crate) struct ActiveDrag {
     pub paths: Vec<PathBuf>,
@@ -537,6 +547,10 @@ pub struct App {
     selected: Vec<u64>,
     pub sel_count: usize,
     pub scroll: f64,
+    /// How far the sidebar is scrolled, when its places don't fit.
+    pub side_scroll: f64,
+    /// When a drag held near the sidebar's top or bottom edge scrolls it next.
+    side_scroll_at: Option<Instant>,
 
     pub history: History,
     cache: Vec<Cached>,
@@ -605,7 +619,8 @@ pub struct App {
     pub pointer: (i32, i32),
     pub hover: Hit,
     last_click: Option<(Instant, Vec<u8>)>,
-    drag_scroll: Option<i32>,
+    /// A scroll bar's thumb being dragged, and where in it the pointer holds it.
+    drag_scroll: Option<(Pane, i32)>,
     pub(crate) file_drag: Option<FileDrag>,
     pub(crate) incoming: Option<IncomingDrag>,
     /// The job whose result decides how a drop is answered, and whether the list was all local.
@@ -707,6 +722,8 @@ impl App {
             selected: Vec::new(),
             sel_count: 0,
             scroll: 0.0,
+            side_scroll: 0.0,
+            side_scroll_at: None,
             history: History::default(),
             cache: Vec::new(),
             standard_places: places.iter().filter(|p| p.kind != PlaceKind::Disk).cloned().collect(),
@@ -797,6 +814,7 @@ impl App {
         self.h = h;
         if rescale && self.scale > 0.0 {
             self.scroll *= scale / self.scale;
+            self.side_scroll *= scale / self.scale;
         }
         self.scale = scale;
         self.text.set_size(crate::text::UI_PX * scale as f32, crate::text::UI_HINTED && scale < 1.5);
@@ -804,6 +822,7 @@ impl App {
             fonts.set_scale(scale);
         }
         self.clamp_scroll();
+        self.clamp_side_scroll();
         self.stats_range = (0, 0);
         self.request_stats();
         self.preview_rescale();
@@ -977,6 +996,7 @@ impl App {
             self.hold_paint = None;
         }
         self.band_on_timer(now);
+        self.side_scroll_on_timer(now);
         self.preview_on_timer(now);
         if self.jobs.iter().any(|j| {
             let due = j.started + JOB_SHOW_AFTER;
@@ -991,7 +1011,7 @@ impl App {
         // A running job that hasn't shown yet needs one wake-up, when it's due to.
         let job = self.jobs.iter().map(|j| j.started + JOB_SHOW_AFTER).filter(|&t| t > Instant::now()).min();
         let band = if let Some(FileDrag::Band(b)) = &self.file_drag { b.scroll_at } else { None };
-        [self.reload_at, self.hold_paint, job, self.preview_deadline(), band].into_iter().flatten().min()
+        [self.reload_at, self.hold_paint, job, self.preview_deadline(), band, self.side_scroll_at].into_iter().flatten().min()
     }
 
     fn on_loaded(&mut self, l: Loaded) {
@@ -1188,6 +1208,7 @@ impl App {
         // A reload can move the rows under a drag, and a disk can have just answered.
         self.refresh_file_drag();
         self.refresh_incoming();
+        self.arm_side_scroll();
     }
 
     fn handle_msg(&mut self, m: Msg) {
@@ -1426,7 +1447,42 @@ impl App {
     }
 
     pub fn max_scroll(&self) -> f64 {
-        (self.content_height() - self.layout().list.h as f64).max(0.0)
+        self.max_scroll_in(Pane::List)
+    }
+
+    /// Where a pane is on screen.
+    pub(crate) fn pane_rect(&self, pane: Pane) -> Rect {
+        let l = self.layout();
+        match pane {
+            Pane::List => l.list,
+            Pane::Sidebar => l.sidebar,
+        }
+    }
+
+    /// How tall what's in a pane is, scrolled or not.
+    fn pane_content(&self, pane: Pane) -> f64 {
+        match pane {
+            Pane::List => self.content_height(),
+            Pane::Sidebar => self.sidebar_height() as f64,
+        }
+    }
+
+    pub fn pane_scroll(&self, pane: Pane) -> f64 {
+        match pane {
+            Pane::List => self.scroll,
+            Pane::Sidebar => self.side_scroll,
+        }
+    }
+
+    pub fn max_scroll_in(&self, pane: Pane) -> f64 {
+        (self.pane_content(pane) - self.pane_rect(pane).h as f64).max(0.0)
+    }
+
+    fn scroll_pane_to(&mut self, pane: Pane, y: f64) {
+        match pane {
+            Pane::List => self.scroll_to(y),
+            Pane::Sidebar => self.side_scroll_to(y),
+        }
     }
 
     pub fn clamp_scroll(&mut self) {
@@ -2477,11 +2533,13 @@ impl App {
         }
         if let Some(gone) = gone {
             self.places = places;
+            self.clamp_side_scroll();
             return self.leave_drive(&gone);
         }
         // udisks2 says plenty that doesn't change the sidebar.
         if places != self.places {
             self.places = places;
+            self.clamp_side_scroll();
             self.invalidate_all();
         }
     }
@@ -2570,6 +2628,7 @@ impl App {
         places.extend(self.pins.iter().cloned());
         places.extend(self.places.iter().filter(|p| p.kind == PlaceKind::Disk).cloned());
         self.places = places;
+        self.clamp_side_scroll();
         // A pin being carried that's gone has nothing left to move.
         // One that's still there is placed among the pins as they are now.
         match &self.pin_drag {
@@ -2632,7 +2691,7 @@ impl App {
     fn pin_gap_at(&self, x: i32, y: i32) -> Option<usize> {
         let l = self.layout();
         // A dialog, menu or preview has the pointer, and nothing underneath takes a drop.
-        if self.bookmarks.is_none() || self.places.is_empty() || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some() || !l.sidebar.contains(x, y) {
+        if self.bookmarks.is_none() || self.places.is_empty() || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some() || !l.sidebar.contains(x, y) || self.on_side_scrollbar(x) {
             return None;
         }
         let (first, n) = self.pins_at();
@@ -2671,7 +2730,7 @@ impl App {
         let row = self.px(30.0);
         match (n, gap) {
             (0, _) if first > 0 => self.place_top(first - 1) + row + self.px(SIDEBAR_GAP) / 2,
-            (0, _) => self.layout().sidebar.y + self.px(8.0),
+            (0, _) => self.layout().sidebar.y + self.px(8.0) - self.side_scroll as i32,
             (_, g) if g < n => self.place_top(first + g),
             _ => self.place_top(first + n - 1) + row,
         }
@@ -2771,12 +2830,122 @@ impl App {
         out
     }
 
-    /// The top of a place's row in the sidebar, below the headings of its section and the ones
-    /// before it, each after the first with a gap above it.
+    /// The top of a place's row on screen, in the sidebar as it's scrolled.
     pub fn place_top(&self, i: usize) -> i32 {
+        self.layout().sidebar.y + self.place_offset(i) - self.side_scroll as i32
+    }
+
+    /// How far down the sidebar's places a place's row starts, below the headings of its
+    /// section and the ones before it, each after the first with a gap above it.
+    fn place_offset(&self, i: usize) -> i32 {
         let headings = self.sidebar_headings().iter().filter(|(h, _)| *h <= i).count() as i32;
         let above = headings * self.px(SIDEBAR_HEADING) + (headings - 1).max(0) * self.px(SIDEBAR_GAP);
-        self.layout().sidebar.y + self.px(8.0) + i as i32 * self.px(30.0) + above
+        self.px(8.0) + i as i32 * self.px(30.0) + above
+    }
+
+    /// How tall the sidebar's places are, with the same space below the last as above the first.
+    fn sidebar_height(&self) -> i32 {
+        match self.places.len() {
+            0 => 0,
+            n => self.place_offset(n - 1) + self.px(30.0) + self.px(8.0),
+        }
+    }
+
+    /// The room the sidebar's scroll bar takes at its right, when the places don't fit.
+    pub fn side_bar_room(&self) -> i32 {
+        if self.scrollbar_visible(Pane::Sidebar) { self.px(6.0) } else { 0 }
+    }
+
+    fn on_side_scrollbar(&self, x: i32) -> bool {
+        self.scrollbar_visible(Pane::Sidebar) && x >= self.layout().sidebar.right() - self.px(12.0)
+    }
+
+    fn clamp_side_scroll(&mut self) {
+        self.side_scroll = self.side_scroll.clamp(0.0, self.max_scroll_in(Pane::Sidebar));
+    }
+
+    fn side_scroll_to(&mut self, y: f64) {
+        let old = self.side_scroll;
+        self.side_scroll = y;
+        self.clamp_side_scroll();
+        if self.side_scroll == old {
+            return;
+        }
+        self.invalidate(self.layout().sidebar);
+        // Whatever's under the pointer just moved: a carried pin's spot, a drag's target, or
+        // the place it hovers.
+        let (x, y) = self.pointer;
+        if self.pin_drag.as_ref().is_some_and(|d| d.active) {
+            self.pin_drag_moved(x, y);
+        } else if x >= 0 && self.menu.is_none() && self.dialog.is_none() && self.drag_scroll.is_none() && self.incoming.is_none() {
+            // A thumb being dragged keeps its hover, wherever the pointer drifts. A drag from
+            // elsewhere has the compositor's cursor, and shows only its target.
+            let h = self.hit(x, y);
+            self.set_hover(h);
+        }
+        self.refresh_file_drag();
+        self.refresh_incoming();
+    }
+
+    /// Scrolls the sidebar just far enough to show a place's row, and its heading if it's the
+    /// first in its section.
+    pub fn reveal_place(&mut self, i: usize) {
+        if i >= self.places.len() {
+            return;
+        }
+        let side = self.layout().sidebar;
+        let heading = if self.sidebar_headings().iter().any(|&(h, _)| h == i) { self.px(SIDEBAR_HEADING) } else { 0 };
+        let (top, bottom) = (self.place_offset(i) - heading - self.px(8.0), self.place_offset(i) + self.px(30.0) + self.px(8.0));
+        if (top as f64) < self.side_scroll {
+            self.side_scroll_to(top as f64);
+        } else if bottom as f64 > self.side_scroll + side.h as f64 {
+            self.side_scroll_to((bottom - side.h) as f64);
+        }
+    }
+
+    /// Which way a drag held near the sidebar's top or bottom edge scrolls it, and how far each
+    /// step: none, when there's no drag there or nowhere further to go.
+    fn side_drag_step(&self) -> f64 {
+        // A drag from elsewhere, or one of this window's out and back, has a position only once
+        // it's moved: Hyprland says the middle of the window when one arrives.
+        let carrying_pin = self.pin_drag.as_ref().is_some_and(|d| d.active);
+        let dragging = carrying_pin || matches!(&self.file_drag, Some(FileDrag::Active(d)) if !d.wayland || (d.inside && d.moved_inside)) || self.incoming.as_ref().is_some_and(|i| i.moved);
+        if !dragging || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some() {
+            return 0.0;
+        }
+        let side = self.layout().sidebar;
+        let (x, y) = self.pointer;
+        let edge = self.px(SIDE_SCROLL_EDGE);
+        if x < side.x || x >= side.right() {
+            return 0.0;
+        }
+        // A carried pin is the window's own pointer, which goes on past the sidebar's ends.
+        let inside = carrying_pin || (side.y..side.bottom()).contains(&y);
+        let depth = if y < side.y + edge && inside && self.side_scroll > 0.0 {
+            y - (side.y + edge)
+        } else if y >= side.bottom() - edge && inside && self.side_scroll < self.max_scroll_in(Pane::Sidebar) {
+            y - (side.bottom() - edge) + 1
+        } else {
+            return 0.0;
+        };
+        // Faster nearer the edge, and faster still past it.
+        let step = (depth.abs().min(edge * 2) as f64 / edge as f64 * self.px(8.0) as f64).max(self.px(2.0) as f64);
+        step.copysign(depth as f64)
+    }
+
+    /// Starts or stops the sidebar's scrolling under a drag, as the pointer comes near its edge
+    /// or leaves it.
+    fn arm_side_scroll(&mut self) {
+        self.side_scroll_at = if self.side_drag_step() != 0.0 { self.side_scroll_at.or_else(|| Some(Instant::now() + BAND_SCROLL_EVERY)) } else { None };
+    }
+
+    fn side_scroll_on_timer(&mut self, now: Instant) {
+        if !self.side_scroll_at.is_some_and(|t| t <= now) {
+            return;
+        }
+        let step = self.side_drag_step();
+        self.side_scroll_at = (step != 0.0).then(|| now + BAND_SCROLL_EVERY);
+        self.side_scroll_to(self.side_scroll + step);
     }
 
     /// The place whose row is at `y`, if any: the heading isn't one.
@@ -2793,7 +2962,7 @@ impl App {
         }
         let l = self.layout();
         let w = self.px(26.0);
-        Some(Rect::new(l.sidebar.right() - self.px(7.0) - w, self.place_top(i), w, self.px(30.0)))
+        Some(Rect::new(l.sidebar.right() - self.px(7.0) - self.side_bar_room() - w, self.place_top(i), w, self.px(30.0)))
     }
 
     /// The list's menu, with "Extract" and "Set as background" after Preview when they apply,
@@ -2957,6 +3126,7 @@ impl App {
         // Whatever just happened may have opened a menu or dialog, like a close request.
         self.refresh_file_drag();
         self.preview_follow();
+        self.arm_side_scroll();
     }
 
     fn handle_input(&mut self, i: Input) {
@@ -3003,6 +3173,10 @@ impl App {
                     self.invalidate_all();
                 } else if self.preview.is_some() {
                     self.preview_scroll(lines, pixels);
+                } else if self.menu.is_none() && self.layout().sidebar.contains(self.pointer.0, self.pointer.1) && self.scrollbar_visible(Pane::Sidebar) {
+                    // Over a sidebar that all fits, the wheel goes on scrolling the list.
+                    let row = self.px(30.0) as f64;
+                    self.side_scroll_to(self.side_scroll + lines * 3.0 * row + pixels * self.scale);
                 } else if self.menu.is_none() {
                     let row = self.layout().row_h as f64;
                     self.scroll_to(self.scroll + lines * 3.0 * row + pixels * self.scale);
@@ -3311,6 +3485,7 @@ impl App {
             (k::KEY_3, true, _) => self.action(Action::SortBy(SortKey::Modified)),
             (_, false, true) => {
                 if let Some(d) = utf8.chars().next().and_then(|c| c.to_digit(10)).filter(|&d| d > 0) {
+                    self.reveal_place(d as usize - 1);
                     self.open_place(d as usize - 1);
                 }
             }
@@ -3399,6 +3574,9 @@ impl App {
             return Hit::PathBar;
         }
         if l.sidebar.contains(x, y) {
+            if self.on_side_scrollbar(x) {
+                return Hit::Scrollbar(Pane::Sidebar);
+            }
             if let Some(i) = self.place_at(y) {
                 if self.eject_rect(i).is_some_and(|r| r.contains(x, y)) {
                     return Hit::Eject(i);
@@ -3431,8 +3609,8 @@ impl App {
             return Hit::None;
         }
         if l.list.contains(x, y) {
-            if self.scrollbar_visible() && x >= l.list.right() - self.px(12.0) {
-                return Hit::Scrollbar;
+            if self.scrollbar_visible(Pane::List) && x >= l.list.right() - self.px(12.0) {
+                return Hit::Scrollbar(Pane::List);
             }
             let row = ((y - l.list.y) as f64 + self.scroll) as i64 / l.row_h.max(1) as i64;
             if (row as usize) < self.rows.len() {
@@ -3443,18 +3621,18 @@ impl App {
         Hit::None
     }
 
-    pub fn scrollbar_visible(&self) -> bool {
-        self.max_scroll() > 0.0
+    pub fn scrollbar_visible(&self, pane: Pane) -> bool {
+        self.max_scroll_in(pane) > 0.0
     }
 
-    /// The thumb's top and height, in the list's coordinates.
-    pub fn scrollbar_thumb(&self) -> (i32, i32) {
-        let l = self.layout();
-        let content = self.content_height().max(1.0);
-        let h = ((l.list.h as f64 / content * l.list.h as f64) as i32).max(self.px(24.0)).min(l.list.h);
-        let travel = (l.list.h - h) as f64;
-        let max = self.max_scroll();
-        let y = if max > 0.0 { (self.scroll / max * travel) as i32 } else { 0 };
+    /// The thumb's top and height, in the pane's coordinates.
+    pub fn scrollbar_thumb(&self, pane: Pane) -> (i32, i32) {
+        let view = self.pane_rect(pane).h;
+        let content = self.pane_content(pane).max(1.0);
+        let h = ((view as f64 / content * view as f64) as i32).max(self.px(24.0)).min(view);
+        let travel = (view - h) as f64;
+        let max = self.max_scroll_in(pane);
+        let y = if max > 0.0 { (self.pane_scroll(pane) / max * travel) as i32 } else { 0 };
         (y, h)
     }
 
@@ -3623,12 +3801,12 @@ impl App {
                 return;
             }
         }
-        if let Some(grab) = self.drag_scroll {
-            let l = self.layout();
-            let (_, h) = self.scrollbar_thumb();
-            let travel = (l.list.h - h).max(1) as f64;
-            let top = (py - l.list.y - grab) as f64;
-            self.scroll_to(top / travel * self.max_scroll());
+        if let Some((pane, grab)) = self.drag_scroll {
+            let area = self.pane_rect(pane);
+            let (_, h) = self.scrollbar_thumb(pane);
+            let travel = (area.h - h).max(1) as f64;
+            let top = (py - area.y - grab) as f64;
+            self.scroll_pane_to(pane, top / travel * self.max_scroll_in(pane));
             return;
         }
         let h = self.hit(px, py);
@@ -3774,15 +3952,15 @@ impl App {
             Hit::Place(i) => self.open_place(i),
             Hit::Eject(i) => self.eject_pressed = self.places.get(i).and_then(|p| p.volume.as_ref()).map(|v| v.block.clone()),
             Hit::Header(key) => self.action(Action::SortBy(key)),
-            Hit::Scrollbar => {
-                let l = self.layout();
-                let (top, h) = self.scrollbar_thumb();
-                let inside = y - l.list.y - top;
+            Hit::Scrollbar(pane) => {
+                let area = self.pane_rect(pane);
+                let (top, h) = self.scrollbar_thumb(pane);
+                let inside = y - area.y - top;
                 if inside >= 0 && inside < h {
-                    self.drag_scroll = Some(inside);
+                    self.drag_scroll = Some((pane, inside));
                 } else {
                     // A click on the track jumps there, and the thumb follows the pointer.
-                    self.drag_scroll = Some(h / 2);
+                    self.drag_scroll = Some((pane, h / 2));
                     self.pointer_moved(x as f64 / self.scale, y as f64 / self.scale);
                 }
             }
@@ -8552,5 +8730,197 @@ mod tests {
         assert_eq!(r.pinned(), ["d"]);
         assert_eq!(answered(&r.app), (true, false));
         assert!(r.work().join("d").is_dir());
+    }
+
+    // ---- A sidebar that scrolls ----
+
+    /// Enough pins that the sidebar can't show them all in the test window.
+    fn long_sidebar(tag: &str) -> Rig {
+        let names: Vec<String> = (1..=30).map(|i| format!("P{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        pin_rig(tag, &names)
+    }
+
+    /// Lets the sidebar's timer run until it stops, as it does at the end it's scrolling to.
+    fn tick_until_still(r: &mut Rig) {
+        let mut now = Instant::now();
+        for _ in 0..2000 {
+            if r.app.side_scroll_at.is_none() {
+                return;
+            }
+            now += Duration::from_millis(20);
+            r.app.on_timer(now);
+        }
+        panic!("the sidebar never stopped scrolling");
+    }
+
+    #[test]
+    fn a_sidebar_that_fits_doesnt_scroll() {
+        let mut r = pin_rig("side-fits", &["A", "B"]);
+        assert!(!r.app.scrollbar_visible(Pane::Sidebar));
+        let side = r.app.layout().sidebar;
+        let (x, y) = ((side.right() - 3) as f64, r.place_y(1));
+        assert_eq!(r.app.hit(x as i32, y as i32), Hit::Place(1), "no scroll bar at its edge");
+        // Over the sidebar, the wheel goes on scrolling the list, as before.
+        for i in 0..200 {
+            fs::write(r.work().join(format!("n{i:03}")), b"").unwrap();
+        }
+        r.app.action(Action::Reload);
+        r.pump_until("listed", |a| a.rows.len() > 200);
+        r.app.input(Input::Move { x: r.sidebar_x(), y });
+        r.app.input(Input::Scroll { lines: 2.0, pixels: 0.0 });
+        assert_eq!(r.app.side_scroll, 0.0);
+        assert!(r.app.scroll > 0.0);
+        // A drag at its bottom edge has nowhere to go.
+        r.carry_to_sidebar("d", (side.bottom() - 4) as f64);
+        assert!(r.app.side_scroll_at.is_none());
+    }
+
+    #[test]
+    fn a_long_sidebar_scrolls_by_wheel_and_scroll_bar_and_what_is_under_the_pointer_follows() {
+        let mut r = long_sidebar("side-wheel");
+        let side = r.app.layout().sidebar;
+        assert!(r.app.scrollbar_visible(Pane::Sidebar));
+        let last = r.app.places.len() - 1;
+        assert!(r.app.place_top(last) > side.bottom(), "the last pin is out of view");
+        let (x, y) = (r.sidebar_x(), r.place_y(5));
+        assert_eq!(r.app.hit(x as i32, y as i32), Hit::Place(5));
+        r.app.input(Input::Move { x, y });
+        // A touchpad's pixels, here exactly four rows.
+        r.app.input(Input::Scroll { lines: 0.0, pixels: 4.0 * r.app.px(30.0) as f64 });
+        assert_eq!(r.app.side_scroll, 4.0 * r.app.px(30.0) as f64);
+        assert_eq!(r.app.scroll, 0.0, "the list stays put");
+        assert_eq!(r.app.hit(x as i32, y as i32), Hit::Place(9), "the same spot is four places on");
+        assert_eq!(r.app.hover, Hit::Place(9), "and the highlight moved with it");
+        // The wheel stops at the end, with the last pin in full view.
+        r.app.input(Input::Scroll { lines: 100.0, pixels: 0.0 });
+        assert_eq!(r.app.side_scroll, r.app.max_scroll_in(Pane::Sidebar));
+        assert!(r.app.place_top(last) + r.app.px(30.0) <= side.bottom());
+        assert!(r.app.place_top(0) < side.y, "and Home above the top");
+        // The scroll bar takes the right edge.
+        let edge = side.right() - 3;
+        assert_eq!(r.app.hit(edge, r.place_y(last) as i32), Hit::Scrollbar(Pane::Sidebar));
+        // Its thumb dragged to the top takes the sidebar back there.
+        let (top, h) = r.app.scrollbar_thumb(Pane::Sidebar);
+        r.app.input(Input::Move { x: edge as f64, y: (side.y + top + h / 2) as f64 });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        // Drifting onto the places while it scrolls doesn't light them up.
+        r.app.input(Input::Move { x, y: (side.y + top + h / 2 - 100) as f64 });
+        assert!(r.app.side_scroll < r.app.max_scroll_in(Pane::Sidebar), "the thumb moved");
+        assert_eq!(r.app.hover, Hit::Scrollbar(Pane::Sidebar), "and keeps its hover");
+        r.app.input(Input::Move { x: edge as f64, y: side.y as f64 - 200.0 });
+        r.release();
+        assert_eq!(r.app.side_scroll, 0.0);
+        assert_eq!(r.app.dir, r.work(), "the thumb's press opened nothing");
+    }
+
+    #[test]
+    fn dragging_a_folder_to_the_sidebars_bottom_edge_scrolls_it_and_pins_where_it_ends_up() {
+        let mut r = long_sidebar("side-drag-pin");
+        let side = r.app.layout().sidebar;
+        r.carry_to_sidebar("d", (side.bottom() - 4) as f64);
+        assert!(r.app.side_scroll_at.is_some(), "near the bottom edge it starts scrolling");
+        tick_until_still(&mut r);
+        assert_eq!(r.app.side_scroll, r.app.max_scroll_in(Pane::Sidebar), "all the way down");
+        assert_eq!(r.drop_target(), Some(Hit::PinGap(30)), "below the last pin now");
+        assert_eq!(r.app.pin_bar(), Some(r.app.place_top(30) + r.app.px(30.0)), "and the bar is drawn there");
+        r.release();
+        r.idle();
+        assert_eq!(r.pinned().last().map(String::as_str), Some("d"));
+        // Back up at the top edge, it scrolls up, and stops when the pointer leaves the edge.
+        r.carry_to_sidebar("e", (side.y + 4) as f64);
+        let at = r.app.side_scroll;
+        r.app.on_timer(Instant::now() + Duration::from_millis(20));
+        assert!(r.app.side_scroll < at);
+        r.app.input(Input::Move { x: r.sidebar_x(), y: (side.y + side.h / 2) as f64 });
+        assert!(r.app.side_scroll_at.is_none());
+        let at = r.app.side_scroll;
+        r.app.on_timer(Instant::now() + Duration::from_secs(1));
+        assert_eq!(r.app.side_scroll, at);
+        // The middle of a place scrolled there is a drop into it.
+        let i = r.app.place_at(side.y + side.h / 2).unwrap();
+        r.app.input(Input::Move { x: r.sidebar_x(), y: r.place_y(i) });
+        assert_eq!(r.drop_target(), Some(Hit::Place(i)));
+    }
+
+    #[test]
+    fn a_carried_pin_scrolls_the_sidebar_even_past_its_edge_and_lands_among_the_pins() {
+        let mut r = long_sidebar("side-reorder");
+        let side = r.app.layout().sidebar;
+        // Out over the status bar, below the sidebar.
+        carry_pin(&mut r, 0, (side.bottom() + 10) as f64);
+        assert!(r.app.side_scroll_at.is_some());
+        tick_until_still(&mut r);
+        assert_eq!(r.app.side_scroll, r.app.max_scroll_in(Pane::Sidebar));
+        assert_eq!(r.app.pin_drag.as_ref().unwrap().gap, Some(30), "after the last pin");
+        r.release();
+        assert_eq!(r.pinned().last().map(String::as_str), Some("P01"));
+        assert_eq!(r.pinned().len(), 30);
+    }
+
+    #[test]
+    fn a_drag_from_elsewhere_scrolls_the_sidebar_only_once_it_has_moved() {
+        // Hyprland reports the middle of the window when a drag arrives (DataDevice.cpp:713).
+        // Here that's at the sidebar's bottom edge, which mustn't start it scrolling.
+        let mut r = long_sidebar("side-incoming");
+        let side = r.app.layout().sidebar;
+        let (x, y) = (r.sidebar_x(), (side.bottom() - 4) as f64);
+        r.app.input(Input::DragEnter { picture: false, x, y, files: true, can_copy: true, can_move: true, marker: None });
+        assert!(r.app.side_scroll_at.is_none());
+        r.app.on_timer(Instant::now() + Duration::from_secs(1));
+        assert_eq!(r.app.side_scroll, 0.0);
+        // The real position comes with a motion, and the pointer then stays still while the
+        // timer scrolls: no more motion arrives during a Wayland drag that doesn't move.
+        r.app.input(Input::DragMove { x, y });
+        r.app.cmds.clear();
+        tick_until_still(&mut r);
+        assert_eq!(r.app.side_scroll, r.app.max_scroll_in(Pane::Sidebar));
+        assert_eq!(r.app.hover, Hit::None, "no place lights up as it passes under the pointer");
+        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::Cursor(_))), "and the compositor's cursor is left alone");
+        let i = r.app.incoming.as_ref().unwrap();
+        assert_eq!(i.target.as_ref().map(|t| t.hit), Some(Hit::PinGap(30)), "the target followed the scroll");
+        r.app.cmds.clear();
+        r.app.input(Input::DragDrop);
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadDrop { pin: Some(Spot::End), .. })));
+        // Leaving stops it.
+        r.app.input(Input::DragEnter { picture: false, x, y: (side.y + 4) as f64, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragMove { x, y: (side.y + 4) as f64 });
+        assert!(r.app.side_scroll_at.is_some());
+        r.app.input(Input::DragLeave);
+        assert!(r.app.side_scroll_at.is_none());
+    }
+
+    #[test]
+    fn alt_numbers_scroll_a_place_out_of_view_into_it() {
+        let mut r = long_sidebar("side-alt");
+        let side = r.app.layout().sidebar;
+        r.app.input(Input::Move { x: r.sidebar_x(), y: r.place_y(3) });
+        r.app.input(Input::Scroll { lines: 100.0, pixels: 0.0 });
+        assert!(r.app.place_top(1) < side.y);
+        // Alt+2 is the first pin, which starts its section: its heading shows too.
+        r.alt("2");
+        assert_eq!(r.app.dir, r.root.join("pins/P01"));
+        assert!(r.app.place_top(1) - r.app.px(SIDEBAR_HEADING) >= side.y, "the pin and its heading are in view");
+        // One in view already doesn't move it.
+        let at = r.app.side_scroll;
+        r.alt("4");
+        assert_eq!(r.app.side_scroll, at);
+    }
+
+    #[test]
+    fn fewer_places_or_a_taller_window_never_leave_the_sidebar_scrolled_past_its_end() {
+        let mut r = long_sidebar("side-clamp");
+        r.app.input(Input::Move { x: r.sidebar_x(), y: r.place_y(3) });
+        r.app.input(Input::Scroll { lines: 100.0, pixels: 0.0 });
+        assert!(r.app.side_scroll > 0.0);
+        r.app.resized(1280, 2000, 1.0);
+        assert_eq!(r.app.side_scroll, 0.0, "it all fits now");
+        r.app.resized(1280, 800, 1.0);
+        r.app.input(Input::Scroll { lines: 100.0, pixels: 0.0 });
+        let keep: String = r.bookmarks().lines().take(5).map(|l| format!("{l}\n")).collect();
+        gannet_core::bookmarks::save(&r.bookmarks_file(), keep.as_bytes()).unwrap();
+        r.app.bookmarks_changed();
+        assert_eq!(r.app.side_scroll, 0.0);
+        assert!(!r.app.scrollbar_visible(Pane::Sidebar));
     }
 }
