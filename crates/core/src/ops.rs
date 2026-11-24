@@ -6,7 +6,9 @@
 //! - Nothing gets overwritten. Replace first moves the item already there to the Trash,
 //!   and if it can't go there, both stay as they were.
 //! - Symlinks are copied and moved as symlinks, never followed.
-//! - One item failing doesn't stop the others. Each failure gets reported.
+//! - One item failing doesn't stop the others. Each failure gets reported. Renaming several
+//!   items at once is the exception: it's all or nothing, so the names never end up half
+//!   changed.
 //! - A move across disks removes each source only after its copy succeeded.
 //! - Folders never get replaced wholesale. Replace on two folders means merge.
 //! - Delete and cross-disk move stop at mount points inside a folder: another disk's
@@ -43,6 +45,9 @@ pub enum Request {
     /// Deletes for good. The UI must have asked first.
     Delete { paths: Vec<PathBuf> },
     Rename { from: PathBuf, to_name: OsString },
+    /// Renames each item to its new name, in its own folder, all or nothing. Items can take
+    /// each other's names. See [`Run::rename_many`].
+    RenameMany { renames: Vec<(PathBuf, OsString)> },
     NewFolder { parent: PathBuf, name: OsString },
     /// Puts items from the Trash back where they came from. Never overwrites.
     Restore { items: Vec<Trashed> },
@@ -315,6 +320,7 @@ fn clean_request(r: Request) -> Request {
         Request::Trash { paths } => Request::Trash { paths: many(paths) },
         Request::Delete { paths } => Request::Delete { paths: many(paths) },
         Request::Rename { from, to_name } => Request::Rename { from: clean_path(from), to_name },
+        Request::RenameMany { renames } => Request::RenameMany { renames: renames.into_iter().map(|(from, name)| (clean_path(from), name)).collect() },
         Request::NewFolder { parent, name } => Request::NewFolder { parent: clean_path(parent), name },
         Request::Restore { items } => Request::Restore { items },
         Request::Extract { archives } => Request::Extract { archives: many(archives) },
@@ -340,6 +346,7 @@ fn label_for(r: &Request) -> String {
         Request::Trash { paths } => format!("Moving {} to Trash", count(paths)),
         Request::Delete { paths } => format!("Deleting {}", count(paths)),
         Request::Rename { from, to_name } => format!("Renaming {} to “{}”", count(std::slice::from_ref(from)), to_name.to_string_lossy()),
+        Request::RenameMany { renames } => format!("Renaming {}", count(&renames.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>())),
         Request::NewFolder { name, .. } => format!("Creating “{}”", name.to_string_lossy()),
         Request::Restore { items } => format!("Restoring {}", count(&items.iter().map(|t| t.original.clone()).collect::<Vec<_>>())),
         Request::Extract { archives } => format!("Extracting {}", count(archives)),
@@ -350,16 +357,21 @@ fn label_for(r: &Request) -> String {
 
 /// A name the app may create: one path component, not `.` or `..`, not too long.
 pub fn validate_name(name: &str) -> Result<(), &'static str> {
+    validate_name_bytes(name.as_bytes())
+}
+
+/// [`validate_name`] for a name that may not be UTF-8.
+pub fn validate_name_bytes(name: &[u8]) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("The name can't be empty");
     }
-    if name == "." || name == ".." {
+    if name == b"." || name == b".." {
         return Err("That name is reserved");
     }
-    if name.contains('/') {
+    if name.contains(&b'/') {
         return Err("A name can't contain “/”");
     }
-    if name.contains('\0') {
+    if name.contains(&0) {
         return Err("A name can't contain a null character");
     }
     if name.len() > 255 {
@@ -520,6 +532,7 @@ impl Run {
                 }
             }
             Request::Rename { from, to_name } => self.rename(from, to_name),
+            Request::RenameMany { renames } => self.rename_many(renames),
             Request::NewFolder { parent, name } => {
                 let target = parent.join(&name);
                 match validate_name(&name.to_string_lossy()).map_err(io::Error::other).and_then(|_| fs::create_dir(&target)) {
@@ -686,6 +699,126 @@ impl Run {
                 self.touched.push(parent);
             }
             Err(e) => self.fail(&from, &e),
+        }
+    }
+
+    /// Renames several items, all or nothing. Everything is checked first, so a clash changes
+    /// nothing. Each item goes once its new name is free: when one is waiting for another to
+    /// move off its name, the other goes first, and items swapping names round a loop free one
+    /// name by moving one of them to a hidden temporary name. Each rename is a step, so one
+    /// undo reverses them all, in reverse order, through the same names. If a rename fails or
+    /// the job is cancelled, the ones done are put back and nothing is left to undo.
+    fn rename_many(&mut self, renames: Vec<(PathBuf, OsString)>) {
+        self.job.progress.total_items.store(renames.len() as u64, Ordering::Relaxed);
+        let Some(moves) = self.plan_renames(&renames) else { return };
+        for (from, _) in &moves {
+            self.touch_parent(from);
+        }
+        // Where each item is now, and which item is waiting for each name. Names are unique,
+        // so each item waits on at most one other and at most one waits on it: once nothing
+        // is ready, what's left is loops.
+        let mut at: Vec<PathBuf> = moves.iter().map(|(from, _)| from.clone()).collect();
+        let wants: std::collections::HashMap<&Path, usize> = moves.iter().enumerate().map(|(i, (_, to))| (to.as_path(), i)).collect();
+        let held: std::collections::HashSet<&Path> = moves.iter().map(|(from, _)| from.as_path()).collect();
+        let mut ready: Vec<usize> = (0..moves.len()).rev().filter(|&i| !held.contains(moves[i].1.as_path())).collect();
+        let mut finished = vec![false; moves.len()];
+        let mut left = moves.len();
+        let mut next_loop = 0;
+        // Each rename done, as where it came from, where it went and the item, for undo.
+        let mut done: Vec<(PathBuf, PathBuf, Option<Stamp>)> = Vec::new();
+        while left > 0 {
+            if self.job.is_cancelled() {
+                return self.unrename(done);
+            }
+            let (i, to) = match ready.pop() {
+                Some(i) => (i, moves[i].1.clone()),
+                None => {
+                    // Everything left is waiting on another in a loop.
+                    while finished[next_loop] {
+                        next_loop += 1;
+                    }
+                    (next_loop, rename_temp_name(&at[next_loop]))
+                }
+            };
+            let from = at[i].clone();
+            self.set_current(&moves[i].0);
+            if let Err(e) = rename_noreplace(&from, &to) {
+                let shown = if to == moves[i].1 { &to } else { &moves[i].0 };
+                self.report(shown, format!("{}, so nothing was renamed", describe(&e)));
+                return self.unrename(done);
+            }
+            done.push((from.clone(), to.clone(), Stamp::of(&to)));
+            if let Some(&j) = wants.get(from.as_path())
+                && !finished[j]
+            {
+                ready.push(j);
+            }
+            at[i] = to;
+            if at[i] == moves[i].1 {
+                finished[i] = true;
+                left -= 1;
+                self.created.push(at[i].clone());
+                self.job.progress.done_items.fetch_add(1, Ordering::Relaxed);
+                self.tick();
+            }
+        }
+        for (from, _, stamp) in done {
+            if let Some(to) = stamp {
+                self.steps.push(Step::Moved { from, to });
+            }
+        }
+    }
+
+    /// The renames that change a name, as from and to, once each name is checked: valid, not
+    /// given twice, and not already taken by something that isn't being renamed.
+    fn plan_renames(&mut self, renames: &[(PathBuf, OsString)]) -> Option<Vec<(PathBuf, PathBuf)>> {
+        let mut moves = Vec::new();
+        let mut targets = std::collections::HashSet::new();
+        for (from, name) in renames {
+            let target = from.parent().unwrap_or(Path::new("/")).join(name);
+            let unchanged = target == *from;
+            if !unchanged && let Err(msg) = validate_name_bytes(name.as_bytes()) {
+                self.report(from, format!("{msg}, so nothing was renamed"));
+                return None;
+            }
+            if !unchanged && fs::symlink_metadata(from).is_err() {
+                self.report(from, "This isn't here any more, so nothing was renamed".into());
+                return None;
+            }
+            if !targets.insert(target.clone()) {
+                self.report(&target, "Two items would get this name, so nothing was renamed".into());
+                return None;
+            }
+            if !unchanged {
+                moves.push((from.clone(), target));
+            }
+        }
+        let moving: std::collections::HashSet<&Path> = moves.iter().map(|(from, _)| from.as_path()).collect();
+        for (_, to) in &moves {
+            if !moving.contains(to.as_path()) && fs::symlink_metadata(to).is_ok() {
+                self.report(to, "Something already has this name, so nothing was renamed".into());
+                return None;
+            }
+        }
+        Some(moves)
+    }
+
+    /// Puts back the renames done, last first. One that can't be put back stops it there, as
+    /// the ones before it may need its name, and what's still renamed is left to undo.
+    fn unrename(&mut self, mut done: Vec<(PathBuf, PathBuf, Option<Stamp>)>) {
+        while let Some((from, to, stamp)) = done.pop() {
+            if let Err(e) = rename_noreplace(&to, &from) {
+                let name = from.file_name().unwrap_or(from.as_os_str()).to_string_lossy();
+                self.report(&to, format!("Couldn't be put back as “{name}”: {}. Undo can try again", describe(&e)));
+                done.push((from, to, stamp));
+                break;
+            }
+        }
+        self.created.clear();
+        for (from, _, stamp) in done {
+            if let Some(to) = stamp {
+                self.steps.push(Step::Moved { from, to });
+            }
         }
     }
 
@@ -1540,6 +1673,13 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn temp_name(target: &Path) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     target.with_file_name(format!(".gannet-partial-{}-{n}", std::process::id()))
+}
+
+/// Where an item waits, hidden, while items swap names. Renamed to without replacing, so a
+/// name that happens to be taken fails the rename rather than losing anything.
+fn rename_temp_name(item: &Path) -> PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    item.with_file_name(format!(".gannet-renaming-{}-{n}", std::process::id()))
 }
 
 /// True if `dest` is `src` or anywhere below it. Follows symlinks on both sides, except
@@ -3206,5 +3346,96 @@ mod tests {
         assert!(done.outcome.cancelled);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         assert_eq!(names_in(&work), ["big.zip"]);
+    }
+
+    /// Each file in `dir` as name=contents, sorted.
+    fn contents_in(dir: &Path) -> Vec<String> {
+        names_in(dir).into_iter().map(|n| format!("{n}={}", fs::read_to_string(dir.join(&n)).unwrap_or_else(|_| "/".into()))).collect()
+    }
+
+    fn renames(dir: &Path, pairs: &[(&str, &str)]) -> Request {
+        Request::RenameMany { renames: pairs.iter().map(|(from, to)| (dir.join(from), OsString::from(to))).collect() }
+    }
+
+    #[test]
+    fn rename_many_swaps_loops_and_chains_and_one_undo_puts_every_name_back() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let w = s.dir("w");
+        for n in ["a", "b", "c", "d", "e", "f", "g", "x", "same"] {
+            fs::write(w.join(n), n).unwrap();
+        }
+        fs::create_dir(w.join("folder")).unwrap();
+        let before = contents_in(&w);
+        // a and b swap, c, d and e go round a loop, f moves along a chain onto g's name as g
+        // leaves it, a folder is renamed, and `same` keeps its name.
+        e.start(renames(&w, &[("a", "b"), ("b", "a"), ("c", "d"), ("d", "e"), ("e", "c"), ("f", "g"), ("g", "h"), ("folder", "dir"), ("same", "same")]));
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(contents_in(&w), ["a=b", "b=a", "c=e", "d=c", "dir=/", "e=d", "g=f", "h=g", "same=same", "x=x"]);
+        let mut created: Vec<_> = done.outcome.created.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        created.sort();
+        assert_eq!(created, ["a", "b", "c", "d", "dir", "e", "g", "h"], "each renamed item, for selecting");
+        assert!(done.outcome.touched.contains(&w));
+        let undone = reverse(&e, &rx, done.outcome.undo);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert_eq!(contents_in(&w), before, "one undo puts every name back");
+        let redone = reverse(&e, &rx, undone.outcome.undo);
+        assert!(redone.errors.is_empty(), "{:?}", redone.errors);
+        assert_eq!(contents_in(&w), ["a=b", "b=a", "c=e", "d=c", "dir=/", "e=d", "g=f", "h=g", "same=same", "x=x"]);
+    }
+
+    #[test]
+    fn rename_many_refuses_any_clash_before_renaming_anything() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let w = s.dir("w");
+        for n in ["a", "b", "c", "taken"] {
+            fs::write(w.join(n), n).unwrap();
+        }
+        let before = contents_in(&w);
+        let cases: [(&[(&str, &str)], &str); 5] = [
+            (&[("a", "x"), ("b", "taken")], "Something already has this name"),
+            (&[("a", "x"), ("b", "x")], "Two items would get this name"),
+            // b keeps its name, so a can't have it.
+            (&[("a", "b"), ("b", "b")], "Two items would get this name"),
+            (&[("a", "x"), ("b", "y/z")], "can't contain"),
+            (&[("a", "x"), ("gone", "y")], "isn't here any more"),
+        ];
+        for (pairs, why) in cases {
+            e.start(renames(&w, pairs));
+            let done = finish(&rx, vec![]);
+            assert_eq!(done.errors.len(), 1, "{pairs:?}: {:?}", done.errors);
+            assert!(done.errors[0].1.contains(why) && done.errors[0].1.contains("nothing was renamed"), "{pairs:?}: {:?}", done.errors);
+            assert_eq!(done.outcome.undo, None);
+            assert_eq!(contents_in(&w), before, "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn rename_many_puts_back_what_it_renamed_when_one_fails() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        // Items can be in different folders. The second folder can't be changed, so its swap
+        // fails after the first folder's rename and swap have gone through.
+        let (one, two) = (s.dir("one"), s.dir("two"));
+        for n in ["a", "b", "c"] {
+            fs::write(one.join(n), n).unwrap();
+        }
+        for n in ["c", "d"] {
+            fs::write(two.join(n), n).unwrap();
+        }
+        fs::set_permissions(&two, fs::Permissions::from_mode(0o555)).unwrap();
+        let pairs = [(&one, "a", "x"), (&one, "b", "c"), (&one, "c", "b"), (&two, "c", "d"), (&two, "d", "c")];
+        e.start(Request::RenameMany { renames: pairs.iter().map(|(d, from, to)| (d.join(from), OsString::from(to))).collect() });
+        let done = finish(&rx, vec![]);
+        fs::set_permissions(&two, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
+        assert_eq!(done.errors[0].0, two.join("c"));
+        assert!(done.errors[0].1.ends_with(", so nothing was renamed"), "{:?}", done.errors);
+        assert_eq!(contents_in(&one), ["a=a", "b=b", "c=c"], "the rename and the swap were put back");
+        assert_eq!(contents_in(&two), ["c=c", "d=d"]);
+        assert_eq!(done.outcome.undo, None, "nothing is left to undo");
+        assert!(done.outcome.created.is_empty());
     }
 }

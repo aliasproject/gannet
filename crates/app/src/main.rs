@@ -13,6 +13,7 @@ mod icons;
 mod media;
 mod paint;
 mod portal;
+mod rename_many;
 mod preview;
 mod preview_window;
 mod service;
@@ -752,6 +753,8 @@ mod bench {
                 Some(crate::app::Dialog::Unlock { waiting: true, .. }) => "unlock-waiting",
                 Some(crate::app::Dialog::Unlock { error: Some(_), .. }) => "unlock-again",
                 Some(crate::app::Dialog::Unlock { .. }) => "unlock",
+                Some(crate::app::Dialog::RenameMany(d)) if !d.can_rename() => "rename-many-blocked",
+                Some(crate::app::Dialog::RenameMany(_)) => "rename-many",
             }),
             a.undo.len(),
             a.redo.len(),
