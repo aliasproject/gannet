@@ -13,12 +13,14 @@ pub struct History {
 pub struct Stop {
     pub dir: PathBuf,
     pub cursor_name: Option<Vec<u8>>,
+    /// What was being searched for in the folder and below, if anything, to search for again.
+    pub search: Option<String>,
 }
 
 impl History {
     /// Records leaving `from` for somewhere new, which drops any forward stops.
     pub fn visit(&mut self, from: Stop) {
-        if self.back.last().map(|s| s.dir.as_path()) != Some(from.dir.as_path()) {
+        if self.back.last().map(|s| (s.dir.as_path(), &s.search)) != Some((from.dir.as_path(), &from.search)) {
             self.back.push(from);
         }
         self.forward.clear();
@@ -49,7 +51,7 @@ impl History {
 pub fn parent_stop(dir: &Path) -> Option<Stop> {
     use std::os::unix::ffi::OsStrExt;
     let parent = dir.parent()?;
-    Some(Stop { dir: parent.to_path_buf(), cursor_name: dir.file_name().map(|n| n.as_bytes().to_vec()) })
+    Some(Stop { dir: parent.to_path_buf(), cursor_name: dir.file_name().map(|n| n.as_bytes().to_vec()), search: None })
 }
 
 #[cfg(test)]
@@ -57,7 +59,7 @@ mod tests {
     use super::*;
 
     fn stop(p: &str) -> Stop {
-        Stop { dir: p.into(), cursor_name: None }
+        Stop { dir: p.into(), cursor_name: None, search: None }
     }
 
     #[test]
@@ -80,6 +82,15 @@ mod tests {
         h.go_back(stop("/b"));
         h.visit(stop("/a"));
         assert!(!h.can_go_forward());
+    }
+
+    #[test]
+    fn a_search_is_a_stop_of_its_own_in_its_folder() {
+        let mut h = History::default();
+        h.visit(stop("/a"));
+        h.visit(Stop { search: Some("x".into()), ..stop("/a") });
+        assert_eq!(h.go_back(stop("/b")).unwrap().search.as_deref(), Some("x"), "back to the search");
+        assert_eq!(h.go_back(stop("/a")).unwrap(), stop("/a"), "then to the folder");
     }
 
     #[test]

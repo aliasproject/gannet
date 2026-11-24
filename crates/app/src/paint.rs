@@ -184,6 +184,12 @@ impl App {
                 _ => Field::new(&self.filter),
             };
             self.paint_field(c, r, &f, focused);
+            // An empty box says how far it reaches.
+            if f.text.is_empty() {
+                let hint = if self.search_below { "Search here and below" } else { "Filter this folder" };
+                let by = self.baseline(r.y, r.h);
+                self.text.draw_fitted(c, hint, (r.x + self.px(10.0)) as f32, by, (r.w - self.px(18.0)) as f32, co.muted);
+            }
         }
     }
 
@@ -318,7 +324,8 @@ impl App {
         let arrow = self.px(14.0);
         let trash = self.listing.as_ref().is_some_and(|l| l.is_trash());
         let recent = self.listing.as_ref().is_some_and(|l| l.is_recent());
-        if let Some((ox, _)) = self.origin_column(l.header, size_x).filter(|_| trash || recent) {
+        let search = self.listing.as_ref().is_some_and(|l| l.search().is_some());
+        if let Some((ox, _)) = self.origin_column(l.header, size_x).filter(|_| trash || recent || search) {
             self.text.draw_str(c, if trash { "Original location" } else { "Location" }, ox as f32, y, co.muted);
         }
         let sort = self.view_sort();
@@ -359,21 +366,30 @@ impl App {
         let Some(listing) = self.listing.clone() else {
             if let Some(e) = self.load_error.clone() {
                 self.paint_center(c, area, &format!("Can't open this folder: {e}"), co.danger);
+            } else if self.loading && self.hold_paint.is_none() && self.search_query().is_some() {
+                self.paint_center(c, area, "Searching…", co.muted);
             }
             return;
         };
         if self.rows.is_empty() {
-            if !self.loading {
-                let msg = if !self.filter.is_empty() {
-                    "Nothing matches the filter"
+            let searching = self.search_query().is_some();
+            if searching && self.loading {
+                self.paint_center(c, area, "Searching…", co.muted);
+            } else if !self.loading {
+                let msg = if searching {
+                    format!("Nothing found in {} or the folders in it", self.crumb_label(&self.dir))
+                } else if !self.filter.is_empty() && self.can_search() {
+                    "Nothing here matches. Ctrl+F searches the folders inside too".to_string()
+                } else if !self.filter.is_empty() {
+                    "Nothing matches the filter".to_string()
                 } else if listing.is_trash() {
-                    "The Trash is empty"
+                    "The Trash is empty".to_string()
                 } else if listing.is_recent() {
-                    "No recent files"
+                    "No recent files".to_string()
                 } else {
-                    "This folder is empty"
+                    "This folder is empty".to_string()
                 };
-                self.paint_center(c, area, msg, co.muted);
+                self.paint_center(c, area, &msg, co.muted);
             }
             return;
         }
@@ -384,7 +400,7 @@ impl App {
         let date_x = area.right() - self.px(14.0) - l.col_date;
         let size_x = date_x - l.col_size;
         let name_x = area.x + self.px(38.0);
-        let origin = self.origin_column(area, size_x).filter(|_| listing.is_trash() || listing.is_recent());
+        let origin = self.origin_column(area, size_x).filter(|_| listing.is_trash() || listing.is_recent() || listing.search().is_some());
         let name_max = (origin.map_or(size_x, |(ox, _)| ox) - self.px(10.0) - name_x) as f32;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let icon = self.px(16.0);
@@ -432,8 +448,10 @@ impl App {
                     let here = listing.path(id);
                     self.cut_paths.contains(&here)
                 };
-                if let Edit::Rename { name: editing, field, .. } = &self.edit
+                // Search results can have several rows of one name.
+                if let Edit::Rename { name: editing, field, path, .. } = &self.edit
                     && editing.as_slice() == name
+                    && (listing.search().is_none() || *path == listing.path(id))
                 {
                     let f = field.clone();
                     let box_h = (row_h - self.px(2.0)).max(1);
@@ -445,6 +463,7 @@ impl App {
                     && let Some(folder) = listing.location(id)
                 {
                     let shown = match home.as_deref().and_then(|h| folder.strip_prefix(h).ok()) {
+                        _ if listing.search().is_some() => self.search_location(folder),
                         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
                         Some(rest) => format!("~/{}", rest.display()),
                         None => folder.display().to_string(),
@@ -722,14 +741,24 @@ impl App {
         self.text.draw_fitted(c, &msg, self.px(12.0) as f32, y, (l.status.w - self.px(24.0)) as f32, co.muted);
     }
 
-    fn status_text(&mut self) -> String {
+    pub(crate) fn status_text(&self) -> String {
         let total = self.rows.len();
-        let mut s = format::count(total, "item", "items");
-        if self.loading && self.listing.as_ref().is_some_and(|l| !l.complete) {
+        let found = self.listing.as_ref().and_then(|l| l.search()).filter(|_| self.search_query().is_some());
+        let mut s = match found {
+            Some(f) if f.truncated => format!("The first {} found. Type more to narrow it", format::count(total, "item", "items").replace(" items", "").replace(" item", "")),
+            Some(_) if self.loading => format!("{} found so far, searching…", format::count(total, "item", "items")),
+            Some(_) => format!("{} found in {} and the folders in it", format::count(total, "item", "items"), self.crumb_label(&self.dir)),
+            None if self.search_query().is_some() => "Searching…".to_string(),
+            None => format::count(total, "item", "items"),
+        };
+        if found.is_none() && self.loading && self.listing.as_ref().is_some_and(|l| !l.complete) {
             s.push_str(" so far, still reading…");
         }
-        if !self.filter.is_empty() {
+        if found.is_none() && !self.filter.is_empty() && self.search_query().is_none() {
             s.push_str(" matching the filter");
+        }
+        if let Some(n) = found.map(|f| f.unreadable).filter(|&n| n > 0) {
+            s.push_str(&format!(" · {} couldn't be read", format::count(n, "folder", "folders")));
         }
         if self.sel_count > 0 {
             s.push_str(&format!(" · {} selected", format::count(self.sel_count, "item", "items").replace(" items", "").replace(" item", "")));

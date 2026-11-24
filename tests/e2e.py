@@ -314,8 +314,8 @@ def typed_path_filter_and_type_ahead(h):
     a = App(h, fs)
     a.wait(lambda s: s["count"] == 5)
     # Filter
-    a.key("f", mods=["ctrl"])
-    a.wait(lambda s: s["edit"].startswith("filter:"))
+    a.type("/")
+    a.wait(lambda s: s["edit"].startswith("filter:") and not s["searching"])
     a.type("BERRY")
     s = a.wait(lambda s: s["filter"] == "BERRY" and s["names"] == ["Blueberry.md", "cherry.txt"] or s["names"] == ["Blueberry.md"], "filter applied")
     a.shot("filter")
@@ -342,6 +342,80 @@ def typed_path_filter_and_type_ahead(h):
     a.shot("missing-folder")
     a.key("Left", mods=["alt"])
     a.wait(lambda s: s["dir"] == str(fs / "sub") and s["names"] == ["x"], "back from the error")
+    a.close()
+
+
+@check
+def searching_below_finds_opens_and_comes_back(h):
+    fs = fresh_fs()
+    tree(fs, {"notes.txt": "x", "other.txt": "", "a/b/notes-deep.md": "xyz", "a/notes-dir/inside": "", "a/c/plain": "", ".hid/notes-hidden": ""})
+    # Enough files below that the walk has something to do.
+    for i in range(40):
+        tree(fs, {f"many/d{i}/f{j}.txt": "" for j in range(50)})
+    a = App(h, fs)
+    a.wait(lambda s: not s["loading"] and s["count"] == 4, "first listing")
+    # / filters only here, and says the search is there.
+    a.type("/")
+    a.wait(lambda s: s["edit"] == "filter:" and not s["searching"], "filter box")
+    a.shot("filter-empty")
+    a.type("deep")
+    s = a.wait(lambda s: s["filter"] == "deep" and s["count"] == 0 and not s["searching"], "nothing here")
+    a.shot("search-filter-finds-nothing")
+    # Ctrl+F, in the box, takes it into every folder below, and back again.
+    a.key("f", mods=["ctrl"])
+    s = a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["names"] == ["notes-deep.md"], "found below")
+    assert s["locations"] == ["fs/a/b"], s["locations"]
+    a.key("f", mods=["ctrl"])
+    a.wait(lambda s: not s["searching"] and s["filter"] == "deep" and s["count"] == 0 and s["found"] is None, "a filter again")
+    a.key("f", mods=["ctrl"])
+    a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["names"] == ["notes-deep.md"], "and a search")
+    a.key("Escape")
+    a.wait(lambda s: not s["searching"] and s["filter"] == "" and s["count"] == 4 and s["found"] is None, "back to the folder")
+    # Straight from the list, an empty box says how far it reaches.
+    a.key("f", mods=["ctrl"])
+    a.wait(lambda s: s["edit"] == "filter:" and s["searching"], "search box")
+    a.shot("search-empty")
+    a.type("notes")
+    s = a.wait(lambda s: s["found"] and s["found"]["complete"] and s["found"]["query"] == "notes" and s["count"] == 3, "found")
+    assert s["names"] == ["notes-dir", "notes-deep.md", "notes.txt"], s["names"]
+    assert s["locations"] == ["fs/a", "fs/a/b", "fs"], s["locations"]
+    assert s["status"] == "3 items found in fs and the folders in it", s["status"]
+    a.shot("search-results")
+    # Into a folder found, and back to the search on it.
+    a.key("Down")
+    a.wait(lambda s: s["edit"] == "none" and s["selected"] == ["notes-dir"], "on the first")
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(fs / "a/notes-dir") and s["names"] == ["inside"] and not s["searching"], "opened")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs) and s["searching"] and s["found"] and s["found"]["complete"] and s["selected"] == ["notes-dir"], "back to the search")
+    # Alt+Enter goes to where a match is, with it selected.
+    a.key("Down")
+    a.wait(lambda s: s["selected"] == ["notes-deep.md"])
+    a.key("Return", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "a/b") and s["selected"] == ["notes-deep.md"], "shown in its folder")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["selected"] == ["notes-deep.md"], "back again")
+    # Hidden folders are searched while hidden files show.
+    a.key("h", mods=["ctrl"])
+    a.wait(lambda s: "notes-hidden" in s["names"], "hidden one found")
+    a.key("h", mods=["ctrl"])
+    a.wait(lambda s: "notes-hidden" not in s["names"] and s["found"]["complete"], "and gone again")
+    # The context menu has what fits a search.
+    a.key("Menu")
+    s = a.wait(lambda s: s["menu"], "menu")
+    assert "Show in folder" in s["menu_items"] and "Paste" not in s["menu_items"], s["menu_items"]
+    a.shot("search-menu")
+    a.key("Escape")
+    # A broad search stops at the limit, and says so.
+    a.key("f", mods=["ctrl"])
+    a.key("a", mods=["ctrl"])
+    a.type("f")
+    s = a.wait(lambda s: s["found"] and s["found"]["query"] == "f" and s["found"]["complete"], "broad search")
+    assert s["found"]["truncated"] and s["count"] == 1000, (s["found"], s["count"])
+    assert s["status"] == "The first 1,000 found. Type more to narrow it", s["status"]
+    a.shot("search-limit")
+    a.key("Escape")
+    a.wait(lambda s: not s["searching"] and s["count"] == 4 and s["found"] is None, "the folder at the end")
     a.close()
 
 
@@ -1408,6 +1482,21 @@ def open_and_save_dialogs_for_other_programs(h):
         a.wait(lambda s: s["dir"] == str(docs) and s["chooser"], "a second chooser")
         a.key("Escape")
         assert p.answer() == (1, {}), "cancelled"
+
+        # In a Save dialog, / is part of the name, and Ctrl+F still searches below.
+        a = p.ask("SaveFile", "Save", current_folder=ay(docs), current_name=("s", "new.txt"))
+        a.wait(lambda s: s["chooser"] and s["chooser"]["name_focused"] and not s["loading"], "a save chooser to search from")
+        a.type("/")
+        a.wait(lambda s: "/" in s["chooser"]["name"] and s["edit"] == "none", "/ typed into the name")
+        a.key("f", mods=["ctrl"])
+        a.type("x.png")
+        s = a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["names"] == ["x.png"], "found from the dialog")
+        assert s["locations"] == ["docs/sub"], s["locations"]
+        a.shot("chooser-search")
+        a.key("Escape")
+        a.wait(lambda s: not s["searching"] and s["found"] is None, "the search ended")
+        a.key("Escape")
+        assert p.answer() == (1, {}), "cancelled from a search"
 
         # A folder opens on Enter, and Enter on a file picks it.
         a = p.ask("OpenFile", "Open", current_folder=ay(docs))
