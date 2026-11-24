@@ -1841,7 +1841,10 @@ impl App {
         let Some(l) = self.listing.clone() else { return };
         let ids = self.selected_ids();
         let [id] = ids.as_slice() else {
-            if ids.len() > 1 {
+            // An Open or Save dialog renames one item at a time, as its menu says.
+            if ids.len() > 1 && self.chooser.is_some() {
+                self.notice("Select one item to rename it".into());
+            } else if ids.len() > 1 {
                 // In the order they're listed, which is the order a running number counts in.
                 let items = ids.iter().map(|&i| (l.path(i), l.name(i).to_vec(), l.kind(i).is_dirlike())).collect();
                 let taken = (0..l.len() as u32).map(|i| l.name(i).to_vec()).collect();

@@ -667,8 +667,8 @@ impl App {
         if d.names.len() > shown {
             // Where the rows shown are in the whole list.
             let track = Rect::new(l.list.right() - self.px(3.0), l.list.y, self.px(3.0), l.list.h);
-            let thumb_h = (track.h as usize * shown / d.names.len()).max(self.px(16.0) as usize) as i32;
-            let thumb_y = track.y + ((track.h - thumb_h) as usize * d.scroll / (d.names.len() - shown).max(1)) as i32;
+            let thumb_h = ((track.h as usize * shown / d.names.len()) as i32).max(self.px(16.0)).min(track.h);
+            let thumb_y = track.y + ((track.h - thumb_h).max(0) as usize * d.scroll / (d.names.len() - shown).max(1)) as i32;
             c.rrect(Rect::new(track.x, thumb_y, track.w, thumb_h), self.px(1.5), co.muted);
         }
         let (line, problem) = d.summary();

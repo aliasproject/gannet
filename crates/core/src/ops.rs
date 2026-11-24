@@ -710,22 +710,30 @@ impl Run {
     /// the job is cancelled, the ones done are put back and nothing is left to undo.
     fn rename_many(&mut self, renames: Vec<(PathBuf, OsString)>) {
         self.job.progress.total_items.store(renames.len() as u64, Ordering::Relaxed);
-        let Some(moves) = self.plan_renames(&renames) else { return };
+        let Some((moves, case_only)) = self.plan_renames(&renames) else { return };
         for (from, _) in &moves {
             self.touch_parent(from);
         }
-        // Where each item is now, and which item is waiting for each name. Names are unique,
-        // so each item waits on at most one other and at most one waits on it: once nothing
-        // is ready, what's left is loops.
         let mut at: Vec<PathBuf> = moves.iter().map(|(from, _)| from.clone()).collect();
+        // Each rename done, as where it came from, where it went and the item, for undo.
+        let mut done: Vec<(PathBuf, PathBuf, Option<Stamp>)> = Vec::new();
+        // A disk that ignores case finds `a.JPG` already at `a.jpg`, so a rename that only
+        // changes case can't go straight there without replacing. It steps aside first.
+        for &i in &case_only {
+            let temp = rename_temp_name(&at[i]);
+            if !self.rename_step(&at[i], &temp, &moves[i].0, &mut done) {
+                return self.unrename(done);
+            }
+            at[i] = temp;
+        }
+        // Which item is waiting for each name. Names are unique, so each item waits on at most
+        // one other and at most one waits on it: once nothing is ready, what's left is loops.
         let wants: std::collections::HashMap<&Path, usize> = moves.iter().enumerate().map(|(i, (_, to))| (to.as_path(), i)).collect();
-        let held: std::collections::HashSet<&Path> = moves.iter().map(|(from, _)| from.as_path()).collect();
+        let held: std::collections::HashSet<&Path> = at.iter().map(PathBuf::as_path).collect();
         let mut ready: Vec<usize> = (0..moves.len()).rev().filter(|&i| !held.contains(moves[i].1.as_path())).collect();
         let mut finished = vec![false; moves.len()];
         let mut left = moves.len();
         let mut next_loop = 0;
-        // Each rename done, as where it came from, where it went and the item, for undo.
-        let mut done: Vec<(PathBuf, PathBuf, Option<Stamp>)> = Vec::new();
         while left > 0 {
             if self.job.is_cancelled() {
                 return self.unrename(done);
@@ -741,13 +749,9 @@ impl Run {
                 }
             };
             let from = at[i].clone();
-            self.set_current(&moves[i].0);
-            if let Err(e) = rename_noreplace(&from, &to) {
-                let shown = if to == moves[i].1 { &to } else { &moves[i].0 };
-                self.report(shown, format!("{}, so nothing was renamed", describe(&e)));
+            if !self.rename_step(&from, &to, &moves[i].0, &mut done) {
                 return self.unrename(done);
             }
-            done.push((from.clone(), to.clone(), Stamp::of(&to)));
             if let Some(&j) = wants.get(from.as_path())
                 && !finished[j]
             {
@@ -769,9 +773,32 @@ impl Run {
         }
     }
 
+    /// One rename of a batch, from where the item is to `to`, noted in `done`. `item` is where it
+    /// started, to name it if this fails. False if it failed, which has been reported.
+    fn rename_step(&mut self, from: &Path, to: &Path, item: &Path, done: &mut Vec<(PathBuf, PathBuf, Option<Stamp>)>) -> bool {
+        self.set_current(item);
+        // A temporary name means nothing to the user, so a failure there names the item.
+        let shown = if to.file_name().is_some_and(|n| n.as_bytes().starts_with(RENAME_TEMP.as_bytes())) { item } else { to };
+        if let Err(e) = rename_noreplace(from, to) {
+            self.report(shown, format!("{}, so nothing was renamed", describe(&e)));
+            return false;
+        }
+        let stamp = Stamp::of(to);
+        let found = stamp.is_some();
+        done.push((from.to_path_buf(), to.to_path_buf(), stamp));
+        // Without knowing which item it is, undo couldn't take it back through this step.
+        if !found {
+            self.report(shown, "It couldn't be found after renaming, so nothing was renamed".into());
+        }
+        found
+    }
+
     /// The renames that change a name, as from and to, once each name is checked: valid, not
-    /// given twice, and not already taken by something that isn't being renamed.
-    fn plan_renames(&mut self, renames: &[(PathBuf, OsString)]) -> Option<Vec<(PathBuf, PathBuf)>> {
+    /// given twice, and not already taken by something that isn't being renamed. Also which
+    /// of them only change the case of letters, or find the item itself at its new name, as a
+    /// disk that ignores case does.
+    #[allow(clippy::type_complexity)]
+    fn plan_renames(&mut self, renames: &[(PathBuf, OsString)]) -> Option<(Vec<(PathBuf, PathBuf)>, Vec<usize>)> {
         let mut moves = Vec::new();
         let mut targets = std::collections::HashSet::new();
         for (from, name) in renames {
@@ -794,13 +821,18 @@ impl Run {
             }
         }
         let moving: std::collections::HashSet<&Path> = moves.iter().map(|(from, _)| from.as_path()).collect();
-        for (_, to) in &moves {
-            if !moving.contains(to.as_path()) && fs::symlink_metadata(to).is_ok() {
+        let mut case_only = Vec::new();
+        for (i, (from, to)) in moves.iter().enumerate() {
+            let itself = Identity::of(to).ok().zip(Identity::of(from).ok()).is_some_and(|(a, b)| a.same_item(&b));
+            if itself || from.file_name().zip(to.file_name()).is_some_and(|(a, b)| a.as_bytes().eq_ignore_ascii_case(b.as_bytes())) {
+                case_only.push(i);
+            }
+            if !itself && !moving.contains(to.as_path()) && fs::symlink_metadata(to).is_ok() {
                 self.report(to, "Something already has this name, so nothing was renamed".into());
                 return None;
             }
         }
-        Some(moves)
+        Some((moves, case_only))
     }
 
     /// Puts back the renames done, last first. One that can't be put back stops it there, as
@@ -1679,8 +1711,10 @@ fn temp_name(target: &Path) -> PathBuf {
 /// name that happens to be taken fails the rename rather than losing anything.
 fn rename_temp_name(item: &Path) -> PathBuf {
     let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    item.with_file_name(format!(".gannet-renaming-{}-{n}", std::process::id()))
+    item.with_file_name(format!("{RENAME_TEMP}{}-{n}", std::process::id()))
 }
+
+const RENAME_TEMP: &str = ".gannet-renaming-";
 
 /// True if `dest` is `src` or anywhere below it. Follows symlinks on both sides, except
 /// that a symlink source is only itself: copying a link never recurses into its target.
@@ -3383,6 +3417,24 @@ mod tests {
         let redone = reverse(&e, &rx, undone.outcome.undo);
         assert!(redone.errors.is_empty(), "{:?}", redone.errors);
         assert_eq!(contents_in(&w), ["a=b", "b=a", "c=e", "d=c", "dir=/", "e=d", "g=f", "h=g", "same=same", "x=x"]);
+    }
+
+    #[test]
+    fn rename_many_changes_only_the_case_by_way_of_a_temporary_name() {
+        // On a disk that ignores case, `a.jpg` already finds `a.JPG`, so going straight there
+        // would be refused. This disk doesn't ignore case, but the same steps run.
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let w = s.dir("w");
+        fs::write(w.join("a.JPG"), "a").unwrap();
+        fs::write(w.join("b.JPG"), "b").unwrap();
+        e.start(renames(&w, &[("a.JPG", "a.jpg"), ("b.JPG", "a.JPG")]));
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(contents_in(&w), ["a.JPG=b", "a.jpg=a"]);
+        let undone = reverse(&e, &rx, done.outcome.undo);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert_eq!(contents_in(&w), ["a.JPG=a", "b.JPG=b"]);
     }
 
     #[test]
