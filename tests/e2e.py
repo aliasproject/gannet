@@ -1158,10 +1158,10 @@ class PrivateBus:
     """A D-Bus session bus of our own, so nothing reaches the real one. Services in
     `services` are started by the bus itself, as on a desktop, with `env`."""
 
-    def __init__(self, services=None, env=None):
-        conf = SCRATCH / "bus.conf"
-        sock = SCRATCH / "bus.sock"
-        sdir = SCRATCH / "bus-services"
+    def __init__(self, services=None, env=None, name="bus"):
+        conf = SCRATCH / f"{name}.conf"
+        sock = SCRATCH / f"{name}.sock"
+        sdir = SCRATCH / f"{name}-services"
         shutil.rmtree(sdir, ignore_errors=True)
         sdir.mkdir()
         for name, text in (services or {}).items():
@@ -1384,6 +1384,289 @@ def set_as_background_goes_through_the_desktop_portal(h):
         a.close()
     finally:
         bus.stop()
+
+
+REGISTRYD = Path("/usr/lib/at-spi2-registryd")
+
+
+class ScreenReader:
+    """A screen reader's world on private buses: the accessibility bus with the real AT-SPI
+    registry on it, a stand-in for at-spi-bus-launcher on the session bus that says where it
+    is and whether a screen reader is on, and a scripted libatspi client (tests/a11y_client.py)."""
+
+    def __init__(self):
+        self.a11y = PrivateBus(name="a11y")
+        # Without the bus's id, so the address still works once the bus is started again.
+        address = self.a11y.address.split(",guid=")[0]
+        launcher = f"[D-BUS Service]\nName=org.a11y.Bus\nExec=/usr/bin/python3 -B {ROOT / 'tests/a11y_bus.py'} {address}\n"
+        self.session = PrivateBus({"org.a11y.Bus.service": launcher}, name="session")
+        self.env = {"PATH": "/usr/bin", "LANG": "C.UTF-8", "HOME": str(SCRATCH / "client/home"), "DBUS_SESSION_BUS_ADDRESS": self.session.address, "AT_SPI_BUS_ADDRESS": address}
+        self.registry = None
+        self.start_registry()
+        self.start_client()
+
+    def start_client(self):
+        self.client = subprocess.Popen(["python3", "-B", str(ROOT / "tests/a11y_client.py")], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(SCRATCH / "stderr.log", "a"), text=True)
+
+    def restart_bus(self):
+        """Stops the accessibility bus, and everything on it, and starts it again at the same address."""
+        self.client.kill()
+        self.client.wait()
+        self.stop_registry()
+        self.a11y.stop()
+        self.a11y = PrivateBus(name="a11y")
+        self.start_registry()
+        self.start_client()
+
+    def launcher_running(self):
+        r = self.session.call("call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", "org.a11y.Bus")
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip() == "b true"
+
+    def start_registry(self):
+        self.registry = subprocess.Popen([str(REGISTRYD)], env=self.env, stdout=subprocess.DEVNULL, stderr=open(SCRATCH / "stderr.log", "a"))
+        deadline = time.monotonic() + 10
+        while "org.a11y.atspi.Registry" not in self.a11y.call("list", "--no-pager").stdout:
+            assert time.monotonic() < deadline, "the AT-SPI registry never started"
+            time.sleep(0.05)
+
+    def stop_registry(self):
+        self.registry.kill()
+        self.registry.wait()
+
+    def ask(self, line):
+        self.client.stdin.write(line + "\n")
+        self.client.stdin.flush()
+        out = json.loads(self.client.stdout.readline())
+        assert "error" not in out, f"{line}: {out['error']}"
+        return out["ok"]
+
+    def until(self, line, pred, what, timeout=8):
+        deadline = time.monotonic() + timeout
+        while True:
+            got = self.ask(line)
+            if pred(got):
+                return got
+            assert time.monotonic() < deadline, f"{what}: {got}"
+            time.sleep(0.1)
+
+    def screen_reader(self, on, what="ScreenReaderEnabled"):
+        """Turns the screen reader on or off, as Orca does when it starts and quits."""
+        r = self.session.call("set-property", "org.a11y.Bus", "/org/a11y/bus", "org.a11y.Status", what, "b", "true" if on else "false")
+        assert r.returncode == 0, r.stderr
+
+    def stop(self):
+        self.client.kill()
+        self.stop_registry()
+        self.session.stop()
+        self.a11y.stop()
+
+
+@check
+def a_screen_reader_can_read_and_drive_the_window(h):
+    try:
+        subprocess.run(["python3", "-c", "import gi; gi.require_version('Atspi', '2.0')"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        raise AssertionError("needs at-spi2-core and python-gobject")
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"docs/sub/x.txt": "x", "docs/a.txt": "a", "docs/b.txt": "b", "docs/c.txt": "c", "one/README.md": "1", "two/README.md": "2"})
+    sr = ScreenReader()
+    try:
+        env = {"DBUS_SESSION_BUS_ADDRESS": sr.session.address}
+        # Two recently used files of the same name, for the Recent view.
+        data = Path(App(h, fs / "docs", launch=False, extra_env=env).env["XDG_DATA_HOME"])
+        data.mkdir(parents=True, exist_ok=True)
+        marks = "".join(f'<bookmark href="file://{fs / d}/README.md" added="{t}" modified="{t}" visited="{t}"/>' for d, t in [("one", "2026-01-01T00:00:00Z"), ("two", "2026-02-01T00:00:00Z")])
+        (data / "recently-used.xbel").write_text(f'<?xml version="1.0"?><xbel version="1.0">{marks}</xbel>')
+        a = App(h, fs / "docs", extra_env=env)
+        a.wait(lambda s: s["names"] == ["sub", "a.txt", "b.txt", "c.txt"], "listed")
+        # With no screen reader on, the window stays off the accessibility bus altogether.
+        time.sleep(0.5)
+        assert sr.ask("apps") == [], "registered with no screen reader on"
+        # Nor does it start at-spi-bus-launcher by asking it: it says when it starts.
+        assert not sr.launcher_running(), "the window started at-spi-bus-launcher"
+
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered once a screen reader is on")
+        t = sr.until("tree", lambda t: t["rows"] == ["sub", "a.txt", "b.txt", "c.txt"], "the rows")
+        assert t["frame"] == "docs - Gannet" and not t["back_enabled"] and t["manages_descendants"], t
+        assert "Home" in t["places"], t
+
+        # Keyboard moves are heard, focus last, and the list names the row that has it.
+        sr.ask("events")
+        a.key("Down")
+        a.wait(lambda s: s["cursor_shown"], "the cursor shows")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "focus is heard")
+        assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["sub"], heard
+        assert any(x["type"] == "object:active-descendant-changed" for x in heard), heard
+        assert sr.ask("tree")["focus"] == ["sub"]
+
+        # A row a screen reader kept never answers for another file: in a new folder, it's gone.
+        assert sr.ask("keep 1") == "a.txt"
+        a.key("Return")
+        a.wait(lambda s: s["names"] == ["x.txt"], "into the folder")
+        t = sr.until("tree", lambda t: t["frame"] == "sub - Gannet", "the new folder's name")
+        assert t["rows"] == ["x.txt"] and t["back_enabled"], t
+        assert "error" in sr.ask("kept"), "a row from the last folder still answers"
+
+        # Back, through its action.
+        sr.ask("events")
+        assert sr.ask("press_back") is True
+        a.wait(lambda s: s["names"] == ["sub", "a.txt", "b.txt", "c.txt"], "back")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:property-change:accessible-name" for x in e), "the window's new name is heard")
+        assert sr.ask("tree")["frame"] == "docs - Gannet"
+
+        # Through AT-SPI, selecting a row adds it to the selection, and moving the keyboard to
+        # a row leaves the selection as it is: neither narrows a selection about to be deleted.
+        a.key("Home")
+        a.wait(lambda s: s["cursor"] == 0 and s["selected"] == ["sub"], "the first row")
+        assert sr.ask("select_row 2") is True
+        a.wait(lambda s: s["selected"] == ["sub", "b.txt"], "b.txt added through AT-SPI")
+        assert sr.ask("focus_row 3") is True
+        a.wait(lambda s: s["cursor"] == 3, "the cursor on c.txt")
+        t = sr.until("tree", lambda t: t["focus"] == ["c.txt"], "focus on c.txt")
+        assert t["selected"] == ["sub", "b.txt"] and a.state()["selected"] == ["sub", "b.txt"], t
+        assert sr.ask("deselect_row 0") is True
+        a.wait(lambda s: s["selected"] == ["b.txt"], "sub taken out through AT-SPI")
+        sr.until("tree", lambda t: t["selected"] == ["b.txt"], "the selection heard")
+
+        # The same row keeps its object as the folder is read again, and a new file is announced.
+        assert sr.ask("keep 2") == "b.txt"
+        sr.ask("events")
+        (fs / "docs/bb.txt").write_text("new")
+        a.wait(lambda s: "bb.txt" in s["names"], "the new file shows")
+        heard = sr.until("events", lambda e: any(x["type"].startswith("object:children-changed:add") for x in e), "the new row is heard")
+        assert [x["source"] for x in heard if x["type"].startswith("object:children-changed:add")] == ["Files"], heard
+        assert not any(x["type"] == "object:state-changed:focused" for x in heard), f"the row with focus was announced again: {heard}"
+        assert sr.ask("kept") == {"role": "list item", "name": "b.txt"}
+
+        # While a dialog is open, a screen reader can't act behind it, as the pointer can't.
+        places = sr.ask("tree")["places"]
+        a.key("a", mods=("ctrl",))
+        a.key("F2")
+        a.wait(lambda s: s["dialog"].startswith("rename-many"), "the dialog")
+        assert sr.ask(f"select_place {places.index('Home')}") is True, "select_place"
+        assert sr.ask("deselect_row 0") is True, "deselect_row"
+        time.sleep(0.5)
+        s = a.state()
+        assert s["dir"] == str(fs / "docs") and s["dialog"].startswith("rename-many") and len(s["selected"]) == 5, s
+        a.key("Escape")
+        a.wait(lambda s: s["dialog"] == "", "the dialog closed")
+        # Outside a menu, a request only closes it, as a click does: the menu never acts on a
+        # selection changed under it.
+        a.click(ROW_X, row_y(1), 0x111)
+        a.wait(lambda s: s["menu"], "the menu")
+        assert sr.ask("deselect_row 0") is True, "deselect_row"
+        a.wait(lambda s: not s["menu"], "the menu closed")
+        assert len(a.state()["selected"]) == 5, a.state()
+
+        # A place opens when it's selected.
+        assert sr.ask(f"select_place {places.index('Home')}") is True
+        a.wait(lambda s: s["dir"] == str(SCRATCH / "client/home"), "home")
+
+        # Leaving a place moves the sidebar's mark, which isn't announced: the keyboard is in
+        # the list, and a screen reader would read out the sidebar on every Back.
+        sr.until("tree", lambda t: t["frame"] == "home - Gannet", "home's name")
+        sr.ask("events")
+        a.key("Left", mods=("alt",))
+        a.wait(lambda s: s["dir"] == str(fs / "docs"), "back from home")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:property-change:accessible-name" for x in e), "the window's new name is heard")
+        time.sleep(0.3)
+        heard += sr.ask("events")
+        assert not [x for x in heard if x["source"] in places], f"the sidebar was announced: {heard}"
+
+        # In Recent, two rows can share a name: each is still its own object, and selecting
+        # the second selects that one, not the first.
+        assert sr.ask(f"select_place {places.index('Recent')}") is True
+        a.wait(lambda s: s["names"] == ["README.md", "README.md"], "Recent")
+        assert sr.until("tree", lambda t: t["rows"] == ["README.md", "README.md"], "Recent's rows")["frame"] == "Recent - Gannet"
+        assert sr.ask("select_row 1") is True
+        assert sr.ask("focus_row 1") is True
+        a.wait(lambda s: s["cursor"] == 1 and s["cursor_shown"] and s["selected"] == ["README.md"], "the second README.md selected")
+        t = sr.until("tree", lambda t: t["focus"] != ["Files"], "focus on a row")
+        assert t["focus_at"] == [1] and t["selected_at"] == [1], f"the wrong row, or both rows as one: {t}"
+
+        # The registry starting again forgets every app: the window joins it again.
+        sr.stop_registry()
+        sr.start_registry()
+        sr.until("apps", lambda x: x == ["Gannet"], "registered again after the registry restarted")
+
+        # The accessibility bus going away ends the server, and the next change starts one on
+        # the new bus.
+        sr.restart_bus()
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered on the new accessibility bus")
+
+        # A server that couldn't start, here for want of a registry, is tried again on the next
+        # change.
+        sr.screen_reader(False)
+        sr.until("apps", lambda x: x == [], "gone once the screen reader is off")
+        sr.stop_registry()
+        sr.screen_reader(True)
+        time.sleep(1)
+        sr.start_registry()
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered once a start that failed is tried again")
+
+        # Once the screen reader goes, so does the window from the bus; and back when it's on,
+        # or when assistive technologies in general are.
+        sr.screen_reader(False)
+        sr.until("apps", lambda x: x == [], "gone once the screen reader is off")
+        sr.screen_reader(True, "IsEnabled")
+        sr.until("apps", lambda x: x == ["Gannet"], "back when assistive technologies are on")
+        a.close()
+    finally:
+        sr.stop()
+
+
+@check
+def a_screen_reader_hears_pins_scrolled_places_and_search_results(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    pins = [f"Pin{i:02}" for i in range(26)]
+    tree(fs, {f"pins/{n}/x": "x" for n in pins} | {"docs/one/README.md": "1", "docs/two/README.md": "2", "docs/a.txt": "a"})
+    sr = ScreenReader()
+    try:
+        env = {"DBUS_SESSION_BUS_ADDRESS": sr.session.address}
+        conf = bookmarks_file(App(h, fs / "docs", launch=False, extra_env=env))
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text("".join((fs / "pins" / n).as_uri() + "\n" for n in pins))
+        a = App(h, fs / "docs", extra_env=env)
+        a.wait(lambda s: s["count"] == 3 and s["side_max"] > 0, "the pins don't fit")
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered")
+
+        # Pins are places, by name. Those scrolled out of the sidebar aren't showing, and one a
+        # screen reader moves to is scrolled into view.
+        t = sr.until("tree", lambda t: "Pin25" in t["places"], "the pins")
+        assert all(n in t["places"] for n in pins), t["places"]
+        assert "Pin00" in t["places_showing"] and "Pin25" not in t["places_showing"], t["places_showing"]
+        sr.ask("events")
+        assert sr.ask(f"focus_place {t['places'].index('Pin25')}") is True
+        a.wait(lambda s: s["side_scroll"] > 0, "scrolled to the last pin")
+        t = sr.until("tree", lambda t: "Pin25" in t["places_showing"], "the last pin showing")
+        assert "Pin00" not in t["places_showing"], t["places_showing"]
+        # And a screen reader that kept the places' states hears them change.
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:showing" for x in e), "showing heard")
+        time.sleep(0.3)
+        heard += sr.ask("events")
+        shown = {x["source"]: x["detail1"] for x in heard if x["type"] == "object:state-changed:showing"}
+        assert shown.get("Pin25") == 1 and shown.get("Pin00") == 0, shown
+
+        # Search results come from many folders: each row is its own, and says where it is.
+        a.key("f", mods=["ctrl"])
+        a.type("README")
+        a.wait(lambda s: s["found"] and s["found"]["complete"] and s["names"] == ["README.md", "README.md"], "found")
+        t = sr.until("tree", lambda t: t["rows"] == ["README.md", "README.md"], "the results")
+        assert t["descriptions"] == ["docs/one", "docs/two"], t["descriptions"]
+        assert sr.ask("select_row 1") is True and sr.ask("focus_row 1") is True
+        a.wait(lambda s: s["cursor"] == 1 and s["selected"] == ["README.md"], "the second result")
+        t = sr.until("tree", lambda t: t["focus_at"] == [1], "focus on the second result")
+        assert t["selected_at"] == [1], t
+        a.close()
+    finally:
+        sr.stop()
 
 
 PORTAL = ["org.freedesktop.impl.portal.desktop.gannet", "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser"]

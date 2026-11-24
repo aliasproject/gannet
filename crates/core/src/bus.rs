@@ -168,22 +168,41 @@ impl Bus {
     ///
     /// The thread keeps the connection open while it follows, so drop the `Following` to
     /// let a connection go. A panic in `on` ends following, and so does nothing else: keep
-    /// `on` from panicking. zbus queues up to 64 messages for it, and drops the oldest
-    /// past that, so `on` should hand work on rather than do it.
-    pub fn follow(&self, rule: MatchRule<'static>, mut on: impl FnMut(zbus::Result<Message>) -> bool + Send + 'static) -> zbus::Result<Following> {
-        let mut stream = block_on(MessageStream::for_match_rule(rule, &self.conn, None))?;
+    /// `on` from panicking. zbus queues up to 64 messages for it. Past that, the whole
+    /// connection waits for `on` to catch up, replies to calls included, so `on` should hand
+    /// work on rather than do it.
+    pub fn follow(&self, rule: MatchRule<'static>, on: impl FnMut(zbus::Result<Message>) -> bool + Send + 'static) -> zbus::Result<Following> {
+        self.follow_all(vec![rule], None, on)
+    }
+
+    /// As `follow`, for messages matching any of `rules`, all on the one thread. `queue` is
+    /// how many messages zbus holds for each rule before the connection waits for `on`:
+    /// more than the default 64 when `on` answers method calls, which come in bursts.
+    pub fn follow_all(&self, rules: Vec<MatchRule<'static>>, queue: Option<usize>, mut on: impl FnMut(zbus::Result<Message>) -> bool + Send + 'static) -> zbus::Result<Following> {
+        let mut streams = rules.into_iter().map(|rule| block_on(MessageStream::for_match_rule(rule, &self.conn, queue.and_then(std::num::NonZeroUsize::new)))).collect::<zbus::Result<Vec<_>>>()?;
         let stop: Arc<StopFlag> = Arc::default();
         let stop2 = stop.clone();
         thread::Builder::new()
             .name("gannet-bus-follow".into())
             .spawn(move || {
+                let mut turn = 0;
                 loop {
                     let next = block_on(poll_fn(|cx| {
                         *stop2.waker.lock().unwrap() = Some(cx.waker().clone());
                         if stop2.stopped.load(Ordering::SeqCst) {
                             return Poll::Ready(None);
                         }
-                        Pin::new(&mut stream).poll_next(cx)
+                        // Each stream in turn, so a busy one can't starve the rest. Any one
+                        // ending ends it all: they end together, when the connection closes.
+                        let n = streams.len();
+                        for k in 0..n {
+                            let i = (turn + k) % n;
+                            if let Poll::Ready(m) = Pin::new(&mut streams[i]).poll_next(cx) {
+                                turn = i + 1;
+                                return Poll::Ready(m);
+                            }
+                        }
+                        Poll::Pending
                     }));
                     let Some(m) = next else { return };
                     if !on(m) {
@@ -322,6 +341,43 @@ mod tests {
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
         assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 2);
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "it stopped after saying so");
+    }
+
+    #[test]
+    fn follows_several_rules_on_one_thread_without_stalling_on_a_burst() {
+        let bus = PrivateBus::start();
+        let gannet = Bus::connect(&bus.address).unwrap();
+        let other = Bus::connect(&bus.address).unwrap();
+        let (tx, rx) = channel();
+        let (go, wait) = channel::<()>();
+        let mut waited = false;
+        let rule = |member: &'static str| MatchRule::builder().msg_type(zbus::message::Type::Signal).interface(IFACE).member(member).build().unwrap();
+        let _following = gannet
+            .follow_all(vec![rule("Changed"), rule("Moved")], Some(1000), move |m| {
+                // Held up until every signal has been sent, so they all queue.
+                if !std::mem::replace(&mut waited, true) {
+                    let _ = wait.recv();
+                }
+                let m = m.unwrap();
+                let n: u32 = m.body().deserialize().unwrap();
+                let _ = tx.send((m.header().member().unwrap().to_string(), n));
+                true
+            })
+            .unwrap();
+        // More than zbus's default queue of 64 for each rule.
+        for n in 0..300u32 {
+            let member = if n % 2 == 0 { "Changed" } else { "Moved" };
+            zbus::block_on(other.connection().emit_signal(None::<&str>, PATH, IFACE, member, &(n,))).unwrap();
+        }
+        // A call there and back, which comes after the signals: with too small a queue, it
+        // waits behind them until they're taken.
+        let asked = std::time::Instant::now();
+        let id: zbus::Result<String> = gannet.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetId", &());
+        assert!(id.is_ok() && asked.elapsed() < Duration::from_secs(5), "the connection stalled behind the queue: {:?}", asked.elapsed());
+        go.send(()).unwrap();
+        let mut got: Vec<(String, u32)> = (0..300).map(|_| rx.recv_timeout(Duration::from_secs(5)).unwrap()).collect();
+        got.sort_by_key(|(_, n)| *n);
+        assert!(got.iter().enumerate().all(|(i, (member, n))| *n == i as u32 && member == if i % 2 == 0 { "Changed" } else { "Moved" }));
     }
 
     #[test]

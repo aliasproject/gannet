@@ -462,12 +462,7 @@ impl App {
                 if let Some((ox, ow)) = origin
                     && let Some(folder) = listing.location(id)
                 {
-                    let shown = match home.as_deref().and_then(|h| folder.strip_prefix(h).ok()) {
-                        _ if listing.search().is_some() => self.search_location(folder),
-                        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
-                        Some(rest) => format!("~/{}", rest.display()),
-                        None => folder.display().to_string(),
-                    };
+                    let shown = if listing.search().is_some() { self.search_location(folder) } else { crate::app::home_location(folder, home.as_deref()) };
                     self.text.draw_fitted(c, &shown, ox as f32, by, ow as f32, dim);
                 }
                 match listing.stat(id) {
