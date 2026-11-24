@@ -400,15 +400,17 @@ impl AppChooser {
     /// The program found more apps while the window is open.
     fn update_choices(&self, handle: OwnedObjectPath, choices: Vec<String>) -> zbus::fdo::Result<()> {
         let choices = clean_choices(choices);
+        // Only what the window was shown can be answered with.
         let mut offered = self.offered.lock().unwrap();
-        let Some(all) = offered.get_mut(handle.as_str()) else { return Err(zbus::fdo::Error::Failed("no dialog is open for that request".into())) };
-        for c in &choices {
-            if !all.contains(c) && all.len() < MAX_NAMES {
-                all.push(c.clone());
+        let Some(all) = offered.get_mut(handle.as_str()).filter(|_| self.dialogs.tell(handle.as_str(), &crate::openwith::choices_line(&choices))) else {
+            return Err(zbus::fdo::Error::Failed("no dialog is open for that request".into()));
+        };
+        for c in choices {
+            if !all.contains(&c) && all.len() < MAX_NAMES {
+                all.push(c);
             }
         }
-        drop(offered);
-        if self.dialogs.tell(handle.as_str(), &crate::openwith::choices_line(&choices)) { Ok(()) } else { Err(zbus::fdo::Error::Failed("no dialog is open for that request".into())) }
+        Ok(())
     }
 }
 

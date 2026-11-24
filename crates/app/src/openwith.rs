@@ -227,7 +227,8 @@ impl Picker {
         };
         let choice = |a: &apps::App| Choice { id: a.id.clone(), name: a.name.clone(), default: default.as_deref() == Some(a.id.as_str()) };
         self.suggested = apps.for_all(&ancestors).into_iter().map(choice).collect();
-        self.others = apps.all_shown().into_iter().filter(|a| !self.suggested.iter().any(|s| s.id == a.id)).map(choice).collect();
+        // An app with nowhere in its command line for a file can't open one.
+        self.others = apps.all_shown().into_iter().filter(|a| a.takes_files() && !self.suggested.iter().any(|s| s.id == a.id)).map(choice).collect();
     }
 
     /// The program found other apps while the window was open.
@@ -471,9 +472,15 @@ impl Window {
 
     fn input(&mut self, i: Input) {
         match i {
+            // A held key that cleared the search, or ticked the box, doesn't go on to cancel,
+            // open, or tick it back.
+            Input::Key { keysym: k::KEY_Escape | k::KEY_Return | k::KEY_KP_Enter | k::KEY_space, repeat: true, .. } => {}
             Input::Key { keysym, utf8, mods, .. } => {
                 let page = self.page();
-                self.finish = self.picker.key(keysym, &utf8, mods, page);
+                // A click that already closed it isn't undone by a key in the same batch.
+                if let Some(f) = self.picker.key(keysym, &utf8, mods, page) {
+                    self.finish = Some(f);
+                }
                 self.reveal();
                 self.dirty = true;
             }
@@ -795,7 +802,7 @@ fn listen_for_choices(wake: Arc<OwnedFd>) -> Receiver<Vec<String>> {
 /// files with it, and makes it the default if that was ticked. Works on a thread of its own,
 /// so nothing waits on the window. `parent` is the list's window handle, if it has one.
 pub fn ask(hub: Hub, paths: Vec<PathBuf>, parent: Option<String>, d: &crate::Dirs) {
-    let (mime_dirs, app_dirs, lists, desktops, programs, user_list) = (d.mime.clone(), d.apps.clone(), d.mimeapps.clone(), d.desktops.clone(), d.programs.clone(), apps::user_list(&d.config));
+    let (mime_dirs, app_dirs, lists, desktops, programs, config) = (d.mime.clone(), d.apps.clone(), d.mimeapps.clone(), d.desktops.clone(), d.programs.clone(), d.config.clone());
     let lang = crate::language();
     let waiter = hub.clone();
     let spawned = std::thread::Builder::new().name("gannet-open-with".into()).spawn(move || {
@@ -830,19 +837,25 @@ pub fn ask(hub: Hub, paths: Vec<PathBuf>, parent: Option<String>, d: &crate::Dir
         let Some((id, always)) = read_outcome(&said) else { return };
         let apps = Apps::load(&app_dirs, &lists, &desktops, lang.as_deref(), &programs);
         let Some(app) = apps.get(&id) else { return hub.send(Msg::Notice("That app isn't installed any more".to_string())) };
-        if let Some(why) = open_with(app, &paths) {
+        if let Some(why) = open_and_remember(app, &paths, always.then_some(types.as_slice()), &config, &lists) {
             hub.send(Msg::Notice(why));
-        }
-        if always
-            && let [mime] = types.as_slice()
-            && let Err(e) = apps::set_default(&user_list, mime, &app.id)
-        {
-            hub.send(Msg::Notice(format!("Couldn't make {} the default: {}", app.name, gannet_core::listing::describe(&e).to_lowercase())));
         }
     });
     if spawned.is_err() {
         hub.send(Msg::Notice("Couldn't show Open With".to_string()));
     }
+}
+
+/// Opens the files with the app, then, with `default_for` one type, makes it that type's
+/// default. An app that couldn't even start isn't made the default. A reason for the user if
+/// either went wrong.
+fn open_and_remember(app: &apps::App, paths: &[PathBuf], default_for: Option<&[String]>, config: &Path, lists: &[PathBuf]) -> Option<String> {
+    if let Some(why) = open_with(app, paths) {
+        return Some(why);
+    }
+    let [mime] = default_for? else { return None };
+    let e = apps::set_default(&apps::user_list(config, lists, mime), mime, &app.id).err()?;
+    Some(format!("Couldn't make {} the default: {}", app.name, gannet_core::listing::describe(&e).to_lowercase()))
 }
 
 /// Starts the app on the files. A reason for the user if it couldn't start.
@@ -1050,6 +1063,36 @@ mod tests {
         assert_eq!(p.search.text, "bro");
         key(&mut p, k::KEY_Escape, "");
         assert_eq!(key(&mut p, k::KEY_Escape, ""), Some(Finish::Cancel));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_app_that_takes_no_files_isnt_offered() {
+        let (dir, _) = installed();
+        std::fs::write(dir.join("applications/settings.desktop"), "[Desktop Entry]\nType=Application\nName=Settings\nExec=/bin/sh\n").unwrap();
+        let apps = Apps::load(&[dir.join("applications")], &[], &[], None, &[]);
+        let p = Picker::new(Spec { types: vec!["video/mp4".into()], ..Spec::default() }, &apps, None, None);
+        assert!(!rows(&p).iter().any(|r| r.starts_with("settings")), "{:?}", rows(&p));
+        assert_eq!(rows(&p).len(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_app_that_cant_start_isnt_made_the_default() {
+        let dir = std::env::temp_dir().join(format!("gannet-test-openwith-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let config = dir.join("config");
+        let lists = vec![config.join("mimeapps.list")];
+        let app = |exec: &str| apps::App { id: "e.desktop".into(), name: "E".into(), exec: vec![exec.into(), "%F".into()], icon: None, terminal: false, dir: None, file: "/e.desktop".into(), mimes: vec![], shown: true };
+        let types = ["text/plain".to_string()];
+        let files = [dir.join("a.txt")];
+        let why = open_and_remember(&app("/nonexistent/editor"), &files, Some(&types), &config, &lists);
+        assert!(why.is_some_and(|w| w.starts_with("Couldn't open E")));
+        assert!(!lists[0].exists(), "not made the default");
+        assert_eq!(open_and_remember(&app("/bin/true"), &files, None, &config, &lists), None);
+        assert!(!lists[0].exists(), "not asked to");
+        assert_eq!(open_and_remember(&app("/bin/true"), &files, Some(&types), &config, &lists), None);
+        assert_eq!(std::fs::read_to_string(&lists[0]).unwrap(), "[Default Applications]\ntext/plain=e.desktop;\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

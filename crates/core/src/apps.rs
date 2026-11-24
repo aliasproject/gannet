@@ -77,9 +77,12 @@ pub fn list_files(config_home: &Path, config_dirs: &[PathBuf], data_home: &Path,
     out
 }
 
-/// The file "Always use" writes to: the user's own list.
-pub fn user_list(config_home: &Path) -> PathBuf {
-    config_home.join("mimeapps.list")
+/// The file "Always use" writes a type's default to: the user's own list, or, when the
+/// desktop's own list in the user's config already names a default for the type, that one,
+/// as it's read first and would win. `lists` are `list_files`'s, most important first.
+pub fn user_list(config_home: &Path, lists: &[PathBuf], mime: &str) -> PathBuf {
+    let own = config_home.join("mimeapps.list");
+    lists.iter().take_while(|l| **l != own).filter(|l| l.parent() == Some(config_home)).find(|l| read_capped(l).is_some_and(|t| parse_list(&t).defaults.contains_key(mime))).cloned().unwrap_or(own)
 }
 
 impl Apps {
@@ -359,13 +362,20 @@ fn parse_list(text: &str) -> List {
 }
 
 impl App {
+    /// Whether its command line has a place for files. One without, like a settings app, can't
+    /// open a file.
+    pub fn takes_files(&self) -> bool {
+        self.exec.iter().skip(1).any(|w| ["%f", "%F", "%u", "%U"].iter().any(|c| w.contains(c)))
+    }
+
     /// The command lines that open `files` with this app: one for them all if it takes several,
     /// one for each if it takes one, and one with none if it takes none. `terminal` goes in
     /// front for an app that runs in one, like `xdg-terminal-exec`.
     pub fn commands(&self, files: &[PathBuf], terminal: &[String]) -> Vec<Vec<OsString>> {
         let words = &self.exec;
         let takes_many = words.iter().any(|w| w == "%F" || w == "%U");
-        let takes_one = !takes_many && words.iter().any(|w| w.contains("%f") || w.contains("%u"));
+        // A list code inside a word, like `--files=%F`, can only hold one file there.
+        let takes_one = !takes_many && self.takes_files();
         let groups: Vec<&[PathBuf]> = if takes_many || files.is_empty() {
             vec![files]
         } else if takes_one {
@@ -590,6 +600,8 @@ mod tests {
         assert_eq!(app("x --new %U").commands(&files, &[]), [os(&["x", "--new", "file:///d/a%20b.txt", "file:///d/%C3%A9"])]);
         assert_eq!(app("x %f").commands(&files, &[]), [os(&["x", "/d/a b.txt"]), os(&["x", "/d/é"])], "one at a time");
         assert_eq!(app("x").commands(&files, &[]), [os(&["x"])], "takes no files");
+        assert!(!app("x --about").takes_files() && app("x %U").takes_files() && app("x --files=%F").takes_files());
+        assert_eq!(app("x --files=%F").commands(&files, &[]), [os(&["x", "--files=/d/a b.txt"]), os(&["x", "--files=/d/é"])], "a list code inside a word holds one");
         assert_eq!(app("x %i %c %k %% %d --file=%f").commands(&files[..1], &[]), [os(&["x", "--icon", "x-icon", "X App", "/usr/share/applications/x.desktop", "%", "--file=/d/a b.txt"])]);
         assert_eq!(app(r#""/opt/my app/x" "--title=a \\"b\\"" %F"#).commands(&files[..1], &[]), [os(&["/opt/my app/x", "--title=a \"b\"", "/d/a b.txt"])], "quoting and escapes");
         let mut t = app("nvim %F");
@@ -606,7 +618,15 @@ mod tests {
         assert_eq!(with_default("[Default Applications]\nimage/png=v.desktop\n", "text/plain", "e.desktop"), "[Default Applications]\ntext/plain=e.desktop;\nimage/png=v.desktop\n");
 
         let s = Scratch::new();
-        let list = user_list(&s.path().join("config"));
+        let config = s.path().join("config");
+        let lists = list_files(&config, &[s.path().join("etc")], &s.path().join("data"), &[], &["Hyprland".into()]);
+        let list = user_list(&config, &lists, "text/plain");
+        assert_eq!(list, config.join("mimeapps.list"), "the user's own list, made if it isn't there");
+        // The desktop's own list is read first, so a default there is changed there.
+        s.file("config/hyprland-mimeapps.list", b"[Default Applications]\nimage/png=v.desktop\n");
+        s.file("etc/hyprland-mimeapps.list", b"[Default Applications]\ntext/plain=sys.desktop\n");
+        assert_eq!(user_list(&config, &lists, "image/png"), config.join("hyprland-mimeapps.list"));
+        assert_eq!(user_list(&config, &lists, "text/plain"), list, "not the system's");
         set_default(&list, "text/plain", "e.desktop").unwrap();
         assert_eq!(std::fs::read_to_string(&list).unwrap(), "[Default Applications]\ntext/plain=e.desktop;\n", "the folder is made");
         // A list kept in a dotfiles folder stays a link.
