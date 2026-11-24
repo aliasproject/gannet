@@ -659,8 +659,8 @@ impl Run {
         if only.is_some() {
             let _ = fs::remove_dir(&tmp);
         }
-        // Folders opened up to be checked get their own modes back, now they're in place. A
-        // folder that can't be written can't be moved to another, so it waits until now.
+        // Folders opened up for the check get their own modes back now they're in place. The one
+        // moved had to be writable to move to another folder, so this waits until now.
         crate::archive::restore_modes(&target, &opened);
         if let Some(stamp) = Stamp::of(&target) {
             self.steps.push(Step::Made(stamp));
@@ -3084,6 +3084,22 @@ mod tests {
         assert_eq!(fs::symlink_metadata(&private).unwrap().permissions().mode() & 0o7777, 0o300);
         fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(fs::read(private.join("key.txt")).unwrap(), b"k");
+    }
+
+    #[test]
+    fn extract_moves_a_single_folder_it_cant_write_and_keeps_its_mode() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        let tar = work.join("release.tar");
+        crafted_tar_with_modes(&tar, &[("proj/", b"", None, 0o555), ("proj/readme.txt", b"r", None, 0o644)]);
+        e.start(Request::Extract { archives: vec![tar] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        let proj = work.join("proj");
+        assert_eq!(fs::symlink_metadata(&proj).unwrap().permissions().mode() & 0o7777, 0o555);
+        assert_eq!(fs::read(proj.join("readme.txt")).unwrap(), b"r");
+        fs::set_permissions(&proj, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

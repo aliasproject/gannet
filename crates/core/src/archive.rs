@@ -168,27 +168,29 @@ pub fn unpack(tool: &OsStr, archive: &File, into: &Path, mut on_entry: impl FnMu
     if status.success() { Ok(()) } else { Err(Failed::from_messages(&problems)) }
 }
 
-/// The folders `check_links` had to open up to read, each with the mode it had, from the top
-/// down. `restore_modes` puts them back, once the folder is where it's staying.
+/// The folders `check_links` had to open up, each with the mode it had, from the top down.
+/// `restore_modes` puts them back, once the folder is where it's staying.
 pub type Opened = Vec<(PathBuf, u32)>;
 
 /// Checks that every symlink under `root`, the folder that will be put in place, points
-/// somewhere inside it. Folders are walked without following links. One the archive made
-/// unreadable is opened up to be read, as a link inside it counts too, and listed so its mode
-/// can be put back. Stops if `cancel` is set.
+/// somewhere inside it. Stops if `cancel` is set.
+///
+/// It works in two passes. The first gives every folder its owner's read, write and search
+/// bits, listing each one it changed so its mode can be put back: a link's lookup must never
+/// meet a folder it can't see into, and the folder put in place has to be writable to be moved
+/// to another. The second resolves every link. Neither follows a link while walking.
 pub fn check_links(root: &Path, cancel: &AtomicBool) -> Result<Opened, Failed> {
+    let root = root.canonicalize().map_err(Failed::Io)?;
     let mut opened = Vec::new();
-    let found = root.canonicalize().map_err(Failed::Io).and_then(|r| walk(&r, &r, cancel, &mut opened).map(|ok| (r, ok)));
-    match found {
-        Ok((_, true)) => Ok(opened),
-        Ok((r, false)) => {
-            restore_modes(&r, &opened);
+    let checked = open_up(&root, &root, cancel, &mut opened).and_then(|()| links_inside(&root, &root, cancel));
+    match checked {
+        Ok(true) => Ok(opened),
+        Ok(false) => {
+            restore_modes(&root, &opened);
             Err(Failed::Unsafe)
         }
         Err(e) => {
-            if let Ok(r) = root.canonicalize() {
-                restore_modes(&r, &opened);
-            }
+            restore_modes(&root, &opened);
             Err(e)
         }
     }
@@ -202,12 +204,26 @@ pub fn restore_modes(root: &Path, opened: &Opened) {
     }
 }
 
-fn walk(root: &Path, dir: &Path, cancel: &AtomicBool, opened: &mut Opened) -> Result<bool, Failed> {
+fn open_up(root: &Path, dir: &Path, cancel: &AtomicBool, opened: &mut Opened) -> Result<(), Failed> {
     let mode = std::fs::symlink_metadata(dir).map_err(Failed::Io)?.permissions().mode() & 0o7777;
-    if mode & 0o500 != 0o500 {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o500)).map_err(Failed::Io)?;
+    if mode & 0o700 != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700)).map_err(Failed::Io)?;
         opened.push((dir.strip_prefix(root).unwrap_or(Path::new("")).to_path_buf(), mode));
     }
+    for entry in std::fs::read_dir(dir).map_err(Failed::Io)? {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Failed::Cancelled);
+        }
+        let entry = entry.map_err(Failed::Io)?;
+        // The entry's own type, so a link to a folder is never walked into or changed.
+        if entry.file_type().map_err(Failed::Io)?.is_dir() {
+            open_up(root, &entry.path(), cancel, opened)?;
+        }
+    }
+    Ok(())
+}
+
+fn links_inside(root: &Path, dir: &Path, cancel: &AtomicBool) -> Result<bool, Failed> {
     for entry in std::fs::read_dir(dir).map_err(Failed::Io)? {
         if cancel.load(Ordering::Relaxed) {
             return Err(Failed::Cancelled);
@@ -221,7 +237,7 @@ fn walk(root: &Path, dir: &Path, cancel: &AtomicBool, opened: &mut Opened) -> Re
             let mut hops = 40;
             resolve(root, dir.to_path_buf(), &target, &mut hops).is_some()
         } else if kind.is_dir() {
-            walk(root, &entry.path(), cancel, opened)?
+            links_inside(root, &entry.path(), cancel)?
         } else {
             true
         };
@@ -234,8 +250,9 @@ fn walk(root: &Path, dir: &Path, cancel: &AtomicBool, opened: &mut Opened) -> Re
 
 /// Where `target`, read as a link in the folder `at`, leads, or None if it leaves `root` at any
 /// step. Links on the way are followed, as the kernel would, until `hops` runs out, so a link to
-/// `.` can't make a later `..` look shallower than it is. A part that doesn't exist yet is taken
-/// as written. An absolute target is refused outright, even one that names a place inside.
+/// `.` can't make a later `..` look shallower than it is. A part that doesn't exist is taken as
+/// written. Any other failure to look at a part refuses it, since what it hides could be a link.
+/// An absolute target is refused outright, even one that names a place inside.
 fn resolve(root: &Path, mut at: PathBuf, target: &Path, hops: &mut u32) -> Option<PathBuf> {
     for part in target.components() {
         match part {
@@ -254,7 +271,9 @@ fn resolve(root: &Path, mut at: PathBuf, target: &Path, hops: &mut u32) -> Optio
                         let further = std::fs::read_link(&next).ok()?;
                         at = resolve(root, at, &further, hops)?;
                     }
-                    _ => at = next,
+                    Ok(_) => at = next,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => at = next,
+                    Err(_) => return None,
                 }
             }
             Component::RootDir | Component::Prefix(_) => return None,
@@ -301,6 +320,35 @@ mod tests {
         assert_eq!(at("l25"), None);
         assert_eq!(at("l0"), None);
         assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_link_through_a_folder_not_yet_opened_is_still_followed() {
+        use std::os::unix::fs::symlink;
+        // proj/d/x -> .. stays inside, but a link -> d/x/.. leads out of proj. With d shut, a
+        // lookup that can't see into it takes x as a plain name. The link is made before and
+        // after d, and named to sort either side of it, so whatever order the folder lists them
+        // in, some case checks the link before d is reached.
+        for (name, link_first) in [("a", true), ("a", false), ("zz", true), ("zz", false)] {
+            let s = crate::testutil::Scratch::new();
+            let root = s.path().join("proj");
+            std::fs::create_dir(&root).unwrap();
+            let link = || symlink("d/x/..", root.join(name)).unwrap();
+            if link_first {
+                link();
+            }
+            std::fs::create_dir(root.join("d")).unwrap();
+            symlink("..", root.join("d/x")).unwrap();
+            if !link_first {
+                link();
+            }
+            std::fs::set_permissions(root.join("d"), std::fs::Permissions::from_mode(0o000)).unwrap();
+            let found = check_links(&root, &AtomicBool::new(false));
+            let mode = std::fs::symlink_metadata(root.join("d")).unwrap().permissions().mode() & 0o7777;
+            std::fs::set_permissions(root.join("d"), std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(matches!(found, Err(Failed::Unsafe)), "{name}, link first {link_first}: {found:?}");
+            assert_eq!(mode, 0o000, "d gets its mode back");
+        }
     }
 
     #[test]
