@@ -219,6 +219,13 @@ ROW_X = 235
 BESIDE_X = 900
 
 
+def menu_choose(a, label):
+    """Chooses an item in the open menu by keyboard, wherever it is in the list."""
+    items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+    assert label in items, items
+    a.key(*["Down"] * (items.index(label) + 1), "Return")
+
+
 @check
 def browse_sort_and_history(h):
     fs = fresh_fs()
@@ -466,7 +473,7 @@ def opening_an_archive_extracts_it_in_gannet(h):
     items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
     assert items.index("Extract") == items.index("Preview") + 1, items
     a.shot("extract-menu")
-    a.key("Down", "Down", "Down", "Return")
+    menu_choose(a, "Extract")
     s = a.wait(lambda s: "project" in s["names"] and s["selected"] == ["project"] and not s["jobs"], "extracted from the menu")
     assert (fs / "project/readme").read_text() == "r"
     a.click(ROW_X, row_y(0), 0x111)
@@ -1291,14 +1298,14 @@ def set_as_background_goes_through_the_desktop_portal(h):
             time.sleep(0.2)
         assert items.index("Set as background") == items.index("Preview") + 1, items
         a.shot("set-as-background-menu")
-        a.key("Down", "Down", "Down", "Return")
+        menu_choose(a, "Set as background")
         a.wait(lambda s: not s["menu"], "chosen")
         a.wait(lambda s: log.exists() and log.read_text().splitlines() == [str(fs / "dl/sunset.png")], "the portal was handed the picture")
         assert a.state()["notices"] == []
         assert "Set as background" not in menu_on(1), "not for a text file"
         a.key("Escape")
         menu_on(0)
-        a.key("Down", "Down", "Down", "Return")
+        menu_choose(a, "Set as background")
         a.wait(lambda s: s["notices"] == ["Couldn't set “fail.png” as the background"], "a refusal is shown")
         a.close()
     finally:
@@ -1312,9 +1319,9 @@ class Portal:
     """Gannet's file chooser backend on a private bus, started by the bus from its service
     file, as xdg-desktop-portal's calls would start it."""
 
-    def __init__(self, h):
+    def __init__(self, h, extra_env=None):
         self.h = h
-        self.watch = App(h, None, launch=False)
+        self.watch = App(h, None, launch=False, extra_env=extra_env)
         # Not --die-with-parent, for the same reason as the "Show in folder" service.
         service = "[D-BUS Service]\nName=org.freedesktop.impl.portal.desktop.gannet\nExec=" + " ".join(sandboxed(["--file-chooser-service"], die_with_parent=False)) + "\n"
         self.bus = PrivateBus({"org.freedesktop.impl.portal.desktop.gannet.service": service}, env=self.watch.env)
@@ -1485,6 +1492,159 @@ def open_and_save_dialogs_for_other_programs(h):
         assert r.returncode == 0, r.stderr
         code, _ = p.answer()
         assert code == 2, code
+    finally:
+        p.stop()
+
+
+def stand_in_apps():
+    """Installed apps of our own, which only log what they're asked to open, in a data folder
+    with the real file-type database. Returns the folder for XDG_DATA_DIRS, and the log."""
+    share = SCRATCH / "share"
+    shutil.rmtree(share, ignore_errors=True)
+    (share / "applications").mkdir(parents=True)
+    (share / "mime").symlink_to("/usr/share/mime")
+    bin_dir = SCRATCH / "appbin"
+    bin_dir.mkdir(exist_ok=True)
+    log = SCRATCH / "apps.log"
+    log.unlink(missing_ok=True)
+    for id, name, code, mimes in [("marked", "Marked", "%F", "text/markdown"), ("writer", "Writer", "%f", "text/plain"), ("unzipper", "Unzipper", "%U", "application/zip"), ("paint", "Paint", "%F", "image/png")]:
+        prog = bin_dir / f"app-{id}"
+        prog.write_text(f'#!/bin/sh\necho "{id} $*" >> {log}\n')
+        prog.chmod(0o755)
+        (share / f"applications/{id}.desktop").write_text(f"[Desktop Entry]\nType=Application\nName={name}\nExec={prog} {code}\nMimeType={mimes};\n")
+    return share, log
+
+
+def open_with_state():
+    try:
+        return json.loads((SCRATCH / "state.json.openwith").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def wait_open_with(pred, what, timeout=6):
+    end = time.monotonic() + timeout
+    s = {}
+    while time.monotonic() < end:
+        s = open_with_state()
+        if s and pred(s):
+            return s
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {what}: {json.dumps(s)[:1500]}")
+
+
+def wait_for_log(log, lines, what):
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not (log.exists() and log.read_text().splitlines() == lines):
+        time.sleep(0.02)
+    assert log.exists() and log.read_text().splitlines() == lines, f"{what}: {log.read_text() if log.exists() else 'nothing'}"
+
+
+@check
+def open_with_picks_another_app_and_can_make_it_the_default(h):
+    fs = fresh_fs()
+    tree(fs, {"notes.md": "# hi", "photos.zip": b"PK\x05\x06" + bytes(18)})
+    share, log = stand_in_apps()
+    config = SCRATCH / "client/config"
+    config.mkdir(parents=True, exist_ok=True)
+    (config / "mimeapps.list").write_text("[Default Applications]\ntext/markdown=marked.desktop\n")
+    (SCRATCH / "state.json.openwith").unlink(missing_ok=True)
+    a = App(h, fs, extra_env={"XDG_DATA_DIRS": str(share)})
+    a.wait(lambda s: s["names"] == ["notes.md", "photos.zip"], "listed")
+
+    def open_with(row):
+        (SCRATCH / "state.json.openwith").unlink(missing_ok=True)
+        a.click(ROW_X, row_y(row), 0x111)
+        items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+        assert items.index("Open with…") == items.index("Open") + 1, items
+        menu_choose(a, "Open with…")
+        h.wait_window(10)
+
+    # The type's apps first, its default marked, then the rest.
+    open_with(0)
+    s = wait_open_with(lambda s: s["rows"], "the apps")
+    assert s["title"] == "Open “notes.md” with", s
+    assert s["rows"] == ["# For Markdown document", "marked.desktop|Marked|default", "writer.desktop|Writer", "# Other apps", "paint.desktop|Paint", "unzipper.desktop|Unzipper"], s["rows"]
+    assert s["picked"] == "marked.desktop" and s["can_always"], s
+    a.shot("open-with")
+    a.type("wri")
+    s = wait_open_with(lambda s: s["search"] == "wri" and s["picked"] == "writer.desktop", "the search")
+    assert s["rows"] == ["# For Markdown document", "writer.desktop|Writer"], s["rows"]
+    a.shot("open-with-search")
+    # Escape clears the search, Space ticks "Always use it", and Enter opens.
+    a.key("Escape")
+    wait_open_with(lambda s: s["search"] == "" and len(s["rows"]) == 6 and s["picked"] == "writer.desktop", "the search cleared")
+    a.key("space")
+    wait_open_with(lambda s: s["always"], "Always use it ticked")
+    a.shot("open-with-always")
+    a.key("Return")
+    wait_for_log(log, [f"writer {fs / 'notes.md'}"], "opened with Writer")
+    assert (config / "mimeapps.list").read_text() == "[Default Applications]\ntext/markdown=writer.desktop;\n", (config / "mimeapps.list").read_text()
+    s = a.wait(lambda s: s["notices"] == [], "no complaint")
+
+    # Now it's the default. Escape closes it without opening anything.
+    open_with(0)
+    s = wait_open_with(lambda s: s["rows"], "the apps again")
+    assert s["rows"][1] == "writer.desktop|Writer|default" and s["picked"] == "writer.desktop", s["rows"]
+    a.key("Escape")
+    a.wait(lambda s: not s["menu"], "back in the list")
+    time.sleep(0.5)
+    assert len(log.read_text().splitlines()) == 1, log.read_text()
+
+    # An archive extracts when opened, but Open With hands it to another app.
+    open_with(1)
+    s = wait_open_with(lambda s: s["rows"], "the apps for a zip")
+    assert s["rows"][:2] == ["# For Zip archive", "unzipper.desktop|Unzipper"], s["rows"]
+    a.shot("open-with-archive")
+    a.key("Return")
+    wait_for_log(log, [f"writer {fs / 'notes.md'}", f"unzipper {uri(fs / 'photos.zip')}"], "opened with Unzipper")
+    time.sleep(0.3)
+    s = a.state()
+    assert s["names"] == ["notes.md", "photos.zip"] and s["jobs"] == 0, s
+    a.close()
+
+
+@check
+def other_programs_open_with_goes_through_the_app_chooser_portal(h):
+    share, _ = stand_in_apps()
+    p = Portal(h, extra_env={"XDG_DATA_DIRS": str(share)})
+    iface = "org.freedesktop.impl.portal.AppChooser"
+
+    def ask(n, choices, **options):
+        (SCRATCH / "state.json.openwith").unlink(missing_ok=True)
+        args = []
+        for k, (sig, v) in options.items():
+            args += [k, sig, str(v)]
+        handle = f"/org/freedesktop/portal/desktop/request/1_1/a{n}"
+        cmd = ["busctl", f"--address={p.bus.address}", "--timeout=60", "--json=short", "call", PORTAL[0], PORTAL[1], iface, "ChooseApplication", "ossasa{sv}", handle, "test.app", "", str(len(choices)), *choices, str(len(options)), *args]
+        p.call = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        h.wait_window(10)
+        return handle
+
+    try:
+        # Only the program's own list, in its order, starting on the one it last chose.
+        handle = ask(1, ["marked", "writer", "not.installed"], content_type=("s", "text/markdown"), filename=("s", "notes.md"), last_choice=("s", "writer"))
+        s = wait_open_with(lambda s: s["rows"], "the apps")
+        assert s["title"] == "Open “notes.md” with", s
+        assert s["rows"] == ["# For Markdown document", "marked|Marked", "writer|Writer"] and s["picked"] == "writer" and not s["can_always"], s
+        a = p.watch
+        a.shot("open-with-portal")
+        # The program finds another app while the window is open.
+        r = p.bus.call("call", PORTAL[0], PORTAL[1], iface, "UpdateChoices", "oas", handle, "3", "marked", "writer", "paint")
+        assert r.returncode == 0, r.stderr
+        s = wait_open_with(lambda s: len(s["rows"]) == 4, "the new list")
+        assert s["rows"][3] == "paint|Paint" and s["picked"] == "writer", s
+        a.key("Down")
+        wait_open_with(lambda s: s["picked"] == "paint", "Paint")
+        a.key("Return")
+        code, results = p.answer()
+        assert code == 0 and results == {"choice": "paint"}, (code, results)
+
+        # Escape cancels.
+        ask(2, ["marked"], content_type=("s", "text/markdown"))
+        wait_open_with(lambda s: s["rows"] == ["# For Markdown document", "marked|Marked"], "the app")
+        a.key("Escape")
+        assert p.answer() == (1, {}), "cancelled"
     finally:
         p.stop()
 
@@ -3453,10 +3613,7 @@ def recent_lists_used_files_newest_first_and_shows_them_in_their_folders(h):
     a.wait(lambda s: s["names"] == ["keep.txt", "new.txt", "middle.txt", "old.txt"], "the newly used file on top")
     # Show in folder goes to where the file is, with it selected; Back comes back.
     a.click(ROW_X, row_y(2), 0x111)
-    a.wait(lambda s: s["menu"], "the menu")
-    for _ in range(3):
-        a.key("Down")
-    a.key("Return")
+    menu_choose(a, "Show in folder")
     a.wait(lambda s: s["dir"] == str(fs / "a") and s["selected"] == ["middle.txt"], "middle.txt in its folder")
     a.key("Left", mods=["alt"])
     a.wait(lambda s: s["dir"] == str(listed), "back in Recent")

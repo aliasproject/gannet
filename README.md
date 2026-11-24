@@ -73,6 +73,7 @@ At run time, Gannet uses these:
 |---|---|---|
 | `fc-match` (fontconfig) | Finding fonts | Gannet can't find a font, so install this |
 | `xdg-open` | Opening files in other apps | Opening files fails |
+| `xdg-terminal-exec` | Open With for apps that run in a terminal, like Neovim | Open With says it's missing for those apps |
 | `bsdtar` (libarchive) | Extracting archives | Extracting says it's missing |
 | `xdg-terminal-exec` | Open in terminal, in whichever terminal is set up | Open in terminal isn't offered |
 | `libmpv` (part of `mpv` on many systems) and `bubblewrap` | Video and sound previews | Videos show a message saying what's needed |
@@ -202,18 +203,40 @@ as installing a file manager shouldn't change that by itself. To choose it, put 
 
     [preferred]
     org.freedesktop.impl.portal.FileChooser=gannet;gtk
+    org.freedesktop.impl.portal.AppChooser=gannet;gtk
 
-then restart the portal with `systemctl --user restart xdg-desktop-portal`. Other portals
+then restart the portal with `systemctl --user restart xdg-desktop-portal`. The second line
+is for Open With (below) and can be left out. Other portals
 stay as your desktop's own configuration has them, as xdg-desktop-portal reads each file in
 turn for what earlier ones leave out. `gtk` after `gannet` is what's used if Gannet isn't
 installed. Older versions of xdg-desktop-portal read only the first file they find, so with
 those, copy your desktop's lines from `/usr/share/xdg-desktop-portal/*-portals.conf` into it.
 
 `gannet --file-chooser-service` is what D-Bus starts. It has no window: it opens one for
-each request, `gannet --choose ...`, and exits after ten minutes with none open. Like "Show
-in folder", it needs `WAYLAND_DISPLAY` in the environment D-Bus gives services. A dialog
-sits over the program's window as its child where the compositor supports xdg-foreign, and
-its app ID is `com.aliasproject.Gannet.Chooser` for window rules.
+each request, `gannet --choose ...` or `gannet --open-with ...`, and exits after ten minutes
+with none open. Like "Show in folder", it needs `WAYLAND_DISPLAY` in the environment D-Bus
+gives services. A dialog sits over the program's window as its child where the compositor
+supports xdg-foreign, and its app ID is `com.aliasproject.Gannet.Chooser` for window rules.
+
+## Open With
+
+Right-click one or more files and choose Open with… to pick an app other than the default.
+The apps for the file's type come first, with the default marked, then every other app, by
+name. Typing searches them, the arrows move, and Enter or a double click opens. Escape clears
+the search, then cancels. "Always use for … files" (Space, before typing) also makes the app
+the default for that type, in `~/.config/mimeapps.list`, where `xdg-open` and other file
+managers look; Undo doesn't reverse that, but choosing another app the same way does. It's
+there for an archive too, which opening extracts in Gannet, so another app can open it instead.
+
+Apps come from the desktop entries in `~/.local/share/applications` and
+`/usr/share/applications` (`XDG_DATA_DIRS`), and the defaults from the `mimeapps.list` files,
+as the freedesktop specs describe. An entry whose program isn't installed is left out. An app
+that runs in a terminal, like Neovim, opens in yours through `xdg-terminal-exec`.
+
+The same window answers other programs' "Open with…" requests through xdg-desktop-portal's
+app chooser, with the `AppChooser` line above. Only sandboxed programs, such as Flatpaks, ask
+it, when they open a file or link with no default app. There it lists the apps the program
+offers, and the portal opens the one picked.
 
 ## Set as background
 
@@ -242,7 +265,7 @@ everything in the archive is inside one folder, that folder comes out as itself,
 another one. Extract is also in the right-click menu. It runs as a job you can stop, and Undo
 moves the folder to the Trash. A damaged archive, one with a password, or one with items that
 would land outside its folder or links that point outside it leaves nothing behind and says why. In Open and Save dialogs,
-opening an archive picks it, as any other file.
+opening an archive picks it, as any other file. To open one in another app, use Open with….
 
 ## Pinned folders
 
