@@ -98,6 +98,8 @@ struct Queue {
     making: VecDeque<Job>,
     /// Being made now, and how to stop each.
     running: Vec<(PathBuf, Arc<OwnedFd>)>,
+    /// The rows on screen, for a look in the cache that finishes after its row has gone.
+    on_screen: HashSet<PathBuf>,
 }
 
 #[derive(Default)]
@@ -157,14 +159,15 @@ impl Thumbs {
         }
         let mut guard = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
         let queue = &mut *guard;
-        if visible.is_empty() && queue.reading.is_empty() && queue.making.is_empty() && queue.running.is_empty() {
+        if visible.is_empty() && queue.on_screen.is_empty() {
             return false;
         }
-        let on_screen: HashSet<&Path> = visible.iter().map(|v| v.0.as_path()).collect();
+        queue.on_screen = visible.iter().map(|v| v.0.clone()).collect();
+        let on_screen = &queue.on_screen;
         let mut dropped = Vec::new();
         for lane in [&mut queue.reading, &mut queue.making] {
             lane.retain(|job| {
-                let keep = on_screen.contains(job.path.as_path()) && job.side == side;
+                let keep = on_screen.contains(&job.path) && job.side == side;
                 if !keep {
                     dropped.push(job.path.clone());
                 }
@@ -172,7 +175,7 @@ impl Thumbs {
             });
         }
         for (path, stop) in &queue.running {
-            if !on_screen.contains(path.as_path()) {
+            if !on_screen.contains(path) {
                 let _ = rustix::io::write(&**stop, &1u64.to_ne_bytes());
             }
         }
@@ -310,8 +313,16 @@ fn read_loop(shared: &Shared, hub: &Hub, cx: &Cx) {
         match look(&job, cx, &never) {
             Some(outcome) => hub.send(Msg::Thumbnail(Done { path: job.path, side: job.side, outcome })),
             None => {
-                shared.queue.lock().unwrap_or_else(|e| e.into_inner()).making.push_back(job);
-                shared.more.notify_all();
+                let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if queue.on_screen.contains(&job.path) {
+                    queue.making.push_back(job);
+                    drop(queue);
+                    shared.more.notify_all();
+                } else {
+                    // Scrolled away while it was looked for: it's asked for again if it's back.
+                    drop(queue);
+                    hub.send(Msg::Thumbnail(Done { path: job.path, side: job.side, outcome: Outcome::Stopped }));
+                }
             }
         }
     }
@@ -654,6 +665,10 @@ mod tests {
         assert_eq!(t.waiting(), 2, "and a is no longer waited on");
         t.plan(&[row("a", None)], 20);
         assert_eq!(queued(&t).0, ["a"], "back on screen, it's asked for again");
+        // What the cache reader checks before passing one on to be made.
+        assert!(t.shared.queue.lock().unwrap().on_screen.contains(Path::new("/f/a")));
+        t.plan(&[], 20);
+        assert!(t.shared.queue.lock().unwrap().on_screen.is_empty() && queued(&t).0.is_empty(), "a folder with none");
     }
 
     #[test]
