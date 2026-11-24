@@ -2430,13 +2430,14 @@ impl App {
                 let (x, y) = self.pointer;
                 self.pin_drag_moved(x, y);
             }
+            // The row under the pointer can be another place now. A menu or dialog has its own
+            // highlight, which follows the pointer only as it moves.
+            _ if self.pointer.0 >= 0 && self.menu.is_none() && self.dialog.is_none() => {
+                let (x, y) = self.pointer;
+                let h = self.hit(x, y);
+                self.set_hover(h);
+            }
             _ => {}
-        }
-        // The row under the pointer can be another place now.
-        let (x, y) = self.pointer;
-        if x >= 0 {
-            let h = self.hit(x, y);
-            self.set_hover(h);
         }
         self.invalidate_all();
     }
@@ -8032,6 +8033,8 @@ mod tests {
         let more = format!("{}file://{}\n", r.bookmarks(), r.root.join("pins/C").display());
         gannet_core::bookmarks::save(&r.bookmarks_file(), more.as_bytes()).unwrap();
         r.app.bookmarks_changed();
+        assert_eq!(r.app.hover, Hit::None, "the carried pin keeps the pointer");
+        assert_eq!(r.app.pointer_cursor, Cursor::Move);
         r.release();
         assert_eq!(r.pinned(), ["B", "A", "C"], "A lands where its bar was, and C stays");
         // The pin carried being unpinned elsewhere ends the drag, and doesn't bring it back.
