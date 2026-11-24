@@ -1643,6 +1643,7 @@ impl App {
     fn a11y_dialog_act(&mut self, act: crate::a11y::Act) {
         use crate::a11y::{Act, DIALOG_BUTTON0, DIALOG_CHECK, RENAME_FIND, RENAME_REPLACE};
         let guarded = self.dialog_guarded();
+        let edit_gen = self.edit_gen;
         let Some(d) = self.dialog.as_mut() else { return };
         let button = |id: u64| id.checked_sub(DIALOG_BUTTON0).map(|i| i as usize);
         match act {
@@ -1654,6 +1655,13 @@ impl App {
                 if let Dialog::Conflict { apply_to_all, .. } = d {
                     *apply_to_all = !*apply_to_all;
                 }
+            }
+            // A change to Find or Replace gives it the keyboard first, as clicking it does, then
+            // is made as typing it would be. One about a field since closed is dropped.
+            Act::EditText(id @ (RENAME_FIND | RENAME_REPLACE), asked, op) if asked == edit_gen => {
+                let Dialog::RenameMany(rm) = d else { return };
+                rm.focus = if id == RENAME_FIND { Focus::Find } else { Focus::Replace };
+                return self.a11y_edit(op);
             }
             Act::Focus(id) => {
                 let n = Self::dialog_buttons(d).len();
@@ -10309,6 +10317,8 @@ mod tests {
         assert_eq!(s.focus, Has::Node(DIALOG_BUTTON0 + 1));
         assert_eq!(s.modal.and_then(|m| m.default), Some(DIALOG_BUTTON0 + 1));
         assert!(s.behind(LIST) && s.behind(BACK) && s.rows_behind(), "what's behind can't be used");
+        use crate::a11y::{COLUMN_NAME, CRUMB0, NOTICES, PATH};
+        assert!(s.behind(PATH) && s.behind(CRUMB0) && s.behind(COLUMN_NAME) && s.behind(NOTICES), "the path bar, the headings and the notices too");
         assert!(!s.behind(FRAME) && !s.behind(DIALOG) && !s.behind(DIALOG_BUTTON0), "the dialog can, in its window");
         // Behind it, nothing happens.
         r.app.on_msg(Msg::A11y(Act::OpenPlace(0)));
@@ -10373,8 +10383,9 @@ mod tests {
         assert_eq!(s.focus, Has::Node(RENAME_FIND));
         assert!(!s.get(DIALOG_BUTTON0).unwrap().enabled, "nothing to rename yet");
         type_in(&mut r, ".jpg");
-        r.app.on_msg(Msg::A11y(Act::Focus(RENAME_REPLACE)));
-        type_in(&mut r, ".jpeg");
+        // Typing into Replace through AT-SPI gives it the keyboard first, as clicking it does.
+        let edit_gen = snapshot(&mut r).edit_gen;
+        r.app.on_msg(Msg::A11y(Act::EditText(RENAME_REPLACE, edit_gen, crate::a11y::TextEdit::Replace(0, 0, ".jpeg".into()))));
         let s = snapshot(&mut r);
         assert_eq!(s.focus, Has::Node(RENAME_REPLACE));
         let field = |id| s.get(id).and_then(|n| n.field.as_ref()).map(|f| f.text.as_str());

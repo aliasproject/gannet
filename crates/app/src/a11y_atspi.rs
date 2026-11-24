@@ -409,8 +409,19 @@ impl Ctx {
             Target::Fixed(n) => snap.behind(n.id),
             Target::Row(..) | Target::Cell(..) => snap.rows_behind(),
         };
-        let request = matches!((iface, member.as_str()), (ACTION, "DoAction") | (COMPONENT, "GrabFocus" | "ScrollTo" | "ScrollToPoint") | (SELECTION, "SelectChild" | "DeselectChild" | "DeselectSelectedChild" | "SelectAll" | "ClearSelection"));
-        if behind && request {
+        let request = matches!(
+            (iface, member.as_str()),
+            (ACTION, "DoAction")
+                | (COMPONENT, "GrabFocus" | "ScrollTo" | "ScrollToPoint")
+                | (SELECTION, "SelectChild" | "DeselectChild" | "DeselectSelectedChild" | "SelectAll" | "ClearSelection")
+                | (TABLE, "AddRowSelection" | "RemoveRowSelection")
+                | (TEXT, "SetCaretOffset" | "AddSelection" | "SetSelection" | "RemoveSelection")
+                | (EDITABLE_TEXT, "SetTextContents" | "InsertText" | "CutText" | "DeleteText" | "PasteText")
+        );
+        // A passphrase is typed with the keyboard only: its text here is dots, which mustn't
+        // become the passphrase.
+        let passphrase = matches!(&target, Target::Fixed(n) if n.role == Role::PasswordText);
+        if (behind || passphrase) && request {
             return self.reply(&h, &(false,));
         }
         match (iface, member.as_str()) {
@@ -582,7 +593,10 @@ impl Ctx {
                 bits(&on)
             }
             Target::Cell(e, at, col) => {
-                let mut on = vec![STATE_VISIBLE, STATE_ENABLED, STATE_SENSITIVE];
+                let mut on = vec![STATE_VISIBLE];
+                if !snap.rows_behind() {
+                    on.extend([STATE_ENABLED, STATE_SENSITIVE]);
+                }
                 // Selected with its row, as `Table.IsSelected` says.
                 if snap.rows.is_selected(*e) {
                     on.push(STATE_SELECTED);

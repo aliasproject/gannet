@@ -2210,6 +2210,8 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "focus moves into the menu")
         assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Open"], heard
         assert sr.ask("focus_row 1") is False, "a row behind the menu"
+        assert "enabled" not in find(d, "column header", "Name")["states"] and all("enabled" not in c["states"] for c in find(d, "list", "Path")["children"]), "the headings and path bar are behind it too"
+        assert sr.ask("heading 0") is False and sr.ask("crumb 0") is False, "nor can they be used"
         # Moving to an item picks it, and its action chooses it.
         assert sr.ask(f'grab ["{w}", "", "Show hidden files"]') is True
         sr.until(f'dump ["{w}"]', lambda d: "focused" in find(d, "menu item", "Show hidden files")["states"], "picked")
@@ -2283,8 +2285,8 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         a.key("F2")
         a.wait(lambda s: s["dialog"].startswith("rename-many"), "the rename dialog")
         a.type(".txt")
-        a.key("Tab")
-        a.type(".md")
+        # Replace, through EditableText, which gives it the keyboard as clicking it does.
+        assert sr.ask("set_text Replace .md") is True
         d = sr.until(f'dump ["{w}"]', lambda d: find(d, "dialog", "Rename 2 items") is not None and "focused" in find(d, "entry", "Replace with")["states"], "the rename dialog")
         dialog = find(d, "dialog", "Rename 2 items")
         assert [(c["role"], c["name"]) for c in dialog["children"]] == [("entry", "Find"), ("entry", "Replace with"), ("list", "Names"), ("button", "Rename"), ("button", "Cancel")], dialog
@@ -2305,6 +2307,7 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         assert dialog["description"] == "It's encrypted. Type its passphrase to open it.", dialog
         phrase = find(dialog, "password text")
         assert phrase["name"] == "Passphrase" and {"focused", "editable"} <= set(phrase["states"]), phrase
+        assert sr.ask("set_text Passphrase hunter2") is False, "a passphrase is only typed"
         sr.ask("events")
         a.type("nope")
         a.key("Return")

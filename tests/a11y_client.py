@@ -135,7 +135,10 @@ def tree():
 
 def entries():
     frame = gannet().get_child_at_index(0)
-    return [k for k in children(frame) if k.get_role() == Atspi.Role.ENTRY]
+    kids = children(frame)
+    # A dialog's fields are in it.
+    kids += [k for d in kids if d.get_role() in (Atspi.Role.DIALOG, Atspi.Role.ALERT) for k in children(d)]
+    return [k for k in kids if k.get_role() in (Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT)]
 
 
 def field(name):
