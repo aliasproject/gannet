@@ -266,6 +266,20 @@ moves the folder to the Trash. A damaged archive, one with a password, or one wi
 would land outside its folder or links that point outside it leaves nothing behind and says why. In Open and Save dialogs,
 opening an archive picks it, as any other file. To open one in another app, use Open with….
 
+## Pinned folders
+
+Drag a folder between places in the sidebar to pin it there, under Pinned: below Trash, or
+just above or below a pin. A bar shows where it will land. Dropping onto a place still moves
+the folder into it; pinning never moves or changes the folder. Files can't be pinned. Drag a
+pin up or down to put the pins in another order, and Escape puts it back. Right-click a pin
+to unpin it, which leaves the folder alone. Alt+1 to Alt+9 follow the sidebar, pins included.
+
+Pins are GTK's bookmarks, kept in `$XDG_CONFIG_HOME/gtk-3.0/bookmarks`, so they're shared
+with Nautilus and GTK's Open and Save dialogs, and every open Gannet window follows changes to
+that file. Gannet only shows local folders, and keeps every other line, like an `sftp://`
+bookmark, as it was. A standard folder like Documents that's also bookmarked shows once, in
+Places. A pinned folder that's gone stays in the sidebar until it's unpinned.
+
 ## Recent
 
 Recent in the sidebar lists the files you've used lately, newest first, with the folder each

@@ -4,6 +4,7 @@
 
 pub mod apps;
 pub mod archive;
+pub mod bookmarks;
 pub mod bus;
 pub mod cli;
 pub mod clipboard;
