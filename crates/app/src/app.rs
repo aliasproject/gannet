@@ -2877,8 +2877,9 @@ impl App {
         let (x, y) = self.pointer;
         if self.pin_drag.as_ref().is_some_and(|d| d.active) {
             self.pin_drag_moved(x, y);
-        } else if x >= 0 && self.menu.is_none() && self.dialog.is_none() && self.drag_scroll.is_none() {
-            // A thumb being dragged keeps its hover, wherever the pointer drifts.
+        } else if x >= 0 && self.menu.is_none() && self.dialog.is_none() && self.drag_scroll.is_none() && self.incoming.is_none() {
+            // A thumb being dragged keeps its hover, wherever the pointer drifts. A drag from
+            // elsewhere has the compositor's cursor, and shows only its target.
             let h = self.hit(x, y);
             self.set_hover(h);
         }
@@ -8871,8 +8872,11 @@ mod tests {
         // The real position comes with a motion, and the pointer then stays still while the
         // timer scrolls: no more motion arrives during a Wayland drag that doesn't move.
         r.app.input(Input::DragMove { x, y });
+        r.app.cmds.clear();
         tick_until_still(&mut r);
         assert_eq!(r.app.side_scroll, r.app.max_scroll_in(Pane::Sidebar));
+        assert_eq!(r.app.hover, Hit::None, "no place lights up as it passes under the pointer");
+        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::Cursor(_))), "and the compositor's cursor is left alone");
         let i = r.app.incoming.as_ref().unwrap();
         assert_eq!(i.target.as_ref().map(|t| t.hit), Some(Hit::PinGap(30)), "the target followed the scroll");
         r.app.cmds.clear();
