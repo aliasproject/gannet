@@ -2878,7 +2878,7 @@ mod tests {
 
     /// Packs `names` (relative to `dir`) with bsdtar, its format chosen by `archive`'s ending.
     fn pack(dir: &Path, archive: &Path, names: &[&str]) {
-        let ok = std::process::Command::new("bsdtar").arg("-a").arg("-cf").arg(archive).arg("-C").arg(dir).args(names).status().unwrap().success();
+        let ok = std::process::Command::new("bsdtar").env("LC_ALL", "C.UTF-8").arg("-a").arg("-cf").arg(archive).arg("-C").arg(dir).args(names).status().unwrap().success();
         assert!(ok, "bsdtar couldn't make {archive:?}");
     }
 
@@ -2952,6 +2952,26 @@ mod tests {
         e.start(Request::Redo(undone.outcome.undo.unwrap()));
         finish(&rx, vec![]);
         assert_eq!(fs::read(folder.join("sub/b.txt")).unwrap(), b"two");
+    }
+
+    #[test]
+    fn extract_keeps_names_that_arent_ascii() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        s.file("src/日本語 café.txt", b"one");
+        s.file("src/Fotos ñ/ü.txt", b"two");
+        let work = s.dir("work");
+        for name in ["names.zip", "names.tar.gz"] {
+            let archive = work.join(name);
+            pack(&s.path().join("src"), &archive, &["日本語 café.txt", "Fotos ñ"]);
+            e.start(Request::Extract { archives: vec![archive] });
+            let done = finish(&rx, vec![]);
+            assert!(done.errors.is_empty(), "{name}: {:?}", done.errors);
+            let folder = work.join("names");
+            assert_eq!(fs::read(folder.join("日本語 café.txt")).unwrap(), b"one", "{name}");
+            assert_eq!(fs::read(folder.join("Fotos ñ/ü.txt")).unwrap(), b"two", "{name}");
+            fs::remove_dir_all(&folder).unwrap();
+        }
     }
 
     #[test]

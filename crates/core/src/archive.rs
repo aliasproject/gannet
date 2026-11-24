@@ -74,7 +74,7 @@ impl Failed {
         }
     }
 
-    /// Sorts out what `bsdtar` said on a failure, in the C locale.
+    /// Sorts out what `bsdtar` said on a failure, in the C.UTF-8 locale.
     fn from_messages(lines: &[String]) -> Failed {
         let said = |s: &str| lines.iter().any(|l| l.contains(s));
         if said("passphrase") || said("Passphrase") || said("Encrypted") || said("encrypted") {
@@ -103,7 +103,8 @@ pub fn unpack(tool: &OsStr, archive: &File, into: &Path, mut on_entry: impl FnMu
         // A password is never asked for: there's nowhere to type it, and this one fails at once.
         .args(["-x", "-v", "--no-same-owner", "--no-same-permissions", "--passphrase", "gannet", "-f", "-", "-C"])
         .arg(into)
-        .env("LC_ALL", "C")
+        // UTF-8, or names that aren't ASCII fail to convert; C.UTF-8 keeps its messages in English.
+        .env("LC_ALL", "C.UTF-8")
         .stdin(input)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
