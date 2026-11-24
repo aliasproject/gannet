@@ -12,6 +12,9 @@ pub const TEXT_LIMIT: usize = 128 * 1024;
 const BINARY_WITHIN: usize = 8000;
 /// More than the decoder could ever write for `TEXT_LIMIT` of text, so anything bigger is refused.
 pub const MAX_ENCODED: usize = 8 * TEXT_LIMIT + 1024;
+/// The most table cells a document keeps. Short rows are filled out to the header's width, so a
+/// few bytes of text can make many cells, and each takes more room written out than it did as text.
+const MAX_CELLS: usize = TEXT_LIMIT / 4;
 
 /// How a run of words looks. These combine.
 pub const BOLD: u8 = 1;
@@ -40,18 +43,18 @@ pub enum Kind {
 /// What a table cell is the first of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Starts {
-    Nothing,
-    Row,
-    Table,
+    Nothing = 0,
+    Row = 1,
+    Table = 2,
 }
 
 /// Where words go across a table column, as its separator row says.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Align {
     #[default]
-    Left,
-    Center,
-    Right,
+    Left = 0,
+    Center = 1,
+    Right = 2,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,7 +154,15 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
     let mut aligns: Vec<Align> = Vec::new();
     let mut column = 0usize;
     let mut starts = Starts::Nothing;
+    // Past `MAX_CELLS`, the rest of the tables' cells, and what's in them, are left out.
+    // pulldown-cmark stops filling out rows after a while too, and then gives the rest of the
+    // table's lines as paragraphs, which are kept.
+    let (mut cells, mut dropping) = (0usize, false);
+    let mut cut = cut;
     for event in Parser::new_ext(text, options) {
+        if dropping && matches!(event, Event::Text(_) | Event::Code(_) | Event::SoftBreak | Event::HardBreak) {
+            continue;
+        }
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => out.open(item.take().map_or(Kind::Paragraph, Kind::Item), quote, indent(&lists)),
@@ -214,7 +225,9 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
                         starts = Starts::Row;
                     }
                 }
+                Tag::TableCell if cells == MAX_CELLS => (dropping, cut) = (true, true),
                 Tag::TableCell => {
+                    cells += 1;
                     let align = aligns.get(column).copied().unwrap_or_default();
                     column += 1;
                     out.open(Kind::Cell { starts, align }, quote, indent(&lists));
@@ -232,7 +245,11 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
                 _ => {}
             },
             Event::End(tag) => match tag {
-                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock | TagEnd::TableCell => out.close(),
+                TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock => out.close(),
+                TagEnd::TableCell => {
+                    out.close();
+                    dropping = false;
+                }
                 TagEnd::BlockQuote(_) => {
                     out.close();
                     quote = quote.saturating_sub(1);
@@ -593,6 +610,25 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_header_over_many_short_rows_cant_make_endless_cells() {
+        // Every short row is filled out to the header's 1000 columns.
+        let mut text = format!("{}|\n{}|\n", "| h ".repeat(1000), "|---".repeat(1000));
+        while text.len() < TEXT_LIMIT - 10 {
+            text.push_str("| x |\n");
+        }
+        let cells = |doc: &Doc| doc.blocks.iter().filter(|b| matches!(b.kind, Kind::Cell { .. })).count();
+        let doc = markdown(&text, false);
+        assert_eq!(cells(&doc), MAX_CELLS);
+        assert!(doc.cut, "said to go on past what's shown");
+        assert!(encode(&doc).len() <= MAX_ENCODED, "and it goes between the processes");
+        // The words of cells left out don't turn up anywhere else, and what follows is still there.
+        let doc = markdown(&format!("{text}\nafter\n"), false);
+        assert_eq!(cells(&doc), MAX_CELLS);
+        assert!(doc.blocks.iter().all(|b| b.kind == Kind::Paragraph || matches!(b.kind, Kind::Cell { .. }) && b.spans.iter().all(|s| s.text == "h" || s.text == "x")), "{:?}", &doc.blocks[MAX_CELLS - 2..]);
+        assert_eq!(doc.blocks.last().unwrap().spans, [span(0, "after")]);
+    }
+
+    #[test]
     fn a_table_in_a_list_or_a_quote_is_in_it() {
         let doc = markdown("> | q |\n> |---|\n> | 1 |\n\n- | i |\n  |---|\n", false);
         let summary: Vec<(Kind, u8, u8)> = doc.blocks.iter().map(|b| (b.kind.clone(), b.quote, b.indent)).collect();
@@ -645,5 +681,12 @@ mod tests {
         let one = |kind: u8| [MAGIC.as_slice(), &[0], &1u32.to_le_bytes(), &[kind, 0, 0], &0u32.to_le_bytes(), &0u32.to_le_bytes()].concat();
         assert!((CELL..=CELL_LAST).all(|k| decode(&one(k)).is_some_and(|d| matches!(d.blocks[0].kind, Kind::Cell { .. }))));
         assert!(decode(&one(CELL_LAST + 1)).is_none());
+        // And each one is the cell it was.
+        for starts in [Starts::Nothing, Starts::Row, Starts::Table] {
+            for align in [Align::Left, Align::Center, Align::Right] {
+                let doc = Doc { blocks: vec![block(Kind::Cell { starts, align }, vec![])], cut: false };
+                assert_eq!(decode(&encode(&doc)), Some(doc));
+            }
+        }
     }
 }

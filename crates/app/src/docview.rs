@@ -485,7 +485,9 @@ fn table(cells: &[Block], left: i32, right: i32, mut y: i32, fonts: &mut Fonts, 
         let mut merged: Vec<Line> = Vec::new();
         let mut x = left;
         for (cell, &w) in row.iter().zip(&widths) {
-            let (from, to) = (x + pad, (x + w - pad).max(x + pad + 1));
+            // A column narrower than its padding gives up some of it, so its words stay inside.
+            let inset = pad.min(w / 4);
+            let (from, to) = (x + inset, (x + w - inset).max(x + inset + 1));
             x += w;
             let mut own = Vec::new();
             flow(cell, from, to, 0, fonts, &mut own);
@@ -621,8 +623,14 @@ pub fn paint(c: &mut Canvas, area: Rect, scroll: i32, layout: &Layout, fonts: &m
             let color = if piece.style & doc::LINK != 0 { ink.link } else if line.quote > 0 { ink.muted } else { ink.text };
             let x = area.x as f32 + piece.x;
             let t = fonts.get(piece.face);
-            // Code among words gets a little box of its own.
-            if piece.style & doc::CODE != 0 && !matches!(line.mark, Mark::Code(..)) && piece.face == Face::Mono && line.pieces.len() > 1 {
+            // Code among words gets a little box of its own, as does code in a table cell, whose
+            // line holds the other cells' words too.
+            let among = match line.mark {
+                Mark::Code(..) => false,
+                Mark::Table { .. } => true,
+                _ => line.pieces.len() > 1,
+            };
+            if piece.style & doc::CODE != 0 && among && piece.face == Face::Mono {
                 let w = t.measure(piece.text.trim_end_matches(' ')).ceil() as i32;
                 let h = t.line_height().ceil() as i32;
                 c.rrect(Rect::new(x as i32 - 3, baseline - t.ascent.round() as i32 - 1, w + 6, h + 2), 4, ink.code);
