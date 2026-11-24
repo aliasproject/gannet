@@ -439,9 +439,17 @@ fn main() {
 
 /// Runs one of the commands for scripts. Returns the exit code.
 fn run_command(verb: &str) -> i32 {
+    // Guessing would aim relative paths somewhere else, and `trash` would move the wrong thing.
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gannet {verb}: can't tell what the current folder is: {}", gannet_core::listing::describe(&e));
+            return 1;
+        }
+    };
     let d = dirs();
     let mut env = gannet_core::cli::Env {
-        cwd: std::env::current_dir().unwrap_or_else(|_| "/".into()),
+        cwd,
         trash: TrashConfig::new(&d.data, rustix::process::geteuid().as_raw()),
         mounts: read_mounts(),
         sorts: gannet_core::folder_sorts::FolderSorts::new(d.state.join("gannet/sorts"), gannet_core::places::newest_first_dirs(&d.home, &d.config)),

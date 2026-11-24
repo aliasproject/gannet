@@ -292,8 +292,10 @@ A path can also be a `file://` URI. Use `--` before paths that start with `-`. T
 words are commands, so to open a folder called `list` in the window, run `gannet ./list`.
 
 Without `--json`, the output is for people and may change. The exit code is 0 when everything
-asked for was done and 1 otherwise, including bad arguments. Each error is also a line on
-stderr: `gannet COMMAND: PATH: message`.
+asked for was done and 1 otherwise, including bad arguments. Each error is also written to
+stderr as `gannet COMMAND: PATH: message`. That's for people: a path can hold a newline, so
+read errors from the JSON. `trash` refuses an empty path and one ending in `.` or `..`, as
+`rm` does, and every command refuses an empty path.
 
 ### JSON output
 
@@ -308,7 +310,8 @@ has:
 | `command` | `"list"`, `"info"`, `"trash"` or `"restore"` |
 | `errors` | `[{"path", "message"}]`, empty on success; `path` is `null` for an error with no path |
 
-and then, by command:
+Bad arguments give only these three fields, with the reason and the usage in `errors`.
+Otherwise there are more, by command:
 
 | Command | Fields |
 |---|---|

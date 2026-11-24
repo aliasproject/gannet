@@ -84,6 +84,11 @@ fn failures_go_to_stderr_with_exit_code_1() {
         let err = text(&out.stderr);
         assert!(err.starts_with(&format!("gannet {}: ", args[0])), "{args:?}: {err}");
     }
+    // A current folder that's gone is an error, not somewhere else to aim relative paths.
+    std::fs::create_dir(h.0.join("gone")).unwrap();
+    let out = Command::new("sh").arg("-c").arg(format!("cd {0}/gone && rmdir {0}/gone && exec \"$0\" trash tmp", h.0.display())).arg(env!("CARGO_BIN_EXE_gannet")).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(text(&out.stderr).starts_with("gannet trash: can't tell what the current folder is"), "{}", text(&out.stderr));
     // With --json, the error is in the output too.
     let out = h.gannet(&["info", "--json", "nope"]);
     assert_eq!(out.status.code(), Some(1));

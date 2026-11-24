@@ -52,8 +52,11 @@ pub fn run(env: &mut Env, verb: &str, args: &[OsString], out: &mut dyn Write, er
     let opts = match Opts::parse(verb, args) {
         Ok(o) => o,
         Err(message) => {
-            let _ = writeln!(err, "gannet {verb}: {message}\nusage: {}", usage(verb));
-            return 1;
+            // A script that asked for JSON still gets an object to read the error from.
+            let json = args.iter().take_while(|a| *a != "--").any(|a| a == "--json");
+            let mut report = Report::default();
+            report.fail(None, format!("{message}\nusage: {}", usage(verb)));
+            return finish(verb, json, Doc { fields: Vec::new(), text: String::new() }, &report, out, err);
         }
     };
     if opts.help {
@@ -67,7 +70,12 @@ pub fn run(env: &mut Env, verb: &str, args: &[OsString], out: &mut dyn Write, er
         "trash" => trash_cmd(env, &opts, &mut report),
         _ => restore(env, &opts, &mut report),
     };
-    let text = match opts.json {
+    finish(verb, opts.json, doc, &report, out, err)
+}
+
+/// Prints a command's output and its errors. Returns the exit code.
+fn finish(verb: &str, json: bool, doc: Doc, report: &Report, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let text = match json {
         true => {
             let mut fields = vec![("version", J::Int(JSON_VERSION as i64)), ("command", J::str(verb))];
             fields.extend(doc.fields);
@@ -78,15 +86,21 @@ pub fn run(env: &mut Env, verb: &str, args: &[OsString], out: &mut dyn Write, er
         }
         false => doc.text,
     };
-    // A reader that stops early, like `head`, isn't a failure of the command.
-    let _ = out.write_all(text.as_bytes());
+    let mut failed = !report.errors.is_empty();
+    // A reader that stops early, like `head`, isn't a failure of the command; a full disk is.
+    if let Err(e) = out.write_all(text.as_bytes()).and_then(|()| out.flush())
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        let _ = writeln!(err, "gannet {verb}: couldn't write the output: {}", crate::listing::describe(&e));
+        failed = true;
+    }
     for (path, message) in &report.errors {
         let _ = match path {
             Some(p) => writeln!(err, "gannet {verb}: {}: {message}", p.display()),
             None => writeln!(err, "gannet {verb}: {message}"),
         };
     }
-    if report.errors.is_empty() { 0 } else { 1 }
+    if failed { 1 } else { 0 }
 }
 
 fn usage(verb: &str) -> &'static str {
@@ -171,12 +185,29 @@ impl Opts {
         if o.help {
             return Ok(o);
         }
+        if o.paths.iter().any(|p| p.is_empty()) {
+            return Err("an empty PATH names nothing".into());
+        }
+        // As rm does: trashing `.` or `..` is almost always a mistake in a script.
+        if verb == "trash" && o.paths.iter().any(|p| is_dot(p.as_bytes())) {
+            return Err("refusing to move “.” or “..” to the Trash".into());
+        }
         match verb {
             "list" if o.paths.len() > 1 => Err("list takes one folder".into()),
             "info" | "trash" if o.paths.is_empty() => Err("no PATH given".into()),
             _ => Ok(o),
         }
     }
+}
+
+/// Whether a path ends in `.` or `..`, trailing slashes aside.
+fn is_dot(p: &[u8]) -> bool {
+    let mut end = p.len();
+    while end > 1 && p[end - 1] == b'/' {
+        end -= 1;
+    }
+    let last = p[..end].rsplit(|&b| b == b'/').next().unwrap_or_default();
+    last == b"." || last == b".."
 }
 
 /// What failed, for stderr and the JSON's `errors`.
@@ -377,7 +408,7 @@ fn restore(env: &mut Env, o: &Opts, report: &mut Report) -> Doc {
     let mut picked: Vec<Trashed> = Vec::new();
     for a in &o.paths {
         let want = clean_arg(env, a);
-        match find_in_trash(l, &loaded.rows, &want) {
+        match find_in_trash(l, &loaded.rows, &want, &env.trash.home_trash, env.trash.uid) {
             Ok(t) if picked.iter().any(|p| p.file == t.file) => {}
             Ok(t) => picked.push(t),
             Err(e) => report.fail(Some(&want), e),
@@ -387,7 +418,9 @@ fn restore(env: &mut Env, o: &Opts, report: &mut Report) -> Doc {
     if !picked.is_empty() {
         let outcome = run_job(env, Request::Restore { items: picked.clone() }, report);
         let created = outcome.map(|o| o.created).unwrap_or_default();
-        restored = picked.into_iter().filter(|t| created.contains(&t.original)).collect();
+        // Each item that's now where it came from and gone from the Trash. Two items from one
+        // path can both be asked for, and only the first can come back.
+        restored = picked.into_iter().filter(|t| created.contains(&t.original) && std::fs::symlink_metadata(&t.file).is_err()).collect();
     }
     let text = restored.iter().map(|t| format!("Restored {}\n", t.original.display())).collect();
     Doc { fields: vec![("restored", J::Arr(restored.iter().map(|t| moved_json(&t.original, &t.file)).collect()))], text }
@@ -395,20 +428,22 @@ fn restore(env: &mut Env, o: &Opts, report: &mut Report) -> Doc {
 
 /// The item `want` names: its path in the Trash, or the path it came from, the latest deleted
 /// if several did.
-fn find_in_trash(l: &crate::listing::Listing, rows: &[u32], want: &Path) -> Result<Trashed, String> {
+fn find_in_trash(l: &crate::listing::Listing, rows: &[u32], want: &Path, home_trash: &Path, uid: u32) -> Result<Trashed, String> {
     let unreadable = "Its record in the Trash is missing or can't be read, so it can't be put back";
     if let Some(&i) = rows.iter().find(|&&i| l.path(i) == want) {
         return l.trashed(i).ok_or_else(|| unreadable.to_string());
     }
-    // The same item by another path, through a link to the Trash folder or the disk.
+    // The same item by another path, through a link to the Trash folder or the disk. Only for a
+    // path that really is in a Trash: a hard link elsewhere is the same inode, but not in it.
     let id = |p: &Path| std::fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()));
-    if let Some(key) = id(want)
+    let real = want.parent().and_then(|p| std::fs::canonicalize(p).ok()).zip(want.file_name()).map(|(p, n)| p.join(n));
+    if real.as_deref().is_some_and(|r| trash::is_inside_trash(home_trash, uid, r))
+        && let Some(key) = id(want)
         && let Some(&i) = rows.iter().find(|&&i| id(&l.path(i)) == Some(key))
     {
         return l.trashed(i).ok_or_else(|| unreadable.to_string());
     }
     // Where it came from. The record has the real folder, which a link in `want` would hide.
-    let real = want.parent().and_then(|p| std::fs::canonicalize(p).ok()).zip(want.file_name()).map(|(p, n)| p.join(n));
     let latest = rows.iter().filter(|&&i| l.original(i).is_some_and(|o| o == want || Some(o) == real.as_deref())).max_by_key(|&&i| (l.trash_info(i).and_then(|t| t.deleted), i));
     match latest {
         Some(&i) => l.trashed(i).ok_or_else(|| unreadable.to_string()),
@@ -900,6 +935,77 @@ mod tests {
         // After `--`, a name starting with a dash is a path.
         std::fs::write(t.env.cwd.join("-n"), b"").unwrap();
         assert_eq!(t.run("info", &["--", "-n"]).0, 0);
+    }
+
+    #[test]
+    fn an_empty_or_dot_path_never_trashes_the_current_folder() {
+        let mut t = setup();
+        std::fs::write(t.env.cwd.join("keep"), b"").unwrap();
+        for arg in ["", ".", "./", "..", "../", "sub/.", "sub/.."] {
+            let (code, out, err) = t.run("trash", &[arg]);
+            assert_eq!((code, out.as_str()), (1, ""), "{arg:?}");
+            assert!(err.contains("usage: gannet trash"), "{arg:?}: {err}");
+        }
+        assert_eq!(t.run("info", &[""]).0, 1);
+        assert_eq!(t.run("restore", &[""]).0, 1);
+        assert!(t.env.cwd.join("keep").exists());
+        assert!(std::fs::read_dir(t.root().join("data/Trash/files")).map_or(true, |mut d| d.next().is_none()));
+        // A name that only starts with dots is a name.
+        std::fs::write(t.env.cwd.join("..x"), b"").unwrap();
+        assert_eq!(t.run("trash", &["..x"]).0, 0);
+    }
+
+    #[test]
+    fn restored_lists_only_what_came_back() {
+        let mut t = setup();
+        let a = t.env.cwd.join("a.txt");
+        std::fs::write(&a, b"first").unwrap();
+        t.run("trash", &["a.txt"]);
+        std::fs::write(&a, b"second").unwrap();
+        t.run("trash", &["a.txt"]);
+        let files = t.root().join("data/Trash/files");
+        let (one, two) = (files.join("a.txt"), files.join("a.2.txt"));
+        let (code, v) = t.json("restore", &[one.to_str().unwrap(), two.to_str().unwrap()]);
+        assert_eq!(code, 1);
+        let restored = v.get("restored").arr();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].get("trash_path").s(), one.to_str().unwrap());
+        assert!(v.get("errors").arr()[0].get("path").s().ends_with("/work/a.txt"));
+        assert!(two.exists());
+    }
+
+    #[test]
+    fn a_hard_link_outside_the_trash_isnt_the_trashed_item() {
+        let mut t = setup();
+        std::fs::write(t.env.cwd.join("a.txt"), b"x").unwrap();
+        std::fs::hard_link(t.env.cwd.join("a.txt"), t.env.cwd.join("b.txt")).unwrap();
+        t.run("trash", &["a.txt"]);
+        let (code, _, err) = t.run("restore", &["b.txt"]);
+        assert_eq!(code, 1);
+        assert!(err.ends_with("b.txt: Not in the Trash\n"), "{err}");
+        assert!(!t.env.cwd.join("a.txt").exists());
+    }
+
+    #[test]
+    fn bad_arguments_with_json_still_print_json_and_a_failed_write_fails() {
+        let mut t = setup();
+        let (code, v) = t.json("list", &["--sort", "colour"]);
+        assert_eq!(code, 1);
+        assert!(matches!(v.get("errors").arr()[0].get("path"), V::Null));
+        assert!(v.get("errors").arr()[0].get("message").s().starts_with("--sort takes name, size or modified"));
+        struct Full;
+        impl Write for Full {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from_raw_os_error(libc::ENOSPC))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        std::fs::write(t.env.cwd.join("a"), b"").unwrap();
+        let mut err = Vec::new();
+        assert_eq!(run(&mut t.env, "list", &[], &mut Full, &mut err), 1);
+        assert!(String::from_utf8(err).unwrap().starts_with("gannet list: couldn't write the output: "));
     }
 
     #[test]
