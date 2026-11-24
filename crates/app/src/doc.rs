@@ -10,11 +10,12 @@ pub const MAGIC: &[u8; 4] = b"GNPD";
 pub const TEXT_LIMIT: usize = 128 * 1024;
 /// A zero byte this near the start means it isn't text, as git decides.
 const BINARY_WITHIN: usize = 8000;
-/// More than the decoder could ever write for `TEXT_LIMIT` of text, so anything bigger is refused.
-pub const MAX_ENCODED: usize = 8 * TEXT_LIMIT + 1024;
 /// The most table cells a document keeps. Short rows are filled out to the header's width, so a
 /// few bytes of text can make many cells, and each takes more room written out than it did as text.
 const MAX_CELLS: usize = TEXT_LIMIT / 4;
+/// More than the decoder could ever write for `TEXT_LIMIT` of text, so anything bigger is refused:
+/// eight times the text, and room for every cell with a span, whatever the text was.
+pub const MAX_ENCODED: usize = 8 * TEXT_LIMIT + MAX_CELLS * 16 + 1024;
 
 /// How a run of words looks. These combine.
 pub const BOLD: u8 = 1;
@@ -154,10 +155,10 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
     let mut aligns: Vec<Align> = Vec::new();
     let mut column = 0usize;
     let mut starts = Starts::Nothing;
-    // Past `MAX_CELLS`, the rest of the tables' cells, and what's in them, are left out.
-    // pulldown-cmark stops filling out rows after a while too, and then gives the rest of the
-    // table's lines as paragraphs, which are kept.
-    let (mut cells, mut dropping) = (0usize, false);
+    // A row that would take the cells past `MAX_CELLS` is left out, words and all, and so is every
+    // row after it. pulldown-cmark stops filling out rows after a while too, and then gives the
+    // rest of the table's lines as paragraphs, which are kept.
+    let (mut cells, mut dropping, mut row_left_out) = (0usize, false, false);
     let mut cut = cut;
     for event in Parser::new_ext(text, options) {
         if dropping && matches!(event, Event::Text(_) | Event::Code(_) | Event::SoftBreak | Event::HardBreak) {
@@ -221,11 +222,12 @@ pub fn markdown(text: &str, cut: bool) -> Doc {
                 }
                 Tag::TableHead | Tag::TableRow => {
                     column = 0;
+                    row_left_out = cells + aligns.len().max(1) > MAX_CELLS;
                     if starts == Starts::Nothing {
                         starts = Starts::Row;
                     }
                 }
-                Tag::TableCell if cells == MAX_CELLS => (dropping, cut) = (true, true),
+                Tag::TableCell if row_left_out || cells == MAX_CELLS => (dropping, cut) = (true, true),
                 Tag::TableCell => {
                     cells += 1;
                     let align = aligns.get(column).copied().unwrap_or_default();
@@ -618,14 +620,27 @@ mod tests {
         }
         let cells = |doc: &Doc| doc.blocks.iter().filter(|b| matches!(b.kind, Kind::Cell { .. })).count();
         let doc = markdown(&text, false);
-        assert_eq!(cells(&doc), MAX_CELLS);
+        // Whole rows, as many as fit.
+        assert_eq!(cells(&doc), MAX_CELLS / 1000 * 1000);
         assert!(doc.cut, "said to go on past what's shown");
         assert!(encode(&doc).len() <= MAX_ENCODED, "and it goes between the processes");
         // The words of cells left out don't turn up anywhere else, and what follows is still there.
         let doc = markdown(&format!("{text}\nafter\n"), false);
-        assert_eq!(cells(&doc), MAX_CELLS);
+        assert_eq!(cells(&doc), MAX_CELLS / 1000 * 1000);
         assert!(doc.blocks.iter().all(|b| b.kind == Kind::Paragraph || matches!(b.kind, Kind::Cell { .. }) && b.spans.iter().all(|s| s.text == "h" || s.text == "x")), "{:?}", &doc.blocks[MAX_CELLS - 2..]);
         assert_eq!(doc.blocks.last().unwrap().spans, [span(0, "after")]);
+        // As many cells as can be, then the rest of the text as what writes out biggest for its
+        // size: empty bullets.
+        let mut text = format!("{}|\n{}|\n", "|".repeat(1000), "|-".repeat(1000));
+        for _ in 0..40 {
+            text.push_str("|x\n");
+        }
+        while text.len() < TEXT_LIMIT - 2 {
+            text.push_str("-\n");
+        }
+        let doc = markdown(&text, false);
+        assert_eq!(cells(&doc), MAX_CELLS / 1000 * 1000);
+        assert!(encode(&doc).len() <= MAX_ENCODED, "{} bytes", encode(&doc).len());
     }
 
     #[test]

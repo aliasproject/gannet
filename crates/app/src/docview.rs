@@ -633,7 +633,9 @@ pub fn paint(c: &mut Canvas, area: Rect, scroll: i32, layout: &Layout, fonts: &m
             if piece.style & doc::CODE != 0 && among && piece.face == Face::Mono {
                 let w = t.measure(piece.text.trim_end_matches(' ')).ceil() as i32;
                 let h = t.line_height().ceil() as i32;
-                c.rrect(Rect::new(x as i32 - 3, baseline - t.ascent.round() as i32 - 1, w + 6, h + 2), 4, ink.code);
+                // On the header's wash, which is the code colour already, it takes the rules' colour.
+                let fill = if matches!(line.mark, Mark::Table { wash: true, .. }) { ink.rule } else { ink.code };
+                c.rrect(Rect::new(x as i32 - 3, baseline - t.ascent.round() as i32 - 1, w + 6, h + 2), 4, fill);
             }
             t.draw_str(c, &piece.text, x, baseline, color);
             if piece.style & (doc::STRUCK | doc::LINK) != 0 {
