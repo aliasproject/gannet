@@ -274,6 +274,77 @@ brings back the item it replaced. Gannet checks that each item is still the one 
 left there, so if something else has taken its name since, that item is left alone and
 Gannet says so. A merge of two folders, and deleting for good, can't be undone.
 
+## Command line
+
+Scripts and agents can handle files the way the window does, with no display and without
+D-Bus:
+
+    gannet list [--json] [--hidden] [--sort name|size|modified] [--reverse] [FOLDER]
+    gannet info [--json] PATH...
+    gannet trash [--json] PATH...
+    gannet restore [--json] [PATH...]
+
+- `list` lists a folder, or the current one, in the window's order: folders first, then the
+  order last chosen for that folder in the window (see [Sorting](#sorting)), or names A to Z.
+  `--sort` picks an order instead, the way a first press in the window would: names A to Z,
+  sizes biggest first, dates newest first. `--reverse` turns it round. Listing never changes
+  the saved orders. Names starting with a dot are left out unless `--hidden` is given.
+- `info` says what each path is: its kind, size, times and permissions, where a link leads, and
+  for an item in the Trash, where it came from and when it was deleted. Links aren't followed.
+- `trash` moves each path to the Trash, on its own disk when it's not on the home disk, as the
+  window does.
+- `restore` with no paths lists the Trash on every disk. With paths, it puts those items back.
+  A path is an item's path in the Trash or the path it came from. If several items came from
+  the same path, the one deleted last comes back. Restoring never overwrites anything: an item
+  whose place is taken stays in the Trash and that's reported as an error.
+
+A path can also be a `file://` URI. Use `--` before paths that start with `-`. These four
+words are commands, so to open a folder called `list` in the window, run `gannet ./list`.
+
+Without `--json`, the output is for people and may change. The exit code is 0 when everything
+asked for was done and 1 otherwise, including bad arguments. Each error is also written to
+stderr as `gannet COMMAND: PATH: message`. That's for people: a path can hold a newline, so
+read errors from the JSON. `trash` refuses an empty path and one ending in `.` or `..`, as
+`rm` does, and every command refuses an empty path.
+
+### JSON output
+
+With `--json`, each command prints one JSON object on one line. It's stable within a
+`version`. New fields can be added in the same version, so ignore ones you don't know. A
+field is only renamed, removed or changed in meaning with a new version number. Every object
+has:
+
+| Field | |
+|---|---|
+| `version` | `1` |
+| `command` | `"list"`, `"info"`, `"trash"` or `"restore"` |
+| `errors` | `[{"path", "message"}]`, empty on success; `path` is `null` for an error with no path |
+
+Bad arguments give only these three fields, with the reason and the usage in `errors`.
+Otherwise there are more, by command:
+
+| Command | Fields |
+|---|---|
+| `list` | `folder`, `folder_uri`, `sort` (`{"key": "name"\|"size"\|"modified", "descending"}`), `hidden`, `items` |
+| `info` | `items`, one for each path that exists, in order |
+| `trash` | `trashed`: `[{"path", "uri", "trash_path", "trash_uri"}]`, where each item was and where it is now |
+| `restore` with no paths | `items`, everything in the Trash, in the window's order for the Trash |
+| `restore` with paths | `restored`: `[{"path", "uri", "trash_path", "trash_uri"}]`, where each item is now and where it was in the Trash |
+
+Each of `items` has every one of these fields, `null` where it doesn't apply:
+
+| Field | |
+|---|---|
+| `name` | The name. In `restore`'s list, the name it had before it was deleted |
+| `path`, `uri` | Where it is. `path` is text; a name that isn't UTF-8 has `U+FFFD` in place of the bytes that aren't, so use `uri` (exact, percent-encoded) to pass it back |
+| `kind` | `"file"`, `"folder"`, `"symlink"` or `"other"` (devices, pipes and sockets) |
+| `size` | Bytes, for files only |
+| `modified`, `accessed`, `changed`, `created` | Seconds since 1970-01-01 UTC. `created` is `null` where the filesystem doesn't record it |
+| `mode` | Permissions in octal, like `"0644"` |
+| `hidden` | Whether the name starts with a dot |
+| `target`, `target_kind` | For a symlink: where it points, as written, and what's there: `"file"`, `"folder"`, `"other"` or `"missing"` |
+| `trash` | For an item in the Trash: `{"original", "original_uri", "deleted"}`, where it came from and when it was deleted (seconds since 1970). `original` is `null` if its record in the Trash can't be read, and then it can't be restored |
+
 ## Drives
 
 USB sticks, SD cards and other drives you plug in show in the sidebar, whether they're mounted
