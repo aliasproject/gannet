@@ -227,8 +227,8 @@ up without restarting Gannet once the portal starts with one that can.
 
 Right-click a folder, or the empty space in a folder, and choose Open in terminal. Gannet asks
 `xdg-terminal-exec` for it, so it opens whichever terminal `~/.config/xdg-terminals.list` names,
-in that folder. The terminal gets a systemd scope of its own, as apps started from a launcher
-do, so it stays open when Gannet closes. It isn't offered for files, in the Trash or Recent, in
+in that folder. Where a systemd user manager runs, the terminal gets a scope of its own, as apps
+started from a launcher do, so it stays open when Gannet closes. It isn't offered for files, in the Trash or Recent, in
 Open and Save dialogs, or where `xdg-terminal-exec` isn't installed. If the terminal can't
 start, the window says so.
 
