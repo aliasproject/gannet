@@ -111,6 +111,8 @@ pub enum Msg {
     DragDevice { drag: u64, path: PathBuf, device: Option<u64> },
     /// The folders among what was dropped to pin, and how many items weren't folders.
     PinDropped { folders: Vec<PathBuf>, at: Spot, not_folders: usize },
+    /// A row's thumbnail, or that it hasn't one.
+    Thumbnail(crate::thumbs::Done),
 }
 
 #[derive(Clone)]
@@ -283,6 +285,9 @@ const WAYLAND_DRAG_GRACE: Duration = Duration::from_millis(300);
 /// How near the top or bottom of a pin a dragged folder has to be to go between pins rather than
 /// into that pin's folder, in logical pixels. A sidebar row is 30.
 const PIN_EDGE: f64 = 7.0;
+/// A row's thumbnail, square, in logical pixels: a little bigger than the 16-pixel icon it
+/// replaces, in a 26-pixel row.
+pub(crate) const THUMBNAIL_PX: f64 = 20.0;
 
 /// A pin pressed in the sidebar. It opens on the release, unless the pointer moves far enough
 /// first, and then it's carried up or down the pins to put them in another order.
@@ -673,6 +678,9 @@ pub struct App {
     pub(crate) key_is_repeat: bool,
     /// Set when this window is an Open or Save dialog for another program.
     pub chooser: Option<crate::chooser::Chooser>,
+    /// The thumbnails shown in place of pictures' and videos' icons. `None` in the preview
+    /// window, which has no list to show them in.
+    pub thumbs: Option<crate::thumbs::Thumbs>,
 }
 
 struct Cached {
@@ -797,6 +805,7 @@ impl App {
             slow_preview: None,
             key_is_repeat: false,
             chooser: None,
+            thumbs: None,
         }
     }
 
@@ -1269,6 +1278,7 @@ impl App {
                     self.rows.clear();
                     self.selected.clear();
                     self.sel_count = 0;
+                    self.request_thumbnails();
                     self.invalidate_all();
                 }
             }
@@ -1276,7 +1286,17 @@ impl App {
                 if g == self.stater_gen {
                     self.invalidate(self.layout().list);
                     self.invalidate(self.layout().status);
+                    // A row's time can show it's changed since its thumbnail was made.
+                    self.request_thumbnails();
                 }
+            }
+            Msg::Thumbnail(done) => {
+                let path = done.path.clone();
+                if self.thumbs.as_mut().is_some_and(|t| t.on_done(done)) {
+                    self.invalidate_row_of(&path);
+                }
+                // One that was stopped may be back on screen.
+                self.request_thumbnails();
             }
             Msg::Derived { generation, listing, sorted, rows, sort } => {
                 let current = self.listing.as_ref().is_some_and(|l| Arc::ptr_eq(l, &listing));
@@ -1370,8 +1390,54 @@ impl App {
         }
     }
 
+    /// The rows on screen that could have a thumbnail are asked for, and any others waiting for
+    /// one are dropped. Not in the Trash, whose files have to be restored first.
+    pub fn request_thumbnails(&mut self) {
+        if self.thumbs.is_none() {
+            return;
+        }
+        let side = self.px(THUMBNAIL_PX).max(1) as u32;
+        let mut visible = Vec::new();
+        if let Some(l) = self.listing.as_ref().filter(|l| !l.is_trash()) {
+            let first = (self.scroll / self.layout().row_h.max(1) as f64) as usize;
+            for &id in self.rows.iter().skip(first).take(self.row_capacity()) {
+                let kind = l.kind(id);
+                let Some(media) = crate::thumbs::media(kind, l.name(id)) else { continue };
+                // A link's own time isn't its file's.
+                let mtime = match l.stat(id) {
+                    Stat::Known { mtime, .. } if kind == Kind::File => Some(mtime),
+                    _ => None,
+                };
+                visible.push((l.path(id), media, mtime));
+            }
+        }
+        if let Some(t) = self.thumbs.as_mut() {
+            t.want(&visible, side);
+        }
+    }
+
+    /// Draws again the row for this file, if it's on screen.
+    fn invalidate_row_of(&mut self, path: &Path) {
+        let Some(l) = self.listing.clone() else { return };
+        let first = (self.scroll / self.layout().row_h.max(1) as f64) as usize;
+        let found = self.rows.iter().enumerate().skip(first).take(self.row_capacity()).find(|&(_, &id)| l.path(id) == path).map(|(row, _)| row);
+        if let Some(row) = found {
+            self.invalidate_row(row);
+        }
+    }
+
+    /// The picture drawn for a row, if it has one.
+    pub fn thumbnail(&self, l: &Listing, id: u32) -> Option<&Arc<crate::thumbs::Pic>> {
+        crate::thumbs::media(l.kind(id), l.name(id))?;
+        if l.is_trash() {
+            return None;
+        }
+        self.thumbs.as_ref()?.picture(&l.path(id))
+    }
+
     /// Asks for sizes and times of the rows on screen, and a screenful around them.
     pub fn request_stats(&mut self) {
+        self.request_thumbnails();
         let (Some(l), Some(st)) = (self.listing.clone(), self.stater.as_ref()) else { return };
         let row_h = self.layout().row_h.max(1) as f64;
         let cap = self.row_capacity();

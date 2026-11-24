@@ -417,7 +417,14 @@ impl App {
                 let name = listing.name(id);
                 let kind = listing.kind(id);
                 let tint = if kind.is_dirlike() { if selected { co.on_selection } else { co.accent } } else { dim };
-                self.icons.draw(c, icon_for(kind, name), area.x + self.px(14.0), y + (row_h - icon) / 2, icon, tint);
+                // A thumbnail in the icon's place, centred where the icon would be.
+                if let Some(pic) = self.thumbnail(&listing, id) {
+                    let (cx, cy) = (area.x + self.px(14.0) + icon / 2, y + row_h / 2);
+                    let (w, h) = (pic.w as i32, pic.h as i32);
+                    c.image(&pic.rgba, w, h, Rect::new(cx - w / 2, cy - h / 2, w, h));
+                } else {
+                    self.icons.draw(c, icon_for(kind, name), area.x + self.px(14.0), y + (row_h - icon) / 2, icon, tint);
+                }
                 let shown = String::from_utf8_lossy(name);
                 let by = y + ((row_h as f32 + self.text.ascent - self.text.descent) / 2.0).round() as i32;
                 // Recent's and the Trash's rows are each somewhere of their own.

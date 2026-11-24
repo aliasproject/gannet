@@ -81,6 +81,7 @@ At run time, Gannet uses these:
 | `shared-mime-info` | Saying what a file is, like "PDF document" | Previews name types like `application/pdf` |
 | `poppler` (`pdfinfo`, `pdftoppm`) and `bubblewrap` | PDF previews | PDFs say what they are, or show a thumbnailer's picture |
 | Thumbnailers, like `glycin` and `libgsf`, and `bubblewrap` | Previews of HEIC, JPEG XL, SVG, office files and more | Those files say what they are |
+| `ffmpeg` (with `ffprobe`) and `bubblewrap` | Videos' thumbnails in the list | Videos keep their icon |
 
 To add it to your app launcher:
 
@@ -416,6 +417,25 @@ own disks stay out of the way, as udisks2 marks them.
 This goes through udisks2, which most Linux desktops run. Polkit decides what's allowed, and
 asks for a password if the system says to. Before acting on a drive, Gannet checks it's still
 the one you picked, as another stick put in can take the same place.
+
+## Thumbnails
+
+Pictures and videos in the list show a small picture of themselves in place of their icon,
+cut to a square from the middle. The icon shows until the picture is ready, and stays for a
+file that can't be shown. Folders, and anything in the Trash, keep their icons.
+
+Thumbnails are kept in the freedesktop cache (`~/.cache/thumbnails`, or under
+`$XDG_CACHE_HOME`) that other apps share, so one another app made is used, and the ones Gannet
+makes, at the 128-pixel "normal" size, are there for other apps. A file that changes gets a new
+one. A file that can't be made into one is noted in `thumbnails/fail/gannet`, so it isn't tried
+again until it changes or Gannet is updated.
+
+Only the rows on screen get thumbnails, and scrolling past a row drops it from the queue, or
+stops it if it's being made, so scrolling never waits. They're made in the background, two at
+a time, at the lowest CPU priority and a low disk priority. Pictures are read by the preview's sandboxed
+decoder, and ones it can't read, like HEIC and SVG, by the system's thumbnailers. Videos get a
+frame from a tenth of the way in, from `ffmpeg`. Both run as the preview's do (see
+[Sandboxing](#sandboxing)).
 
 ## Preview
 
