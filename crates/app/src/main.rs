@@ -288,7 +288,7 @@ fn main() {
         app.open_selecting(start_dir, names);
     }
     let mut first_frame = true;
-    // What screen readers see, while one is running. Only a file manager window has it yet.
+    // What screen readers see, while one is running.
     let mut a11y = a11y::Link::new();
     #[cfg(feature = "bench")]
     let mut bench = bench::Bench::new(app.viewer);
@@ -389,14 +389,15 @@ fn main() {
                     app.system_bus = Some(address.clone());
                     drives::watch(hub.clone(), address);
                 }
-                // Only a file manager window offers "Set as background", and is served to screen
-                // readers so far.
-                if !app.viewer && app.chooser.is_none() {
-                    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-                    if let Some(address) = gannet_core::bus::session_address(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(), runtime.as_deref()) {
+                // Every window is served to screen readers, and only a file manager window offers
+                // "Set as background".
+                let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+                if let Some(address) = gannet_core::bus::session_address(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(), runtime.as_deref()) {
+                    let manager = !app.viewer && app.chooser.is_none();
+                    if manager {
                         app.session_bus = Some(address.clone());
-                        session::watch(hub.clone(), address, a11y.shared.clone(), std::env::var("AT_SPI_BUS_ADDRESS").ok());
                     }
+                    session::watch(hub.clone(), address, manager, a11y.shared.clone(), std::env::var("AT_SPI_BUS_ADDRESS").ok());
                 }
             }
             let mut missing = app.text.take_missing();

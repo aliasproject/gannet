@@ -26,6 +26,29 @@ pub const SIDEBAR: u64 = 2;
 pub const LIST: u64 = 3;
 pub const BACK: u64 = 4;
 pub const PLACE0: u64 = 100;
+// The Open and Save dialog's bar. Its file types are by their place among the request's.
+pub const CHOOSER_ACCEPT: u64 = 20;
+pub const CHOOSER_CANCEL: u64 = 21;
+pub const CHOOSER_SAVE_NAME: u64 = 22;
+pub const CHOOSER_INFO: u64 = 23;
+pub const CHOOSER_TYPES: u64 = 24;
+pub const CHOOSER_TYPE0: u64 = 1 << 16;
+// The preview window.
+pub const PREVIEW: u64 = 50;
+pub const PREVIEW_NAME: u64 = 51;
+pub const PREVIEW_KIND: u64 = 52;
+pub const PREVIEW_SHOWS: u64 = 53;
+pub const PREVIEW_PREVIOUS: u64 = 54;
+pub const PREVIEW_NEXT: u64 = 55;
+pub const PREVIEW_CLOSE: u64 = 56;
+// The Open With window. Its apps and headings are numbered from `OPEN_WITH_ROW0`, each keeping
+// its number while the window is open.
+pub const OPEN_WITH_SEARCH: u64 = 60;
+pub const OPEN_WITH_APPS: u64 = 61;
+pub const OPEN_WITH_ALWAYS: u64 = 62;
+pub const OPEN_WITH_CANCEL: u64 = 63;
+pub const OPEN_WITH_OPEN: u64 = 64;
+pub const OPEN_WITH_ROW0: u64 = 1 << 20;
 // A menu or dialog open over the window, and the dialog's parts. A menu's items and a dialog's
 // buttons are by their place in it, and the rename dialog's names by theirs.
 pub const MENU: u64 = 30;
@@ -51,6 +74,10 @@ pub enum Role {
     CheckBox,
     /// A line of text that can be typed in. Its text is the node's `field`.
     Entry,
+    Label,
+    Heading,
+    /// What the preview window shows.
+    Document,
     /// A dialog that asks before going on, like whether to delete for good.
     Alert,
     /// A passphrase being typed. Its `field` has a dot for each character, never the text.
@@ -428,25 +455,41 @@ pub struct Link {
     dir: Arc<PathBuf>,
     era: u64,
     here: Arc<Here>,
+    no_rows: Rows,
 }
 
 impl Link {
     pub fn new() -> Self {
-        Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0, here: Arc::default() }
+        Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0, here: Arc::default(), no_rows: Rows::default() }
     }
 
-    /// Hands the server a snapshot if anything changed. Costs nothing while no one listens.
+    /// Hands the server a snapshot of the app's window if anything changed. Costs nothing
+    /// while no one listens.
     pub fn update(&mut self, app: &mut App) {
+        if self.listening() {
+            let snap = self.build(app);
+            self.offer(snap);
+        }
+    }
+
+    /// Whether a screen reader is listening, so a snapshot is wanted. Forgets the last one
+    /// when not, and when a new server started, which is sent the next one whole.
+    pub fn listening(&mut self) -> bool {
         if !self.shared.is_live() {
             self.last = None;
-            return;
+            return false;
         }
         let epoch = self.shared.current_epoch();
         if epoch != self.epoch {
             self.epoch = epoch;
             self.last = None;
         }
-        let snap = self.build(app);
+        true
+    }
+
+    /// Hands the server a snapshot built elsewhere, as the Open With window's is, if it isn't
+    /// the same as the last. Ask `listening` first.
+    pub fn offer(&mut self, snap: Snapshot) {
         if self.last.as_ref() == Some(&snap) {
             return;
         }
@@ -456,7 +499,15 @@ impl Link {
         self.last = Some(snap);
     }
 
+    /// No rows, the same each time, so a window without a file list compares as unchanged.
+    pub fn no_rows(&self) -> Rows {
+        self.no_rows.clone()
+    }
+
     pub(crate) fn build(&mut self, app: &mut App) -> Snapshot {
+        if app.viewer {
+            return self.build_viewer(app);
+        }
         if *self.dir != app.dir {
             self.dir = Arc::new(app.dir.clone());
             self.era += 1;
@@ -508,6 +559,17 @@ impl Link {
             Some(e) if app.cursor_shown => Focus::Row(e),
             _ => Focus::Node(LIST),
         };
+        if let Some(c) = app.chooser.as_ref() {
+            // A dialog for another program, named for what it asked, and where it is.
+            fixed[0].role = Role::Dialog;
+            fixed[0].name = format!("{} - {title}", c.spec.title());
+            let parts = app.a11y_chooser_parts();
+            fixed[0].children.extend(parts.iter().filter(|n| n.parent == FRAME).map(|n| n.id));
+            if parts.iter().any(|n| n.id == CHOOSER_SAVE_NAME && n.field.is_some()) && app.a11y_name_has_keyboard() {
+                focus = Focus::Node(CHOOSER_SAVE_NAME);
+            }
+            fixed.extend(parts);
+        }
         // What's open over the window, drawn last: a menu, then a dialog, which has the keyboard
         // if both are open.
         let mut modal = None;
@@ -519,6 +581,41 @@ impl Link {
         }
         Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone(), modal }
     }
+
+    /// The preview window: the file's name, its kind and what's shown of it, and buttons to
+    /// walk its folder and close it.
+    fn build_viewer(&mut self, app: &App) -> Snapshot {
+        let s = app.a11y_preview();
+        let r = Rect::new(0, 0, app.w, app.h);
+        let fixed = vec![
+            Node::new(FRAME, Role::Frame, if s.name.is_empty() { "Preview".to_string() } else { format!("{} - Preview", s.name) }, r, 0).with_children(vec![PREVIEW, PREVIEW_PREVIOUS, PREVIEW_NEXT, PREVIEW_CLOSE]),
+            // What has the keyboard, so moving to another file reads out its name, and the rest
+            // is there to be read.
+            Node::new(PREVIEW, Role::Document, s.name.clone(), s.area, FRAME).described([s.kind.as_str(), s.shows.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ")).with_children(vec![PREVIEW_NAME, PREVIEW_KIND, PREVIEW_SHOWS]),
+            Node::new(PREVIEW_NAME, Role::Label, s.name, s.title, PREVIEW),
+            Node::new(PREVIEW_KIND, Role::Label, s.kind, s.area, PREVIEW),
+            Node::new(PREVIEW_SHOWS, Role::Label, s.shows, s.foot, PREVIEW),
+            // Placed as the keys that do the same: there are no buttons on screen.
+            Node::new(PREVIEW_PREVIOUS, Role::PushButton, "Previous file", Rect::default(), FRAME).enabled(s.can_step.0).doing(click("Show the previous file in the folder", "Left")),
+            Node::new(PREVIEW_NEXT, Role::PushButton, "Next file", Rect::default(), FRAME).enabled(s.can_step.1).doing(click("Show the next file in the folder", "Right")),
+            Node::new(PREVIEW_CLOSE, Role::PushButton, "Close", Rect::default(), FRAME).doing(click("Close the preview", "Escape")),
+        ];
+        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone(), modal: None }
+    }
+}
+
+/// What the preview window says about the file it shows.
+pub struct PreviewText {
+    pub name: String,
+    /// Its kind, like "PNG image".
+    pub kind: String,
+    /// What's shown of it: a picture's size, a document's lines, or why it can't be shown.
+    pub shows: String,
+    pub title: Rect,
+    pub area: Rect,
+    pub foot: Rect,
+    /// Whether there's a file before it and after it.
+    pub can_step: (bool, bool),
 }
 
 /// The menu open, if one is: its parts, the menu first, and the part with the keyboard. That's

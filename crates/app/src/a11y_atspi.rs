@@ -61,6 +61,7 @@ const STATE_VISIBLE: u32 = 30;
 const STATE_MANAGES_DESCENDANTS: u32 = 31;
 const STATE_IS_DEFAULT: u32 = 39;
 const STATE_CHECKABLE: u32 = 41;
+const STATE_READ_ONLY: u32 = 43;
 
 // AtspiLive: how urgently an announcement is to be made.
 const POLITE: i32 = 1;
@@ -210,6 +211,9 @@ fn role_of(r: Role) -> (u32, &'static str) {
         Role::PushButton => (43, "push button"),
         Role::CheckBox => (7, "check box"),
         Role::Entry => (79, "entry"),
+        Role::Label => (29, "label"),
+        Role::Heading => (83, "heading"),
+        Role::Document => (82, "document frame"),
         Role::Alert => (2, "alert"),
         Role::PasswordText => (40, "password text"),
         Role::Menu => (33, "menu"),
@@ -430,6 +434,7 @@ impl Ctx {
                     Role::Entry => on.extend([STATE_FOCUSABLE, STATE_EDITABLE, STATE_SINGLE_LINE]),
                     Role::PasswordText => on.extend([STATE_FOCUSABLE, STATE_EDITABLE, STATE_SINGLE_LINE]),
                     Role::MenuItem => on.extend([STATE_SELECTABLE, STATE_FOCUSABLE]),
+                    Role::Document => on.extend([STATE_FOCUSABLE, STATE_READ_ONLY]),
                     Role::List if n.id == a11y::LIST => on.extend([STATE_FOCUSABLE, STATE_MULTISELECTABLE, STATE_MANAGES_DESCENDANTS]),
                     Role::List => on.push(STATE_FOCUSABLE),
                     _ => {}
@@ -595,6 +600,11 @@ impl Ctx {
                         self.hub.send(Msg::A11y(Act::Focus(n.id)));
                         true
                     }
+                    // An entry, or an item of another list, which moving to picks.
+                    Target::Fixed(n) if matches!(n.role, Role::Entry | Role::ListItem) && n.enabled => {
+                        self.hub.send(Msg::A11y(Act::Focus(n.id)));
+                        true
+                    }
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -690,13 +700,17 @@ impl Ctx {
             "SelectChild" => {
                 // Selecting a row adds it to the selection, as Ctrl+click does, leaving the
                 // rest and the cursor as they are; selecting a place opens it, as clicking one
-                // does.
+                // does; and in the other lists, which pick one thing, it picks it.
                 let ok = match i {
                     Some(at) if n.id == a11y::LIST => snap.rows.entry(at).is_some_and(|e| self.tell_row(snap, e, |d, k| Act::SelectRow(d, k, true))),
                     Some(at) if n.id == a11y::SIDEBAR && at < n.children.len() => {
                         self.hub.send(Msg::A11y(Act::OpenPlace(at)));
                         true
                     }
+                    Some(at) => n.children.get(at).and_then(|&c| snap.get(c)).filter(|c| c.role == Role::ListItem && c.enabled).is_some_and(|c| {
+                        self.hub.send(Msg::A11y(Act::Focus(c.id)));
+                        true
+                    }),
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -753,6 +767,9 @@ impl Ctx {
             // is in the list. A screen reader asking still hears it.
             if o.selected != n.selected && n.parent != a11y::SIDEBAR {
                 state(&path, "selected", n.selected);
+                if n.role == Role::ListItem {
+                    self.event(&fixed_path(n.parent), OBJECT_EVENT, "SelectionChanged", ("", 0), Variant::from(0i32));
+                }
             }
         }
         // Parts coming and going: places, and the Open With window's apps as a search narrows
