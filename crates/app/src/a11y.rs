@@ -17,14 +17,21 @@ use std::sync::{Arc, Mutex};
 
 use gannet_core::listing::Listing;
 
-use crate::app::App;
+use crate::app::{App, Edit};
 use crate::canvas::Rect;
+use crate::field::Field;
 
 /// Ids of the window's fixed parts. Places are by their place in the sidebar.
 pub const FRAME: u64 = 1;
 pub const SIDEBAR: u64 = 2;
 pub const LIST: u64 = 3;
 pub const BACK: u64 = 4;
+/// The typed path, while it's open.
+pub const PATH_FIELD: u64 = 5;
+/// The box that filters the list or searches below, while it's showing.
+pub const FILTER: u64 = 6;
+/// The field a row is renamed in, or a new folder named in.
+pub const NAME_FIELD: u64 = 7;
 pub const PLACE0: u64 = 100;
 // The Open and Save dialog's bar. Its file types are by their place among the request's.
 pub const CHOOSER_ACCEPT: u64 = 20;
@@ -145,6 +152,65 @@ impl Node {
 /// A push button's action.
 pub const fn click(description: &'static str, keys: &'static str) -> Action {
     Action::new("click", description, keys)
+}
+
+/// Where a field's characters are drawn, for a screen reader that shows or magnifies them.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TextGeometry {
+    /// The text, its width, and how far from its start each character's left edge is, and the
+    /// last one's right edge. Measured once for each text and size: the field scrolling with
+    /// its caret only moves it.
+    measured: Arc<(String, f32, Vec<f32>)>,
+    /// The left edge of each character, and the right edge of the last.
+    pub edges: Vec<i32>,
+    /// The line the text is on.
+    pub line: Rect,
+}
+
+impl TextGeometry {
+    /// Where a field's characters are, its text starting at `x0` on `line`. The measuring is
+    /// kept from `prev` while the text and its width are the same, so a field scrolling with its
+    /// caret only moves them, and a new scale or font measures them again. Measuring up to each
+    /// character, as the caret is placed, takes time in proportion to the square of the length,
+    /// so a longer text, such as a deep path, is measured a character at a time. That can be a
+    /// pixel or two off where letters kern.
+    pub fn measure(text: &mut crate::text::Text, f: &Field, x0: f32, line: Rect, prev: Option<&TextGeometry>) -> Self {
+        let width = text.measure(&f.text);
+        let measured = match prev.map(|g| &g.measured).filter(|m| m.0 == f.text && m.1 == width) {
+            Some(m) => m.clone(),
+            None => {
+                let s = &f.text;
+                let mut offsets = vec![0.0];
+                if s.len() <= 128 {
+                    offsets.extend(s.char_indices().map(|(i, c)| text.measure(&s[..i + c.len_utf8()])));
+                } else {
+                    let mut x = 0.0;
+                    for c in s.chars() {
+                        x += text.measure(c.encode_utf8(&mut [0; 4]));
+                        offsets.push(x);
+                    }
+                }
+                Arc::new((s.clone(), width, offsets))
+            }
+        };
+        let edges = measured.2.iter().map(|o| (x0 + o).round() as i32).collect();
+        TextGeometry { measured, edges, line }
+    }
+
+    /// A character's box, or an empty box at the end, past the last one.
+    pub fn char_rect(&self, at: usize) -> Rect {
+        let last = self.edges.len().saturating_sub(1);
+        let (a, b) = (self.edges.get(at.min(last)).copied().unwrap_or(0), self.edges.get((at + 1).min(last)).copied().unwrap_or(0));
+        Rect::new(a, self.line.y, b - a, self.line.h)
+    }
+
+    /// The character at a point on the line, if there's one there.
+    pub fn char_at(&self, x: i32, y: i32) -> Option<usize> {
+        if y < self.line.y || y >= self.line.y + self.line.h {
+            return None;
+        }
+        self.edges.windows(2).position(|e| x >= e[0] && x < e[1])
+    }
 }
 
 /// The folder shown, and what's needed to say where a row of Recent, the Trash or a search is.
@@ -290,12 +356,38 @@ pub struct Snapshot {
     pub window_focused: bool,
     /// The folder shown.
     pub dir: Arc<PathBuf>,
+    /// Where each field's characters are, by the field's id. A field with none has no boxes.
+    pub text_geometry: Vec<(u64, Arc<TextGeometry>)>,
+    /// Which field is open, as `App::edit_gen` counts them: a request about one since closed
+    /// is dropped.
+    pub edit_gen: u64,
 }
 
 impl Snapshot {
     pub fn get(&self, id: u64) -> Option<&Node> {
         self.fixed.iter().find(|n| n.id == id)
     }
+
+    pub fn geometry(&self, id: u64) -> Option<&TextGeometry> {
+        self.text_geometry.iter().find(|(i, _)| *i == id).map(|(_, g)| &**g)
+    }
+}
+
+/// A change a screen reader asks of a field. Offsets are in characters, as AT-SPI counts.
+#[derive(Clone, PartialEq, Debug)]
+pub enum TextEdit {
+    /// Move the caret, leaving nothing selected.
+    Caret(usize),
+    /// Select from the first to the second.
+    Select(usize, usize),
+    /// Put the text in place of the characters between the two, as typing over them does.
+    Replace(usize, usize, String),
+    /// Copy the characters between the two to the clipboard.
+    Copy(usize, usize),
+    /// Copy them, then delete them.
+    Cut(usize, usize),
+    /// Paste the clipboard at a place.
+    Paste(usize),
 }
 
 /// Something a screen reader asked for.
@@ -317,6 +409,9 @@ pub enum Act {
     SelectRow(Arc<PathBuf>, Vec<u8>, bool),
     /// Scroll a row into view without moving the cursor.
     ShowRow(Arc<PathBuf>, Vec<u8>),
+    /// Change a field's text, caret or selection, through what typing in it does. The number
+    /// is the snapshot's `edit_gen`.
+    EditText(u64, u64, TextEdit),
     /// Someone started listening: hand over a snapshot.
     Wake,
 }
@@ -408,7 +503,7 @@ impl Link {
 
     /// Hands the server a snapshot of the app's window if anything changed. Costs nothing
     /// while no one listens.
-    pub fn update(&mut self, app: &App) {
+    pub fn update(&mut self, app: &mut App) {
         if self.listening() {
             let snap = self.build(app);
             self.offer(snap);
@@ -442,12 +537,18 @@ impl Link {
         self.last = Some(snap);
     }
 
+    /// Where a field's characters were in the last snapshot handed over, so a window building
+    /// its own needn't measure them again while its text is the same.
+    pub fn geometry(&self, id: u64) -> Option<&TextGeometry> {
+        self.last.as_ref().and_then(|s| s.geometry(id))
+    }
+
     /// No rows, the same each time, so a window without a file list compares as unchanged.
     pub fn no_rows(&self) -> Rows {
         self.no_rows.clone()
     }
 
-    fn build(&mut self, app: &App) -> Snapshot {
+    pub(crate) fn build(&mut self, app: &mut App) -> Snapshot {
         if app.viewer {
             return self.build_viewer(app);
         }
@@ -491,15 +592,26 @@ impl Link {
         let b = app.px(36.0);
         // As the window's title says it, so Recent and the Trash are called that.
         let title = app.crumb_label(&app.dir);
+        let fields = Self::fields(app);
+        // In the order they're drawn: the toolbar, the sidebar, then the list and what's on it.
+        let mut frame_kids = vec![BACK];
+        frame_kids.extend(fields.iter().filter(|n| n.id != NAME_FIELD).map(|n| n.id));
+        frame_kids.extend([SIDEBAR, LIST]);
+        frame_kids.extend(fields.iter().filter(|n| n.id == NAME_FIELD).map(|n| n.id));
         let mut fixed = vec![
-            Node::new(FRAME, Role::Frame, format!("{title} - Gannet"), Rect::new(0, 0, app.w, app.h), 0).with_children(vec![BACK, SIDEBAR, LIST]),
+            Node::new(FRAME, Role::Frame, format!("{title} - Gannet"), Rect::new(0, 0, app.w, app.h), 0).with_children(frame_kids),
             Node::new(BACK, Role::PushButton, "Back", Rect::new(app.px(6.0), 0, b, l.toolbar.h), FRAME).enabled(app.history.can_go_back()).doing(click("Go back", "<Alt>Left")),
             Node::new(SIDEBAR, Role::List, "Places", l.sidebar, FRAME).with_children(places.iter().map(|n| n.id).collect()),
             Node::new(LIST, Role::List, "Files", l.list, FRAME),
         ];
         fixed.extend(places);
-        let mut focus = match rows.entry(app.cursor) {
-            Some(e) if app.cursor_shown => Focus::Row(e),
+        // The filter box can show what it filters by without being typed in.
+        let typing = fields.iter().map(|n| n.id).find(|&id| id != FILTER || matches!(app.edit, Edit::Filter(_)));
+        fixed.extend(fields);
+        let mut focus = match (typing, rows.entry(app.cursor)) {
+            // A field being typed in has the keyboard.
+            (Some(id), _) => Focus::Node(id),
+            (None, Some(e)) if app.cursor_shown => Focus::Row(e),
             _ => Focus::Node(LIST),
         };
         if let Some(c) = app.chooser.as_ref() {
@@ -513,7 +625,54 @@ impl Link {
             }
             fixed.extend(parts);
         }
-        Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone() }
+        // Where every field's characters are, the Save dialog's name among them. Each is drawn by
+        // `paint_field` in its node's box.
+        let mut text_geometry = Vec::new();
+        for n in &fixed {
+            let Some(f) = n.field.as_ref() else { continue };
+            let prev = self.last.as_ref().and_then(|s| s.geometry(n.id));
+            let x0 = app.field_text_x(n.rect, f);
+            let line = app.field_line(n.rect);
+            text_geometry.push((n.id, Arc::new(TextGeometry::measure(&mut app.text, f, x0, line, prev))));
+        }
+        Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry, edit_gen: app.edit_gen() }
+    }
+
+    /// The text fields of the file manager's own window showing.
+    fn fields(app: &mut App) -> Vec<Node> {
+        let mut out = Vec::new();
+        let list = app.layout().list;
+        let mut add = |id, name: String, description: &str, rect: Rect, f: Field| {
+            // The row being renamed can be scrolled out of view.
+            let showing = id != NAME_FIELD || rect.intersects(list);
+            let mut n = Node::new(id, Role::Entry, name, rect, FRAME).described(description).showing(showing);
+            n.field = Some(f);
+            out.push(n);
+        };
+        if let Edit::Path(f) = &app.edit {
+            let f = f.clone();
+            add(PATH_FIELD, "Path".into(), "Enter a full path, starting with / or ~", app.path_box(), f);
+        }
+        if let Some(r) = app.filter_rect() {
+            let f = match &app.edit {
+                Edit::Filter(f) => f.clone(),
+                _ => Field::new(&app.filter),
+            };
+            // Named for what it does, and described as its empty box says it.
+            let (name, hint) = if app.search_below { ("Search", "Search here and below") } else { ("Filter", "Filter this folder") };
+            add(FILTER, name.into(), hint, r, f);
+        }
+        let named = match &app.edit {
+            Edit::Rename { field, name, .. } => Some((field.clone(), format!("Rename {}", String::from_utf8_lossy(name)))),
+            Edit::NewFolder(field) => Some((field.clone(), "New folder name".to_string())),
+            _ => None,
+        };
+        if let Some((f, name)) = named
+            && let Some(r) = app.name_field_rect()
+        {
+            add(NAME_FIELD, name, "", r, f);
+        }
+        out
     }
 
     /// The preview window: the file's name, its kind and what's shown of it, and buttons to
@@ -534,7 +693,7 @@ impl Link {
             Node::new(PREVIEW_NEXT, Role::PushButton, "Next file", Rect::default(), FRAME).enabled(s.can_step.1).doing(click("Show the next file in the folder", "Right")),
             Node::new(PREVIEW_CLOSE, Role::PushButton, "Close", Rect::default(), FRAME).doing(click("Close the preview", "Escape")),
         ];
-        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone() }
+        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry: Vec::new(), edit_gen: 0 }
     }
 }
 
@@ -570,6 +729,16 @@ mod tests {
         assert!(!r.showing(0), "scrolled out of view above");
         assert!(r.showing(1), "partly in view");
         assert!(r.showing(11) && !r.showing(12), "the list is 200 high");
+    }
+
+    #[test]
+    fn a_fields_characters_are_found_by_place() {
+        let g = TextGeometry { measured: Arc::default(), edges: vec![10, 17, 25, 31], line: Rect::new(0, 20, 100, 16) };
+        assert_eq!(g.char_rect(1), Rect::new(17, 20, 8, 16));
+        assert_eq!(g.char_rect(3), Rect::new(31, 20, 0, 16), "past the end, an empty box");
+        assert_eq!(g.char_at(17, 20), Some(1));
+        assert_eq!(g.char_at(30, 35), Some(2));
+        assert_eq!((g.char_at(31, 25), g.char_at(9, 25), g.char_at(12, 36)), (None, None, None), "beside the text, or below the line");
     }
 
     #[test]

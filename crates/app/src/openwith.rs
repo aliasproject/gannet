@@ -24,7 +24,7 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
 use rustix::fd::OwnedFd;
 use xkbcommon::xkb::keysyms as k;
 
-use crate::a11y::{self, Act, Node, Role};
+use crate::a11y::{self, Act, Node, Role, TextEdit};
 use crate::app::{Hub, Msg};
 use crate::canvas::{Canvas, Rect};
 use crate::field::Field;
@@ -556,7 +556,7 @@ impl Window {
     /// What screen readers see: the search box, the apps under their headings with the
     /// default marked, and the buttons. The app picked has the keyboard, as its row is where
     /// the arrows move.
-    fn a11y_snapshot(&mut self, rows: a11y::Rows) -> a11y::Snapshot {
+    fn a11y_snapshot(&mut self, rows: a11y::Rows, prev: Option<&a11y::TextGeometry>) -> a11y::Snapshot {
         let l = self.layout();
         let (tops, _) = self.row_tops();
         let full = Rect::new(0, 0, self.w, self.h);
@@ -595,7 +595,14 @@ impl Window {
         fixed[0].children.extend([a11y::OPEN_WITH_CANCEL, a11y::OPEN_WITH_OPEN]);
         fixed.push(Node::new(a11y::OPEN_WITH_CANCEL, Role::PushButton, "Cancel", l.cancel, a11y::FRAME).doing(a11y::click("Close without opening", "Escape")));
         fixed.push(Node::new(a11y::OPEN_WITH_OPEN, Role::PushButton, "Open", l.open, a11y::FRAME).enabled(can).doing(a11y::click("Open with the app picked", "Return")));
-        a11y::Snapshot { fixed, rows, focus, window_focused: self.has_keyboard, dir: Arc::default() }
+        // Where the search's characters are, as `paint_search` places them.
+        let f = &self.picker.search;
+        let (r, line_h) = (l.search, self.text.line_height() as i32);
+        let shift = (self.text.measure(&f.text[..f.caret]) - (r.w - self.px(16.0)) as f32 + 2.0).max(0.0);
+        let x0 = (r.x + self.px(8.0)) as f32 - shift;
+        let line = Rect::new(r.x, r.y + (r.h - line_h) / 2, r.w, line_h);
+        let geometry = a11y::TextGeometry::measure(&mut self.text, f, x0, line, prev);
+        a11y::Snapshot { fixed, rows, focus, window_focused: self.has_keyboard, dir: Arc::default(), text_geometry: vec![(a11y::OPEN_WITH_SEARCH, Arc::new(geometry))], edit_gen: 0 }
     }
 
     /// Does what a screen reader asked, as the pointer would.
@@ -617,8 +624,23 @@ impl Window {
                     self.reveal();
                 }
             }
-            // Typing in the search box through a screen reader comes with the text fields' own
-            // requests, which need routing here once they exist.
+            // Typing in the search box through a screen reader, as on the keyboard: the apps
+            // shown follow the text. The window has no clipboard, as Ctrl+C, X and V do nothing
+            // here, so copying and pasting don't either, and cutting is refused.
+            Act::EditText(a11y::OPEN_WITH_SEARCH, _, op) => {
+                let s = &mut self.picker.search;
+                let before = s.text.clone();
+                match op {
+                    TextEdit::Caret(at) => s.select_chars(at, at),
+                    TextEdit::Select(from, to) => s.select_chars(from, to),
+                    TextEdit::Replace(from, to, with) => s.replace_chars(from, to, &with),
+                    TextEdit::Copy(..) | TextEdit::Cut(..) | TextEdit::Paste(_) => return,
+                }
+                if self.picker.search.text != before {
+                    self.picker.rebuild();
+                    self.reveal();
+                }
+            }
             _ => return,
         }
         self.dirty = true;
@@ -845,7 +867,7 @@ pub fn main() -> ! {
             std::process::exit(0);
         }
         if a11y.listening() {
-            let snap = win.a11y_snapshot(a11y.no_rows());
+            let snap = win.a11y_snapshot(a11y.no_rows(), a11y.geometry(a11y::OPEN_WITH_SEARCH));
             a11y.offer(snap);
         }
         if wl.must_paint() || (win.dirty && wl.can_paint()) {
@@ -1229,13 +1251,13 @@ mod tests {
 
     #[test]
     fn a_screen_reader_sees_the_apps_and_picks_one() {
-        use crate::a11y::{self, Act, Focus, Role};
+        use crate::a11y::{self, Act, Focus, Role, TextEdit};
         let (dir, apps) = installed();
         let db = mime_db(&dir);
         let spec = Spec { types: vec!["text/markdown".into()], offer_always: true, ..Spec::default() };
         let picker = Picker::new(spec, &apps, Some(&db), None);
         let mut w = Window { picker, apps, text: Text::new(crate::text::UI_PX, false), colors: theme::builtin(true), scale: 1.0, w: 520, h: 560, scroll: 0, pointer: (0, 0), hover: Hit::None, last_click: None, dirty: false, finish: None, has_keyboard: true, a11y_ids: HashMap::new() };
-        let snap = w.a11y_snapshot(a11y::Rows::default());
+        let snap = w.a11y_snapshot(a11y::Rows::default(), None);
         let list = snap.get(a11y::OPEN_WITH_APPS).unwrap();
         let items: Vec<(Role, &str, &str)> = list.children.iter().map(|&id| snap.get(id).unwrap()).map(|n| (n.role, n.name.as_str(), n.description.as_str())).collect();
         assert_eq!(items[..3], [(Role::Heading, "For Markdown document", ""), (Role::ListItem, "Notes", "Default"), (Role::ListItem, "Hidden MD", "")]);
@@ -1247,11 +1269,23 @@ mod tests {
         let editor = list.children[3];
         w.picker.search = crate::field::Field::new("edit");
         w.picker.rebuild();
-        let snap = w.a11y_snapshot(a11y::Rows::default());
+        let snap = w.a11y_snapshot(a11y::Rows::default(), None);
         assert_eq!(snap.get(a11y::OPEN_WITH_APPS).unwrap().children[1], editor);
         assert_eq!(snap.focus, Focus::Node(editor));
         w.picker.search = crate::field::Field::default();
         w.picker.rebuild();
+        // Typing in the search through a screen reader narrows the apps, as on the keyboard,
+        // and the search's characters are placed for it.
+        w.a11y_act(Act::EditText(a11y::OPEN_WITH_SEARCH, 0, TextEdit::Replace(0, 0, "edit".into())));
+        assert_eq!((w.picker.search.text.as_str(), w.picker.picked().unwrap().id.as_str()), ("edit", "editor.desktop"));
+        let snap = w.a11y_snapshot(a11y::Rows::default(), None);
+        assert_eq!(snap.geometry(a11y::OPEN_WITH_SEARCH).map(|g| g.edges.len()), Some(5));
+        w.a11y_act(Act::EditText(a11y::OPEN_WITH_SEARCH, 0, TextEdit::Select(0, 2)));
+        assert_eq!(w.picker.search.selection(), (0, 2));
+        w.a11y_act(Act::EditText(a11y::OPEN_WITH_SEARCH, 0, TextEdit::Paste(0)));
+        assert_eq!(w.picker.search.text, "edit", "there's no clipboard here");
+        w.a11y_act(Act::EditText(a11y::OPEN_WITH_SEARCH, 0, TextEdit::Replace(0, usize::MAX, String::new())));
+        assert!(w.picker.search.text.is_empty() && w.picker.rows.len() > 3, "every app again");
         // Moving to an app picks it; ticking and its action open with it.
         w.a11y_act(Act::Focus(notes));
         assert_eq!(w.picker.picked().unwrap().id, "notes.desktop");
