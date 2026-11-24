@@ -430,6 +430,8 @@ pub enum Action {
     SetBackground,
     /// Unpacks the archives selected, each into a folder beside it.
     Extract,
+    /// Opens the person's terminal in the folder selected, or the one on screen.
+    OpenTerminal,
     /// For the pin whose menu it is.
     OpenPin,
     Unpin,
@@ -532,6 +534,8 @@ pub struct App {
     pub session_bus: Option<String>,
     /// Whether the desktop portal can set the background, which "Set as background" needs.
     pub can_set_background: bool,
+    /// How to open a terminal, where `xdg-terminal-exec` is installed.
+    pub terminal: Option<gannet_core::terminal::Terminal>,
     /// The drives udisks2 reported last.
     pub volumes: Vec<Volume>,
     /// The drive a sidebar menu is open for.
@@ -695,6 +699,7 @@ impl App {
             system_bus: None,
             session_bus: None,
             can_set_background: false,
+            terminal: None,
             volumes: Vec::new(),
             drive_menu: None,
             bookmarks: None,
@@ -1563,6 +1568,7 @@ impl App {
             Action::ChooseFilter(i) => self.choose_filter(i),
             Action::ShowInFolder => self.show_in_folder(),
             Action::SetBackground => self.set_background(),
+            Action::OpenTerminal => self.open_terminal(),
             Action::Extract => {
                 if let Some(archives) = self.selected_archives() {
                     self.extract(archives);
@@ -2648,7 +2654,8 @@ impl App {
         Some(Rect::new(l.sidebar.right() - self.px(7.0) - w, self.place_top(i), w, self.px(30.0)))
     }
 
-    /// The list's menu, with "Set as background" after Preview when it applies.
+    /// The list's menu, with "Extract" and "Set as background" after Preview when they apply,
+    /// and "Open in terminal" last.
     fn context_items(&self) -> Vec<MenuItem> {
         let mut items = self.view_menu_items();
         if self.selected_archives().is_some() {
@@ -2659,7 +2666,32 @@ impl App {
             let at = items.iter().position(|m| m.action == Action::Preview).map_or(items.len(), |p| p + 1);
             items.insert(at, MenuItem { label: "Set as background", keys: "", action: Action::SetBackground, enabled: true });
         }
+        if self.terminal_folder().is_some() {
+            items.push(MenuItem { label: "Open in terminal", keys: "", action: Action::OpenTerminal, enabled: true });
+        }
         items
+    }
+
+    /// The folder "Open in terminal" would open in: the one folder selected, or with nothing
+    /// selected, the folder on screen. Only where `xdg-terminal-exec` is installed, and never
+    /// in a chooser, the Trash or Recent, which aren't folders to work in.
+    fn terminal_folder(&self) -> Option<PathBuf> {
+        if self.terminal.is_none() || self.chooser.is_some() || self.viewer || self.is_recent_view() || self.in_trash() {
+            return None;
+        }
+        let l = self.listing.as_ref()?;
+        match self.selected_ids().as_slice() {
+            [] => Some(self.dir.clone()),
+            [one] if l.kind(*one).is_dirlike() => Some(l.path(*one)),
+            _ => None,
+        }
+    }
+
+    fn open_terminal(&mut self) {
+        let (Some(dir), Some(terminal)) = (self.terminal_folder(), self.terminal.as_ref()) else { return };
+        let name = dir.file_name().map_or_else(|| dir.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let hub = self.hub.clone();
+        terminal.open(&dir, move |why| hub.send(Msg::Notice(format!("Couldn't open a terminal in “{name}”: {why}"))));
     }
 
     /// The picture "Set as background" would use: the one file selected, if it's a picture, in
@@ -7442,6 +7474,119 @@ mod tests {
         r.app.on_msg(Msg::CanSetBackground(true));
         r.select("sunset.png");
         assert!(!menu_has_set_as_background(&mut r));
+    }
+
+    /// A stand-in `xdg-terminal-exec` in the rig, which writes the folder it started in and its
+    /// arguments to `terminal.log`, or fails with `exit`.
+    fn stand_in_terminal(r: &mut Rig, exit: i32) -> PathBuf {
+        let bin = r.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = r.root.join("terminal.log");
+        let draft = r.root.join("terminal.draft");
+        fs::write(&draft, format!("#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> '{}'\nexit {exit}\n", log.display())).unwrap();
+        // Written by `install`, so no descriptor open for writing it can leak into another
+        // test's child and make running it fail with "Text file busy".
+        assert!(std::process::Command::new("install").arg("-m755").arg(&draft).arg(bin.join("xdg-terminal-exec")).status().unwrap().success());
+        r.app.terminal = gannet_core::terminal::Terminal::find(Some(bin.as_os_str()), None);
+        assert!(r.app.terminal.is_some());
+        log
+    }
+
+    fn menu_has_open_in_terminal(r: &mut Rig) -> bool {
+        r.app.context_items().iter().any(|m| m.action == Action::OpenTerminal)
+    }
+
+    #[test]
+    fn open_in_terminal_is_offered_for_a_folder_and_the_empty_space() {
+        let mut r = Rig::new("terminal-menu");
+        fs::create_dir(r.work().join("src")).unwrap();
+        fs::create_dir(r.work().join("docs")).unwrap();
+        fs::write(r.work().join("notes.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("src", r.work().join("linked")).unwrap();
+        let w = r.work();
+        r.open(w);
+        assert!(!menu_has_open_in_terminal(&mut r), "not without xdg-terminal-exec");
+        stand_in_terminal(&mut r, 0);
+        let labels: Vec<_> = r.app.context_items().iter().map(|m| m.label).collect();
+        assert_eq!(labels.last(), Some(&"Open in terminal"), "last, on the empty space");
+        for folder in ["src", "linked"] {
+            r.select(folder);
+            assert!(menu_has_open_in_terminal(&mut r), "{folder}");
+        }
+        r.select("notes.txt");
+        assert!(!menu_has_open_in_terminal(&mut r), "not for a file");
+        r.app.select_all();
+        assert!(!menu_has_open_in_terminal(&mut r), "not for several items");
+        r.app.clear_selection();
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        assert!(!menu_has_open_in_terminal(&mut r), "never in an Open or Save dialog");
+        assert!(!r.app.chooser_allows(Action::OpenTerminal));
+    }
+
+    #[test]
+    fn open_in_terminal_is_not_offered_in_the_trash_or_recent() {
+        let mut r = Rig::new("terminal-trash");
+        stand_in_terminal(&mut r, 0);
+        fs::create_dir(r.work().join("old")).unwrap();
+        r.open(r.work());
+        r.select("old");
+        r.key(k::KEY_Delete, "");
+        r.idle();
+        open_trash(&mut r);
+        assert!(!menu_has_open_in_terminal(&mut r), "the Trash's empty space");
+        r.select("old");
+        assert!(!menu_has_open_in_terminal(&mut r), "a folder in the Trash");
+        let recent = r.app.recent_file.clone();
+        fs::create_dir_all(recent.parent().unwrap()).unwrap();
+        fs::write(&recent, "<?xml version=\"1.0\"?><xbel version=\"1.0\"></xbel>").unwrap();
+        r.open(recent);
+        assert!(r.app.is_recent_view());
+        assert!(!menu_has_open_in_terminal(&mut r), "Recent");
+        r.app.action(Action::OpenTerminal);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!r.root.join("terminal.log").exists(), "nothing started from Recent");
+    }
+
+    #[test]
+    fn open_in_terminal_opens_the_folder_selected_or_the_one_on_screen() {
+        let mut r = Rig::new("terminal-open");
+        fs::create_dir(r.work().join("my project")).unwrap();
+        let w = r.work();
+        r.open(w.clone());
+        let log = stand_in_terminal(&mut r, 0);
+        r.select("my project");
+        r.app.action(Action::OpenTerminal);
+        let wait = |n: usize| {
+            let end = Instant::now() + Duration::from_secs(10);
+            while fs::read_to_string(&log).map_or(0, |s| s.lines().count()) < n {
+                assert!(Instant::now() < end, "the terminal wasn't asked for");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait(1);
+        r.app.clear_selection();
+        r.app.action(Action::OpenTerminal);
+        wait(2);
+        let p = w.join("my project");
+        assert_eq!(fs::read_to_string(&log).unwrap(), format!("{}|--dir={}\n{}|--dir={}\n", p.display(), p.display(), w.display(), w.display()));
+        std::thread::sleep(Duration::from_millis(200));
+        while let Ok(m) = r.rx.try_recv() {
+            r.app.on_msg(m);
+        }
+        assert!(r.app.notices.is_empty(), "{:?}", r.app.notices);
+    }
+
+    #[test]
+    fn a_terminal_that_cant_start_says_so() {
+        let mut r = Rig::new("terminal-fails");
+        fs::create_dir(r.work().join("src")).unwrap();
+        let w = r.work();
+        r.open(w);
+        stand_in_terminal(&mut r, 1);
+        r.select("src");
+        r.app.action(Action::OpenTerminal);
+        r.pump_until("the notice", |a| !a.notices.is_empty());
+        assert_eq!(r.app.notices, ["Couldn't open a terminal in “src”: it exited with code 1"]);
     }
 
     #[test]
