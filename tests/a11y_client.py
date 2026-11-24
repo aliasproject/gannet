@@ -82,6 +82,8 @@ def tree():
         "places": [p.get_name() for p in children(places)],
         "rows": [r.get_name() for r in rows],
         "selected": [r.get_name() for r in rows if r.get_state_set().contains(Atspi.StateType.SELECTED)],
+        "selected_at": [i for i, r in enumerate(rows) if r.get_state_set().contains(Atspi.StateType.SELECTED)],
+        "focus_at": [i for i, r in enumerate(rows) if focused(r)],
         "focus": focus,
         "manages_descendants": files.get_state_set().contains(Atspi.StateType.MANAGES_DESCENDANTS),
     }

@@ -69,10 +69,10 @@ type Ref = (String, OwnedObjectPath);
 type CacheItem = (Ref, Ref, Ref, i32, i32, Vec<String>, String, u32, String, Vec<u32>);
 
 /// Serves the app on the accessibility bus at `address` until `shared` is disconnected, the
-/// connection closes or it can't start. Returns the server's number at once; the work is on
-/// threads of its own. `stopped` is called with that number once it has stopped, however it
-/// stopped.
-pub fn start(shared: Arc<Shared>, hub: Hub, address: String, stopped: impl FnOnce(u64) + Send + 'static) -> u64 {
+/// connection closes or it can't start. Returns the server's number at once, or None if its
+/// thread couldn't start; the work is on threads of its own. `stopped` is called with that
+/// number once it has stopped, however it stopped.
+pub fn start(shared: Arc<Shared>, hub: Hub, address: String, stopped: impl FnOnce(u64) + Send + 'static) -> Option<u64> {
     let epoch = shared.next_epoch();
     let spawned = std::thread::Builder::new().name("gannet-a11y".into()).spawn(move || {
         if let Err(e) = run(&shared, epoch, hub, &address) {
@@ -81,10 +81,13 @@ pub fn start(shared: Arc<Shared>, hub: Hub, address: String, stopped: impl FnOnc
         shared.stopped(epoch);
         stopped(epoch);
     });
-    if spawned.is_err() {
-        eprintln!("gannet: accessibility: couldn't start a thread");
+    match spawned {
+        Ok(_) => Some(epoch),
+        Err(e) => {
+            eprintln!("gannet: accessibility: couldn't start a thread: {e}");
+            None
+        }
     }
-    epoch
 }
 
 /// Tells the server its connection closed: the thread following the bus drops it when the
@@ -116,21 +119,30 @@ fn run(shared: &Shared, epoch: u64, hub: Hub, address: &str) -> zbus::Result<()>
         }
         true
     })?;
-    ctx.embed()?;
     if !shared.connect(epoch, tx) {
         return Ok(());
     }
+    // The app is introduced only once there's a snapshot to answer from: the registry and
+    // screen readers ask about it straight away.
     hub.send(Msg::A11y(Act::Wake));
-    let mut old: Option<Arc<Snapshot>> = None;
+    let mut old = loop {
+        match rx.recv() {
+            Ok(ToServer::Snapshot(s)) => break Arc::new(s),
+            // Not introduced yet, so there's nothing to introduce again.
+            Ok(ToServer::Embed) => {}
+            Ok(ToServer::Stop) | Err(_) => return Ok(()),
+            Ok(ToServer::Lost) => return Err(zbus::Error::Failure("lost the accessibility bus".into())),
+        }
+    };
+    *ctx.now.lock().unwrap() = Some(old.clone());
+    ctx.embed()?;
     for m in rx {
         match m {
             ToServer::Snapshot(s) => {
                 let new = Arc::new(s);
                 *ctx.now.lock().unwrap() = Some(new.clone());
-                if let Some(old) = &old {
-                    ctx.emit_changes(old, &new);
-                }
-                old = Some(new);
+                ctx.emit_changes(&old, &new);
+                old = new;
             }
             ToServer::Embed => {
                 if let Err(e) = ctx.embed() {
@@ -169,7 +181,7 @@ fn row_path(era: u64, key: &[u8]) -> String {
     p
 }
 
-/// The folder visit and file name a row's path names.
+/// The folder visit and key a row's path names.
 fn parse_row(rest: &str) -> Option<(u64, Vec<u8>)> {
     let (era, hex) = rest.split_once('_')?;
     if hex.len() % 2 != 0 {
@@ -657,7 +669,7 @@ impl Ctx {
             }
         }
 
-        // Selection, by name. Rows that left the list aren't told they're no longer selected.
+        // Selection, by key. Rows that left the list aren't told they're no longer selected.
         if same_folder {
             let (was, is) = (old.rows.selected_keys(), new.rows.selected_keys());
             let changed: Vec<&Cow<'_, [u8]>> = was.symmetric_difference(&is).filter(|k| new.rows.position_of(k).is_some()).collect();

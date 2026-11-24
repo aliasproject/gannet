@@ -1479,12 +1479,12 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         # the second selects that one, not the first.
         assert sr.ask(f"select_place {places.index('Recent')}") is True
         a.wait(lambda s: s["names"] == ["README.md", "README.md"], "Recent")
-        sr.until("tree", lambda t: t["rows"] == ["README.md", "README.md"], "Recent's rows")
+        assert sr.until("tree", lambda t: t["rows"] == ["README.md", "README.md"], "Recent's rows")["frame"] == "Recent - Gannet"
         assert sr.ask("select_row 1") is True
         assert sr.ask("focus_row 1") is True
         a.wait(lambda s: s["cursor"] == 1 and s["cursor_shown"] and s["selected"] == ["README.md"], "the second README.md selected")
         t = sr.until("tree", lambda t: t["focus"] != ["Files"], "focus on a row")
-        assert t["focus"] == ["README.md"] and t["selected"] == ["README.md"], f"both rows answered as one: {t}"
+        assert t["focus_at"] == [1] and t["selected_at"] == [1], f"the wrong row, or both rows as one: {t}"
 
         # The registry starting again forgets every app: the window joins it again.
         sr.stop_registry()

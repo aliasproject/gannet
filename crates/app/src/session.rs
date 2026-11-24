@@ -89,12 +89,13 @@ pub fn watch(hub: Hub, address: String, a11y: Arc<Shared>, a11y_address: Option<
                 let want = if is_enabled(&bus) { a11y_bus(&bus, a11y_address.as_deref()) } else { None };
                 if want.as_ref() != serving.as_ref().map(|(at, _)| at) || restart {
                     a11y.disconnect();
-                    serving = want.map(|at| {
+                    // A server whose thread couldn't start is tried again on the next change.
+                    serving = want.and_then(|at| {
                         let servers = servers.clone();
                         let epoch = a11y_atspi::start(a11y.clone(), hub.clone(), at.clone(), move |epoch| {
                             let _ = servers.send(Seen::Stopped(epoch));
-                        });
-                        (at, epoch)
+                        })?;
+                        Some((at, epoch))
                     });
                 }
             }

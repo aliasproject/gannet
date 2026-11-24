@@ -4,7 +4,9 @@
 //! Nothing here runs unless a screen reader is listening: `Link::update` returns at once
 //! otherwise. The file list's rows aren't copied into the snapshot one by one. It shares the
 //! app's listing and row order, and the server reads each row from them when it's asked, so a
-//! folder of a hundred thousand files costs no more than one of ten.
+//! folder of a hundred thousand files takes no more memory to serve than one of ten, and a
+//! question about one row costs the same in either. A change to the rows still costs time in
+//! proportion to the folder, as it does for the app itself.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -333,7 +335,8 @@ impl Link {
         let place_h = app.px(30.0);
         let places: Vec<Node> = app.places.iter().enumerate().map(|(i, p)| Node { id: PLACE0 + i as u64, role: Role::ListItem, name: p.label.clone(), rect: Rect::new(l.sidebar.x, app.place_top(i), l.sidebar.w, place_h), children: Vec::new(), parent: SIDEBAR, selected: p.path == app.dir, enabled: true }).collect();
         let b = app.px(36.0);
-        let title = app.dir.file_name().map_or_else(|| app.dir.display().to_string(), |n| n.to_string_lossy().into_owned());
+        // As the window's title says it, so Recent and the Trash are called that.
+        let title = app.crumb_label(&app.dir);
         let mut fixed = vec![
             Node { id: FRAME, role: Role::Frame, name: format!("{title} - Gannet"), rect: Rect::new(0, 0, app.w, app.h), children: vec![BACK, SIDEBAR, LIST], parent: 0, selected: false, enabled: true },
             Node { id: BACK, role: Role::PushButton, name: "Back".into(), rect: Rect::new(app.px(6.0), 0, b, l.toolbar.h), children: Vec::new(), parent: FRAME, selected: false, enabled: app.history.can_go_back() },
