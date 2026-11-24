@@ -244,7 +244,8 @@ to unpin it, which leaves the folder alone. Alt+1 to Alt+9 follow the sidebar, p
 Pins are GTK's bookmarks, kept in `$XDG_CONFIG_HOME/gtk-3.0/bookmarks`, so they're shared
 with Nautilus and GTK's Open and Save dialogs, and every open Gannet window follows changes to
 that file. Gannet only shows local folders, and keeps every other line, like an `sftp://`
-bookmark, as it was. A pinned folder that's gone stays in the sidebar until it's unpinned.
+bookmark, as it was. A standard folder like Documents that's also bookmarked shows once, in
+Places. A pinned folder that's gone stays in the sidebar until it's unpinned.
 
 ## Recent
 

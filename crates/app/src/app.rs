@@ -108,6 +108,8 @@ pub enum Msg {
     Dropped(Dropped),
     DragSource { drag: u64, facts: Option<(u64, bool)> },
     DragDevice { drag: u64, path: PathBuf, device: Option<u64> },
+    /// The folders among what was dropped to pin, and how many items weren't folders.
+    PinDropped { folders: Vec<PathBuf>, at: Spot, not_folders: usize },
 }
 
 #[derive(Clone)]
@@ -126,10 +128,8 @@ pub struct Dropped {
     pub saved: Option<Result<PathBuf, String>>,
     /// No files and no picture, but a web address.
     pub link: bool,
-    /// Where to pin what was dropped, rather than moving it. Then `paths` are only the folders.
+    /// Where to pin what was dropped, rather than moving it.
     pub pin: Option<Spot>,
-    /// How many of the items dropped to pin weren't folders.
-    pub not_folders: usize,
 }
 
 /// What a clipboard read is for.
@@ -1178,6 +1178,14 @@ impl App {
             Msg::PreviewShow(path, sort) => self.on_preview_show(path, sort),
             Msg::ListGone => self.cmds.push(Cmd::Quit),
             Msg::Dropped(d) => self.on_dropped(d),
+            Msg::PinDropped { folders, at, not_folders } => {
+                if not_folders > 0 {
+                    self.notice("Only folders can be pinned".into());
+                }
+                if !folders.is_empty() {
+                    self.pin_folders(folders, at);
+                }
+            }
             Msg::DragSource { drag, facts } => {
                 if let Some(FileDrag::Active(d)) = &mut self.file_drag
                     && d.id == drag
@@ -2403,7 +2411,9 @@ impl App {
     /// Reads the pins again, as this window or another program has changed them.
     pub fn bookmarks_changed(&mut self) {
         let Some(file) = &self.bookmarks else { return };
-        let pins = gannet_core::places::pinned_places(&bookmarks::read(file));
+        // A standard place pinned too, as some desktops do for GTK's dialogs, shows once.
+        let mut pins = gannet_core::places::pinned_places(&bookmarks::read(file));
+        pins.retain(|p| !self.standard_places.iter().any(|s| s.path == p.path));
         if pins == self.pins {
             return;
         }
@@ -2432,6 +2442,11 @@ impl App {
         (first, self.pins.len())
     }
 
+    /// Whether a folder already has a row in the sidebar's top sections, pinned or standard.
+    fn in_sidebar(&self, path: &Path) -> bool {
+        self.pin_index(path).is_some() || self.standard_places.iter().any(|p| p.path == path)
+    }
+
     fn pin_index(&self, path: &Path) -> Option<usize> {
         self.pins.iter().position(|p| p.path == path)
     }
@@ -2451,7 +2466,8 @@ impl App {
         self.bookmarks_changed();
     }
 
-    fn pin_folders(&mut self, paths: Vec<PathBuf>, at: Spot) {
+    fn pin_folders(&mut self, mut paths: Vec<PathBuf>, at: Spot) {
+        paths.retain(|p| !self.standard_places.iter().any(|s| s.path == *p));
         self.change_pins(|text| bookmarks::with_added(text, &paths, &at));
     }
 
@@ -2460,7 +2476,8 @@ impl App {
     /// the space around the Pinned heading or below the last pin, before the next section.
     fn pin_gap_at(&self, x: i32, y: i32) -> Option<usize> {
         let l = self.layout();
-        if self.bookmarks.is_none() || self.places.is_empty() || !l.sidebar.contains(x, y) {
+        // A dialog, menu or preview has the pointer, and nothing underneath takes a drop.
+        if self.bookmarks.is_none() || self.places.is_empty() || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some() || !l.sidebar.contains(x, y) {
             return None;
         }
         let (first, n) = self.pins_at();
@@ -3865,12 +3882,12 @@ impl App {
         }
         // Between places, folders are pinned. Ones pinned already stay where they are, so there's
         // nothing to do with only those.
+        // Folders that are in the sidebar already, as a pin or a standard place, fall through to
+        // whatever's under them.
         if d.folders
+            && !d.paths.iter().all(|p| self.in_sidebar(p))
             && let Some(gap) = self.pin_gap_at(x, y)
         {
-            if d.paths.iter().all(|p| self.pin_index(p).is_some()) {
-                return None;
-            }
             return Some(DropTarget { hit: Hit::PinGap(gap), dest: PathBuf::new(), trash: false, pin: Some(self.spot(gap)) });
         }
         let hit = self.hit(x, y);
@@ -4373,18 +4390,22 @@ impl App {
     /// only offers a move, because its keys and disks can't be seen from here.
     fn on_dropped(&mut self, d: Dropped) {
         if let Some(at) = d.pin {
-            if d.not_folders > 0 {
-                self.notice("Only folders can be pinned".into());
-            } else if d.paths.is_empty() {
-                self.notice("Couldn't get any folders from that drag".into());
-            }
-            if !d.paths.is_empty() {
-                self.pin_folders(d.paths, at);
-            }
             // Pinning leaves everything where it was. Hearing the drop finished, a program that
             // only offered a move may delete its side, so only one that allows a copy, or another
-            // Gannet window, hears that.
+            // Gannet window, hears that. It's answered first: asking whether each item is a folder
+            // can hang on a disk that's stopped answering, and some compositors keep the pointer
+            // from every window until a drop is answered.
             self.cmds.push(if d.can_copy || d.decided.is_some() { Cmd::FinishDrop } else { Cmd::AbandonDrop });
+            if d.paths.is_empty() {
+                self.notice("Couldn't get any folders from that drag".into());
+                return;
+            }
+            let hub = self.hub.clone();
+            let _ = std::thread::Builder::new().name("gannet-pin".into()).spawn(move || {
+                let total = d.paths.len();
+                let folders: Vec<PathBuf> = d.paths.into_iter().filter(|p| p.is_dir()).collect();
+                hub.send(Msg::PinDropped { not_folders: total - folders.len(), folders, at });
+            });
             return;
         }
         match d.saved {
@@ -5438,7 +5459,7 @@ mod tests {
     }
 
     fn dropped(r: &Rig, names: &[&str], can_copy: bool, can_move: bool) -> Dropped {
-        Dropped { paths: names.iter().map(|n| r.root.join(n)).collect(), dest: r.root.join("work"), trash: false, can_copy, can_move, decided: None, all_local: true, saved: None, link: false, pin: None, not_folders: 0 }
+        Dropped { paths: names.iter().map(|n| r.root.join(n)).collect(), dest: r.root.join("work"), trash: false, can_copy, can_move, decided: None, all_local: true, saved: None, link: false, pin: None }
     }
 
     #[test]
@@ -5447,7 +5468,7 @@ mod tests {
         r.open(r.work());
         let saved = r.work().join("columns.png");
         fs::write(&saved, b"png").unwrap();
-        let base = Dropped { paths: Vec::new(), dest: r.work(), trash: false, can_copy: true, can_move: false, decided: None, all_local: false, saved: Some(Ok(saved)), link: false, pin: None, not_folders: 0 };
+        let base = Dropped { paths: Vec::new(), dest: r.work(), trash: false, can_copy: true, can_move: false, decided: None, all_local: false, saved: Some(Ok(saved)), link: false, pin: None };
         r.app.cmds.clear();
         r.app.on_msg(Msg::Dropped(base.clone()));
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::FinishDrop)), "the browser hears it was taken");
@@ -8041,20 +8062,58 @@ mod tests {
     #[test]
     fn a_drop_from_elsewhere_pins_its_folders_and_answers_at_once() {
         let mut r = pin_rig("pins-dropped", &[]);
-        let dropped = |r: &Rig, names: &[&str], not_folders: usize, can_copy: bool| Dropped { paths: names.iter().map(|n| r.work().join(n)).collect(), dest: PathBuf::new(), trash: false, can_copy, can_move: true, decided: None, all_local: true, saved: None, link: false, pin: Some(Spot::End), not_folders };
+        let dropped = |r: &Rig, names: &[&str], can_copy: bool| Dropped { paths: names.iter().map(|n| r.work().join(n)).collect(), dest: PathBuf::new(), trash: false, can_copy, can_move: true, decided: None, all_local: true, saved: None, link: false, pin: Some(Spot::End) };
         // Hyprland refuses the pointer to every window until a drop is finished
-        // (SeatManager.cpp:352), so the answer can't wait for anything.
+        // (SeatManager.cpp:352), so the answer goes out before anything is asked of the disk,
+        // which could hang.
         r.app.cmds.clear();
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["d"], 1, true)));
+        r.app.on_msg(Msg::Dropped(dropped(&r, &["d", "f"], true)));
         assert_eq!(answered(&r.app), (true, false));
+        assert_eq!(r.pinned(), Vec::<String>::new(), "the folders are only known a moment later");
+        r.pump_until("pinned", |a| a.pins.len() == 1);
         assert_eq!(r.pinned(), ["d"]);
         assert_eq!(r.app.notices, ["Only folders can be pinned"]);
         assert!(r.work().join("d").is_dir() && r.work().join("f").is_file());
         // An app that only offers a move could delete its side on hearing the drop worked.
         r.app.cmds.clear();
-        r.app.on_msg(Msg::Dropped(dropped(&r, &["e"], 0, false)));
+        r.app.on_msg(Msg::Dropped(dropped(&r, &["e"], false)));
         assert_eq!(answered(&r.app), (false, true));
+        r.pump_until("pinned", |a| a.pins.len() == 2);
         assert_eq!(r.pinned(), ["d", "e"]);
+    }
+
+    #[test]
+    fn nothing_is_pinned_under_a_dialog() {
+        let mut r = pin_rig("pins-modal", &[]);
+        let (x, gap) = (r.sidebar_x(), (r.app.place_top(0) + r.app.px(40.0)) as f64);
+        r.app.dialog = Some(Dialog::ConfirmQuit { at: 1 });
+        r.app.input(Input::DragEnter { picture: false, x, y: gap, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragMove { x, y: gap });
+        assert!(r.app.incoming.as_ref().unwrap().target.is_none(), "the dialog takes no drop");
+        assert!(r.app.pin_bar().is_none());
+    }
+
+    #[test]
+    fn a_folder_already_in_the_sidebar_drops_on_whats_under_it() {
+        let mut r = pin_rig("pins-already", &[]);
+        let trash = r.root.join("data/Trash/files");
+        r.app.places.push(Place { label: "Trash".into(), path: trash, kind: PlaceKind::Trash, volume: None });
+        r.app.standard_places = r.app.places.clone();
+        r.app.bookmarks_changed();
+        // Near Trash's bottom edge a new folder is pinned, and a pinned one goes to the Trash.
+        let edge = (r.app.place_top(1) + r.app.px(30.0) - 2) as f64;
+        r.carry_to_sidebar("d", edge);
+        assert_eq!(r.drop_target(), Some(Hit::PinGap(0)));
+        r.release();
+        r.carry_to_sidebar("d", edge);
+        assert_eq!(r.drop_target(), Some(Hit::Place(1)), "it's already pinned");
+        r.app.cancel_file_drag();
+        // A standard place pinned in the file, as some desktops do for GTK's dialogs, shows once.
+        let home = gannet_core::uri::to_file_uri(&r.root.join("home"));
+        let text = format!("{home}\n{}", r.bookmarks());
+        gannet_core::bookmarks::save(&r.bookmarks_file(), text.as_bytes()).unwrap();
+        r.app.bookmarks_changed();
+        assert_eq!(r.labels(), ["Home", "Trash", "d"]);
     }
 
     #[test]

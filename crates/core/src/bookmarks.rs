@@ -166,8 +166,13 @@ pub fn save(file: &Path, text: &[u8]) -> std::io::Result<()> {
     name.extend_from_slice(file.file_name().map_or(&b"bookmarks"[..], |n| n.as_bytes()));
     name.extend_from_slice(format!(".gannet-{}", std::process::id()).as_bytes());
     let temp = dir.join(std::ffi::OsStr::from_bytes(&name));
+    let mode = std::fs::metadata(&file).ok().map(|m| m.permissions());
     let written = (|| {
         let mut f = std::fs::File::create(&temp)?;
+        // The file keeps the permissions it had.
+        if let Some(mode) = mode {
+            f.set_permissions(mode)?;
+        }
         f.write_all(text)?;
         f.sync_all()?;
         std::fs::rename(&temp, &file)
@@ -295,6 +300,16 @@ mod tests {
         assert!(!edit(&file, |t| without(t, Path::new("/nothing"))).unwrap(), "nothing to write");
         let left: Vec<_> = std::fs::read_dir(file.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["bookmarks"], "no temporary file is left behind");
+    }
+
+    #[test]
+    fn the_file_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let s = Scratch::new();
+        let file = s.file("gtk-3.0/bookmarks", b"file:///a\n");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(edit(&file, |t| with_added(t, &["/b".into()], &Spot::End)).unwrap());
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

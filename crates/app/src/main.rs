@@ -494,7 +494,7 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
     const MAX: u64 = 64 * 1024 * 1024;
     /// The largest picture taken from a browser.
     const MAX_IMAGE: u64 = 256 * 1024 * 1024;
-    let nothing = |dest, pin| app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false, saved: None, link: false, pin, not_folders: 0 };
+    let nothing = |dest, pin| app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false, saved: None, link: false, pin };
     let Some(read) = wl.read_drop() else {
         hub.send(Msg::Dropped(nothing(dest, pin)));
         return;
@@ -536,15 +536,8 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
     let waiting = std::thread::Builder::new().name("gannet-drop-wait".into()).spawn(move || {
         let until = std::time::Instant::now() + PATIENCE;
         let data = list.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).ok().flatten().unwrap_or_default();
-        let (mut paths, _) = clipboard::parse(clipboard::URI_LIST, &data);
+        let (paths, _) = clipboard::parse(clipboard::URI_LIST, &data);
         let all_local = clipboard::uri_list_is_all_local(&data, &paths);
-        // Only folders are pinned. Asking a disk can hang, which is why this is done here.
-        let mut not_folders = 0;
-        if pin.is_some() {
-            let before = paths.len();
-            paths.retain(|p| p.is_dir());
-            not_folders = before - paths.len();
-        }
         let address = gannet_core::webdrop::web_address(&data);
         // Files win: a picture is only kept when nothing else came.
         let saved = image_mime.filter(|_| paths.is_empty() && pin.is_none()).map(|mime| {
@@ -556,7 +549,7 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
             gannet_core::webdrop::save_new(&wait_dest, &name, &bytes).map_err(|e| gannet_core::listing::describe(&e).to_lowercase())
         });
         let link = paths.is_empty() && saved.is_none() && address.is_some();
-        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local, saved, link, pin, not_folders }));
+        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local, saved, link, pin }));
     });
     if waiting.is_err() {
         hub.send(Msg::Dropped(nothing(dest, pin_back)));
