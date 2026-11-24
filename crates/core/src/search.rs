@@ -104,6 +104,10 @@ pub fn walk_skipping(root: &Path, query: &str, show_hidden: bool, limit: usize, 
                 continue;
             }
             let mut ty = e.file_type();
+            // Some filesystems don't say what an entry is, so it's asked, once, here.
+            if ty == FileType::Unknown {
+                ty = statat(fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT).map_or(FileType::Unknown, |st| FileType::from_raw_mode(st.st_mode as _));
+            }
             if ty == FileType::Directory && skip(&dir.join(std::ffi::OsStr::from_bytes(b))) {
                 continue;
             }

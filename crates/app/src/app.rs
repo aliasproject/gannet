@@ -846,6 +846,15 @@ impl App {
     /// Shows the folder now if it's cached and there's no search, and reads or searches it
     /// either way.
     fn show_folder(&mut self) {
+        // A full path in a Save dialog's name, as picking a search's match puts there, would
+        // still save over that file once the folder showing is another: only the name stays.
+        if let Some(c) = self.chooser.as_mut()
+            && c.spec.mode == crate::chooser::Mode::Save
+            && c.name.text.starts_with('/')
+            && let Some(name) = Path::new(&c.name.text).file_name().map(|n| n.to_string_lossy().into_owned())
+        {
+            c.name = Field::new(&name);
+        }
         match self.cache.iter().position(|c| c.listing.dir == self.dir).filter(|_| self.search_query().is_none()) {
             Some(i) => {
                 let c = self.cache.remove(i);
@@ -4737,6 +4746,10 @@ mod tests {
         let deep_path = r.work().join("a/b/notes-deep.md");
         assert!(matches!(&r.app.dialog, Some(Dialog::ConfirmReplace { existing, .. }) if *existing == [deep_path.clone()]), "asks about the match itself");
         assert!(!r.work().join("notes-deep.md").exists());
+        // Leaving the search leaves just the name, to save in the folder showing.
+        r.app.dialog = None;
+        r.key(k::KEY_Escape, "");
+        assert_eq!(r.app.chooser.as_ref().unwrap().name.text, "notes-deep.md");
     }
 
     #[test]
