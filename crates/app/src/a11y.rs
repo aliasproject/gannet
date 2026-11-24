@@ -534,6 +534,12 @@ impl Link {
         self.last = Some(snap);
     }
 
+    /// Where a field's characters were in the last snapshot handed over, so a window building
+    /// its own needn't measure them again while its text is the same.
+    pub fn geometry(&self, id: u64) -> Option<&TextGeometry> {
+        self.last.as_ref().and_then(|s| s.geometry(id))
+    }
+
     /// No rows, the same each time, so a window without a file list compares as unchanged.
     pub fn no_rows(&self) -> Rows {
         self.no_rows.clone()

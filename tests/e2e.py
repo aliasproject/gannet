@@ -1931,10 +1931,20 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         assert sr.ask("grab [\"Save the report\", \"Name\"]") is True
         a.wait(lambda s: s["chooser"]["name_focused"], "the keyboard back in the name")
         sr.until("dump [\"Save the report\"]", lambda w: a11y_focus(w) == ["Name"], "focus back on the name")
+        # The name reads and edits as the main window's fields do: typing through AT-SPI
+        # changes it, and the change is heard.
+        f = sr.ask("fields")
+        assert [(x["name"], x["text"], x["editable"], "EditableText" in x["interfaces"], len(x["boxes"])) for x in f] == [("Name", "report.txt", True, True, 10)], f
+        assert all(b[2] > 0 for b in f[0]["boxes"]), f[0]["boxes"]
+        sr.ask("events")
+        assert sr.ask("insert Name 6 -final") is True
+        a.wait(lambda s: s["chooser"]["name"] == "report-final.txt", "the name typed into through AT-SPI")
+        heard = sr.until("events", lambda e: any(x["type"].startswith("object:text-changed:insert") for x in e), "the typing heard")
+        assert [(x["text"], x["detail1"], x["source"]) for x in heard if x["type"].startswith("object:text-changed:insert")] == [("-final", 6, "Name")], heard
         # Save, through its action.
         assert sr.ask("do [\"Save the report\", \"Save\"]") is True
         out = said(a)
-        assert out.startswith("accept\n") and f"uri {uri(docs / 'report.txt')}" in out, out
+        assert out.startswith("accept\n") and f"uri {uri(docs / 'report-final.txt')}" in out, out
 
         # Open: what's picked is said, and Cancel cancels.
         sr.screen_reader(False)
@@ -1994,6 +2004,19 @@ def a_screen_reader_can_pick_an_app_in_open_with(h):
         heard = sr.until("events", lambda e: any(x["type"].startswith("object:children-changed:remove") for x in e), "the apps going heard")
         a.key("Escape")
         wait_open_with(lambda s: s["search"] == "", "the search cleared")
+        # Typing in the search through AT-SPI narrows the list as typing does, and is heard.
+        sr.ask("events")
+        assert sr.ask("set_text Search pai") is True
+        wait_open_with(lambda s: s["search"] == "pai" and s["picked"] == "paint.desktop", "searched through AT-SPI")
+        heard = sr.until("events", lambda e: any(x["type"].startswith("object:text-changed:insert") for x in e), "the typing heard")
+        assert [x["text"] for x in heard if x["type"].startswith("object:text-changed:insert")] == ["pai"], heard
+        f = sr.ask("fields")
+        assert [(x["name"], x["text"], x["caret"], len(x["boxes"])) for x in f] == [("Search apps", "pai", 3, 3)], f
+        assert all(b[2] > 0 for b in f[0]["boxes"]), f[0]["boxes"]
+        assert sr.ask("delete Search 0 3") is True
+        wait_open_with(lambda s: s["search"] == "", "the search emptied through AT-SPI")
+        assert sr.ask(f"grab {json.dumps([title, 'Apps', 'Writer'])}") is True
+        wait_open_with(lambda s: s["picked"] == "writer.desktop", "Writer picked again")
         # Always use it, then Open, through their actions.
         assert sr.ask(f"do {json.dumps([title, 'Always use for Markdown document files'])}") is True
         wait_open_with(lambda s: s["always"], "ticked")

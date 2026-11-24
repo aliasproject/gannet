@@ -1499,7 +1499,7 @@ impl App {
     /// Does what a screen reader asked. A request about a row in a folder the window has
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
-        use crate::a11y::{Act, BACK, FILTER, NAME_FIELD, PATH_FIELD};
+        use crate::a11y::{Act, BACK, CHOOSER_SAVE_NAME, FILTER, NAME_FIELD, PATH_FIELD};
         // As with the pointer: nothing behind a dialog can be used, and anything outside a menu
         // only closes it, so the menu never acts on a selection changed under it.
         if self.dialog.is_some() || matches!(act, Act::Wake) {
@@ -1540,12 +1540,18 @@ impl App {
                 if edit_gen != self.edit_gen {
                     return;
                 }
-                let ours = matches!((&self.edit, id), (Edit::Path(_), PATH_FIELD) | (Edit::Filter(_), FILTER) | (Edit::Rename { .. } | Edit::NewFolder(_), NAME_FIELD));
-                // Changing the filter box's text while it shows but isn't typed in opens it first,
-                // as clicking it does.
+                let ours = matches!((&self.edit, id), (Edit::Path(_), PATH_FIELD) | (Edit::Filter(_), FILTER) | (Edit::Rename { .. } | Edit::NewFolder(_), NAME_FIELD)) || (id == CHOOSER_SAVE_NAME && self.a11y_name_has_keyboard());
+                let saving = self.chooser.as_ref().is_some_and(|c| c.spec.mode == crate::chooser::Mode::Save);
+                // Changing the text of a field that shows but isn't typed in gives it the
+                // keyboard first, as clicking it does: the filter box, or the Save dialog's name.
                 if !ours && id == FILTER && matches!(self.edit, Edit::None) && self.filter_rect().is_some() {
                     self.leave_field();
                     self.start_filter("");
+                } else if !ours && id == CHOOSER_SAVE_NAME && saving {
+                    self.leave_field();
+                    if let Some(c) = self.chooser.as_mut() {
+                        c.name_focused = true;
+                    }
                 } else if !ours {
                     return;
                 }
@@ -9880,5 +9886,38 @@ mod tests {
         assert!(r.app.a11y_name_has_keyboard(), "a request about another folder took the keyboard");
         r.app.on_msg(Msg::A11y(Act::Press(CHOOSER_CANCEL)));
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::Quit)) && r.app.chooser.as_ref().unwrap().picked.is_none(), "cancelled");
+    }
+
+    #[test]
+    fn a_screen_reader_types_the_name_to_save_as() {
+        use crate::a11y::{Act, CHOOSER_SAVE_NAME, Focus, Link, TextEdit};
+        let mut r = Rig::new("a11y-save-name");
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        let spec = crate::chooser::Spec { mode: crate::chooser::Mode::Save, name: Some("new.txt".into()), ..crate::chooser::Spec::default() };
+        r.app.chooser = Some(crate::chooser::Chooser::new(spec, &[], None));
+        r.open(r.work());
+        let mut px = vec![0u32; (r.app.w * r.app.h) as usize];
+        r.app.paint(&mut crate::canvas::Canvas::new(&mut px, r.app.w, r.app.h));
+        let name = |r: &Rig| r.app.chooser.as_ref().unwrap().name.text.clone();
+        // The snapshot has where its characters are, and the number its requests carry.
+        let s = Link::new().build(&mut r.app);
+        assert_eq!(s.focus, Focus::Node(CHOOSER_SAVE_NAME));
+        assert_eq!(s.geometry(CHOOSER_SAVE_NAME).map(|g| g.edges.len()), Some("new.txt".len() + 1));
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, s.edit_gen, TextEdit::Replace(0, 3, "report".into()))));
+        assert_eq!(name(&r), "report.txt");
+        // With the keyboard in the list, typing in the name gives it the keyboard first, as a
+        // click on it does.
+        r.app.on_msg(Msg::A11y(Act::FocusRow(Arc::new(r.work()), b"a.txt".to_vec())));
+        assert!(!r.app.a11y_name_has_keyboard());
+        let edit_gen = r.app.edit_gen;
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, edit_gen, TextEdit::Replace(0, usize::MAX, "b.txt".into()))));
+        assert!(r.app.a11y_name_has_keyboard());
+        assert_eq!(name(&r), "b.txt");
+        // A request from before the filter box opened is dropped.
+        r.key(k::KEY_Tab, "");
+        r.key(0, "/");
+        assert!(matches!(r.app.edit, Edit::Filter(_)));
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, edit_gen, TextEdit::Replace(0, 0, "x".into()))));
+        assert_eq!(name(&r), "b.txt");
     }
 }
