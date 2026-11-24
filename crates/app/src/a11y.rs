@@ -33,15 +33,59 @@ pub const FILTER: u64 = 6;
 /// The field a row is renamed in, or a new folder named in.
 pub const NAME_FIELD: u64 = 7;
 pub const PLACE0: u64 = 100;
+// The Open and Save dialog's bar. Its file types are by their place among the request's.
+pub const CHOOSER_ACCEPT: u64 = 20;
+pub const CHOOSER_CANCEL: u64 = 21;
+pub const CHOOSER_SAVE_NAME: u64 = 22;
+pub const CHOOSER_INFO: u64 = 23;
+pub const CHOOSER_TYPES: u64 = 24;
+pub const CHOOSER_TYPE0: u64 = 1 << 16;
+// The preview window.
+pub const PREVIEW: u64 = 50;
+pub const PREVIEW_NAME: u64 = 51;
+pub const PREVIEW_KIND: u64 = 52;
+pub const PREVIEW_SHOWS: u64 = 53;
+pub const PREVIEW_PREVIOUS: u64 = 54;
+pub const PREVIEW_NEXT: u64 = 55;
+pub const PREVIEW_CLOSE: u64 = 56;
+// The Open With window. Its apps and headings are numbered from `OPEN_WITH_ROW0`, each keeping
+// its number while the window is open.
+pub const OPEN_WITH_SEARCH: u64 = 60;
+pub const OPEN_WITH_APPS: u64 = 61;
+pub const OPEN_WITH_ALWAYS: u64 = 62;
+pub const OPEN_WITH_CANCEL: u64 = 63;
+pub const OPEN_WITH_OPEN: u64 = 64;
+pub const OPEN_WITH_ROW0: u64 = 1 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Frame,
+    Dialog,
     List,
     ListItem,
     PushButton,
-    /// A single line of editable text, served with its `Node::field`.
+    CheckBox,
+    /// A line of text that can be typed in. Its text is the node's `field`.
     Entry,
+    Label,
+    Heading,
+    /// What the preview window shows.
+    Document,
+}
+
+/// The one thing a part does when a screen reader asks: its name and description, as AT-SPI
+/// has them, and the key that does it too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Action {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub keys: &'static str,
+}
+
+impl Action {
+    pub const fn new(name: &'static str, description: &'static str, keys: &'static str) -> Self {
+        Self { name, description, keys }
+    }
 }
 
 /// One of the window's fixed parts: everything but the file list's rows.
@@ -50,6 +94,8 @@ pub struct Node {
     pub id: u64,
     pub role: Role,
     pub name: String,
+    /// Said after the name: an app being the default, or what the preview shows.
+    pub description: String,
     /// In the window's own pixels. Wayland never says where a window is on screen.
     pub rect: Rect,
     pub children: Vec<u64>,
@@ -59,10 +105,53 @@ pub struct Node {
     pub enabled: bool,
     /// Whether any of it is in view: a place can be scrolled out of the sidebar.
     pub showing: bool,
-    /// What it's for, beyond its name: the filter box says how far it reaches.
-    pub description: String,
+    pub action: Option<Action>,
+    /// A check box's state.
+    pub checked: Option<bool>,
     /// An entry's text, caret and selection.
-    pub field: Option<Field>,
+    pub field: Option<crate::field::Field>,
+}
+
+impl Node {
+    /// A part with nothing selected, checked or typed in, enabled and showing.
+    pub fn new(id: u64, role: Role, name: impl Into<String>, rect: Rect, parent: u64) -> Self {
+        Node { id, role, name: name.into(), description: String::new(), rect, children: Vec::new(), parent, selected: false, enabled: true, showing: true, action: None, checked: None, field: None }
+    }
+
+    pub fn described(mut self, d: impl Into<String>) -> Self {
+        self.description = d.into();
+        self
+    }
+
+    pub fn with_children(mut self, c: Vec<u64>) -> Self {
+        self.children = c;
+        self
+    }
+
+    pub fn doing(mut self, a: Action) -> Self {
+        self.action = Some(a);
+        self
+    }
+
+    pub fn enabled(mut self, on: bool) -> Self {
+        self.enabled = on;
+        self
+    }
+
+    pub fn selected(mut self, on: bool) -> Self {
+        self.selected = on;
+        self
+    }
+
+    pub fn showing(mut self, on: bool) -> Self {
+        self.showing = on;
+        self
+    }
+}
+
+/// A push button's action.
+pub const fn click(description: &'static str, keys: &'static str) -> Action {
+    Action::new("click", description, keys)
 }
 
 /// Where a field's characters are drawn, for a screen reader that shows or magnifies them.
@@ -78,6 +167,33 @@ pub struct TextGeometry {
 }
 
 impl TextGeometry {
+    /// Where a field's characters are, its text starting at `x0` on `line`. The measuring is
+    /// kept from `prev` while the text is the same, so a field scrolling with its caret only
+    /// moves them. Measuring up to each character, as the caret is placed, takes time in
+    /// proportion to the square of the length, so a longer text, such as a deep path, is
+    /// measured a character at a time. That can be a pixel or two off where letters kern.
+    pub fn measure(text: &mut crate::text::Text, f: &Field, x0: f32, line: Rect, prev: Option<&TextGeometry>) -> Self {
+        let measured = match prev.map(|g| &g.measured).filter(|m| m.0 == f.text) {
+            Some(m) => m.clone(),
+            None => {
+                let s = &f.text;
+                let mut offsets = vec![0.0];
+                if s.len() <= 128 {
+                    offsets.extend(s.char_indices().map(|(i, c)| text.measure(&s[..i + c.len_utf8()])));
+                } else {
+                    let mut x = 0.0;
+                    for c in s.chars() {
+                        x += text.measure(c.encode_utf8(&mut [0; 4]));
+                        offsets.push(x);
+                    }
+                }
+                Arc::new((s.clone(), offsets))
+            }
+        };
+        let edges = measured.1.iter().map(|o| (x0 + o).round() as i32).collect();
+        TextGeometry { measured, edges, line }
+    }
+
     /// A character's box, or an empty box at the end, past the last one.
     pub fn char_rect(&self, at: usize) -> Rect {
         let last = self.edges.len().saturating_sub(1);
@@ -237,7 +353,7 @@ pub struct Snapshot {
     pub window_focused: bool,
     /// The folder shown.
     pub dir: Arc<PathBuf>,
-    /// Where each field's characters are, by the field's id.
+    /// Where each field's characters are, by the field's id. A field with none has no boxes.
     pub text_geometry: Vec<(u64, Arc<TextGeometry>)>,
     /// Which field is open, as `App::edit_gen` counts them: a request about one since closed
     /// is dropped.
@@ -273,8 +389,11 @@ pub enum TextEdit {
 
 /// Something a screen reader asked for.
 pub enum Act {
-    /// Press a button.
+    /// Do a part's action: press a button, tick a box, or open with an app.
     Press(u64),
+    /// Give a part the keyboard: an entry, or an item of a list other than the file list, which
+    /// picks it, as moving to it does with the keyboard.
+    Focus(u64),
     /// Open a place in the sidebar.
     OpenPlace(usize),
     /// Scroll the sidebar to show a place.
@@ -287,8 +406,6 @@ pub enum Act {
     SelectRow(Arc<PathBuf>, Vec<u8>, bool),
     /// Scroll a row into view without moving the cursor.
     ShowRow(Arc<PathBuf>, Vec<u8>),
-    /// Move the keyboard to one of the window's parts, as clicking it would: the filter box.
-    Focus(u64),
     /// Change a field's text, caret or selection, through what typing in it does. The number
     /// is the snapshot's `edit_gen`.
     EditText(u64, u64, TextEdit),
@@ -373,25 +490,41 @@ pub struct Link {
     dir: Arc<PathBuf>,
     era: u64,
     here: Arc<Here>,
+    no_rows: Rows,
 }
 
 impl Link {
     pub fn new() -> Self {
-        Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0, here: Arc::default() }
+        Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0, here: Arc::default(), no_rows: Rows::default() }
     }
 
-    /// Hands the server a snapshot if anything changed. Costs nothing while no one listens.
+    /// Hands the server a snapshot of the app's window if anything changed. Costs nothing
+    /// while no one listens.
     pub fn update(&mut self, app: &mut App) {
+        if self.listening() {
+            let snap = self.build(app);
+            self.offer(snap);
+        }
+    }
+
+    /// Whether a screen reader is listening, so a snapshot is wanted. Forgets the last one
+    /// when not, and when a new server started, which is sent the next one whole.
+    pub fn listening(&mut self) -> bool {
         if !self.shared.is_live() {
             self.last = None;
-            return;
+            return false;
         }
         let epoch = self.shared.current_epoch();
         if epoch != self.epoch {
             self.epoch = epoch;
             self.last = None;
         }
-        let snap = self.build(app);
+        true
+    }
+
+    /// Hands the server a snapshot built elsewhere, as the Open With window's is, if it isn't
+    /// the same as the last. Ask `listening` first.
+    pub fn offer(&mut self, snap: Snapshot) {
         if self.last.as_ref() == Some(&snap) {
             return;
         }
@@ -401,7 +534,15 @@ impl Link {
         self.last = Some(snap);
     }
 
+    /// No rows, the same each time, so a window without a file list compares as unchanged.
+    pub fn no_rows(&self) -> Rows {
+        self.no_rows.clone()
+    }
+
     pub(crate) fn build(&mut self, app: &mut App) -> Snapshot {
+        if app.viewer {
+            return self.build_viewer(app);
+        }
         if *self.dir != app.dir {
             self.dir = Arc::new(app.dir.clone());
             self.era += 1;
@@ -436,63 +577,72 @@ impl Link {
                 // Placed as drawn, with the sidebar scrolled.
                 let rect = Rect::new(l.sidebar.x, app.place_top(i), l.sidebar.w, place_h);
                 let showing = rect.y + rect.h > l.sidebar.y && rect.y < l.sidebar.y + l.sidebar.h;
-                Node { id: PLACE0 + i as u64, role: Role::ListItem, name: p.label.clone(), rect, children: Vec::new(), parent: SIDEBAR, selected: p.path == app.dir, enabled: true, showing, description: String::new(), field: None }
+                Node::new(PLACE0 + i as u64, Role::ListItem, p.label.clone(), rect, SIDEBAR).selected(p.path == app.dir).showing(showing).doing(Action::new("activate", "Open", ""))
             })
             .collect();
         let b = app.px(36.0);
         // As the window's title says it, so Recent and the Trash are called that.
         let title = app.crumb_label(&app.dir);
         let fields = Self::fields(app);
-        let node = |id, role, name: &str, rect, children, enabled| Node { id, role, name: name.into(), rect, children, parent: FRAME, selected: false, enabled, showing: true, description: String::new(), field: None };
         // In the order they're drawn: the toolbar, the sidebar, then the list and what's on it.
         let mut frame_kids = vec![BACK];
-        frame_kids.extend(fields.iter().filter(|(n, _)| n.id != NAME_FIELD).map(|(n, _)| n.id));
+        frame_kids.extend(fields.iter().filter(|n| n.id != NAME_FIELD).map(|n| n.id));
         frame_kids.extend([SIDEBAR, LIST]);
-        frame_kids.extend(fields.iter().filter(|(n, _)| n.id == NAME_FIELD).map(|(n, _)| n.id));
+        frame_kids.extend(fields.iter().filter(|n| n.id == NAME_FIELD).map(|n| n.id));
         let mut fixed = vec![
-            Node { id: FRAME, role: Role::Frame, name: format!("{title} - Gannet"), rect: Rect::new(0, 0, app.w, app.h), children: frame_kids, parent: 0, selected: false, enabled: true, showing: true, description: String::new(), field: None },
-            node(BACK, Role::PushButton, "Back", Rect::new(app.px(6.0), 0, b, l.toolbar.h), Vec::new(), app.history.can_go_back()),
-            node(SIDEBAR, Role::List, "Places", l.sidebar, places.iter().map(|n| n.id).collect(), true),
-            node(LIST, Role::List, "Files", l.list, Vec::new(), true),
+            Node::new(FRAME, Role::Frame, format!("{title} - Gannet"), Rect::new(0, 0, app.w, app.h), 0).with_children(frame_kids),
+            Node::new(BACK, Role::PushButton, "Back", Rect::new(app.px(6.0), 0, b, l.toolbar.h), FRAME).enabled(app.history.can_go_back()).doing(click("Go back", "<Alt>Left")),
+            Node::new(SIDEBAR, Role::List, "Places", l.sidebar, FRAME).with_children(places.iter().map(|n| n.id).collect()),
+            Node::new(LIST, Role::List, "Files", l.list, FRAME),
         ];
         fixed.extend(places);
-        // A field's characters are measured again only when its text changes.
-        let mut text_geometry = Vec::new();
-        for (n, x0) in &fields {
-            let Some(f) = n.field.as_ref() else { continue };
-            let kept = self.last.as_ref().and_then(|s| s.text_geometry.iter().find(|(i, _)| *i == n.id)).map(|(_, g)| &g.measured).filter(|m| m.0 == f.text);
-            let measured = match kept {
-                Some(m) => m.clone(),
-                None => Arc::new((f.text.clone(), app.char_offsets(&f.text))),
-            };
-            let edges = measured.1.iter().map(|o| (x0 + o).round() as i32).collect();
-            text_geometry.push((n.id, Arc::new(TextGeometry { measured, edges, line: app.field_line(n.rect) })));
-        }
         // The filter box can show what it filters by without being typed in.
-        let typing = fields.iter().map(|(n, _)| n.id).find(|&id| id != FILTER || matches!(app.edit, Edit::Filter(_)));
-        fixed.extend(fields.into_iter().map(|(n, _)| n));
-        let focus = match (typing, rows.entry(app.cursor)) {
+        let typing = fields.iter().map(|n| n.id).find(|&id| id != FILTER || matches!(app.edit, Edit::Filter(_)));
+        fixed.extend(fields);
+        let mut focus = match (typing, rows.entry(app.cursor)) {
+            // A field being typed in has the keyboard.
             (Some(id), _) => Focus::Node(id),
             (None, Some(e)) if app.cursor_shown => Focus::Row(e),
             _ => Focus::Node(LIST),
         };
+        if let Some(c) = app.chooser.as_ref() {
+            // A dialog for another program, named for what it asked, and where it is.
+            fixed[0].role = Role::Dialog;
+            fixed[0].name = format!("{} - {title}", c.spec.title());
+            let parts = app.a11y_chooser_parts();
+            fixed[0].children.extend(parts.iter().filter(|n| n.parent == FRAME).map(|n| n.id));
+            if parts.iter().any(|n| n.id == CHOOSER_SAVE_NAME && n.field.is_some()) && app.a11y_name_has_keyboard() {
+                focus = Focus::Node(CHOOSER_SAVE_NAME);
+            }
+            fixed.extend(parts);
+        }
+        // Where every field's characters are, the Save dialog's name among them. Each is drawn by
+        // `paint_field` in its node's box.
+        let mut text_geometry = Vec::new();
+        for n in &fixed {
+            let Some(f) = n.field.as_ref() else { continue };
+            let prev = self.last.as_ref().and_then(|s| s.geometry(n.id));
+            let x0 = app.field_text_x(n.rect, f);
+            let line = app.field_line(n.rect);
+            text_geometry.push((n.id, Arc::new(TextGeometry::measure(&mut app.text, f, x0, line, prev))));
+        }
         Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry, edit_gen: app.edit_gen() }
     }
 
-    /// The text fields showing, each with where its text starts.
-    fn fields(app: &mut App) -> Vec<(Node, f32)> {
+    /// The text fields of the file manager's own window showing.
+    fn fields(app: &mut App) -> Vec<Node> {
         let mut out = Vec::new();
         let list = app.layout().list;
-        let mut add = |app: &mut App, id, name: String, description: &str, rect: Rect, f: Field| {
-            let x0 = app.field_text_x(rect, &f);
+        let mut add = |id, name: String, description: &str, rect: Rect, f: Field| {
             // The row being renamed can be scrolled out of view.
             let showing = id != NAME_FIELD || rect.intersects(list);
-            out.push((Node { id, role: Role::Entry, name, rect, children: Vec::new(), parent: FRAME, selected: false, enabled: true, showing, description: description.into(), field: Some(f) }, x0));
+            let mut n = Node::new(id, Role::Entry, name, rect, FRAME).described(description).showing(showing);
+            n.field = Some(f);
+            out.push(n);
         };
         if let Edit::Path(f) = &app.edit {
             let f = f.clone();
-            let r = app.path_box();
-            add(app, PATH_FIELD, "Path".into(), "Enter a full path, starting with / or ~", r, f);
+            add(PATH_FIELD, "Path".into(), "Enter a full path, starting with / or ~", app.path_box(), f);
         }
         if let Some(r) = app.filter_rect() {
             let f = match &app.edit {
@@ -501,7 +651,7 @@ impl Link {
             };
             // Named for what it does, and described as its empty box says it.
             let (name, hint) = if app.search_below { ("Search", "Search here and below") } else { ("Filter", "Filter this folder") };
-            add(app, FILTER, name.into(), hint, r, f);
+            add(FILTER, name.into(), hint, r, f);
         }
         let named = match &app.edit {
             Edit::Rename { field, name, .. } => Some((field.clone(), format!("Rename {}", String::from_utf8_lossy(name)))),
@@ -511,10 +661,45 @@ impl Link {
         if let Some((f, name)) = named
             && let Some(r) = app.name_field_rect()
         {
-            add(app, NAME_FIELD, name, "", r, f);
+            add(NAME_FIELD, name, "", r, f);
         }
         out
     }
+
+    /// The preview window: the file's name, its kind and what's shown of it, and buttons to
+    /// walk its folder and close it.
+    fn build_viewer(&mut self, app: &App) -> Snapshot {
+        let s = app.a11y_preview();
+        let r = Rect::new(0, 0, app.w, app.h);
+        let fixed = vec![
+            Node::new(FRAME, Role::Frame, if s.name.is_empty() { "Preview".to_string() } else { format!("{} - Preview", s.name) }, r, 0).with_children(vec![PREVIEW, PREVIEW_PREVIOUS, PREVIEW_NEXT, PREVIEW_CLOSE]),
+            // What has the keyboard, so moving to another file reads out its name, and the rest
+            // is there to be read.
+            Node::new(PREVIEW, Role::Document, s.name.clone(), s.area, FRAME).described([s.kind.as_str(), s.shows.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ")).with_children(vec![PREVIEW_NAME, PREVIEW_KIND, PREVIEW_SHOWS]),
+            Node::new(PREVIEW_NAME, Role::Label, s.name, s.title, PREVIEW),
+            Node::new(PREVIEW_KIND, Role::Label, s.kind, s.area, PREVIEW),
+            Node::new(PREVIEW_SHOWS, Role::Label, s.shows, s.foot, PREVIEW),
+            // Placed as the keys that do the same: there are no buttons on screen.
+            Node::new(PREVIEW_PREVIOUS, Role::PushButton, "Previous file", Rect::default(), FRAME).enabled(s.can_step.0).doing(click("Show the previous file in the folder", "Left")),
+            Node::new(PREVIEW_NEXT, Role::PushButton, "Next file", Rect::default(), FRAME).enabled(s.can_step.1).doing(click("Show the next file in the folder", "Right")),
+            Node::new(PREVIEW_CLOSE, Role::PushButton, "Close", Rect::default(), FRAME).doing(click("Close the preview", "Escape")),
+        ];
+        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry: Vec::new(), edit_gen: 0 }
+    }
+}
+
+/// What the preview window says about the file it shows.
+pub struct PreviewText {
+    pub name: String,
+    /// Its kind, like "PNG image".
+    pub kind: String,
+    /// What's shown of it: a picture's size, a document's lines, or why it can't be shown.
+    pub shows: String,
+    pub title: Rect,
+    pub area: Rect,
+    pub foot: Rect,
+    /// Whether there's a file before it and after it.
+    pub can_step: (bool, bool),
 }
 
 #[cfg(test)]

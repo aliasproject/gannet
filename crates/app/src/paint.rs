@@ -230,25 +230,6 @@ impl App {
         Rect::new(r.x, r.y + (r.h - line) / 2, r.w, line)
     }
 
-    /// How far from the start of a field's text each character's left edge is, and the last
-    /// one's right edge, for screen readers. Measuring up to each character, as the caret is
-    /// placed, takes time in proportion to the square of the length, so a longer text, such as
-    /// a deep path, is measured a character at a time. That can be a pixel or two off where
-    /// letters kern.
-    pub(crate) fn char_offsets(&mut self, text: &str) -> Vec<f32> {
-        let mut out = vec![0.0];
-        if text.len() <= 128 {
-            out.extend(text.char_indices().map(|(i, c)| self.text.measure(&text[..i + c.len_utf8()])));
-        } else {
-            let mut x = 0.0;
-            for c in text.chars() {
-                x += self.text.measure(c.encode_utf8(&mut [0; 4]));
-                out.push(x);
-            }
-        }
-        out
-    }
-
     /// Where the rename or new folder field is drawn, as `paint_list` draws it.
     pub(crate) fn name_field_rect(&self) -> Option<Rect> {
         let l = self.layout();

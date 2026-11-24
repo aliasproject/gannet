@@ -1783,7 +1783,7 @@ def a_screen_reader_reads_and_edits_the_text_fields(h):
         e = heard("object:text-caret-moved")
         assert [x["detail1"] for x in e if x["type"] == "object:text-caret-moved"] == [0], e
         assert any(x["type"] == "object:text-selection-changed" for x in e), e
-        assert sr.ask("select Rename 0 5") is True
+        assert sr.ask("select_text Rename 0 5") is True
         sr.until("fields", lambda fs: fs[0]["selections"] == [[0, 5]], "selected through AT-SPI")
         a.type("pear")
         a.wait(lambda s: s["edit"] == "rename:pear.txt", "typed over the selection")
@@ -1816,6 +1816,190 @@ def a_screen_reader_reads_and_edits_the_text_fields(h):
         assert any(x["source"] == "other - Gannet" or x["source"] == "docs - Gannet" for x in e if x["type"].startswith("object:children-changed:remove")), e
         assert sr.ask("fields") == []
         a.close()
+    finally:
+        sr.stop()
+
+
+def a11y_find(node, name, role=None):
+    """The first part of a dumped window with that name (and role), looking all the way down."""
+    if node["name"] == name and role in (None, node["role"]):
+        return node
+    for c in node.get("children", []):
+        found = a11y_find(c, name, role)
+        if found:
+            return found
+    return None
+
+
+def a11y_focus(node):
+    """The names of the parts that have the keyboard."""
+    out = [node["name"]] if "focused" in node["states"] else []
+    for c in node.get("children", []):
+        out += a11y_focus(c)
+    return out
+
+
+def a11y_window(h, sr, args, extra_env=None, launcher_started=False):
+    """Starts one of Gannet's other windows on the screen reader's buses, with its standard
+    output kept, as the window says there what was picked."""
+    a = App(h, None, launch=False, extra_env={"DBUS_SESSION_BUS_ADDRESS": sr.session.address, **(extra_env or {})})
+    a.proc = subprocess.Popen(sandboxed(args), env=a.env, stderr=open(SCRATCH / "stderr.log", "a"), stdout=subprocess.PIPE)
+    h.wait_window(10)
+    # With no screen reader on, it stays off the accessibility bus, and doesn't start
+    # at-spi-bus-launcher by asking it.
+    time.sleep(0.5)
+    assert sr.ask("apps") == [], "registered with no screen reader on"
+    assert launcher_started or not sr.launcher_running(), "the window started at-spi-bus-launcher"
+    sr.screen_reader(True)
+    sr.until("apps", lambda x: x == ["Gannet"], "registered once a screen reader is on")
+    return a
+
+
+def said(a):
+    out, _ = a.proc.communicate(timeout=10)
+    return out.decode()
+
+
+@check
+def a_screen_reader_can_read_and_walk_the_preview_window(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"a.png": png_bytes(4, 3), "b.txt": "one\ntwo\nthree\n", "c.md": "# hi"})
+    sr = ScreenReader()
+    try:
+        a = a11y_window(h, sr, ["--preview", str(fs / "a.png")])
+        # The file's name, its kind and what's shown, as words, with the picture's size.
+        w = sr.until("dump [\"Preview\"]", lambda w: "4 × 3" in (a11y_find(w, "a.png", "document frame") or {}).get("description", ""), "the picture described")
+        assert w["role"] == "frame" and w["name"] == "a.png - Preview", w
+        doc = a11y_find(w, "a.png", "document frame")
+        assert doc["description"].startswith("Picture, 4 × 3"), doc
+        assert [c["name"] for c in doc["children"]] == ["a.png", "Picture", doc["description"].removeprefix("Picture, ")], doc
+        assert a11y_focus(w) == ["a.png"], a11y_focus(w)
+        prev, nxt = a11y_find(w, "Previous file"), a11y_find(w, "Next file")
+        assert "enabled" not in prev["states"] and "enabled" in nxt["states"] and nxt["action"] == "click", (prev, nxt)
+        a.shot("a11y-preview")
+
+        # Next, through its action: the window's new name and the file's are heard, and what
+        # it shows is said as text.
+        sr.ask("events")
+        assert sr.ask("do [\"Preview\", \"Next file\"]") is True
+        w = sr.until("dump [\"Preview\"]", lambda w: w["name"] == "b.txt - Preview" and "3 lines" in (a11y_find(w, "b.txt", "document frame") or {}).get("description", ""), "the next file")
+        assert a11y_focus(w) == ["b.txt"], a11y_focus(w)
+        heard = sr.until("events", lambda e: any(x["type"] == "object:property-change:accessible-name" and x["source"] == "b.txt" for x in e), "the new name heard where the keyboard is")
+        sr.ask("do [\"Preview\", \"Next file\"]")
+        w = sr.until("dump [\"Preview\"]", lambda w: w["name"] == "c.md - Preview", "the last file")
+        assert "enabled" not in a11y_find(w, "Next file")["states"], w
+        assert sr.ask("do [\"Preview\", \"Previous file\"]") is True
+        sr.until("dump [\"Preview\"]", lambda w: w["name"] == "b.txt - Preview", "back a file")
+
+        # Close closes it.
+        assert sr.ask("do [\"Preview\", \"Close\"]") is True
+        a.proc.wait(5)
+        sr.until("apps", lambda x: x == [], "gone with the window")
+    finally:
+        sr.stop()
+
+
+@check
+def a_screen_reader_can_use_the_open_and_save_dialogs(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"docs/a.txt": "a", "docs/b.png": png_bytes(4, 4), "docs/sub/x.png": png_bytes(4, 4)})
+    docs = fs / "docs"
+    sr = ScreenReader()
+    try:
+        # Save: a dialog named for the request and the folder, with the name to save as where
+        # the keyboard is, the file types, the file list as in the main window, and the buttons.
+        a = a11y_window(h, sr, ["--choose", "save", "--title", "Save the report", "--folder", str(docs), "--name", "report.txt", "--filter", "Text", "--glob", "*.txt", "--filter", "All files", "--glob", "*"])
+        w = sr.until("dump [\"Save the report\"]", lambda w: [r["name"] for r in a11y_find(w, "Files", "list")["children"]] == ["sub", "a.txt"], "the rows")
+        assert w["role"] == "dialog" and w["name"] == "Save the report - docs", w
+        name = a11y_find(w, "Name", "entry")
+        assert name and "editable" in name["states"] and a11y_focus(w) == ["Name"], (name, a11y_focus(w))
+        types = a11y_find(w, "File type", "list")
+        assert [(t["name"], "selected" in t["states"]) for t in types["children"]] == [("Text", True), ("All files", False)], types
+        assert "enabled" in a11y_find(w, "Save", "button")["states"] and a11y_find(w, "Cancel", "button"), w
+        a.shot("a11y-chooser-save")
+        # Picking a file type through the list shows its files.
+        assert sr.ask("select [\"Save the report\", \"File type\", 1]") is True
+        a.wait(lambda s: s["chooser"]["filter"] == 1 and s["names"] == ["sub", "a.txt", "b.png"], "every file")
+        sr.until("dump [\"Save the report\"]", lambda w: "selected" in a11y_find(w, "All files")["states"], "the type picked heard")
+        # A row moved to takes the keyboard from the name, as a click does.
+        sr.ask("events")
+        assert sr.ask("grab [\"Save the report\", \"Files\", \"a.txt\"]") is True
+        a.wait(lambda s: not s["chooser"]["name_focused"] and s["cursor"] == 1, "the keyboard in the list")
+        sr.until("dump [\"Save the report\"]", lambda w: a11y_focus(w) == ["a.txt"], "focus on a.txt")
+        assert sr.ask("grab [\"Save the report\", \"Name\"]") is True
+        a.wait(lambda s: s["chooser"]["name_focused"], "the keyboard back in the name")
+        sr.until("dump [\"Save the report\"]", lambda w: a11y_focus(w) == ["Name"], "focus back on the name")
+        # Save, through its action.
+        assert sr.ask("do [\"Save the report\", \"Save\"]") is True
+        out = said(a)
+        assert out.startswith("accept\n") and f"uri {uri(docs / 'report.txt')}" in out, out
+
+        # Open: what's picked is said, and Cancel cancels.
+        sr.screen_reader(False)
+        sr.until("apps", lambda x: x == [], "off")
+        a = a11y_window(h, sr, ["--choose", "open", "--folder", str(docs)], launcher_started=True)
+        w = sr.until("dump [\"Open File\"]", lambda w: a11y_find(w, "Choose a file to open", "label"), "what to do")
+        assert w["role"] == "dialog" and "enabled" not in a11y_find(w, "Open", "button")["states"], w
+        assert sr.ask("grab [\"Open File\", \"Files\", \"b.png\"]") is True
+        a.wait(lambda s: s["cursor"] == 2 and s["cursor_shown"], "the cursor on b.png")
+        sr.until("dump [\"Open File\"]", lambda w: a11y_find(w, "“b.png”", "label") and "enabled" in a11y_find(w, "Open", "button")["states"], "b.png picked, and Open usable")
+        a.shot("a11y-chooser-open")
+        assert sr.ask("do [\"Open File\", \"Cancel\"]") is True
+        assert said(a) == "cancel\n"
+    finally:
+        sr.stop()
+
+
+@check
+def a_screen_reader_can_pick_an_app_in_open_with(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    share, _ = stand_in_apps()
+    config = SCRATCH / "client/config"
+    config.mkdir(parents=True, exist_ok=True)
+    (config / "mimeapps.list").write_text("[Default Applications]\ntext/markdown=marked.desktop\n")
+    (SCRATCH / "state.json.openwith").unlink(missing_ok=True)
+    sr = ScreenReader()
+    try:
+        a = a11y_window(h, sr, ["--open-with", "--what", "“notes.md”", "--type", "text/markdown", "--offer-always"], {"XDG_DATA_DIRS": str(share)})
+        title = "Open “notes.md” with"
+        w = sr.until(f"dump {json.dumps([title])}", lambda w: a11y_find(w, "Apps", "list") and a11y_find(w, "Apps", "list")["children"], "the apps")
+        assert w["role"] == "dialog" and w["name"] == title, w
+        apps = a11y_find(w, "Apps", "list")["children"]
+        assert [(x["role"], x["name"], x["description"]) for x in apps] == [("heading", "For Markdown document", ""), ("list item", "Marked", "Default"), ("list item", "Writer", ""), ("heading", "Other apps", ""), ("list item", "Paint", ""), ("list item", "Unzipper", "")], apps
+        assert a11y_focus(w) == ["Marked"] and "selected" in apps[1]["states"], (a11y_focus(w), apps[1])
+        search = a11y_find(w, "Search apps", "entry")
+        assert search and "editable" in search["states"], search
+        always = a11y_find(w, "Always use for Markdown document files", "check box")
+        assert always and "checked" not in always["states"] and always["action"] == "toggle", always
+        a.shot("a11y-open-with")
+
+        # Moving to an app picks it, and the move is heard.
+        sr.ask("events")
+        assert sr.ask(f"grab {json.dumps([title, 'Apps', 'Writer'])}") is True
+        wait_open_with(lambda s: s["picked"] == "writer.desktop", "Writer picked")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "focus heard")
+        assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Writer"], heard
+        # So does selecting one through the list.
+        assert sr.ask(f"select {json.dumps([title, 'Apps', 4])}") is True
+        wait_open_with(lambda s: s["picked"] == "paint.desktop", "Paint picked")
+        assert sr.ask(f"select {json.dumps([title, 'Apps', 0])}") is False, "a heading can't be picked"
+        # A search narrows the list, and the apps that went are heard going.
+        sr.ask("events")
+        a.type("wri")
+        wait_open_with(lambda s: s["picked"] == "writer.desktop", "the search")
+        w = sr.until(f"dump {json.dumps([title])}", lambda w: [x["name"] for x in a11y_find(w, "Apps", "list")["children"]] == ["For Markdown document", "Writer"], "the list narrowed")
+        assert a11y_focus(w) == ["Writer"], a11y_focus(w)
+        heard = sr.until("events", lambda e: any(x["type"].startswith("object:children-changed:remove") for x in e), "the apps going heard")
+        a.key("Escape")
+        wait_open_with(lambda s: s["search"] == "", "the search cleared")
+        # Always use it, then Open, through their actions.
+        assert sr.ask(f"do {json.dumps([title, 'Always use for Markdown document files'])}") is True
+        wait_open_with(lambda s: s["always"], "ticked")
+        sr.until(f"dump {json.dumps([title])}", lambda w: "checked" in a11y_find(w, "Always use for Markdown document files")["states"], "the tick heard")
+        assert sr.ask(f"do {json.dumps([title, 'Open'])}") is True
+        assert said(a) == "open writer.desktop\nalways\n"
     finally:
         sr.stop()
 
