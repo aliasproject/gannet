@@ -2680,6 +2680,43 @@ def text_and_markdown_show_as_documents(h):
 
 
 @check
+def markdown_tables_show_as_tables(h):
+    fs = fresh_fs()
+    # A menu as one is often written, with nothing over its second column, and a table with
+    # aligned columns.
+    (fs / "menu.md").write_text(
+        "# Dinner Menu\n\n"
+        "| Course | |\n|---|---|\n"
+        "| Starter | Roasted tomato soup with basil oil and grilled sourdough |\n"
+        "| Main | Pan-seared salmon with lemon butter, crushed new potatoes and green beans |\n"
+        "| Side | Garden salad |\n"
+        "| Dessert | Dark chocolate tart with *salted* caramel and **vanilla** cream |\n"
+        "| Drinks | `Sparkling water`, [house wine](https://example.com), ~~beer~~ |\n\n"
+        "## Shopping\n\n"
+        "| Item | Qty | Price |\n|:--|:-:|--:|\n| Salmon fillets | 4 | 23.80 |\n| Potatoes | 1 kg | 2.10 |\n| Dark chocolate | 2 | 5.00 |\n\n"
+        "That's everything.\n"
+    )
+    a = App(h, fs, extra_env={"LANG": "C.UTF-8"})
+    a.wait(lambda s: s["count"] == 1, "listing")
+    a.key("space")
+    s = a.wait(lambda s: preview_of(s).get("state") == "markdown" and doc_of(s).get("lines", 0) > 0, "the Markdown, laid out")
+    a.shot("preview-table")
+    d = doc_of(s)
+    # Both tables: six rows and four, each cell's words on its row's line when there's room.
+    assert d["table_lines"] == 10, d
+    assert 0 < d["table_right"] < d["width"], d
+    # Narrow, the long cells wrap inside their column rather than run past the window.
+    a.resize_preview(380, 600)
+    s = a.wait(lambda s: 0 < doc_of(s).get("width", 0) < 400, "laid out narrow")
+    a.shot("preview-table-narrow")
+    d = doc_of(s)
+    assert d["table_lines"] > 10, f"long cells wrap: {d}"
+    assert d["table_right"] <= d["width"], f"the table fits the window: {d}"
+    assert a.alive()
+    a.close()
+
+
+@check
 def animations_move(h):
     fs = fresh_fs()
     ffmpeg("-f", "lavfi", "-i", "testsrc=size=120x90:rate=10", "-t", "1", fs / "a-moving.gif")
