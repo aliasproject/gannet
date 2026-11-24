@@ -239,8 +239,8 @@ pub struct Snapshot {
     pub dir: Arc<PathBuf>,
     /// Where each field's characters are, by the field's id.
     pub text_geometry: Vec<(u64, Arc<TextGeometry>)>,
-    /// Which rename or new folder the name field is for: requests about an earlier one are
-    /// dropped.
+    /// Which field is open, as `App::edit_gen` counts them: a request about one since closed
+    /// is dropped.
     pub edit_gen: u64,
 }
 

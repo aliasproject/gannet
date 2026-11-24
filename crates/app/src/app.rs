@@ -620,6 +620,8 @@ pub struct App {
     selection_epoch: u64,
     /// Counts the changes started, each of which clears redo.
     change_epoch: u64,
+    /// Which field is open: each one opened or closed, and each rename or new folder, is a new
+    /// one, so a late paste or screen reader request about an earlier one is dropped.
     edit_gen: u64,
     paste_in_flight: bool,
     /// When an unasked-for dialog appeared. Input right after that was meant for
@@ -1137,7 +1139,7 @@ impl App {
             _ => false,
         };
         if l.settled && renaming_gone {
-            self.edit = Edit::None;
+            self.set_edit(Edit::None);
         }
         // Settings changed while this was loading: it was built for the old ones.
         if l.sort != self.view_sort() {
