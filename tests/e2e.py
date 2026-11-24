@@ -437,6 +437,51 @@ def opening_uses_the_default_app(h):
 
 
 @check
+def opening_an_archive_extracts_it_in_gannet(h):
+    fs = fresh_fs()
+    tree(fs, {"src/a.txt": "a", "src/b.txt": "b", "pack/project/readme": "r"})
+    subprocess.run(["bsdtar", "-a", "-cf", str(fs / "photos.zip"), "-C", str(fs / "src"), "a.txt", "b.txt"], check=True)
+    subprocess.run(["bsdtar", "-a", "-cf", str(fs / "project-1.0.tar.gz"), "-C", str(fs / "pack"), "project"], check=True)
+    shutil.rmtree(fs / "src")
+    shutil.rmtree(fs / "pack")
+    # Anything handed to the default app would land here, as Nautilus did.
+    bin_dir = SCRATCH / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    log = SCRATCH / "opened.log"
+    log.unlink(missing_ok=True)
+    opener = bin_dir / "xdg-open"
+    opener.write_text(f'#!/bin/sh\necho "$1" >> {log}\nexit 0\n')
+    opener.chmod(0o755)
+    a = App(h, fs, path_prefix=str(bin_dir))
+    a.wait(lambda s: s["names"] == ["photos.zip", "project-1.0.tar.gz"], "listed")
+    a.type("photos")
+    a.wait(lambda s: s["selected"] == ["photos.zip"])
+    a.key("Return")
+    s = a.wait(lambda s: s["names"] == ["photos", "photos.zip", "project-1.0.tar.gz"] and s["selected"] == ["photos"] and not s["jobs"], "the folder appears, selected")
+    assert s["notices"] == [], s["notices"]
+    assert sorted(os.listdir(fs / "photos")) == ["a.txt", "b.txt"]
+    a.shot("extract-opened")
+    # From the menu: one folder inside comes out as itself, not wrapped in another.
+    a.click(ROW_X, row_y(2), 0x111)
+    items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+    assert items.index("Extract") == items.index("Preview") + 1, items
+    a.shot("extract-menu")
+    a.key("Down", "Down", "Down", "Return")
+    s = a.wait(lambda s: "project" in s["names"] and s["selected"] == ["project"] and not s["jobs"], "extracted from the menu")
+    assert (fs / "project/readme").read_text() == "r"
+    a.click(ROW_X, row_y(0), 0x111)
+    assert "Extract" not in a.wait(lambda s: s["menu"], "the menu")["menu_items"], "not for a folder"
+    a.key("Escape")
+    # Undo sends the last one to the Trash.
+    a.key("z", mods=("ctrl",))
+    a.wait(lambda s: "project" not in s["names"], "undone")
+    a.shot("extract-undone")
+    time.sleep(0.5)
+    assert not log.exists(), f"handed to another app: {log.read_text()}"
+    a.close()
+
+
+@check
 def live_refresh_keeps_selection(h):
     fs = fresh_fs()
     tree(fs, {"a": "", "b": "", "c": ""})
@@ -1707,21 +1752,29 @@ def any_file_says_what_it_is_and_opens_in_its_app(h):
     a.key("Down")
     s = a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "unknown bytes")
     assert preview_of(s)["kind"] == "application/octet-stream", s["preview"]
-    # Enter, or the Open button, opens it in its app and leaves the preview up.
+    # An archive is extracted from the list, not opened from here, so Enter only says so.
     a.key("Up", "Up")
     a.wait(lambda s: preview_of(s).get("name") == "a-archive.zip", "back to the archive")
+    a.key("Return")
+    a.wait(lambda s: any("from the list" in n for n in json.loads(a.preview_file.read_text())["notices"]), "says to open it from the list", timeout=5)
+    assert not log.exists(), log.read_text()
+    assert not (fs / "a-archive").exists(), "nothing extracted"
+    # Enter, or the Open button, opens anything else in its app and leaves the preview up. A zip
+    # without the ending isn't one Gannet unpacks.
+    a.key("Down")
+    a.wait(lambda s: preview_of(s).get("name") == "b-no-extension", "the unnamed zip")
     a.key("Return")
     end = time.monotonic() + 5
     while time.monotonic() < end and not log.exists():
         time.sleep(0.02)
-    assert log.read_text().strip() == str(fs / "a-archive.zip"), log.read_text()
+    assert log.read_text().strip() == str(fs / "b-no-extension"), log.read_text()
     assert a.state()["preview"], "still previewing"
-    a.key("Down", "Down")
+    a.key("Down")
     a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "the blob")
     x, y, w, h_ = a.preview_window()
     # The button sits below the picture and two lines of words, in the middle.
     a.click(x + w // 2, y + 533)
-    a.wait(lambda s: json.loads(a.preview_file.read_text())["notices"], "a failure shows in the window", timeout=5)
+    a.wait(lambda s: any("c-blob.xyz" in n for n in json.loads(a.preview_file.read_text())["notices"]), "a failure shows in the window", timeout=5)
     assert "c-blob.xyz" in log.read_text()
     a.shot("preview-open-failed")
     a.close()

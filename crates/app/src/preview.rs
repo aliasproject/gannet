@@ -2014,6 +2014,12 @@ impl App {
     /// Enter in the preview window: the file opens in its app, and the preview stays.
     fn preview_open_file(&mut self) {
         let Some(path) = self.preview.as_ref().map(|p| p.path.clone()) else { return };
+        // The list unpacks archives, where the job and its undo can be seen. Handed to the
+        // default app instead, an archive would open in whatever claims it, such as Nautilus.
+        if path.file_name().is_some_and(|n| gannet_core::archive::is_archive(n.as_encoded_bytes())) {
+            self.notice("Open it from the list to extract it".into());
+            return;
+        }
         let hub = self.hub.clone();
         gannet_core::open::open_with_default(&path, move |p, why| hub.send(Msg::Notice(format!("Couldn't open {}: {why}", display_name(&p)))));
     }
