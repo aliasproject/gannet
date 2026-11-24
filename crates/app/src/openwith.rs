@@ -584,7 +584,9 @@ impl Window {
         fixed.extend([search, apps]);
         fixed.extend(items);
         if let Some(r) = l.always {
-            let mut always = Node::new(a11y::OPEN_WITH_ALWAYS, Role::CheckBox, self.picker.always_label(), r, a11y::FRAME).doing(a11y::Action::new("toggle", "Make it the default", "space"));
+            // Space ticks it only until there's a search, where it's typed.
+            let keys = if self.picker.search.text.is_empty() { "space" } else { "" };
+            let mut always = Node::new(a11y::OPEN_WITH_ALWAYS, Role::CheckBox, self.picker.always_label(), r, a11y::FRAME).doing(a11y::Action::new("toggle", "Make it the default", keys));
             always.checked = Some(self.picker.always);
             fixed[0].children.push(always.id);
             fixed.push(always);

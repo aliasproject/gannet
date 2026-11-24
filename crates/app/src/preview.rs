@@ -1973,7 +1973,9 @@ impl App {
                 let kind = v.sound.as_ref().map_or_else(|| what.to_string(), |i| i.description.clone());
                 // Not where it's got to, which would be news every second while it plays.
                 let s = v.state;
-                (kind, vec![format!("{}, {} long", if s.paused { "paused" } else { "playing" }, clock(s.duration))])
+                let state = if s.paused { "paused" } else { "playing" };
+                // Its length once the player knows it.
+                (kind, vec![if s.duration > 0.0 { format!("{state}, {} long", clock(s.duration)) } else { state.to_string() }])
             }
             Content::Doc { info, .. } => (info.description.clone(), foot_parts(p, None, None).into_iter().skip(1).collect()),
             Content::Pdf(pdf) => (pdf.info.description.clone(), [pdf.info.size.map(format::size), Some(format::count(pdf.pages.len(), "page", "pages"))].into_iter().flatten().collect()),

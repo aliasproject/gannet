@@ -522,7 +522,7 @@ impl Link {
         let s = app.a11y_preview();
         let r = Rect::new(0, 0, app.w, app.h);
         let fixed = vec![
-            Node::new(FRAME, Role::Frame, format!("{} - Preview", s.name), r, 0).with_children(vec![PREVIEW, PREVIEW_PREVIOUS, PREVIEW_NEXT, PREVIEW_CLOSE]),
+            Node::new(FRAME, Role::Frame, if s.name.is_empty() { "Preview".to_string() } else { format!("{} - Preview", s.name) }, r, 0).with_children(vec![PREVIEW, PREVIEW_PREVIOUS, PREVIEW_NEXT, PREVIEW_CLOSE]),
             // What has the keyboard, so moving to another file reads out its name, and the rest
             // is there to be read.
             Node::new(PREVIEW, Role::Document, s.name.clone(), s.area, FRAME).described([s.kind.as_str(), s.shows.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ")).with_children(vec![PREVIEW_NAME, PREVIEW_KIND, PREVIEW_SHOWS]),
