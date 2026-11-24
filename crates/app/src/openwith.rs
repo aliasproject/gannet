@@ -226,8 +226,8 @@ impl Picker {
             _ => None,
         };
         let choice = |a: &apps::App| Choice { id: a.id.clone(), name: a.name.clone(), default: default.as_deref() == Some(a.id.as_str()) };
-        self.suggested = apps.for_all(&ancestors).into_iter().map(choice).collect();
         // An app with nowhere in its command line for a file can't open one.
+        self.suggested = apps.for_all(&ancestors).into_iter().filter(|a| a.takes_files()).map(choice).collect();
         self.others = apps.all_shown().into_iter().filter(|a| a.takes_files() && !self.suggested.iter().any(|s| s.id == a.id)).map(choice).collect();
     }
 
@@ -1069,10 +1069,10 @@ mod tests {
     #[test]
     fn an_app_that_takes_no_files_isnt_offered() {
         let (dir, _) = installed();
-        std::fs::write(dir.join("applications/settings.desktop"), "[Desktop Entry]\nType=Application\nName=Settings\nExec=/bin/sh\n").unwrap();
+        std::fs::write(dir.join("applications/settings.desktop"), "[Desktop Entry]\nType=Application\nName=Settings\nExec=/bin/sh\nMimeType=video/mp4;\n").unwrap();
         let apps = Apps::load(&[dir.join("applications")], &[], &[], None, &[]);
         let p = Picker::new(Spec { types: vec!["video/mp4".into()], ..Spec::default() }, &apps, None, None);
-        assert!(!rows(&p).iter().any(|r| r.starts_with("settings")), "{:?}", rows(&p));
+        assert!(!rows(&p).iter().any(|r| r.starts_with("settings")), "not even for a type it names: {:?}", rows(&p));
         assert_eq!(rows(&p).len(), 5);
         let _ = std::fs::remove_dir_all(&dir);
     }

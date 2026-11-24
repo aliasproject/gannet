@@ -446,7 +446,9 @@ pub fn set_default(list: &Path, mime: &str, id: &str) -> std::io::Result<()> {
     let updated = with_default(&text, mime, id);
     let dir = target.parent().ok_or_else(|| std::io::Error::other("the list has no folder"))?;
     std::fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!(".mimeapps.list.gannet-{}", std::process::id()));
+    // Numbered too, as two Open With windows from one list can each write a default at once.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir.join(format!(".mimeapps.list.gannet-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::write(&tmp, updated)?;
     std::fs::rename(&tmp, &target).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
