@@ -115,8 +115,9 @@ To add it to your app launcher:
 
 ## Searching
 
-Ctrl+F filters the folder showing. Ctrl+Shift+F, or Ctrl+Shift+F in the filter, searches it
-and every folder inside it for names that contain what's typed, ignoring case. Matches appear
+Ctrl+F filters the folder showing. Ctrl+Shift+F searches it and every folder inside it for
+names that contain what's typed, ignoring case; in the filter, it turns the filter into a
+search, and Ctrl+F turns it back. Matches appear
 as they're found, nearest folders first, with where each one is beside it, and each letter
 typed starts the search again. Enter opens a match, Alt+Enter shows it in its folder, and
 going back from there comes back to the search. Escape ends it.
@@ -125,7 +126,10 @@ There's no index: each search reads the folders as they are now, and nothing run
 you're not searching. Reading 200,000 files takes a few tens of milliseconds once they've been
 read before. A search stays on the folder's own disk, so other disks, network shares and
 `/proc` mounted inside aren't read, and it doesn't follow symlinks to folders. Hidden folders
-are only searched while hidden files show. It stops after 1,000 matches, and says so.
+are only searched while hidden files show. It stops after 1,000 matches, and says so. Only
+the folder searched is watched for changes, so a file changed deeper down by another program
+shows as it was until the search runs again (F5, or typing). Changing the sort while searching
+sorts the folder that way too.
 
 ## Sorting
 

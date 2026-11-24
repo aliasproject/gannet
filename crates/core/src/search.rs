@@ -50,7 +50,8 @@ pub struct Walked {
 }
 
 /// Searches `root` and below for names containing `query`, ignoring case. `step` hears of
-/// each match and is asked now and then whether to go on; `None` means it said to stop.
+/// each match and is asked now and then whether to go on, and returning false from either
+/// stops the walk; `None` means it was stopped.
 /// Fails only if `root` itself can't be read.
 pub fn walk(root: &Path, query: &str, show_hidden: bool, limit: usize, step: &mut dyn FnMut(Step) -> bool) -> std::io::Result<Option<Walked>> {
     let needle = query.to_lowercase();
@@ -71,6 +72,8 @@ pub fn walk(root: &Path, query: &str, show_hidden: bool, limit: usize, step: &mu
             // A folder that became a symlink since it was listed isn't followed either.
             None => match open_dir(&dir, false) {
                 Ok(fd) => fd,
+                // One that went since it was listed was never there to read.
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound) => continue,
                 Err(_) => {
                     walked.unreadable += 1;
                     continue;
@@ -111,7 +114,10 @@ pub fn walk(root: &Path, query: &str, show_hidden: bool, limit: usize, step: &mu
                     },
                     _ => Kind::Other,
                 };
-                step(Step::Found(Found { path: at, kind, size: st.as_ref().map(|s| s.stx_size), mtime: st.map_or(0, |s| s.stx_mtime.tv_sec) }));
+                // Looking at a match can be slow, so a search that's been replaced stops here too.
+                if !step(Step::Found(Found { path: at, kind, size: st.as_ref().map(|s| s.stx_size), mtime: st.map_or(0, |s| s.stx_mtime.tv_sec) })) {
+                    return Ok(None);
+                }
                 found += 1;
                 if found >= limit {
                     walked.truncated = true;
@@ -288,6 +294,25 @@ mod tests {
         .unwrap();
         assert!(r.is_none());
         assert_eq!(ticks, 3, "it stopped at once");
+    }
+
+    #[test]
+    fn it_stops_at_a_match_when_told() {
+        let s = Scratch::new();
+        for i in 0..5 {
+            s.file(&format!("hit-{i}"), b"");
+        }
+        let mut seen = 0;
+        let r = walk(s.path(), "hit", false, LIMIT, &mut |st| {
+            if matches!(st, Step::Found(_)) {
+                seen += 1;
+                return false;
+            }
+            true
+        })
+        .unwrap();
+        assert!(r.is_none());
+        assert_eq!(seen, 1);
     }
 
     #[test]

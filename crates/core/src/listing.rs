@@ -843,7 +843,10 @@ fn load_search(req: LoadRequest, watch: Option<&Arc<Watch>>, cancel: &Arc<Atomic
     let (mut found, mut shown, mut next_show) = (Vec::new(), 0, SEARCH_FIRST_SHOW);
     let result = crate::search::walk(&req.dir, &query, req.show_hidden, limit, &mut |step| {
         match step {
-            crate::search::Step::Found(f) => found.push(f),
+            crate::search::Step::Found(f) => {
+                found.push(f);
+                return !stale();
+            }
             crate::search::Step::Tick if stale() => return false,
             crate::search::Step::Tick => {
                 if let Some(d) = req.slow_read {

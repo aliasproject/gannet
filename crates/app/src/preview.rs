@@ -2102,12 +2102,15 @@ impl App {
             return;
         }
         self.previewer = Some(path.clone());
-        if path.parent() != Some(self.dir.as_path()) {
+        // A search's rows are anywhere below, and found by their paths.
+        let search = self.listing.as_ref().is_some_and(|l| l.search().is_some());
+        if !search && path.parent() != Some(self.dir.as_path()) {
             return;
         }
         let Some(name) = path.file_name().map(|n| n.as_encoded_bytes()) else { return };
+        let key = if search { path.as_os_str().as_encoded_bytes() } else { name };
         // A file the list doesn't show (its filter hides it, say) leaves the cursor where it is.
-        let Some(row) = self.listing.as_ref().and_then(|l| self.rows.iter().position(|&i| *l.key(i) == *name)) else { return };
+        let Some(row) = self.listing.as_ref().and_then(|l| self.rows.iter().position(|&i| *l.key(i) == *key)) else { return };
         if row != self.cursor || !self.cursor_shown {
             self.move_cursor(row, Mods { ctrl: self.sel_count > 1, ..Mods::default() });
         }

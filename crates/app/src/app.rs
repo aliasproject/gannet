@@ -1724,6 +1724,12 @@ impl App {
         self.invalidate(self.layout().status);
     }
 
+    /// Opens the filter on this folder only, as Ctrl+F and / do, even after a search.
+    fn start_filter_here(&mut self) {
+        self.start_filter("");
+        self.set_search_below(false);
+    }
+
     /// Opens the filter as a search of this folder and every folder below it.
     fn start_search(&mut self) {
         self.start_filter("");
@@ -2013,7 +2019,12 @@ impl App {
                 if o.touched.contains(&self.dir) || trash_touched || search_touched {
                     use std::os::unix::ffi::OsStrExt;
                     // A selection made since the job began is the user's, and stays.
-                    self.pending_select = o.created.iter().filter(|_| selection_untouched).filter(|p| p.parent() == Some(self.dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_bytes().to_vec()).collect();
+                    // A search's rows are known by their paths, and can be anywhere below.
+                    self.pending_select = if search_touched {
+                        o.created.iter().filter(|_| selection_untouched).filter(|p| p.starts_with(&self.dir)).map(|p| p.as_os_str().as_bytes().to_vec()).collect()
+                    } else {
+                        o.created.iter().filter(|_| selection_untouched).filter(|p| p.parent() == Some(self.dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_bytes().to_vec()).collect()
+                    };
                     self.reload_at = None;
                     self.reload();
                 }
@@ -2958,7 +2969,7 @@ impl App {
             (k::KEY_h, true, _) => self.action(Action::ToggleHidden),
             (k::KEY_l, true, _) => self.start_path_edit(),
             (k::KEY_f | k::KEY_F, true, _) if m.shift => self.start_search(),
-            (k::KEY_f, true, _) => self.start_filter(""),
+            (k::KEY_f, true, _) => self.start_filter_here(),
             (k::KEY_a, true, _) => self.select_all(),
             (k::KEY_n, true, _) if !m.shift => self.action(Action::NewWindow),
             (k::KEY_q | k::KEY_w, true, _) => self.request_close(),
@@ -2970,7 +2981,7 @@ impl App {
                     self.open_place(d as usize - 1);
                 }
             }
-            (_, false, false) if !m.logo && utf8 == "/" => self.start_filter(""),
+            (_, false, false) if !m.logo && utf8 == "/" => self.start_filter_here(),
             (_, false, false) if !m.logo && !utf8.is_empty() && !utf8.chars().any(char::is_control) => self.type_ahead(utf8),
             _ => {}
         }
@@ -4705,6 +4716,37 @@ mod tests {
         r.idle();
         r.pump_until("searched again", |a| !a.loading && a.listing.as_ref().is_some_and(|l| (0..l.len() as u32).any(|i| l.name(i) == b"notes-renamed.md")));
         assert!(r.work().join("a/b/notes-renamed.md").exists());
+        assert_eq!(r.selected_names(), ["notes-renamed.md"], "the renamed match stays selected");
+    }
+
+    #[test]
+    fn ctrl_f_and_slash_filter_only_here_even_after_a_search() {
+        let mut r = search_rig("search-then-filter");
+        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        // Enter on the empty search box, then a plain filter.
+        r.key(k::KEY_Return, "");
+        r.ctrl(k::KEY_f);
+        r.type_text("notes");
+        assert!(!r.app.search_below && r.app.search_query().is_none());
+        r.pump_until("filtered", |a| !a.loading);
+        assert_eq!(r.row_names(), ["notes.txt"]);
+        r.key(k::KEY_Escape, "");
+        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        r.key(k::KEY_Return, "");
+        r.key(0, "/");
+        assert!(matches!(r.app.edit, Edit::Filter(_)) && !r.app.search_below);
+    }
+
+    #[test]
+    fn the_preview_window_stepping_moves_the_cursor_through_matches() {
+        let mut r = search_rig("search-preview");
+        r.search("notes");
+        r.key(k::KEY_Down, "");
+        r.select("notes-dir");
+        r.app.previewer = Some(r.work().join("a/notes-dir"));
+        let generation = r.app.previewer_gen;
+        r.app.on_preview_stepped(generation, r.work().join("a/b/notes-deep.md"));
+        assert_eq!(r.selected_names(), ["notes-deep.md"]);
     }
 
     #[test]
