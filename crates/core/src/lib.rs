@@ -17,6 +17,7 @@ pub mod ops;
 pub mod places;
 pub mod recent;
 pub mod sort;
+pub mod terminal;
 pub mod theme;
 pub mod thumbcache;
 pub mod thumbnailers;

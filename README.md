@@ -74,6 +74,7 @@ At run time, Gannet uses these:
 | `fc-match` (fontconfig) | Finding fonts | Gannet can't find a font, so install this |
 | `xdg-open` | Opening files in other apps | Opening files fails |
 | `bsdtar` (libarchive) | Extracting archives | Extracting says it's missing |
+| `xdg-terminal-exec` | Open in terminal, in whichever terminal is set up | Open in terminal isn't offered |
 | `libmpv` (part of `mpv` on many systems) and `bubblewrap` | Video and sound previews | Videos show a message saying what's needed |
 | `udisks2` | Mounting, unlocking and ejecting drives | Only drives that are already mounted show |
 | `shared-mime-info` | Saying what a file is, like "PDF document" | Previews name types like `application/pdf` |
@@ -221,6 +222,15 @@ whether Gannet is allowed to. The item only shows where the portal can do it: GN
 portals can, and so can aliasOS's once it has its Wallpaper portal backend. Elsewhere, such as
 on sway with only the GTK and wlr portals, it stays hidden rather than doing nothing. It shows
 up without restarting Gannet once the portal starts with one that can.
+
+## Open in terminal
+
+Right-click a folder, or the empty space in a folder, and choose Open in terminal. Gannet asks
+`xdg-terminal-exec` for it, so it opens whichever terminal `~/.config/xdg-terminals.list` names,
+in that folder. Where a systemd user manager runs, the terminal gets a scope of its own, as apps
+started from a launcher do, so it stays open when Gannet closes. It isn't offered for files, in the Trash or Recent, in
+Open and Save dialogs, or where `xdg-terminal-exec` isn't installed. If the terminal can't
+start, the window says so.
 
 ## Archives
 
