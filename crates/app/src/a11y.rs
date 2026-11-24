@@ -363,6 +363,8 @@ pub struct News {
     pub posted: u64,
     pub notices: Vec<String>,
     pub jobs: Vec<JobNews>,
+    /// The last few jobs to end, each with whether it did all it was asked.
+    pub ended: Vec<(u64, bool)>,
 }
 
 /// A job as the panel shows it.
@@ -384,7 +386,7 @@ impl Snapshot {
 
     /// What to announce on going from `old` to this, each with whether it's urgent: notices
     /// posted, which are, and jobs that finished and the list sorted another way, which aren't.
-    /// A job stopped, or one that failed, posts a notice of its own.
+    /// A job stopped, or one with errors, isn't finished: it posts a notice of its own.
     pub fn news_since(&self, old: &Snapshot) -> Vec<(String, bool)> {
         let mut out = Vec::new();
         if old.rows.era == self.rows.era && old.rows.sort != self.rows.sort {
@@ -394,7 +396,8 @@ impl Snapshot {
             }
         }
         let (was, is) = (&old.news, &self.news);
-        for j in was.jobs.iter().filter(|j| !j.stopping && !is.jobs.iter().any(|n| n.id == j.id)) {
+        let clean = |id: u64| is.ended.iter().any(|&(e, ok)| e == id && ok);
+        for j in was.jobs.iter().filter(|j| !is.jobs.iter().any(|n| n.id == j.id) && clean(j.id)) {
             out.push((format!("Finished: {}", j.label), false));
         }
         // Notices are added at the end, so the new ones are the last.
@@ -416,6 +419,8 @@ pub enum Act {
     OpenCrumb(Arc<PathBuf>, usize),
     /// Eject the drive at that place in the sidebar, if it's still the one of that name.
     Eject(usize, String),
+    /// Dismiss the notice at that place among them, if it still says that.
+    Dismiss(usize, String),
     /// Put the cursor on a row without changing the selection: the row of that key
     /// (`Listing::key`) in that folder. A request about a folder the window has left is dropped,
     /// here and for each request about a row.
@@ -657,7 +662,9 @@ fn columns(app: &App, l: &Layout) -> Vec<Col> {
 /// A column's heading, which sorts the list by it, as clicking it does. Recent's order is fixed,
 /// and nothing sorts by where a row is.
 fn heading(app: &App, l: &Layout, c: &Col) -> Node {
-    let n = Node::new(c.column.heading(), Role::ColumnHeader, c.name, Rect::new(c.x, l.header.y, c.w, l.header.h), FRAME).showing(c.w > 0);
+    // The Name heading starts left of the names, over their icons, as it's drawn.
+    let x = if c.column == Column::Name { l.header.x + app.px(14.0) } else { c.x };
+    let n = Node::new(c.column.heading(), Role::ColumnHeader, c.name, Rect::new(x, l.header.y, c.x + c.w - x, l.header.h), FRAME).showing(c.w > 0);
     let action = match c.column {
         Column::Name => click("Sort by name", "<Control>1"),
         Column::Size => click("Sort by size", "<Control>2"),
@@ -753,7 +760,7 @@ fn panel(app: &App, l: &Layout) -> (Node, Vec<Node>, News) {
         parts.push(Node::new(DISMISS0 + i as u64, Role::PushButton, "Dismiss", close(first + i), NOTICES).described(text.clone()).showing(shown).doing(click("Dismiss the notice", "")));
     }
     let panel = Node::new(NOTICES, Role::Panel, "Notices", l.notices, FRAME).showing(l.notices.h > 0).with_children(parts.iter().map(|n| n.id).collect());
-    let news = News { posted: app.notices_posted, notices: app.notices.clone(), jobs };
+    let news = News { posted: app.notices_posted, notices: app.notices.clone(), jobs, ended: app.jobs_ended.clone() };
     (panel, parts, news)
 }
 

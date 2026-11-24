@@ -1716,7 +1716,7 @@ def a_screen_reader_reads_columns_the_path_and_drives_and_hears_the_news(h):
         assert p[-1]["showing"] and p[-2]["name"] == fs.name, p
         assert sr.ask(f"crumb {len(p) - 2}") is True
         a.wait(lambda s: s["dir"] == str(fs) and s["selected"] == ["docs"], "up to the folder above, on the one come from")
-        sr.until("path", lambda p: p[-1]["name"] == fs.name and p[-1]["current"] == "location", "the path says where it is now")
+        sr.until("path", lambda p: p[-1]["name"] == fs.name and p[-1]["current"] == "location" and p[-1]["showing"], "the path says where it is now, placed as drawn")
         a.key("Return")
         a.wait(lambda s: s["dir"] == str(fs / "docs") and s["count"] == 4, "back in docs")
 

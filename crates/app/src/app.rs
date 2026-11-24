@@ -605,6 +605,9 @@ pub struct App {
     pub notices: Vec<String>,
     /// How many notices have been posted, so a screen reader can tell which are new.
     pub notices_posted: u64,
+    /// The last few jobs to end, each with whether it did all it was asked: not stopped, and
+    /// without errors. A screen reader announces only those as finished.
+    pub jobs_ended: Vec<(u64, bool)>,
     /// The path bar's parts as last laid out: (start x, width, folder).
     crumbs_laid: Vec<(i32, i32, PathBuf)>,
 
@@ -769,6 +772,7 @@ impl App {
             menu: None,
             notices: Vec::new(),
             notices_posted: 0,
+            jobs_ended: Vec::new(),
             crumbs_laid: Vec::new(),
             engine,
             recent_file: trash_dir.parent().and_then(Path::parent).map_or_else(PathBuf::new, |d| d.join(gannet_core::recent::FILE)),
@@ -1508,7 +1512,7 @@ impl App {
     /// Does what a screen reader asked. A request about a row in a folder the window has
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
-        use crate::a11y::{Act, BACK, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, DISMISS0, STOP0};
+        use crate::a11y::{Act, BACK, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, STOP0};
         // As with the pointer: nothing behind a dialog can be used, and anything outside a menu
         // only closes it, so the menu never acts on a selection changed under it.
         if self.dialog.is_some() || matches!(act, Act::Wake) {
@@ -1532,9 +1536,9 @@ impl App {
                     _ => SortKey::Modified,
                 }));
             }
-            Act::Press(id) if (DISMISS0..DISMISS0 * 2).contains(&id) => {
-                let i = (id - DISMISS0) as usize;
-                if i < self.notices.len() {
+            // Checked by what it says, as the notices may have moved since.
+            Act::Dismiss(i, text) => {
+                if self.notices.get(i) == Some(&text) {
                     self.notices.remove(i);
                     self.clamp_scroll();
                     self.invalidate_all();
@@ -2328,6 +2332,10 @@ impl App {
             ops::Event::Finished(o) => {
                 self.answer_drop(&o);
                 let view = self.jobs.iter().position(|j| j.job.id == o.job).map(|i| self.jobs.remove(i));
+                if self.jobs_ended.len() >= 16 {
+                    self.jobs_ended.remove(0);
+                }
+                self.jobs_ended.push((o.job, !o.cancelled && o.errors == 0));
                 let selection_untouched = view.as_ref().is_some_and(|v| v.selection_epoch == self.selection_epoch);
                 if o.cancelled
                     && let Some(v) = &view
@@ -9807,7 +9815,10 @@ mod tests {
         assert_eq!(t.news_since(&s), [("Something broke".to_string(), true), ("Something broke".to_string(), true)]);
         assert_eq!(t.get(NOTICES).unwrap().children, [NOTICE0, DISMISS0, NOTICE0 + 1, DISMISS0 + 1]);
         assert_eq!(t.get(DISMISS0 + 1).unwrap().description, "Something broke");
-        r.app.on_msg(Msg::A11y(Act::Press(DISMISS0)));
+        // A request for a notice that has moved since does nothing.
+        r.app.on_msg(Msg::A11y(Act::Dismiss(0, "Something else".into())));
+        assert_eq!(r.app.notices.len(), 2);
+        r.app.on_msg(Msg::A11y(Act::Dismiss(0, "Something broke".into())));
         let u = a11y_snapshot(&r.app);
         assert_eq!(r.app.notices.len(), 1);
         assert!(u.news_since(&t).is_empty(), "dismissing one isn't news");
@@ -9832,6 +9843,10 @@ mod tests {
         r.pump_until("copied", |a| a.jobs.is_empty());
         let t = a11y_snapshot(&r.app);
         assert_eq!(t.news_since(&s), [("Finished: Copying “a.txt” to dest".to_string(), false)]);
+        // Had it ended with errors, which post notices of their own, it wouldn't be finished.
+        let mut failed = t.clone();
+        failed.news.ended = vec![(job.id, false)];
+        assert!(failed.news_since(&s).is_empty(), "a job with errors announced as finished");
 
         // A job stopped through its button posts a notice that it stopped, not that it finished.
         r.app.start_job(Request::Copy { sources: vec![r.work().join("a.txt")], dest: r.work().join("dest") });

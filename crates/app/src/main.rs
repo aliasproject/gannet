@@ -370,7 +370,6 @@ fn main() {
                 }
             }
         }
-        a11y.update(&app);
         if wl.must_paint() || (!app.dirty.is_empty() && wl.can_paint() && app.hold_paint.is_none()) {
             let damage = if wl.must_paint() { canvas::Rect::new(0, 0, i32::MAX / 2, i32::MAX / 2) } else { std::mem::take(&mut app.dirty) };
             app.dirty = canvas::Rect::default();
@@ -405,6 +404,8 @@ fn main() {
                 find_fallback_fonts(&hub, missing);
             }
         }
+        // After painting, so what a screen reader is told is placed as it's drawn.
+        a11y.update(&app);
         #[cfg(feature = "bench")]
         bench.idle(&app);
         #[cfg(feature = "bench")]

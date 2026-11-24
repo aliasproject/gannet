@@ -673,6 +673,8 @@ impl Ctx {
                     } else if (a11y::EJECT0..a11y::NOTICE0).contains(&n.id) {
                         // Named for the drive, so it can't eject another that took its place.
                         Act::Eject((n.id - a11y::EJECT0) as usize, snap.get(n.parent).map(|p| p.name.clone()).unwrap_or_default())
+                    } else if (a11y::DISMISS0..a11y::DISMISS0 * 2).contains(&n.id) {
+                        Act::Dismiss((n.id - a11y::DISMISS0) as usize, n.description.clone())
                     } else {
                         Act::Press(n.id)
                     };
