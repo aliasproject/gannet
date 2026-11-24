@@ -1511,13 +1511,19 @@ impl App {
             self.close_menu();
             return;
         }
+        if self.a11y_chooser_act(&act) {
+            return;
+        }
         let row = |app: &Self, dir: &Path, key: &[u8]| {
             let l = app.listing.as_ref().filter(|_| app.dir == dir)?;
             app.rows.iter().position(|&e| *l.key(e) == *key)
         };
         match act {
-            Act::Press(BACK) => self.go_back(),
-            Act::Press(_) | Act::Wake => {}
+            Act::Press(BACK) if !self.viewer => self.go_back(),
+            Act::Press(crate::a11y::PREVIEW_PREVIOUS) if self.viewer => self.preview_move(-1),
+            Act::Press(crate::a11y::PREVIEW_NEXT) if self.viewer => self.preview_move(1),
+            Act::Press(crate::a11y::PREVIEW_CLOSE) if self.viewer => self.close_preview(),
+            Act::Press(_) | Act::Focus(_) | Act::Wake => {}
             Act::OpenPlace(i) => {
                 self.reveal_place(i);
                 self.open_place(i);
@@ -9586,5 +9592,63 @@ mod tests {
         r.app.bookmarks_changed();
         assert_eq!(r.app.side_scroll, 0.0);
         assert!(!r.app.scrollbar_visible(Pane::Sidebar));
+    }
+
+    #[test]
+    fn a_screen_reader_hears_the_preview_and_walks_it() {
+        use crate::a11y::{Act, BACK, PREVIEW_CLOSE, PREVIEW_NEXT, PREVIEW_PREVIOUS};
+        let mut r = viewer_rig("a11y-viewer", "a");
+        let t = r.app.a11y_preview();
+        assert_eq!((t.name.as_str(), t.can_step), ("a", (false, true)), "the first of three");
+        r.app.on_msg(Msg::A11y(Act::Press(PREVIEW_NEXT)));
+        assert_eq!(showing(&r).as_deref(), Some("b"));
+        assert_eq!(r.app.a11y_preview().can_step, (true, true));
+        r.app.on_msg(Msg::A11y(Act::Press(PREVIEW_PREVIOUS)));
+        assert_eq!(showing(&r).as_deref(), Some("a"));
+        // The preview has no Back button: a request meant for a list's does nothing here.
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::A11y(Act::Press(BACK)));
+        assert_eq!(showing(&r).as_deref(), Some("a"));
+        r.app.on_msg(Msg::A11y(Act::Press(PREVIEW_CLOSE)));
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::Quit)), "closed");
+    }
+
+    #[test]
+    fn a_screen_reader_can_use_the_save_dialogs_bar() {
+        use crate::a11y::{Act, CHOOSER_CANCEL, CHOOSER_SAVE_NAME, CHOOSER_TYPE0, CHOOSER_TYPES, Role};
+        let mut r = Rig::new("a11y-chooser");
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        fs::write(r.work().join("b.png"), "b").unwrap();
+        let glob = |g: &str| vec![crate::chooser::Pattern::Glob(g.into())];
+        let filters = vec![crate::chooser::Filter { label: "Text".into(), patterns: glob("*.txt") }, crate::chooser::Filter { label: "All files".into(), patterns: glob("*") }];
+        let spec = crate::chooser::Spec { mode: crate::chooser::Mode::Save, name: Some("new.txt".into()), filters, ..crate::chooser::Spec::default() };
+        r.app.chooser = Some(crate::chooser::Chooser::new(spec, &[], None));
+        r.open(r.work());
+        // The bar is placed as it was last drawn.
+        let mut px = vec![0u32; (r.app.w * r.app.h) as usize];
+        r.app.paint(&mut crate::canvas::Canvas::new(&mut px, r.app.w, r.app.h));
+        let parts = r.app.a11y_chooser_parts();
+        let name = parts.iter().find(|n| n.id == CHOOSER_SAVE_NAME).expect("the name field");
+        assert_eq!((name.role, name.field.as_ref().map(|f| f.text.as_str())), (Role::Entry, Some("new.txt")));
+        assert!(!name.rect.is_empty() && r.app.a11y_name_has_keyboard());
+        let types = parts.iter().find(|n| n.id == CHOOSER_TYPES).expect("the file types");
+        assert_eq!(types.children, [CHOOSER_TYPE0, CHOOSER_TYPE0 + 1]);
+        assert!(parts.iter().any(|n| n.id == CHOOSER_TYPE0 && n.selected));
+        assert!(parts.iter().filter(|n| n.parent == CHOOSER_TYPES).all(|n| n.showing && n.rect == types.rect), "the types count as showing, or a screen reader leaves them out");
+        // Picking a file type shows its files.
+        r.app.on_msg(Msg::A11y(Act::Focus(CHOOSER_TYPE0 + 1)));
+        r.pump_until("every file", |a| a.rows.len() == 2);
+        assert_eq!(r.app.chooser.as_ref().unwrap().filter, Some(1));
+        // Moving to a row takes the keyboard from the name, and moving to the name gives it back.
+        let dir = Arc::new(r.work());
+        r.app.on_msg(Msg::A11y(Act::FocusRow(dir, b"b.png".to_vec())));
+        assert!(!r.app.a11y_name_has_keyboard() && r.app.cursor_shown);
+        r.app.on_msg(Msg::A11y(Act::Focus(CHOOSER_SAVE_NAME)));
+        assert!(r.app.a11y_name_has_keyboard());
+        // A late request about a folder the dialog has left doesn't take the keyboard from the name.
+        r.app.on_msg(Msg::A11y(Act::FocusRow(Arc::new(r.work().join("gone")), b"b.png".to_vec())));
+        assert!(r.app.a11y_name_has_keyboard(), "a request about another folder took the keyboard");
+        r.app.on_msg(Msg::A11y(Act::Press(CHOOSER_CANCEL)));
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::Quit)) && r.app.chooser.as_ref().unwrap().picked.is_none(), "cancelled");
     }
 }

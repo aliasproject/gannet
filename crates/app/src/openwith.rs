@@ -7,6 +7,7 @@
 //! opens itself. Either way the window only says what was picked, on its standard output, as
 //! the Open and Save dialogs do.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{BufRead, Read, Write};
 use std::os::fd::AsFd;
@@ -23,6 +24,7 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags, eventfd, poll};
 use rustix::fd::OwnedFd;
 use xkbcommon::xkb::keysyms as k;
 
+use crate::a11y::{self, Act, Node, Role};
 use crate::app::{Hub, Msg};
 use crate::canvas::{Canvas, Rect};
 use crate::field::Field;
@@ -376,6 +378,10 @@ struct Window {
     last_click: Option<(Instant, usize)>,
     dirty: bool,
     finish: Option<Finish>,
+    has_keyboard: bool,
+    /// Each app's and heading's number for screen readers, kept while the window's open, so
+    /// one keeps its object as a search comes and goes.
+    a11y_ids: HashMap<String, u64>,
 }
 
 impl Window {
@@ -523,6 +529,7 @@ impl Window {
             }
             Input::Resized => self.dirty = true,
             Input::Close => self.finish = Some(Finish::Cancel),
+            Input::Focus(on) => self.has_keyboard = on,
             _ => {}
         }
     }
@@ -533,6 +540,87 @@ impl Window {
         self.scale = scale;
         self.text.set_size(crate::text::UI_PX * scale as f32, crate::text::UI_HINTED && scale < 1.5);
         self.reveal();
+        self.dirty = true;
+    }
+
+    /// A row's number for screen readers.
+    fn a11y_id(&mut self, row: &Row) -> u64 {
+        let key = match row {
+            Row::Heading(h) => format!("# {h}"),
+            Row::App(c) => c.id.clone(),
+        };
+        let next = a11y::OPEN_WITH_ROW0 + self.a11y_ids.len() as u64;
+        *self.a11y_ids.entry(key).or_insert(next)
+    }
+
+    /// What screen readers see: the search box, the apps under their headings with the
+    /// default marked, and the buttons. The app picked has the keyboard, as its row is where
+    /// the arrows move.
+    fn a11y_snapshot(&mut self, rows: a11y::Rows) -> a11y::Snapshot {
+        let l = self.layout();
+        let (tops, _) = self.row_tops();
+        let full = Rect::new(0, 0, self.w, self.h);
+        let mut fixed = vec![Node::new(a11y::FRAME, Role::Dialog, self.picker.spec.title(), full, 0)];
+        let mut search = Node::new(a11y::OPEN_WITH_SEARCH, Role::Entry, "Search apps", l.search, a11y::FRAME);
+        search.field = Some(self.picker.search.clone());
+        let mut items = Vec::new();
+        let mut focus = a11y::Focus::Node(a11y::OPEN_WITH_SEARCH);
+        for (i, row) in self.picker.rows.clone().iter().enumerate() {
+            let id = self.a11y_id(row);
+            let r = Rect::new(l.list.x, l.list.y + tops[i] - self.scroll, l.list.w, self.row_h(row));
+            let showing = r.y + r.h > l.list.y && r.y < l.list.bottom();
+            items.push(match row {
+                Row::Heading(h) => Node::new(id, Role::Heading, h.clone(), r, a11y::OPEN_WITH_APPS).showing(showing),
+                Row::App(c) => {
+                    if self.picker.cursor == Some(i) {
+                        focus = a11y::Focus::Node(id);
+                    }
+                    Node::new(id, Role::ListItem, c.name.clone(), r, a11y::OPEN_WITH_APPS).described(if c.default { "Default" } else { "" }).selected(self.picker.cursor == Some(i)).showing(showing).doing(a11y::Action::new("activate", "Open with this app", "Return"))
+                }
+            });
+        }
+        let apps = Node::new(a11y::OPEN_WITH_APPS, Role::List, "Apps", l.list, a11y::FRAME).with_children(items.iter().map(|n| n.id).collect());
+        fixed[0].children = vec![a11y::OPEN_WITH_SEARCH, a11y::OPEN_WITH_APPS];
+        fixed.extend([search, apps]);
+        fixed.extend(items);
+        if let Some(r) = l.always {
+            // Space ticks it only until there's a search, where it's typed.
+            let keys = if self.picker.search.text.is_empty() { "space" } else { "" };
+            let mut always = Node::new(a11y::OPEN_WITH_ALWAYS, Role::CheckBox, self.picker.always_label(), r, a11y::FRAME).doing(a11y::Action::new("toggle", "Make it the default", keys));
+            always.checked = Some(self.picker.always);
+            fixed[0].children.push(always.id);
+            fixed.push(always);
+        }
+        let can = self.picker.picked().is_some();
+        fixed[0].children.extend([a11y::OPEN_WITH_CANCEL, a11y::OPEN_WITH_OPEN]);
+        fixed.push(Node::new(a11y::OPEN_WITH_CANCEL, Role::PushButton, "Cancel", l.cancel, a11y::FRAME).doing(a11y::click("Close without opening", "Escape")));
+        fixed.push(Node::new(a11y::OPEN_WITH_OPEN, Role::PushButton, "Open", l.open, a11y::FRAME).enabled(can).doing(a11y::click("Open with the app picked", "Return")));
+        a11y::Snapshot { fixed, rows, focus, window_focused: self.has_keyboard, dir: Arc::default() }
+    }
+
+    /// Does what a screen reader asked, as the pointer would.
+    fn a11y_act(&mut self, act: Act) {
+        let row = |w: &mut Self, id: u64| (0..w.picker.rows.len()).find(|&i| matches!(w.picker.rows[i], Row::App(_)) && w.a11y_id(&w.picker.rows[i].clone()) == id);
+        match act {
+            Act::Press(a11y::OPEN_WITH_OPEN) => self.finish = self.picker.picked().map(|c| Finish::Open(c.id.clone())),
+            Act::Press(a11y::OPEN_WITH_CANCEL) => self.finish = Some(Finish::Cancel),
+            Act::Press(a11y::OPEN_WITH_ALWAYS) if self.picker.can_always() => self.picker.always = !self.picker.always,
+            Act::Press(id) => {
+                if let Some(i) = row(self, id) {
+                    self.picker.cursor = Some(i);
+                    self.finish = self.picker.picked().map(|c| Finish::Open(c.id.clone()));
+                }
+            }
+            Act::Focus(id) => {
+                if let Some(i) = row(self, id) {
+                    self.picker.cursor = Some(i);
+                    self.reveal();
+                }
+            }
+            // Typing in the search box through a screen reader comes with the text fields' own
+            // requests, which need routing here once they exist.
+            _ => return,
+        }
         self.dirty = true;
     }
 
@@ -705,13 +793,18 @@ pub fn main() -> ! {
     let (db, apps) = loading.join().unwrap_or_default();
     let picker = Picker::new(spec, &apps, db.as_ref(), lang.as_deref());
     let (w, h) = wl.physical_size();
-    let mut win = Window { picker, apps, text, colors, scale: 1.0, w, h, scroll: 0, pointer: (0, 0), hover: Hit::None, last_click: None, dirty: true, finish: None };
+    let mut win = Window { picker, apps, text, colors, scale: 1.0, w, h, scroll: 0, pointer: (0, 0), hover: Hit::None, last_click: None, dirty: true, finish: None, has_keyboard: false, a11y_ids: HashMap::new() };
     win.resized(w, h, wl.scale());
     win.reveal();
 
     // A new list of apps, from the service.
     let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).expect("eventfd"));
     let updates = listen_for_choices(wake.clone());
+    // What a screen reader asks for, while one is running.
+    let (tx, asked) = channel();
+    let hub = Hub { tx, wake: wake.clone() };
+    let mut a11y = a11y::Link::new();
+    let mut first_frame = true;
     #[cfg(feature = "bench")]
     let mut bench = bench::Bench::new();
     loop {
@@ -725,6 +818,14 @@ pub fn main() -> ! {
                 win.resized(w, h, wl.scale());
             }
             win.input(i);
+        }
+        while let Ok(m) = asked.try_recv() {
+            // A click that already closed it isn't undone.
+            if let Msg::A11y(act) = m
+                && win.finish.is_none()
+            {
+                win.a11y_act(act);
+            }
         }
         while let Ok(ids) = updates.try_recv() {
             let apps = std::mem::take(&mut win.apps);
@@ -743,9 +844,20 @@ pub fn main() -> ! {
             }
             std::process::exit(0);
         }
+        if a11y.listening() {
+            let snap = win.a11y_snapshot(a11y.no_rows());
+            a11y.offer(snap);
+        }
         if wl.must_paint() || (win.dirty && wl.can_paint()) {
             win.dirty = false;
             wl.paint(Rect::new(0, 0, i32::MAX / 2, i32::MAX / 2), |c| win.paint(c));
+            // Served to screen readers once it's up, as the other windows are.
+            if std::mem::take(&mut first_frame) {
+                let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+                if let Some(address) = gannet_core::bus::session_address(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(), runtime.as_deref()) {
+                    crate::session::watch(hub.clone(), address, false, a11y.shared.clone(), std::env::var("AT_SPI_BUS_ADDRESS").ok());
+                }
+            }
         }
         #[cfg(feature = "bench")]
         bench.idle(&win);
@@ -1112,6 +1224,43 @@ mod tests {
         assert_eq!(p.picked().unwrap().id, "editor", "still on the same one");
         p.set_choices(vec![], &apps);
         assert!(p.picked().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_screen_reader_sees_the_apps_and_picks_one() {
+        use crate::a11y::{self, Act, Focus, Role};
+        let (dir, apps) = installed();
+        let db = mime_db(&dir);
+        let spec = Spec { types: vec!["text/markdown".into()], offer_always: true, ..Spec::default() };
+        let picker = Picker::new(spec, &apps, Some(&db), None);
+        let mut w = Window { picker, apps, text: Text::new(crate::text::UI_PX, false), colors: theme::builtin(true), scale: 1.0, w: 520, h: 560, scroll: 0, pointer: (0, 0), hover: Hit::None, last_click: None, dirty: false, finish: None, has_keyboard: true, a11y_ids: HashMap::new() };
+        let snap = w.a11y_snapshot(a11y::Rows::default());
+        let list = snap.get(a11y::OPEN_WITH_APPS).unwrap();
+        let items: Vec<(Role, &str, &str)> = list.children.iter().map(|&id| snap.get(id).unwrap()).map(|n| (n.role, n.name.as_str(), n.description.as_str())).collect();
+        assert_eq!(items[..3], [(Role::Heading, "For Markdown document", ""), (Role::ListItem, "Notes", "Default"), (Role::ListItem, "Hidden MD", "")]);
+        let notes = list.children[1];
+        assert_eq!(snap.focus, Focus::Node(notes), "the app picked has the keyboard");
+        assert_eq!(snap.get(a11y::FRAME).unwrap().role, Role::Dialog);
+        assert!(snap.get(a11y::OPEN_WITH_ALWAYS).is_some_and(|n| n.checked == Some(false)));
+        // An app keeps its number as a search narrows the list.
+        let editor = list.children[3];
+        w.picker.search = crate::field::Field::new("edit");
+        w.picker.rebuild();
+        let snap = w.a11y_snapshot(a11y::Rows::default());
+        assert_eq!(snap.get(a11y::OPEN_WITH_APPS).unwrap().children[1], editor);
+        assert_eq!(snap.focus, Focus::Node(editor));
+        w.picker.search = crate::field::Field::default();
+        w.picker.rebuild();
+        // Moving to an app picks it; ticking and its action open with it.
+        w.a11y_act(Act::Focus(notes));
+        assert_eq!(w.picker.picked().unwrap().id, "notes.desktop");
+        w.a11y_act(Act::Focus(a11y::OPEN_WITH_APPS));
+        assert_eq!(w.picker.picked().unwrap().id, "notes.desktop", "the list itself isn't an app");
+        w.a11y_act(Act::Press(a11y::OPEN_WITH_ALWAYS));
+        assert!(w.picker.always);
+        w.a11y_act(Act::Press(editor));
+        assert_eq!(w.finish, Some(Finish::Open("editor.desktop".into())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
