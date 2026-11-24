@@ -172,6 +172,11 @@ impl Listing {
         self.trash.as_ref()?.info[i as usize].as_ref().map(|inf| inf.original.as_path())
     }
 
+    /// What a row of the Trash view's info file says, if it could be read.
+    pub fn trash_info(&self, i: u32) -> Option<&Info> {
+        self.trash.as_ref()?.info[i as usize].as_ref()
+    }
+
     /// What restoring a row of the Trash view needs, if its info file could be read.
     pub fn trashed(&self, i: u32) -> Option<Trashed> {
         let t = self.trash.as_ref()?;
@@ -296,6 +301,13 @@ pub enum SortKey {
 pub struct SortSpec {
     pub key: SortKey,
     pub descending: bool,
+}
+
+impl SortKey {
+    /// The order a first click gives: names A to Z, but the newest and the biggest first.
+    pub fn first_order(self) -> SortSpec {
+        SortSpec { key: self, descending: self != SortKey::Name }
+    }
 }
 
 impl Default for SortSpec {

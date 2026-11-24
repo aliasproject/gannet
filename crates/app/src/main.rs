@@ -15,6 +15,7 @@ mod icons;
 mod media;
 mod paint;
 mod portal;
+mod rename_many;
 mod preview;
 mod preview_window;
 mod session;
@@ -48,6 +49,7 @@ struct Dirs {
     config: PathBuf,
     cache: PathBuf,
     data: PathBuf,
+    state: PathBuf,
     /// The shared-mime-info folders, first wins.
     mime: Vec<PathBuf>,
     /// Where thumbnailers are described, first wins.
@@ -62,7 +64,7 @@ fn dirs() -> Dirs {
     let data_dirs = std::env::var_os("XDG_DATA_DIRS").filter(|d| !d.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
     let in_data = |name: &str| std::iter::once(data.join(name)).chain(std::env::split_paths(&data_dirs).filter(|p| p.is_absolute()).map(|p| p.join(name))).collect::<Vec<_>>();
     let (mime, thumbnailers) = (in_data("mime"), in_data("thumbnailers"));
-    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data, home, mime, thumbnailers }
+    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), state: var("XDG_STATE_HOME", ".local/state"), data, home, mime, thumbnailers }
 }
 
 /// The language messages are in, as GLib chooses it for GTK apps: the first of `LANGUAGE`, then
@@ -87,6 +89,10 @@ fn start_location(arg: Option<OsString>, home: &Path) -> PathBuf {
 fn main() {
     // Folder names aren't always valid UTF-8, so neither are arguments.
     let arg = std::env::args_os().nth(1);
+    // `gannet list`, `info`, `trash` and `restore`: no window, no display and no D-Bus.
+    if let Some(verb) = arg.as_deref().filter(|a| gannet_core::cli::is_verb(a)).and_then(|a| a.to_str()) {
+        std::process::exit(run_command(verb));
+    }
     if let Some(a) = arg.as_deref().and_then(|a| a.to_str()) {
         if a == decode::ARG {
             decode::helper_main(std::env::args().nth(2).as_deref());
@@ -118,7 +124,7 @@ fn main() {
             service::claim_main(a == service::RELEASE_ARG);
         }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}", preview_window::USAGE, chooser::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG);
+            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}\n       {}\n\nA folder named like a command opens as ./NAME. `gannet COMMAND --help` says more.", preview_window::USAGE, chooser::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG, gannet_core::cli::USAGE);
             return;
         }
         if a == "--version" {
@@ -206,9 +212,11 @@ fn main() {
     let trash = TrashConfig::new(&d.data, rustix::process::geteuid().as_raw());
     let engine = Engine::new(trash, Arc::new(move |e| op_hub.send(Msg::Op(e))));
     let mut app = App::new(hub.clone(), engine, d.data.join("Trash/files"), colors, source, text, places, start_dir.clone(), w, h, wl.scale());
+    app.folder_sorts = gannet_core::folder_sorts::FolderSorts::new(d.state.join("gannet/sorts"), gannet_core::places::newest_first_dirs(&d.home, &d.config));
     let dir_watch = Watch::new().ok().map(Arc::new);
     app.watch = dir_watch.clone();
     app.cache_home = Some(d.cache.clone());
+    app.terminal = gannet_core::terminal::Terminal::find(std::env::var_os("PATH").as_deref(), std::env::var_os("XDG_RUNTIME_DIR").as_deref().map(Path::new));
     app.kinds = Arc::new(preview::Kinds::new(d.mime.clone(), language()).with_thumbnailers(d.thumbnailers.clone()));
     let mut theme_watch = ThemeWatch::new(theme_paths.clone()).ok();
     let mut theme_due: Option<Instant> = None;
@@ -228,7 +236,12 @@ fn main() {
     let following = viewing.as_ref().is_some_and(|v| v.follow);
     if let Some(v) = viewing {
         app.show_hidden = v.hidden;
-        app.sort = v.sort;
+        // Opened by the list, it's told the list's order; on its own, the folder's own.
+        if let Some(sort) = v.sort {
+            app.sort = sort;
+        }
+        // Following the list, the order always comes from the list, never from what's saved.
+        app.fixed_sort = v.sort.is_some() || v.follow;
         app.start_viewer(v.path);
         if v.follow {
             preview_window::listen_to_the_list(hub.clone());
@@ -303,9 +316,9 @@ fn main() {
                     }
                 }
                 Cmd::ClosePreview => previewer = None,
-                Cmd::PreviewShow(path) => {
+                Cmd::PreviewShow(path, sort) => {
                     if let Some(p) = previewer.as_mut() {
-                        p.show(&path);
+                        p.show(&path, sort);
                     }
                 }
                 Cmd::PreviewStepped(path) => {
@@ -431,6 +444,28 @@ fn main() {
             theme_due = Some(Instant::now() + std::time::Duration::from_millis(15));
         }
     }
+}
+
+/// Runs one of the commands for scripts. Returns the exit code.
+fn run_command(verb: &str) -> i32 {
+    // Guessing would aim relative paths somewhere else, and `trash` would move the wrong thing.
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gannet {verb}: can't tell what the current folder is: {}", gannet_core::listing::describe(&e));
+            return 1;
+        }
+    };
+    let d = dirs();
+    let mut env = gannet_core::cli::Env {
+        cwd,
+        trash: TrashConfig::new(&d.data, rustix::process::geteuid().as_raw()),
+        mounts: read_mounts(),
+        sorts: gannet_core::folder_sorts::FolderSorts::new(d.state.join("gannet/sorts"), gannet_core::places::newest_first_dirs(&d.home, &d.config)),
+        disks_give_up: gannet_core::listing::DISKS_GIVE_UP,
+    };
+    let args: Vec<OsString> = std::env::args_os().skip(2).collect();
+    gannet_core::cli::run(&mut env, verb, &args, &mut std::io::stdout().lock(), &mut std::io::stderr().lock())
 }
 
 /// A read reports `WouldBlock` when it had nothing to dispatch, which is ordinary: all that arrived
@@ -752,6 +787,8 @@ mod bench {
                 Some(crate::app::Dialog::Unlock { waiting: true, .. }) => "unlock-waiting",
                 Some(crate::app::Dialog::Unlock { error: Some(_), .. }) => "unlock-again",
                 Some(crate::app::Dialog::Unlock { .. }) => "unlock",
+                Some(crate::app::Dialog::RenameMany(d)) if !d.can_rename() => "rename-many-blocked",
+                Some(crate::app::Dialog::RenameMany(_)) => "rename-many",
             }),
             a.undo.len(),
             a.redo.len(),

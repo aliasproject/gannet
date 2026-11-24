@@ -3,8 +3,10 @@
 //! the preview, and the list says so.
 //!
 //! With `--follow`, the two talk over the child's stdin and stdout: each sends a path, ended by a
-//! NUL as a name can hold a newline, whenever its cursor moves. The list closes the window by
-//! closing the child's stdin, and the child takes the end of its stdin to mean the list has gone.
+//! NUL as a name can hold a newline, whenever its cursor moves. Only the list's messages start
+//! with two bytes for its order, so the window walks the folder in the order the list shows it;
+//! the window sends back just the path. The list closes the window by closing the child's stdin,
+//! and the child takes the end of its stdin to mean the list has gone.
 
 use std::ffi::OsString;
 use std::io::{Read, Write};
@@ -27,7 +29,8 @@ const MAX_MESSAGE: usize = 4096;
 pub struct Args {
     pub path: PathBuf,
     pub hidden: bool,
-    pub sort: SortSpec,
+    /// `None` without `--sort` or `--descending`: the folder's own saved order then.
+    pub sort: Option<SortSpec>,
     pub follow: bool,
 }
 
@@ -35,16 +38,16 @@ pub const USAGE: &str = "gannet --preview [--hidden] [--sort name|size|modified]
 
 /// The arguments after `--preview`. `None` if they don't make sense.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Option<Args> {
-    let mut out = Args { path: PathBuf::new(), hidden: false, sort: SortSpec::default(), follow: false };
+    let mut out = Args { path: PathBuf::new(), hidden: false, sort: None, follow: false };
     let mut args = args.into_iter();
     let mut path = None;
     while let Some(a) = args.next() {
         match a.to_str() {
             Some("--hidden") => out.hidden = true,
             Some("--follow") => out.follow = true,
-            Some("--descending") => out.sort.descending = true,
+            Some("--descending") => out.sort.get_or_insert_with(SortSpec::default).descending = true,
             Some("--sort") => {
-                out.sort.key = match args.next()?.to_str()? {
+                out.sort.get_or_insert_with(SortSpec::default).key = match args.next()?.to_str()? {
                     "name" => SortKey::Name,
                     "size" => SortKey::Size,
                     "modified" => SortKey::Modified,
@@ -114,10 +117,10 @@ impl Child {
         Ok(Self { stdin })
     }
 
-    /// Asks the window to show another file. If the window is too busy to take it, it's
-    /// dropped: the next move sends the newest anyway.
-    pub fn show(&mut self, path: &Path) {
-        let mut message = path.as_os_str().as_bytes().to_vec();
+    /// Asks the window to show another file, in the list's order. If the window is too busy to
+    /// take it, it's dropped: the next move sends the newest anyway.
+    pub fn show(&mut self, path: &Path, sort: SortSpec) {
+        let mut message = show_message(path, sort);
         message.push(0);
         // Up to this size, a write to a pipe goes in whole or not at all.
         if message.len() <= MAX_MESSAGE {
@@ -138,12 +141,48 @@ pub fn tell_the_list(path: &Path) {
 pub fn listen_to_the_list(hub: Hub) {
     let them = hub.clone();
     let started = std::thread::Builder::new().name("gannet-list".into()).spawn(move || {
-        read_paths(std::io::stdin().lock(), |path| them.send(Msg::PreviewShow(path)));
+        read_paths(std::io::stdin().lock(), |message| {
+            if let Some((path, sort)) = read_show(message) {
+                them.send(Msg::PreviewShow(path, sort));
+            }
+        });
         them.send(Msg::ListGone);
     });
     if started.is_err() {
         hub.send(Msg::ListGone);
     }
+}
+
+/// What the list sends: the order's key and direction, a byte each, then the path.
+fn show_message(path: &Path, sort: SortSpec) -> Vec<u8> {
+    let key = match sort.key {
+        SortKey::Name => b'n',
+        SortKey::Size => b's',
+        SortKey::Modified => b'm',
+    };
+    let mut out = vec![key, if sort.descending { b'-' } else { b'+' }];
+    out.extend_from_slice(path.as_os_str().as_bytes());
+    out
+}
+
+fn read_show(message: PathBuf) -> Option<(PathBuf, SortSpec)> {
+    let bytes = message.into_os_string().into_vec();
+    let (&[key, dir], path) = bytes.split_first_chunk::<2>()?;
+    let key = match key {
+        b'n' => SortKey::Name,
+        b's' => SortKey::Size,
+        b'm' => SortKey::Modified,
+        _ => return None,
+    };
+    let descending = match dir {
+        b'+' => false,
+        b'-' => true,
+        _ => return None,
+    };
+    if path.is_empty() {
+        return None;
+    }
+    Some((PathBuf::from(OsString::from_vec(path.to_vec())), SortSpec { key, descending }))
 }
 
 /// Reads NUL-ended paths until the end, passing each on. A path that's too long to be one is
@@ -188,7 +227,25 @@ mod tests {
         let line = command_line(Path::new("/a/--odd name"), true, sort);
         assert_eq!(line[0], ARG);
         let back = parse(line.into_iter().skip(1)).unwrap();
-        assert_eq!(back, Args { path: "/a/--odd name".into(), hidden: true, sort, follow: true });
+        assert_eq!(back, Args { path: "/a/--odd name".into(), hidden: true, sort: Some(sort), follow: true });
+    }
+
+    #[test]
+    fn without_an_order_the_folder_keeps_its_own() {
+        assert_eq!(args(&["x.png"]).unwrap().sort, None);
+        assert_eq!(args(&["--descending", "x.png"]).unwrap().sort, Some(SortSpec { key: SortKey::Name, descending: true }));
+    }
+
+    #[test]
+    fn the_lists_order_comes_with_each_path() {
+        for sort in [SortSpec::default(), SortSpec { key: SortKey::Modified, descending: true }, SortSpec { key: SortKey::Size, descending: false }] {
+            let path = PathBuf::from(OsString::from_vec(b"/a/new\nline \xff".to_vec()));
+            let message = PathBuf::from(OsString::from_vec(show_message(&path, sort)));
+            assert_eq!(read_show(message), Some((path, sort)));
+        }
+        assert_eq!(read_show(PathBuf::from("x")), None);
+        assert_eq!(read_show(PathBuf::from("n+")), None);
+        assert_eq!(read_show(PathBuf::from("q+/a")), None);
     }
 
     #[test]

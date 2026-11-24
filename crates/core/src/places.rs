@@ -58,17 +58,32 @@ pub fn standard_places(home: &Path, config_home: &Path, data_home: &Path) -> Vec
         Place { label: "Home".into(), path: home.to_path_buf(), kind: PlaceKind::Home, volume: None },
         Place { label: "Recent".into(), path: data_home.join(crate::recent::FILE), kind: PlaceKind::Recent, volume: None },
     ];
-    let text = std::fs::read_to_string(config_home.join("user-dirs.dirs")).unwrap_or_default();
-    let dirs = parse_user_dirs(&text, home);
+    let dirs = read_user_dirs(home, config_home);
     let wanted = [("DOCUMENTS", "Documents", PlaceKind::Documents), ("DOWNLOAD", "Downloads", PlaceKind::Downloads), ("MUSIC", "Music", PlaceKind::Music), ("PICTURES", "Pictures", PlaceKind::Pictures), ("VIDEOS", "Videos", PlaceKind::Videos)];
     for (key, label, kind) in wanted {
-        let path = dirs.iter().find(|(k, _)| k == key).map(|(_, p)| p.clone()).unwrap_or_else(|| home.join(label));
+        let path = user_dir(&dirs, key, label, home);
         if path != home && path.is_dir() {
             places.push(Place { label: label.into(), path, kind, volume: None });
         }
     }
     places.push(Place { label: "Trash".into(), path: data_home.join("Trash/files"), kind: PlaceKind::Trash, volume: None });
     places
+}
+
+/// The folders that start out newest first: Downloads, Pictures and Videos, wherever
+/// `user-dirs.dirs` puts them, but never home itself.
+pub fn newest_first_dirs(home: &Path, config_home: &Path) -> Vec<PathBuf> {
+    let dirs = read_user_dirs(home, config_home);
+    [("DOWNLOAD", "Downloads"), ("PICTURES", "Pictures"), ("VIDEOS", "Videos")].iter().map(|(key, label)| user_dir(&dirs, key, label, home)).filter(|p| p != home).collect()
+}
+
+fn read_user_dirs(home: &Path, config_home: &Path) -> Vec<(String, PathBuf)> {
+    parse_user_dirs(&std::fs::read_to_string(config_home.join("user-dirs.dirs")).unwrap_or_default(), home)
+}
+
+/// Where `user-dirs.dirs` puts a folder, or its usual name in home.
+fn user_dir(dirs: &[(String, PathBuf)], key: &str, label: &str, home: &Path) -> PathBuf {
+    dirs.iter().find(|(k, _)| k == key).map(|(_, p)| p.clone()).unwrap_or_else(|| home.join(label))
 }
 
 const NETWORK_FS: [&str; 5] = ["nfs", "nfs4", "cifs", "smb3", "sshfs"];
@@ -113,6 +128,14 @@ mod tests {
     use super::*;
     use crate::mounts::parse_mountinfo;
     use crate::testutil::Scratch;
+
+    #[test]
+    fn newest_first_follows_user_dirs() {
+        let s = Scratch::new();
+        s.file("config/user-dirs.dirs", b"XDG_DOWNLOAD_DIR=\"$HOME/Inbox\"\nXDG_VIDEOS_DIR=\"$HOME/\"\n");
+        let home = s.path().join("h");
+        assert_eq!(newest_first_dirs(&home, &s.path().join("config")), vec![home.join("Inbox"), home.join("Pictures")]);
+    }
 
     #[test]
     fn user_dirs_parse() {

@@ -233,11 +233,11 @@ def browse_sort_and_history(h):
     assert ".hidden" in s["names"] and s["hidden"]
     a.key("h", mods=["ctrl"])
     a.wait(lambda s: s["count"] == 5, "hidden hidden")
-    # Sort by size, both ways
+    # Sort by size, biggest first, then the other way
     a.key("2", mods=["ctrl"])
-    s = a.wait(lambda s: s["sort"] == "Size" and s["names"][2:] == ["b10.txt", "A.TXT", "b9.txt"], "size ascending")
+    a.wait(lambda s: s["sort"] == "Size" and s["desc"] and s["names"][2:] == ["b9.txt", "A.TXT", "b10.txt"], "size descending")
     a.key("2", mods=["ctrl"])
-    a.wait(lambda s: s["desc"] and s["names"][2:] == ["b9.txt", "A.TXT", "b10.txt"], "size descending")
+    a.wait(lambda s: not s["desc"] and s["names"][2:] == ["b10.txt", "A.TXT", "b9.txt"], "size ascending")
     a.key("1", mods=["ctrl"])
     a.wait(lambda s: s["sort"] == "Name" and s["names"][2] == "A.TXT", "name again")
     # Into a folder with the keyboard, back, forward, up
@@ -254,6 +254,50 @@ def browse_sort_and_history(h):
     a.key("BackSpace")
     a.wait(lambda s: s["dir"] == str(fs) and s["selected"] == ["adir"], "up lands on the folder it came from")
     a.close()
+
+
+@check
+def each_folder_keeps_its_sort_after_a_restart(h):
+    fs = fresh_fs()
+    tree(fs, {"old.txt": "x", "new.txt": "xx", "mid.txt": "xxx", "sub/a.txt": "", "sub/bb.txt": "x"})
+    now = time.time()
+    for name, age in (("old.txt", 300), ("mid.txt", 200), ("new.txt", 100)):
+        os.utime(fs / name, (now - age, now - age))
+    a = App(h, fs)
+    a.wait(lambda s: not s["loading"] and s["names"] == ["sub", "mid.txt", "new.txt", "old.txt"], "by name at first")
+    # One press of Ctrl+3 puts the newest at the top.
+    a.key("3", mods=["ctrl"])
+    a.wait(lambda s: s["sort"] == "Modified" and s["desc"] and s["names"] == ["sub", "new.txt", "mid.txt", "old.txt"], "newest first")
+    a.shot("sort-newest-first")
+    # The folder inside takes it too, until it's sorted on its own.
+    a.key("Down")
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(fs / "sub") and s["sort"] == "Modified" and s["desc"], "the folder inside inherits")
+    a.key("2", mods=["ctrl"])
+    a.wait(lambda s: s["sort"] == "Size" and s["names"] == ["bb.txt", "a.txt"], "sub biggest first")
+    a.close()
+    a = App(h, fs)
+    a.wait(lambda s: not s["loading"] and s["sort"] == "Modified" and s["names"] == ["sub", "new.txt", "mid.txt", "old.txt"], "still newest first after a restart")
+    a.key("Down")
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(fs / "sub") and s["sort"] == "Size" and s["desc"], "sub kept its own")
+    a.close()
+    # Downloads starts newest first; a folder beside it doesn't.
+    home = Path(a.env["HOME"])
+    for d in ("Downloads", "Documents"):
+        shutil.rmtree(home / d, ignore_errors=True)
+        tree(home / d, {"older.zip": "", "newer.zip": ""})
+        os.utime(home / d / "older.zip", (now - 100, now - 100))
+    a = App(h, home / "Downloads")
+    a.wait(lambda s: not s["loading"] and s["sort"] == "Modified" and s["desc"] and s["names"] == ["newer.zip", "older.zip"], "Downloads newest first")
+    a.shot("sort-downloads")
+    a.key("l", mods=["ctrl"])
+    a.type(str(home / "Documents"))
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(home / "Documents") and s["sort"] == "Name" and s["names"] == ["newer.zip", "older.zip"], "Documents by name")
+    a.close()
+    for d in ("Downloads", "Documents"):
+        shutil.rmtree(home / d, ignore_errors=True)
 
 
 @check
@@ -390,6 +434,117 @@ def opening_uses_the_default_app(h):
     assert "bad.xyz" in s["notices"][0] and "No app" in s["notices"][0], s["notices"]
     a.shot("open-failed")
     a.close()
+
+
+@check
+def opening_an_archive_extracts_it_in_gannet(h):
+    fs = fresh_fs()
+    tree(fs, {"src/a.txt": "a", "src/b.txt": "b", "pack/project/readme": "r"})
+    subprocess.run(["bsdtar", "-a", "-cf", str(fs / "photos.zip"), "-C", str(fs / "src"), "a.txt", "b.txt"], check=True)
+    subprocess.run(["bsdtar", "-a", "-cf", str(fs / "project-1.0.tar.gz"), "-C", str(fs / "pack"), "project"], check=True)
+    shutil.rmtree(fs / "src")
+    shutil.rmtree(fs / "pack")
+    # Anything handed to the default app would land here, as Nautilus did.
+    bin_dir = SCRATCH / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    log = SCRATCH / "opened.log"
+    log.unlink(missing_ok=True)
+    opener = bin_dir / "xdg-open"
+    opener.write_text(f'#!/bin/sh\necho "$1" >> {log}\nexit 0\n')
+    opener.chmod(0o755)
+    a = App(h, fs, path_prefix=str(bin_dir))
+    a.wait(lambda s: s["names"] == ["photos.zip", "project-1.0.tar.gz"], "listed")
+    a.type("photos")
+    a.wait(lambda s: s["selected"] == ["photos.zip"])
+    a.key("Return")
+    s = a.wait(lambda s: s["names"] == ["photos", "photos.zip", "project-1.0.tar.gz"] and s["selected"] == ["photos"] and not s["jobs"], "the folder appears, selected")
+    assert s["notices"] == [], s["notices"]
+    assert sorted(os.listdir(fs / "photos")) == ["a.txt", "b.txt"]
+    a.shot("extract-opened")
+    # From the menu: one folder inside comes out as itself, not wrapped in another.
+    a.click(ROW_X, row_y(2), 0x111)
+    items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+    assert items.index("Extract") == items.index("Preview") + 1, items
+    a.shot("extract-menu")
+    a.key("Down", "Down", "Down", "Return")
+    s = a.wait(lambda s: "project" in s["names"] and s["selected"] == ["project"] and not s["jobs"], "extracted from the menu")
+    assert (fs / "project/readme").read_text() == "r"
+    a.click(ROW_X, row_y(0), 0x111)
+    assert "Extract" not in a.wait(lambda s: s["menu"], "the menu")["menu_items"], "not for a folder"
+    a.key("Escape")
+    # Undo sends the last one to the Trash.
+    a.key("z", mods=("ctrl",))
+    a.wait(lambda s: "project" not in s["names"], "undone")
+    a.shot("extract-undone")
+    time.sleep(0.5)
+    assert not log.exists(), f"handed to another app: {log.read_text()}"
+    a.close()
+
+
+@check
+def open_in_terminal_asks_xdg_terminal_exec_for_the_folder(h):
+    fs = fresh_fs()
+    tree(fs, {"my project/readme": "r", "broken/x": "", "notes.txt": "n"})
+    # A stand-in for the launcher: it logs where it started and what it was asked, and never
+    # starts a real terminal. In "broken" it fails, as when no terminal is set up.
+    bin_dir = SCRATCH / "terminal-bin"
+    shutil.rmtree(bin_dir, ignore_errors=True)
+    bin_dir.mkdir()
+    log = SCRATCH / "terminal.log"
+    log.unlink(missing_ok=True)
+    launcher = bin_dir / "xdg-terminal-exec"
+    launcher.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$PWD" "$*" >> {log}\ncase "$PWD" in */broken) exit 1;; esac\nexit 0\n')
+    launcher.chmod(0o755)
+
+    def logged(n):
+        end = time.monotonic() + 5
+        while time.monotonic() < end and (not log.exists() or len(log.read_text().splitlines()) < n):
+            time.sleep(0.02)
+        return log.read_text().splitlines() if log.exists() else []
+
+    def menu_at(row_or_y):
+        a.click(ROW_X, row_or_y, 0x111)
+        return a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+
+    a = App(h, fs, path_prefix=str(bin_dir))
+    a.wait(lambda s: s["names"] == ["broken", "my project", "notes.txt"], "listed")
+    # The empty space: the folder on screen.
+    items = menu_at(row_y(6))
+    assert items[-1] == "Open in terminal", items
+    a.shot("terminal-menu-empty")
+    a.key("Up", "Return")
+    assert logged(1) == [f"{fs}|--dir={fs}"], logged(1)
+    # A folder: that folder.
+    items = menu_at(row_y(1))
+    assert items[-1] == "Open in terminal", items
+    a.shot("terminal-menu-folder")
+    a.key("Up", "Return")
+    assert logged(2)[1] == f"{fs / 'my project'}|--dir={fs / 'my project'}", logged(2)
+    assert a.state()["notices"] == [], a.state()["notices"]
+    # Not for a file.
+    assert "Open in terminal" not in menu_at(row_y(2)), "not for a file"
+    a.key("Escape")
+    # A terminal that can't start says so.
+    assert menu_at(row_y(0))[-1] == "Open in terminal"
+    a.key("Up", "Return")
+    s = a.wait(lambda s: s["notices"], "the failure shown")
+    assert s["notices"] == ["Couldn't open a terminal in “broken”: it exited with code 1"], s["notices"]
+    a.shot("terminal-failed")
+    a.close()
+    # Without xdg-terminal-exec it isn't offered.
+    shutil.rmtree(bin_dir)
+    bin_dir.mkdir()
+    for tool in ("fc-match", "xdg-open"):
+        if shutil.which(tool):
+            os.symlink(shutil.which(tool), bin_dir / tool)
+    a = App(h, fs, bwrap_extra=("--setenv", "PATH", str(bin_dir)))
+    a.wait(lambda s: s["count"] == 3, "listed")
+    assert "Open in terminal" not in menu_at(row_y(6)), "not without the launcher"
+    assert "Open in terminal" not in menu_at(row_y(1))
+    a.key("Escape")
+    a.close()
+    shutil.rmtree(bin_dir, ignore_errors=True)
+    assert len(logged(3)) == 3, "nothing more was started"
 
 
 @check
@@ -705,6 +860,66 @@ def rename_new_folder_and_bad_names(h):
     a.key("Return")
     a.wait(lambda s: s["selected"] == ["Made Here"] and s["jobs"] == 0, "folder made and selected")
     assert (fs / "Made Here").is_dir()
+    a.close()
+
+
+@check
+def renaming_several_files_at_once(h):
+    fs = fresh_fs()
+    tree(fs, {"IMG_1.jpg": "1", "IMG_2.jpg": "2", "IMG_3.jpg": "3", "notes.txt": "n"})
+    a = App(h, fs)
+    a.wait(lambda s: s["count"] == 4)
+    a.key("a", mods=["ctrl"])
+    a.wait(lambda s: len(s["selected"]) == 4)
+    a.key("F2")
+    a.wait(lambda s: s["dialog"] == "rename-many-blocked", "F2 on several opens the dialog, with nothing to do yet")
+    a.type("IMG_")
+    a.key("Tab")
+    a.type("Trip ")
+    a.wait(lambda s: s["dialog"] == "rename-many")
+    a.shot("rename-many")
+    a.key("Return")
+    a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0 and s["selected"] == ["Trip 1.jpg", "Trip 2.jpg", "Trip 3.jpg"], "renamed and selected")
+    assert sorted(p.name for p in fs.iterdir()) == ["Trip 1.jpg", "Trip 2.jpg", "Trip 3.jpg", "notes.txt"]
+    a.key("z", mods=["ctrl"])
+    a.wait(lambda s: s["jobs"] == 0 and s["undo"] == 0, "one undo")
+    assert sorted(p.name for p in fs.iterdir()) == ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg", "notes.txt"]
+    # Every name the same: refused, and the dialog says which clash.
+    a.key("a", mods=["ctrl"])
+    a.key("F2")
+    a.wait(lambda s: s["dialog"].startswith("rename-many"))
+    a.key("Tab")
+    a.type("same")
+    a.wait(lambda s: s["dialog"] == "rename-many-blocked")
+    a.shot("rename-many-clash")
+    a.key("Return")
+    a.key("Escape")
+    a.wait(lambda s: s["dialog"] == "")
+    assert sorted(p.name for p in fs.iterdir()) == ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg", "notes.txt"]
+    # {n} counts in the list's order. Sorted by name backwards, IMG_3 becomes IMG_1 and IMG_1
+    # becomes IMG_3: they swap names.
+    a.key("1", mods=["ctrl"])
+    a.wait(lambda s: s["desc"] and s["names"][0] == "notes.txt")
+    a.key("Escape")
+    a.key("Home")
+    a.key("Down")
+    a.wait(lambda s: s["selected"] == ["IMG_3.jpg"])
+    a.key("Down", mods=["shift"])
+    a.key("Down", mods=["shift"])
+    a.wait(lambda s: s["selected"] == ["IMG_3.jpg", "IMG_2.jpg", "IMG_1.jpg"])
+    a.key("F2")
+    a.wait(lambda s: s["dialog"].startswith("rename-many"))
+    a.key("Tab")
+    a.type("IMG_{n}")
+    a.wait(lambda s: s["dialog"] == "rename-many")
+    a.shot("rename-many-swap")
+    a.key("Return")
+    a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0 and s["undo"] == 1, "swapped")
+    assert [(fs / f"IMG_{i}.jpg").read_text() for i in (1, 2, 3)] == ["3", "2", "1"]
+    assert not [p.name for p in fs.iterdir() if p.name.startswith(".gannet")]
+    a.key("z", mods=["ctrl"])
+    a.wait(lambda s: s["jobs"] == 0 and s["undo"] == 0, "swap undone")
+    assert [(fs / f"IMG_{i}.jpg").read_text() for i in (1, 2, 3)] == ["1", "2", "3"]
     a.close()
 
 
@@ -1878,21 +2093,29 @@ def any_file_says_what_it_is_and_opens_in_its_app(h):
     a.key("Down")
     s = a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "unknown bytes")
     assert preview_of(s)["kind"] == "application/octet-stream", s["preview"]
-    # Enter, or the Open button, opens it in its app and leaves the preview up.
+    # An archive is extracted from the list, not opened from here, so Enter only says so.
     a.key("Up", "Up")
     a.wait(lambda s: preview_of(s).get("name") == "a-archive.zip", "back to the archive")
+    a.key("Return")
+    a.wait(lambda s: any("from the list" in n for n in json.loads(a.preview_file.read_text())["notices"]), "says to open it from the list", timeout=5)
+    assert not log.exists(), log.read_text()
+    assert not (fs / "a-archive").exists(), "nothing extracted"
+    # Enter, or the Open button, opens anything else in its app and leaves the preview up. A zip
+    # without the ending isn't one Gannet unpacks.
+    a.key("Down")
+    a.wait(lambda s: preview_of(s).get("name") == "b-no-extension", "the unnamed zip")
     a.key("Return")
     end = time.monotonic() + 5
     while time.monotonic() < end and not log.exists():
         time.sleep(0.02)
-    assert log.read_text().strip() == str(fs / "a-archive.zip"), log.read_text()
+    assert log.read_text().strip() == str(fs / "b-no-extension"), log.read_text()
     assert a.state()["preview"], "still previewing"
-    a.key("Down", "Down")
+    a.key("Down")
     a.wait(lambda s: preview_of(s).get("name") == "c-blob.xyz" and preview_of(s)["state"] == "info", "the blob")
     x, y, w, h_ = a.preview_window()
     # The button sits below the picture and two lines of words, in the middle.
     a.click(x + w // 2, y + 533)
-    a.wait(lambda s: json.loads(a.preview_file.read_text())["notices"], "a failure shows in the window", timeout=5)
+    a.wait(lambda s: any("c-blob.xyz" in n for n in json.loads(a.preview_file.read_text())["notices"]), "a failure shows in the window", timeout=5)
     assert "c-blob.xyz" in log.read_text()
     a.shot("preview-open-failed")
     a.close()
@@ -3595,6 +3818,8 @@ def main():
         for t in TESTS:
             if want not in t.__name__:
                 continue
+            # The scratch folders are reused, so every check starts with no folder sorts saved.
+            shutil.rmtree(SCRATCH / "client/state/gannet", ignore_errors=True)
             try:
                 t(h)
                 print(f"ok    {t.__name__}", flush=True)

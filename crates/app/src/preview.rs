@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use gannet_core::foldersize::{self, Tally};
 use gannet_core::history::Stop;
-use gannet_core::listing::Stat;
+use gannet_core::listing::{SortSpec, Stat};
 use gannet_core::mime::{self, MimeDb};
 use gannet_core::thumbcache;
 use gannet_core::thumbnailers::Thumbnailers;
@@ -1167,12 +1167,12 @@ impl App {
             self.previewer_cursor = Some(path.clone());
             if self.previewer.as_ref() != Some(&path) {
                 self.previewer = Some(path.clone());
-                self.cmds.push(Cmd::PreviewShow(path));
+                self.cmds.push(Cmd::PreviewShow(path, self.view_sort()));
             }
             return;
         }
         self.previewer_gen += 1;
-        self.cmds.push(Cmd::OpenPreview { generation: self.previewer_gen, path: path.clone(), hidden: self.show_hidden, sort: self.sort });
+        self.cmds.push(Cmd::OpenPreview { generation: self.previewer_gen, path: path.clone(), hidden: self.show_hidden, sort: self.view_sort() });
         self.previewer = Some(path.clone());
         self.previewer_cursor = Some(path);
     }
@@ -2014,6 +2014,12 @@ impl App {
     /// Enter in the preview window: the file opens in its app, and the preview stays.
     fn preview_open_file(&mut self) {
         let Some(path) = self.preview.as_ref().map(|p| p.path.clone()) else { return };
+        // The list unpacks archives, where the job and its undo can be seen. Handed to the
+        // default app instead, an archive would open in whatever claims it, such as Nautilus.
+        if path.file_name().is_some_and(|n| gannet_core::archive::is_archive(n.as_encoded_bytes())) {
+            self.notice("Open it from the list to extract it".into());
+            return;
+        }
         let hub = self.hub.clone();
         gannet_core::open::open_with_default(&path, move |p, why| hub.send(Msg::Notice(format!("Couldn't open {}: {why}", display_name(&p)))));
     }
@@ -2035,11 +2041,14 @@ impl App {
         self.preview_begin(path, false);
     }
 
-    /// The list moved its cursor: show what it's on now.
-    pub fn on_preview_show(&mut self, path: PathBuf) {
-        if !self.viewer || self.preview.as_ref().is_some_and(|p| p.path == path) {
+    /// The list moved its cursor, or changed its order: show what it's on now, walking its
+    /// folder in the list's order.
+    pub fn on_preview_show(&mut self, path: PathBuf, sort: SortSpec) {
+        let resort = sort != self.sort;
+        if !self.viewer || (!resort && self.preview.as_ref().is_some_and(|p| p.path == path)) {
             return;
         }
+        self.sort = sort;
         self.previewer = Some(path.clone());
         let name = path.file_name().map(|n| n.as_encoded_bytes().to_vec());
         if name.as_ref().is_some_and(|n| n.first() == Some(&b'.')) && !self.show_hidden {
@@ -2049,8 +2058,12 @@ impl App {
         let dir = path.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
         let row = self.listing.as_ref().filter(|l| l.dir == dir && !self.loading).and_then(|l| name.as_ref().and_then(|n| self.rows.iter().position(|&i| *l.key(i) == **n)));
         match row {
-            Some(row) => self.move_cursor(row, Mods::default()),
-            None => self.go(Stop { dir, cursor_name: name }),
+            Some(row) if !resort => self.move_cursor(row, Mods::default()),
+            // Read again in the new order, for the arrows to walk.
+            _ => self.go(Stop { dir, cursor_name: name }),
+        }
+        if self.preview.as_ref().is_some_and(|p| p.path == path) {
+            return;
         }
         // Settling, as the list's arrows can run through files as fast as the key repeats.
         self.preview_begin(path, true);
@@ -2077,7 +2090,7 @@ impl App {
             self.previewer_cursor = Some(path.clone());
             if self.previewer.as_ref() != Some(&path) {
                 self.previewer = Some(path.clone());
-                self.cmds.push(Cmd::PreviewShow(path));
+                self.cmds.push(Cmd::PreviewShow(path, self.view_sort()));
             }
         }
     }

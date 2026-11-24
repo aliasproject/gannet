@@ -6,7 +6,9 @@
 //! - Nothing gets overwritten. Replace first moves the item already there to the Trash,
 //!   and if it can't go there, both stay as they were.
 //! - Symlinks are copied and moved as symlinks, never followed.
-//! - One item failing doesn't stop the others. Each failure gets reported.
+//! - One item failing doesn't stop the others. Each failure gets reported. Renaming several
+//!   items at once is the exception: it's all or nothing, so the names never end up half
+//!   changed.
 //! - A move across disks removes each source only after its copy succeeded.
 //! - Folders never get replaced wholesale. Replace on two folders means merge.
 //! - Delete and cross-disk move stop at mount points inside a folder: another disk's
@@ -43,9 +45,14 @@ pub enum Request {
     /// Deletes for good. The UI must have asked first.
     Delete { paths: Vec<PathBuf> },
     Rename { from: PathBuf, to_name: OsString },
+    /// Renames each item to its new name, in its own folder, all or nothing. Items can take
+    /// each other's names. See [`Run::rename_many`].
+    RenameMany { renames: Vec<(PathBuf, OsString)> },
     NewFolder { parent: PathBuf, name: OsString },
     /// Puts items from the Trash back where they came from. Never overwrites.
     Restore { items: Vec<Trashed> },
+    /// Unpacks each archive into a new folder beside it. See [`crate::archive`].
+    Extract { archives: Vec<PathBuf> },
     /// Reverses a finished operation. Its outcome's `undo` is how to redo it.
     Undo(Undo),
     /// The same as `Undo`, for something undo reversed, so it's labelled as a redo.
@@ -236,11 +243,13 @@ pub struct Engine {
     pub force_sync_error: bool,
     /// Test seam: copy with read and write, as on a kernel that refuses `sendfile`.
     pub force_no_sendfile: bool,
+    /// The program that unpacks archives. Test seam: one that isn't there.
+    pub extractor: OsString,
 }
 
 impl Engine {
     pub fn new(trash: TrashConfig, sink: Sink) -> Self {
-        Self { trash, sink, next_id: Arc::new(AtomicU64::new(1)), force_exdev: false, force_sync_error: false, force_no_sendfile: false }
+        Self { trash, sink, next_id: Arc::new(AtomicU64::new(1)), force_exdev: false, force_sync_error: false, force_no_sendfile: false, extractor: "bsdtar".into() }
     }
 
     pub fn start(&self, request: Request) -> Job {
@@ -254,6 +263,7 @@ impl Engine {
             force_exdev: self.force_exdev,
             force_sync_error: self.force_sync_error,
             force_no_sendfile: self.force_no_sendfile,
+            extractor: self.extractor.clone(),
             errors: 0,
             noted_leftovers: 0,
             sticky_files: None,
@@ -310,8 +320,10 @@ fn clean_request(r: Request) -> Request {
         Request::Trash { paths } => Request::Trash { paths: many(paths) },
         Request::Delete { paths } => Request::Delete { paths: many(paths) },
         Request::Rename { from, to_name } => Request::Rename { from: clean_path(from), to_name },
+        Request::RenameMany { renames } => Request::RenameMany { renames: renames.into_iter().map(|(from, name)| (clean_path(from), name)).collect() },
         Request::NewFolder { parent, name } => Request::NewFolder { parent: clean_path(parent), name },
         Request::Restore { items } => Request::Restore { items },
+        Request::Extract { archives } => Request::Extract { archives: many(archives) },
         Request::Undo(u) => Request::Undo(u),
         Request::Redo(u) => Request::Redo(u),
     }
@@ -334,8 +346,10 @@ fn label_for(r: &Request) -> String {
         Request::Trash { paths } => format!("Moving {} to Trash", count(paths)),
         Request::Delete { paths } => format!("Deleting {}", count(paths)),
         Request::Rename { from, to_name } => format!("Renaming {} to “{}”", count(std::slice::from_ref(from)), to_name.to_string_lossy()),
+        Request::RenameMany { renames } => format!("Renaming {}", count(&renames.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>())),
         Request::NewFolder { name, .. } => format!("Creating “{}”", name.to_string_lossy()),
         Request::Restore { items } => format!("Restoring {}", count(&items.iter().map(|t| t.original.clone()).collect::<Vec<_>>())),
+        Request::Extract { archives } => format!("Extracting {}", count(archives)),
         Request::Undo(_) => "Undoing".to_string(),
         Request::Redo(_) => "Redoing".to_string(),
     }
@@ -343,16 +357,21 @@ fn label_for(r: &Request) -> String {
 
 /// A name the app may create: one path component, not `.` or `..`, not too long.
 pub fn validate_name(name: &str) -> Result<(), &'static str> {
+    validate_name_bytes(name.as_bytes())
+}
+
+/// [`validate_name`] for a name that may not be UTF-8.
+pub fn validate_name_bytes(name: &[u8]) -> Result<(), &'static str> {
     if name.is_empty() {
         return Err("The name can't be empty");
     }
-    if name == "." || name == ".." {
+    if name == b"." || name == b".." {
         return Err("That name is reserved");
     }
-    if name.contains('/') {
+    if name.contains(&b'/') {
         return Err("A name can't contain “/”");
     }
-    if name.contains('\0') {
+    if name.contains(&0) {
         return Err("A name can't contain a null character");
     }
     if name.len() > 255 {
@@ -449,6 +468,7 @@ struct Run {
     force_exdev: bool,
     force_sync_error: bool,
     force_no_sendfile: bool,
+    extractor: OsString,
     errors: usize,
     /// Items left in place on purpose, so a folder that won't empty isn't a surprise.
     noted_leftovers: usize,
@@ -512,6 +532,7 @@ impl Run {
                 }
             }
             Request::Rename { from, to_name } => self.rename(from, to_name),
+            Request::RenameMany { renames } => self.rename_many(renames),
             Request::NewFolder { parent, name } => {
                 let target = parent.join(&name);
                 match validate_name(&name.to_string_lossy()).map_err(io::Error::other).and_then(|_| fs::create_dir(&target)) {
@@ -526,6 +547,7 @@ impl Run {
                 }
             }
             Request::Restore { items } => self.restore_all(items),
+            Request::Extract { archives } => self.extract_all(archives),
             Request::Undo(u) | Request::Redo(u) => self.reverse(u),
         }
     }
@@ -556,6 +578,111 @@ impl Run {
         }
     }
 
+    fn extract_all(&mut self, archives: Vec<PathBuf>) {
+        let sizes: Vec<u64> = archives.iter().map(|a| fs::metadata(a).map_or(0, |m| m.len())).collect();
+        self.job.progress.total_bytes.store(sizes.iter().sum(), Ordering::Relaxed);
+        self.job.progress.total_items.store(archives.len() as u64, Ordering::Relaxed);
+        let mut before = 0;
+        for (a, size) in archives.iter().zip(sizes) {
+            if self.job.is_cancelled() {
+                break;
+            }
+            self.extract_one(a, before, size);
+            before += size;
+            self.job.progress.done_bytes.store(before, Ordering::Relaxed);
+            self.job.progress.done_items.fetch_add(1, Ordering::Relaxed);
+            self.tick();
+        }
+    }
+
+    /// Unpacks into a hidden folder beside the archive, then renames that into place, so a
+    /// half-unpacked folder never shows under the real name, and a failure leaves nothing.
+    /// When everything is in one folder, that folder is what goes into place.
+    fn extract_one(&mut self, archive: &Path, before: u64, size: u64) {
+        self.set_current(archive);
+        let Some(parent) = archive.parent() else { return };
+        let file = match File::open(archive) {
+            Ok(f) => f,
+            Err(e) => return self.fail(archive, &e),
+        };
+        let tmp = temp_name(archive);
+        if let Err(e) = fs::create_dir(&tmp) {
+            return self.fail(archive, &e);
+        }
+        let (progress, sink, job, cancel) = (self.job.progress.clone(), self.sink.clone(), self.job.id, self.job.cancel.clone());
+        let mut last = Instant::now();
+        let unpacked = crate::archive::unpack(
+            &self.extractor,
+            &file,
+            &tmp,
+            |name| {
+                if let Ok(mut c) = progress.current.lock() {
+                    *c = name.trim_end_matches('/').rsplit('/').next().unwrap_or(name).to_string();
+                }
+            },
+            |at| {
+                // Zip and 7z read their tables at the end first, then go back for the entries, so
+                // this follows where it's reading now rather than the furthest it has been.
+                progress.done_bytes.store(before + at.min(size), Ordering::Relaxed);
+                if last.elapsed() >= Duration::from_millis(50) {
+                    last = Instant::now();
+                    sink(Event::Progress(job));
+                }
+                !cancel.load(Ordering::Relaxed)
+            },
+        );
+        if let Err(why) = unpacked {
+            remove_partial(&tmp);
+            if !matches!(why, crate::archive::Failed::Cancelled) {
+                self.report(archive, why.message());
+            }
+            return;
+        }
+        // What goes into place is decided once, and that same folder is what the links are
+        // checked against: a link can stay inside the hidden folder yet leave the one put in place.
+        let only = only_folder(&tmp);
+        let (from, name) = match &only {
+            Some(n) => (tmp.join(n), n.as_bytes().to_vec()),
+            None => (tmp.clone(), crate::archive::folder_name(archive.file_name().map_or(&b""[..], |n| n.as_bytes()))),
+        };
+        let opened = match crate::archive::check_links(&from, &self.job.cancel) {
+            Ok(o) => o,
+            Err(why) => {
+                remove_partial(&tmp);
+                if !matches!(why, crate::archive::Failed::Cancelled) {
+                    self.report(archive, why.message());
+                }
+                return;
+            }
+        };
+        // Something could take the name between choosing it and the rename, so it tries again.
+        let mut placed = Err(io::Error::from(io::ErrorKind::AlreadyExists));
+        let mut target = PathBuf::new();
+        for _ in 0..100 {
+            target = numbered_name(parent, &name);
+            placed = rename_noreplace(&from, &target);
+            if !matches!(&placed, Err(e) if e.kind() == io::ErrorKind::AlreadyExists) {
+                break;
+            }
+        }
+        if let Err(e) = placed {
+            remove_partial(&tmp);
+            return self.fail(archive, &e);
+        }
+        if only.is_some() {
+            let _ = fs::remove_dir(&tmp);
+        }
+        // Folders opened up for the check get their own modes back now they're in place. The one
+        // moved had to be writable to move to another folder, so this waits until now, and that
+        // one stays writable for its owner so undo can move it to the Trash.
+        crate::archive::restore_modes(&target, &opened);
+        if let Some(stamp) = Stamp::of(&target) {
+            self.steps.push(Step::Made(stamp));
+        }
+        self.created.push(target.clone());
+        self.touch_parent(&target);
+    }
+
     fn rename(&mut self, from: PathBuf, to_name: OsString) {
         if let Err(msg) = validate_name(&to_name.to_string_lossy()) {
             self.fail(&from, &io::Error::other(msg));
@@ -572,6 +699,161 @@ impl Run {
                 self.touched.push(parent);
             }
             Err(e) => self.fail(&from, &e),
+        }
+    }
+
+    /// Renames several items, all or nothing. Everything is checked first, so a clash changes
+    /// nothing. Each item goes once its new name is free: when one is waiting for another to
+    /// move off its name, the other goes first, and items swapping names round a loop free one
+    /// name by moving one of them to a hidden temporary name. Each rename is a step, so one
+    /// undo reverses them all, in reverse order, through the same names. If a rename fails or
+    /// the job is cancelled, the ones done are put back and nothing is left to undo.
+    fn rename_many(&mut self, renames: Vec<(PathBuf, OsString)>) {
+        let Some((moves, case_only)) = self.plan_renames(&renames) else { return };
+        self.job.progress.total_items.store(moves.len() as u64, Ordering::Relaxed);
+        for (from, _) in &moves {
+            self.touch_parent(from);
+        }
+        let mut at: Vec<PathBuf> = moves.iter().map(|(from, _)| from.clone()).collect();
+        // Each rename done, as where it came from, where it went and the item, for undo.
+        let mut done: Vec<(PathBuf, PathBuf, Option<Stamp>)> = Vec::new();
+        // A disk that ignores case finds `a.JPG` already at `a.jpg`, so a rename that only
+        // changes case can't go straight there without replacing. It steps aside first.
+        for &i in &case_only {
+            let temp = rename_temp_name(&at[i]);
+            if self.job.is_cancelled() || !self.rename_step(&at[i], &temp, &moves[i].0, &mut done) {
+                return self.unrename(done);
+            }
+            at[i] = temp;
+        }
+        // Which item is waiting for each name. Names are unique, so each item waits on at most
+        // one other and at most one waits on it: once nothing is ready, what's left is loops.
+        let wants: std::collections::HashMap<&Path, usize> = moves.iter().enumerate().map(|(i, (_, to))| (to.as_path(), i)).collect();
+        let held: std::collections::HashSet<&Path> = at.iter().map(PathBuf::as_path).collect();
+        let mut ready: Vec<usize> = (0..moves.len()).rev().filter(|&i| !held.contains(moves[i].1.as_path())).collect();
+        let mut finished = vec![false; moves.len()];
+        let mut left = moves.len();
+        let mut next_loop = 0;
+        while left > 0 {
+            if self.job.is_cancelled() {
+                return self.unrename(done);
+            }
+            let (i, to) = match ready.pop() {
+                Some(i) => (i, moves[i].1.clone()),
+                None => {
+                    // Everything left is waiting on another in a loop.
+                    while finished[next_loop] {
+                        next_loop += 1;
+                    }
+                    (next_loop, rename_temp_name(&at[next_loop]))
+                }
+            };
+            let from = at[i].clone();
+            if !self.rename_step(&from, &to, &moves[i].0, &mut done) {
+                return self.unrename(done);
+            }
+            if let Some(&j) = wants.get(from.as_path())
+                && !finished[j]
+            {
+                ready.push(j);
+            }
+            at[i] = to;
+            if at[i] == moves[i].1 {
+                finished[i] = true;
+                left -= 1;
+                self.created.push(at[i].clone());
+                self.job.progress.done_items.fetch_add(1, Ordering::Relaxed);
+                self.tick();
+            }
+        }
+        for (from, _, stamp) in done {
+            if let Some(to) = stamp {
+                self.steps.push(Step::Moved { from, to });
+            }
+        }
+    }
+
+    /// One rename of a batch, from where the item is to `to`, noted in `done`. `item` is where it
+    /// started, to name it if this fails. False if it failed, which has been reported.
+    fn rename_step(&mut self, from: &Path, to: &Path, item: &Path, done: &mut Vec<(PathBuf, PathBuf, Option<Stamp>)>) -> bool {
+        self.set_current(item);
+        // A temporary name means nothing to the user, so a failure there names the item.
+        let shown = if to.file_name().is_some_and(|n| n.as_bytes().starts_with(RENAME_TEMP.as_bytes())) { item } else { to };
+        if let Err(e) = rename_noreplace(from, to) {
+            self.report(shown, format!("{}, so nothing was renamed", describe(&e)));
+            return false;
+        }
+        let stamp = Stamp::of(to);
+        let found = stamp.is_some();
+        done.push((from.to_path_buf(), to.to_path_buf(), stamp));
+        // Without knowing which item it is, undo couldn't take it back through this step.
+        if !found {
+            self.report(shown, "It couldn't be found after renaming, so nothing was renamed".into());
+        }
+        found
+    }
+
+    /// The renames that change a name, as from and to, once each name is checked: valid, not
+    /// given twice, and not already taken by something that isn't being renamed. Also which
+    /// of them only change the case of letters, or find the item itself at its new name, as a
+    /// disk that ignores case does.
+    #[allow(clippy::type_complexity)]
+    fn plan_renames(&mut self, renames: &[(PathBuf, OsString)]) -> Option<(Vec<(PathBuf, PathBuf)>, Vec<usize>)> {
+        let mut moves = Vec::new();
+        let mut targets = std::collections::HashSet::new();
+        for (from, name) in renames {
+            let target = from.parent().unwrap_or(Path::new("/")).join(name);
+            let unchanged = target == *from;
+            if !unchanged && let Err(msg) = validate_name_bytes(name.as_bytes()) {
+                self.report(from, format!("{msg}, so nothing was renamed"));
+                return None;
+            }
+            if !unchanged && fs::symlink_metadata(from).is_err() {
+                self.report(from, "This isn't here any more, so nothing was renamed".into());
+                return None;
+            }
+            if !targets.insert(target.clone()) {
+                self.report(&target, "Two items would get this name, so nothing was renamed".into());
+                return None;
+            }
+            if !unchanged {
+                moves.push((from.clone(), target));
+            }
+        }
+        let moving: std::collections::HashSet<&Path> = moves.iter().map(|(from, _)| from.as_path()).collect();
+        let mut case_only = Vec::new();
+        for (i, (from, to)) in moves.iter().enumerate() {
+            // Only a name that differs in case: a hard link under another name is the same
+            // item too, but it's another name, and taken.
+            let same_but_case = from.file_name().zip(to.file_name()).is_some_and(|(a, b)| a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase());
+            let itself = same_but_case && Identity::of(to).ok().zip(Identity::of(from).ok()).is_some_and(|(a, b)| a.same_item(&b));
+            if same_but_case {
+                case_only.push(i);
+            }
+            if !itself && !moving.contains(to.as_path()) && fs::symlink_metadata(to).is_ok() {
+                self.report(to, "Something already has this name, so nothing was renamed".into());
+                return None;
+            }
+        }
+        Some((moves, case_only))
+    }
+
+    /// Puts back the renames done, last first. One that can't be put back stops it there, as
+    /// the ones before it may need its name, and what's still renamed is left to undo.
+    fn unrename(&mut self, mut done: Vec<(PathBuf, PathBuf, Option<Stamp>)>) {
+        while let Some((from, to, stamp)) = done.pop() {
+            if let Err(e) = rename_noreplace(&to, &from) {
+                let name = from.file_name().unwrap_or(from.as_os_str()).to_string_lossy();
+                self.report(&to, format!("Couldn't be put back as “{name}”: {}. Undo can try again", describe(&e)));
+                done.push((from, to, stamp));
+                break;
+            }
+        }
+        self.created.clear();
+        for (from, _, stamp) in done {
+            if let Some(to) = stamp {
+                self.steps.push(Step::Moved { from, to });
+            }
         }
     }
 
@@ -1428,6 +1710,15 @@ fn temp_name(target: &Path) -> PathBuf {
     target.with_file_name(format!(".gannet-partial-{}-{n}", std::process::id()))
 }
 
+/// Where an item waits, hidden, while items swap names. Renamed to without replacing, so a
+/// name that happens to be taken fails the rename rather than losing anything.
+fn rename_temp_name(item: &Path) -> PathBuf {
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    item.with_file_name(format!("{RENAME_TEMP}{}-{n}", std::process::id()))
+}
+
+const RENAME_TEMP: &str = ".gannet-renaming-";
+
 /// True if `dest` is `src` or anywhere below it. Follows symlinks on both sides, except
 /// that a symlink source is only itself: copying a link never recurses into its target.
 fn is_inside_itself(src: &Path, dest: &Path) -> bool {
@@ -1451,6 +1742,58 @@ pub(crate) fn char_boundary_at_most(b: &[u8], max: usize) -> usize {
         n -= 1;
     }
     n
+}
+
+/// The one thing in `dir`, if it's a folder that isn't hidden.
+fn only_folder(dir: &Path) -> Option<OsString> {
+    let mut rd = fs::read_dir(dir).ok()?;
+    let one = rd.next()?.ok()?;
+    if rd.next().is_some() || one.file_name().as_bytes().starts_with(b".") || !one.file_type().ok()?.is_dir() {
+        return None;
+    }
+    Some(one.file_name())
+}
+
+/// Removes what a failed or cancelled extract left, whatever the job's cancel says. It never
+/// follows a link, and stays on the disk it started on.
+fn remove_partial(path: &Path) {
+    fn go(path: &Path, dev: u64) {
+        let Ok(m) = fs::symlink_metadata(path) else { return };
+        if m.is_dir() {
+            if m.dev() != dev {
+                return;
+            }
+            // An archive can make a folder read-only, which would keep what's in it.
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+            for e in fs::read_dir(path).into_iter().flatten().flatten() {
+                go(&e.path(), dev);
+            }
+            let _ = fs::remove_dir(path);
+        } else {
+            let _ = fs::remove_file(path);
+        }
+    }
+    if let Ok(m) = fs::symlink_metadata(path) {
+        go(path, m.dev());
+    }
+}
+
+/// `photos` in `dir`, or `photos (2)`, `photos (3)` and so on if that's taken.
+pub fn numbered_name(dir: &Path, name: &[u8]) -> PathBuf {
+    let first = dir.join(OsStr::from_bytes(name));
+    if fs::symlink_metadata(&first).is_err() {
+        return first;
+    }
+    for n in 2u32.. {
+        let suffix = format!(" ({n})");
+        let mut out = name[..char_boundary_at_most(name, 255 - suffix.len())].to_vec();
+        out.extend_from_slice(suffix.as_bytes());
+        let candidate = dir.join(OsString::from_vec(out));
+        if fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 /// `report.pdf` -> `report (copy).pdf`, then `report (copy 2).pdf`, and so on.
@@ -2708,5 +3051,449 @@ mod tests {
         assert!(redone.errors.is_empty(), "{:?}", redone.errors);
         assert!(!a.exists(), "redo redoes only what undo undid");
         assert_eq!(fs::read(&b).unwrap(), b"new b");
+    }
+
+    /// Packs `names` (relative to `dir`) with bsdtar, its format chosen by `archive`'s ending.
+    fn pack(dir: &Path, archive: &Path, names: &[&str]) {
+        let ok = std::process::Command::new("bsdtar").env("LC_ALL", "C.UTF-8").arg("-a").arg("-cf").arg(archive).arg("-C").arg(dir).args(names).status().unwrap().success();
+        assert!(ok, "bsdtar couldn't make {archive:?}");
+    }
+
+    /// A tar file written by hand, for entries no archiver would make: `(name, data, symlink to)`.
+    fn crafted_tar(path: &Path, entries: &[(&str, &[u8], Option<&str>)]) {
+        let with: Vec<_> = entries.iter().map(|&(n, d, l)| (n, d, l, 0o644)).collect();
+        crafted_tar_with_modes(path, &with);
+    }
+
+    /// As `crafted_tar`, with each entry's mode. A name ending in `/` is a folder.
+    fn crafted_tar_with_modes(path: &Path, entries: &[(&str, &[u8], Option<&str>, u32)]) {
+        let mut out = Vec::new();
+        for &(name, data, link, mode) in entries {
+            let mut h = [0u8; 512];
+            h[..name.len()].copy_from_slice(name.as_bytes());
+            h[100..107].copy_from_slice(format!("{mode:07o}").as_bytes());
+            h[108..115].copy_from_slice(b"0001750");
+            h[116..123].copy_from_slice(b"0001750");
+            let size = if link.is_some() { 0 } else { data.len() };
+            h[124..135].copy_from_slice(format!("{size:011o}").as_bytes());
+            h[136..147].copy_from_slice(b"00000000000");
+            h[156] = if link.is_some() { b'2' } else if name.ends_with('/') { b'5' } else { b'0' };
+            if let Some(l) = link {
+                h[157..157 + l.len()].copy_from_slice(l.as_bytes());
+            }
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+            h[148..156].copy_from_slice(b"        ");
+            let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+            h[148..155].copy_from_slice(format!("{sum:06o}\0").as_bytes());
+            out.extend_from_slice(&h);
+            if link.is_none() {
+                out.extend_from_slice(data);
+                out.resize(out.len().div_ceil(512) * 512, 0);
+            }
+        }
+        out.resize(out.len() + 1024, 0);
+        fs::write(path, out).unwrap();
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn extract_makes_a_folder_beside_the_archive_and_undo_and_redo_work() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        s.file("src/a.txt", b"one");
+        s.file("src/sub/b.txt", b"two");
+        let work = s.dir("work");
+        let zip = work.join("photos.zip");
+        pack(&s.path().join("src"), &zip, &["a.txt", "sub"]);
+        e.start(Request::Extract { archives: vec![zip.clone()] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        let folder = work.join("photos");
+        assert_eq!(done.outcome.created, vec![folder.clone()]);
+        assert!(done.outcome.touched.contains(&work));
+        assert_eq!(fs::read(folder.join("a.txt")).unwrap(), b"one");
+        assert_eq!(fs::read(folder.join("sub/b.txt")).unwrap(), b"two");
+        assert!(zip.exists(), "the archive stays");
+        no_partials(&work);
+
+        e.start(Request::Undo(done.outcome.undo.unwrap()));
+        let undone = finish(&rx, vec![]);
+        assert!(!folder.exists());
+        assert!(s.path().join("data/Trash/files/photos/a.txt").exists(), "undo moves it to the Trash");
+        e.start(Request::Redo(undone.outcome.undo.unwrap()));
+        finish(&rx, vec![]);
+        assert_eq!(fs::read(folder.join("sub/b.txt")).unwrap(), b"two");
+    }
+
+    #[test]
+    fn extract_keeps_names_that_arent_ascii() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        s.file("src/日本語 café.txt", b"one");
+        s.file("src/Fotos ñ/ü.txt", b"two");
+        let work = s.dir("work");
+        for name in ["names.zip", "names.tar.gz"] {
+            let archive = work.join(name);
+            pack(&s.path().join("src"), &archive, &["日本語 café.txt", "Fotos ñ"]);
+            e.start(Request::Extract { archives: vec![archive] });
+            let done = finish(&rx, vec![]);
+            assert!(done.errors.is_empty(), "{name}: {:?}", done.errors);
+            let folder = work.join("names");
+            assert_eq!(fs::read(folder.join("日本語 café.txt")).unwrap(), b"one", "{name}");
+            assert_eq!(fs::read(folder.join("Fotos ñ/ü.txt")).unwrap(), b"two", "{name}");
+            fs::remove_dir_all(&folder).unwrap();
+        }
+    }
+
+    #[test]
+    fn extract_doesnt_wrap_one_folder_in_another_or_reuse_a_name() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        s.file("src/project/readme", b"r");
+        let work = s.dir("work");
+        let tgz = work.join("project-1.0.tar.gz");
+        pack(&s.path().join("src"), &tgz, &["project"]);
+        for _ in 0..2 {
+            e.start(Request::Extract { archives: vec![tgz.clone()] });
+            let done = finish(&rx, vec![]);
+            assert!(done.errors.is_empty(), "{:?}", done.errors);
+        }
+        assert_eq!(names_in(&work), ["project", "project (2)", "project-1.0.tar.gz"]);
+        assert_eq!(fs::read(work.join("project (2)/readme")).unwrap(), b"r");
+
+        // Loose files get a folder named after the archive, numbered the same way.
+        let zip = work.join("loose.zip");
+        pack(&s.path().join("src/project"), &zip, &["readme"]);
+        s.dir("work/loose");
+        e.start(Request::Extract { archives: vec![zip] });
+        let done = finish(&rx, vec![]);
+        assert_eq!(done.outcome.created, vec![work.join("loose (2)")]);
+        assert!(work.join("loose (2)/readme").exists());
+    }
+
+    #[test]
+    fn extract_of_an_archive_reaching_outside_its_folder_leaves_nothing() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        let evil = work.join("evil.tar");
+        crafted_tar(&evil, &[("ok.txt", b"ok", None), ("../escaped.txt", b"bad", None)]);
+        let links = work.join("links.tar");
+        crafted_tar(&links, &[("ln", b"", Some("../..")), ("ln/through.txt", b"bad", None)]);
+        e.start(Request::Extract { archives: vec![evil, links] });
+        let done = finish(&rx, vec![]);
+        assert_eq!(done.errors.len(), 2, "{:?}", done.errors);
+        assert!(done.errors.iter().all(|(_, m)| m.contains("outside its folder")), "{:?}", done.errors);
+        assert!(done.outcome.created.is_empty() && done.outcome.undo.is_none());
+        assert!(!s.path().join("escaped.txt").exists() && !s.path().join("through.txt").exists());
+        assert_eq!(names_in(&work), ["evil.tar", "links.tar"]);
+    }
+
+    #[test]
+    fn extract_refuses_symlinks_pointing_outside_but_keeps_those_inside() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        let up = work.join("up.tar");
+        crafted_tar(&up, &[("ok.txt", b"ok", None), ("ln", b"", Some("../../secret"))]);
+        let absolute = work.join("absolute.tar");
+        crafted_tar(&absolute, &[("ln", b"", Some("/etc"))]);
+        // A link to `.` makes `x/..` the folder above, though it reads as the folder itself.
+        let dot = work.join("dot.tar");
+        crafted_tar(&dot, &[("x", b"", Some(".")), ("y", b"", Some("x/.."))]);
+        e.start(Request::Extract { archives: vec![up, absolute, dot] });
+        let done = finish(&rx, vec![]);
+        assert_eq!(done.errors.len(), 3, "{:?}", done.errors);
+        assert!(done.errors.iter().all(|(_, m)| m.contains("outside its folder")), "{:?}", done.errors);
+        assert!(done.outcome.created.is_empty() && done.outcome.undo.is_none());
+        assert_eq!(names_in(&work), ["absolute.tar", "dot.tar", "up.tar"]);
+
+        let fine = work.join("fine.tar");
+        crafted_tar(&fine, &[("b", b"bee", None), ("a/ln", b"", Some("../b")), ("a/here", b"", Some("."))]);
+        e.start(Request::Extract { archives: vec![fine] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(fs::read(work.join("fine/a/ln")).unwrap(), b"bee");
+        assert_eq!(fs::read_link(work.join("fine/a/here")).unwrap(), Path::new("."));
+    }
+
+    #[test]
+    fn extract_checks_links_against_the_folder_that_is_put_in_place() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        // Each holds one folder, which is put in place on its own, so `..` from inside it is
+        // the folder the archive is in.
+        let up = work.join("up.tar");
+        crafted_tar(&up, &[("proj/a.txt", b"a", None), ("proj/docs", b"", Some(".."))]);
+        let sib = work.join("sib.tar");
+        crafted_tar(&sib, &[("proj/a.txt", b"a", None), ("proj/sib", b"", Some("../sib"))]);
+        e.start(Request::Extract { archives: vec![up, sib] });
+        let done = finish(&rx, vec![]);
+        assert_eq!(done.errors.len(), 2, "{:?}", done.errors);
+        assert!(done.errors.iter().all(|(_, m)| m.contains("outside its folder")), "{:?}", done.errors);
+        assert_eq!(names_in(&work), ["sib.tar", "up.tar"]);
+
+        let fine = work.join("fine.tar");
+        crafted_tar(&fine, &[("proj/b", b"bee", None), ("proj/a", b"", Some("b"))]);
+        e.start(Request::Extract { archives: vec![fine] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(fs::read(work.join("proj/a")).unwrap(), b"bee");
+    }
+
+    #[test]
+    fn extract_of_links_that_each_lead_to_two_more_ends_quickly() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        // l0 -> l1/l1, l1 -> l2/l2 … l30 -> . doubles the hops at each level. The kernel gives up
+        // after 40 in all and can't open l0 either, so it's refused, and it must not take long.
+        let names: Vec<String> = (0..=30).map(|i| format!("l{i}")).collect();
+        let targets: Vec<String> = (0..30).map(|i| format!("l{0}/l{0}", i + 1)).chain([".".to_string()]).collect();
+        let entries: Vec<_> = names.iter().zip(&targets).map(|(n, t)| (n.as_str(), &b""[..], Some(t.as_str()))).collect();
+        let chain = work.join("chain.tar");
+        crafted_tar(&chain, &entries);
+        let started = Instant::now();
+        e.start(Request::Extract { archives: vec![chain] });
+        let done = finish(&rx, vec![]);
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
+        assert_eq!(names_in(&work), ["chain.tar"]);
+    }
+
+    #[test]
+    fn extract_reads_folders_the_archive_made_unreadable_and_keeps_their_modes() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        let tar = work.join("backup.tar");
+        crafted_tar_with_modes(&tar, &[("notes.txt", b"n", None, 0o644), ("private/", b"", None, 0o300), ("private/key.txt", b"k", None, 0o600)]);
+        e.start(Request::Extract { archives: vec![tar] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        let private = work.join("backup/private");
+        assert_eq!(fs::symlink_metadata(&private).unwrap().permissions().mode() & 0o7777, 0o300);
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::read(private.join("key.txt")).unwrap(), b"k");
+    }
+
+    #[test]
+    fn extract_moves_a_single_folder_it_cant_write_and_undo_can_move_it_again() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        let tar = work.join("release.tar");
+        crafted_tar_with_modes(&tar, &[("proj/", b"", None, 0o555), ("proj/sub/", b"", None, 0o555), ("proj/readme.txt", b"r", None, 0o644)]);
+        e.start(Request::Extract { archives: vec![tar] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        let proj = work.join("proj");
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        // The top folder keeps write for its owner, or it couldn't be moved to the Trash again.
+        assert_eq!(mode(&proj), 0o755);
+        assert_eq!(mode(&proj.join("sub")), 0o555, "folders inside keep the archive's modes");
+        assert_eq!(fs::read(proj.join("readme.txt")).unwrap(), b"r");
+        e.start(Request::Undo(done.outcome.undo.unwrap()));
+        let undone = finish(&rx, vec![]);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert!(!proj.exists(), "undo moves it to the Trash");
+        let trashed = s.path().join("data/Trash/files/proj");
+        fs::set_permissions(trashed.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn extract_of_a_damaged_or_locked_archive_leaves_nothing() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        let garbage = s.file("work/broken.zip", b"this was never a zip file");
+        // Data that doesn't compress, so cutting the archive in half cuts the file short.
+        let mut x = 0x2545_f491_u32;
+        let noise: Vec<u8> = (0..65536)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect();
+        s.file("src/a.txt", &noise);
+        let whole = s.path().join("whole.zip");
+        pack(&s.path().join("src"), &whole, &["a.txt"]);
+        let bytes = fs::read(&whole).unwrap();
+        let truncated = s.file("work/truncated.zip", &bytes[..bytes.len() / 2]);
+        let locked = work.join("locked.zip");
+        let ok = std::process::Command::new("bsdtar")
+            .args(["--format", "zip", "--options", "zip:encryption=zipcrypt", "--passphrase", "secret", "-cf"])
+            .arg(&locked)
+            .arg("-C")
+            .arg(s.path().join("src"))
+            .arg("a.txt")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        e.start(Request::Extract { archives: vec![garbage, truncated, locked] });
+        let done = finish(&rx, vec![]);
+        let messages: Vec<&str> = done.errors.iter().map(|(_, m)| m.as_str()).collect();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(messages[0].contains("damaged") && messages[1].contains("damaged"), "{messages:?}");
+        assert!(messages[2].contains("password"), "{messages:?}");
+        assert!(done.outcome.created.is_empty());
+        assert_eq!(names_in(&work), ["broken.zip", "locked.zip", "truncated.zip"]);
+    }
+
+    #[test]
+    fn extract_without_bsdtar_says_so() {
+        let s = Scratch::new();
+        let (mut e, rx) = engine(&s);
+        e.extractor = s.path().join("no-such-bsdtar").into_os_string();
+        let zip = s.file("work/a.zip", b"PK");
+        e.start(Request::Extract { archives: vec![zip] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors[0].1.contains("libarchive"), "{:?}", done.errors);
+        assert_eq!(names_in(&s.path().join("work")), ["a.zip"]);
+    }
+
+    #[test]
+    fn cancelling_an_extract_removes_what_it_unpacked() {
+        let s = Scratch::new();
+        let (mut e, rx) = engine(&s);
+        // A stand-in that writes something, then takes its time.
+        let tool = s.file("slow-bsdtar", b"#!/bin/sh\nwhile [ \"$1\" != -C ]; do shift; done\nmkdir -p \"$2/half\" && echo x > \"$2/half/file\"\nexec sleep 30\n");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        e.extractor = tool.into_os_string();
+        let zip = s.file("work/big.zip", b"PK");
+        let job = e.start(Request::Extract { archives: vec![zip] });
+        let work = s.path().join("work");
+        let started = Instant::now();
+        while !fs::read_dir(&work).unwrap().flatten().any(|d| d.path().join("half/file").exists()) {
+            assert!(started.elapsed() < Duration::from_secs(10), "the stand-in never started");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        job.cancel();
+        let done = finish(&rx, vec![]);
+        assert!(done.outcome.cancelled);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(names_in(&work), ["big.zip"]);
+    }
+
+    /// Each file in `dir` as name=contents, sorted.
+    fn contents_in(dir: &Path) -> Vec<String> {
+        names_in(dir).into_iter().map(|n| format!("{n}={}", fs::read_to_string(dir.join(&n)).unwrap_or_else(|_| "/".into()))).collect()
+    }
+
+    fn renames(dir: &Path, pairs: &[(&str, &str)]) -> Request {
+        Request::RenameMany { renames: pairs.iter().map(|(from, to)| (dir.join(from), OsString::from(to))).collect() }
+    }
+
+    #[test]
+    fn rename_many_swaps_loops_and_chains_and_one_undo_puts_every_name_back() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let w = s.dir("w");
+        for n in ["a", "b", "c", "d", "e", "f", "g", "x", "same"] {
+            fs::write(w.join(n), n).unwrap();
+        }
+        fs::create_dir(w.join("folder")).unwrap();
+        let before = contents_in(&w);
+        // a and b swap, c, d and e go round a loop, f moves along a chain onto g's name as g
+        // leaves it, a folder is renamed, and `same` keeps its name.
+        e.start(renames(&w, &[("a", "b"), ("b", "a"), ("c", "d"), ("d", "e"), ("e", "c"), ("f", "g"), ("g", "h"), ("folder", "dir"), ("same", "same")]));
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(contents_in(&w), ["a=b", "b=a", "c=e", "d=c", "dir=/", "e=d", "g=f", "h=g", "same=same", "x=x"]);
+        let mut created: Vec<_> = done.outcome.created.iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        created.sort();
+        assert_eq!(created, ["a", "b", "c", "d", "dir", "e", "g", "h"], "each renamed item, for selecting");
+        assert!(done.outcome.touched.contains(&w));
+        let undone = reverse(&e, &rx, done.outcome.undo);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert_eq!(contents_in(&w), before, "one undo puts every name back");
+        let redone = reverse(&e, &rx, undone.outcome.undo);
+        assert!(redone.errors.is_empty(), "{:?}", redone.errors);
+        assert_eq!(contents_in(&w), ["a=b", "b=a", "c=e", "d=c", "dir=/", "e=d", "g=f", "h=g", "same=same", "x=x"]);
+    }
+
+    #[test]
+    fn rename_many_changes_only_the_case_by_way_of_a_temporary_name() {
+        // On a disk that ignores case, `a.jpg` already finds `a.JPG`, so going straight there
+        // would be refused. This disk doesn't ignore case, but the same steps run.
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let w = s.dir("w");
+        fs::write(w.join("a.JPG"), "a").unwrap();
+        fs::write(w.join("b.JPG"), "b").unwrap();
+        e.start(renames(&w, &[("a.JPG", "a.jpg"), ("b.JPG", "a.JPG")]));
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(contents_in(&w), ["a.JPG=b", "a.jpg=a"]);
+        let undone = reverse(&e, &rx, done.outcome.undo);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert_eq!(contents_in(&w), ["a.JPG=a", "b.JPG=b"]);
+    }
+
+    #[test]
+    fn rename_many_refuses_any_clash_before_renaming_anything() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let w = s.dir("w");
+        for n in ["a", "b", "c", "taken"] {
+            fs::write(w.join(n), n).unwrap();
+        }
+        // Another name for the same file is still another name.
+        fs::hard_link(w.join("c"), w.join("c-link")).unwrap();
+        let before = contents_in(&w);
+        let cases: [(&[(&str, &str)], &str); 6] = [
+            (&[("a", "x"), ("b", "taken")], "Something already has this name"),
+            (&[("c", "c-link"), ("b", "x")], "Something already has this name"),
+            (&[("a", "x"), ("b", "x")], "Two items would get this name"),
+            // b keeps its name, so a can't have it.
+            (&[("a", "b"), ("b", "b")], "Two items would get this name"),
+            (&[("a", "x"), ("b", "y/z")], "can't contain"),
+            (&[("a", "x"), ("gone", "y")], "isn't here any more"),
+        ];
+        for (pairs, why) in cases {
+            e.start(renames(&w, pairs));
+            let done = finish(&rx, vec![]);
+            assert_eq!(done.errors.len(), 1, "{pairs:?}: {:?}", done.errors);
+            assert!(done.errors[0].1.contains(why) && done.errors[0].1.contains("nothing was renamed"), "{pairs:?}: {:?}", done.errors);
+            assert_eq!(done.outcome.undo, None);
+            assert_eq!(contents_in(&w), before, "{pairs:?}");
+        }
+    }
+
+    #[test]
+    fn rename_many_puts_back_what_it_renamed_when_one_fails() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        // Items can be in different folders. The second folder can't be changed, so its swap
+        // fails after the first folder's rename and swap have gone through.
+        let (one, two) = (s.dir("one"), s.dir("two"));
+        for n in ["a", "b", "c"] {
+            fs::write(one.join(n), n).unwrap();
+        }
+        for n in ["c", "d"] {
+            fs::write(two.join(n), n).unwrap();
+        }
+        fs::set_permissions(&two, fs::Permissions::from_mode(0o555)).unwrap();
+        let pairs = [(&one, "a", "x"), (&one, "b", "c"), (&one, "c", "b"), (&two, "c", "d"), (&two, "d", "c")];
+        e.start(Request::RenameMany { renames: pairs.iter().map(|(d, from, to)| (d.join(from), OsString::from(to))).collect() });
+        let done = finish(&rx, vec![]);
+        fs::set_permissions(&two, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
+        assert_eq!(done.errors[0].0, two.join("c"));
+        assert!(done.errors[0].1.ends_with(", so nothing was renamed"), "{:?}", done.errors);
+        assert_eq!(contents_in(&one), ["a=a", "b=b", "c=c"], "the rename and the swap were put back");
+        assert_eq!(contents_in(&two), ["c=c", "d=d"]);
+        assert_eq!(done.outcome.undo, None, "nothing is left to undo");
+        assert!(done.outcome.created.is_empty());
     }
 }
