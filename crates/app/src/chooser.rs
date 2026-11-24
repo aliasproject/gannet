@@ -304,6 +304,9 @@ pub struct Chooser {
     pub name: Field,
     /// Whether typing goes to the name rather than the list.
     pub name_focused: bool,
+    /// The full path a search's match put in the name, to cut back to its name when the
+    /// search ends. A path typed in stays as typed.
+    pub match_path: Option<String>,
     pub rows: Arc<RowFilter>,
     db: Option<Arc<MimeDb>>,
     /// What was picked, once it's done. `None` when closed without.
@@ -329,7 +332,7 @@ impl Chooser {
         let labels = spec.filters.iter().map(|f| &*Box::leak(f.label.clone().into_boxed_str())).collect();
         let folders_only = matches!(spec.mode, Mode::Folder | Mode::SaveFiles);
         let rows = Arc::new(RowFilter::new(folders_only, filter.and_then(|i| spec.filters.get(i)), db.clone()));
-        Self { spec, filter, name, name_focused, rows, db, picked: None, labels, out, drawn: Default::default() }
+        Self { spec, filter, name, name_focused, match_path: None, rows, db, picked: None, labels, out, drawn: Default::default() }
     }
 
     fn set_filter(&mut self, i: usize) {
@@ -468,9 +471,8 @@ impl App {
         match mode {
             Mode::Open if !files.is_empty() => self.chooser_accept(),
             Mode::Save if !files.is_empty() => {
-                let name = String::from_utf8_lossy(l.name(files[0])).into_owned();
                 if let Some(c) = self.chooser.as_mut() {
-                    c.name = Field::new(&name);
+                    c.set_name_from(&l, files[0]);
                 }
                 self.chooser_accept();
             }
@@ -678,7 +680,7 @@ impl App {
             && c.spec.mode == Mode::Save
             && !l.kind(id).is_dirlike()
         {
-            c.name = Field::new(&String::from_utf8_lossy(l.name(id)));
+            c.set_name_from(&l, id);
             self.invalidate(self.layout().status);
         }
     }
@@ -735,7 +737,9 @@ impl App {
             ch.drawn = (b.accept, b.cancel, b.filter);
         }
         let Some(ch) = self.chooser.as_ref() else { return };
-        let (name, focused, accept_label) = (ch.name.clone(), ch.name_focused, ch.spec.accept_label());
+        // The path or filter box, while open, has the keyboard before the name does.
+        let focused = ch.name_focused && matches!(self.edit, crate::app::Edit::None);
+        let (name, accept_label) = (ch.name.clone(), ch.spec.accept_label());
         let filter_label = ch.filter.and_then(|i| ch.labels.get(i).copied());
         if let Some((r, label_x)) = b.name {
             let by = self.baseline(r.y, r.h);
@@ -828,11 +832,26 @@ fn allows(a: Action) -> bool {
     match a {
         Action::Open | Action::Preview | Action::ToggleHidden | Action::SortBy(_) | Action::Reload => true,
         Action::Rename | Action::NewFolder | Action::Trash | Action::Undo | Action::Redo => true,
-        Action::ShowInFolder | Action::OpenDrive | Action::Unmount | Action::Eject | Action::ChooseFilter(_) => true,
-        Action::NewWindow | Action::Cut | Action::Copy | Action::Paste | Action::DeleteForGood | Action::Restore | Action::EmptyTrash | Action::SetBackground | Action::Extract | Action::OpenTerminal => false,
+        Action::ShowInFolder | Action::OpenPin | Action::Unpin | Action::OpenDrive | Action::Unmount | Action::Eject | Action::ChooseFilter(_) => true,
+        Action::NewWindow | Action::Cut | Action::Copy | Action::Paste | Action::DeleteForGood | Action::Restore | Action::EmptyTrash | Action::SetBackground | Action::Extract | Action::OpenWith | Action::OpenTerminal => false,
     }
 }
 
+
+/// What goes in a Save dialog's name field for saving over a file in the list. A search's match
+/// can be in any folder below, so it's named in full, and the save goes where it is.
+impl Chooser {
+    /// Puts a picked file in the name: its name, or in a search its full path, so the save
+    /// goes where the match is.
+    fn set_name_from(&mut self, l: &gannet_core::listing::Listing, id: u32) {
+        let text = match l.search() {
+            Some(_) => l.path(id).to_string_lossy().into_owned(),
+            None => String::from_utf8_lossy(l.name(id)).into_owned(),
+        };
+        self.match_path = l.search().is_some().then(|| text.clone());
+        self.name = Field::new(&text);
+    }
+}
 
 #[cfg(test)]
 mod tests {

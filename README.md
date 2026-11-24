@@ -73,6 +73,7 @@ At run time, Gannet uses these:
 |---|---|---|
 | `fc-match` (fontconfig) | Finding fonts | Gannet can't find a font, so install this |
 | `xdg-open` | Opening files in other apps | Opening files fails |
+| `xdg-terminal-exec` | Open With for apps that run in a terminal, like Neovim | Open With says it's missing for those apps |
 | `bsdtar` (libarchive) | Extracting archives | Extracting says it's missing |
 | `xdg-terminal-exec` | Open in terminal, in whichever terminal is set up | Open in terminal isn't offered |
 | `libmpv` (part of `mpv` on many systems) and `bubblewrap` | Video and sound previews | Videos show a message saying what's needed |
@@ -80,6 +81,7 @@ At run time, Gannet uses these:
 | `shared-mime-info` | Saying what a file is, like "PDF document" | Previews name types like `application/pdf` |
 | `poppler` (`pdfinfo`, `pdftoppm`) and `bubblewrap` | PDF previews | PDFs say what they are, or show a thumbnailer's picture |
 | Thumbnailers, like `glycin` and `libgsf`, and `bubblewrap` | Previews of HEIC, JPEG XL, SVG, office files and more | Those files say what they are |
+| `ffmpeg` (with `ffprobe`) and `bubblewrap` | Videos' thumbnails in the list | Videos keep their icon |
 
 To add it to your app launcher:
 
@@ -100,7 +102,9 @@ To add it to your app launcher:
 | Up, back, forward, home | Backspace or Alt+Up, Alt+Left, Alt+Right, Alt+Home |
 | Places in the sidebar | Alt+1 to Alt+9 |
 | Jump to a name | Just type it |
-| Filter, type a path | Ctrl+F or `/`, Ctrl+L |
+| Search here and in the folders inside | Ctrl+F |
+| Filter this folder, type a path | `/`, Ctrl+L |
+| Show a search's match in its folder | Alt+Enter |
 | Hidden files | Ctrl+H |
 | Sort by name, size, modified (again to reverse) | Ctrl+1, Ctrl+2, Ctrl+3 |
 | Copy, cut, paste | Ctrl+C, Ctrl+X, Ctrl+V |
@@ -111,6 +115,24 @@ To add it to your app launcher:
 | Stop the newest operation | Ctrl+. |
 | Context menu | Menu key or F10 |
 | Reload, new window, close | F5 or Ctrl+R, Ctrl+N, Ctrl+Q or Ctrl+W |
+
+## Searching
+
+Ctrl+F searches the folder showing and every folder inside it for names that contain what's
+typed, ignoring case. `/` filters only the folder showing. In the box, Ctrl+F turns a search
+into a filter and back, keeping what's typed. Matches appear
+as they're found, nearest folders first, with where each one is beside it, and each letter
+typed starts the search again. Enter opens a match, Alt+Enter shows it in its folder, and
+going back from there comes back to the search. Escape ends it.
+
+There's no index: each search reads the folders as they are now, and nothing runs while
+you're not searching. Reading 200,000 files takes a few tens of milliseconds once they've been
+read before. A search stays on the folder's own disk, so other disks, network shares and
+`/proc` mounted inside aren't read, and it doesn't follow symlinks to folders. Hidden folders
+are only searched while hidden files show. It stops after 1,000 matches, and says so. Only
+the folder searched is watched for changes, so a file changed deeper down by another program
+shows as it was until the search runs again (F5, or typing). Changing the sort while searching
+sorts the folder that way too.
 
 ## Sorting
 
@@ -201,18 +223,40 @@ as installing a file manager shouldn't change that by itself. To choose it, put 
 
     [preferred]
     org.freedesktop.impl.portal.FileChooser=gannet;gtk
+    org.freedesktop.impl.portal.AppChooser=gannet;gtk
 
-then restart the portal with `systemctl --user restart xdg-desktop-portal`. Other portals
+then restart the portal with `systemctl --user restart xdg-desktop-portal`. The second line
+is for Open With (below) and can be left out. Other portals
 stay as your desktop's own configuration has them, as xdg-desktop-portal reads each file in
 turn for what earlier ones leave out. `gtk` after `gannet` is what's used if Gannet isn't
 installed. Older versions of xdg-desktop-portal read only the first file they find, so with
 those, copy your desktop's lines from `/usr/share/xdg-desktop-portal/*-portals.conf` into it.
 
 `gannet --file-chooser-service` is what D-Bus starts. It has no window: it opens one for
-each request, `gannet --choose ...`, and exits after ten minutes with none open. Like "Show
-in folder", it needs `WAYLAND_DISPLAY` in the environment D-Bus gives services. A dialog
-sits over the program's window as its child where the compositor supports xdg-foreign, and
-its app ID is `com.aliasproject.Gannet.Chooser` for window rules.
+each request, `gannet --choose ...` or `gannet --open-with ...`, and exits after ten minutes
+with none open. Like "Show in folder", it needs `WAYLAND_DISPLAY` in the environment D-Bus
+gives services. A dialog sits over the program's window as its child where the compositor
+supports xdg-foreign, and its app ID is `com.aliasproject.Gannet.Chooser` for window rules.
+
+## Open With
+
+Right-click one or more files and choose Open with… to pick an app other than the default.
+The apps for the file's type come first, with the default marked, then every other app, by
+name. Typing searches them, the arrows move, and Enter or a double click opens. Escape clears
+the search, then cancels. "Always use for … files" (Space, before typing) also makes the app
+the default for that type, in `~/.config/mimeapps.list`, where `xdg-open` and other file
+managers look; Undo doesn't reverse that, but choosing another app the same way does. It's
+there for an archive too, which opening extracts in Gannet, so another app can open it instead.
+
+Apps come from the desktop entries in `~/.local/share/applications` and
+`/usr/share/applications` (`XDG_DATA_DIRS`), and the defaults from the `mimeapps.list` files,
+as the freedesktop specs describe. An entry whose program isn't installed is left out. An app
+that runs in a terminal, like Neovim, opens in yours through `xdg-terminal-exec`.
+
+The same window answers other programs' "Open with…" requests through xdg-desktop-portal's
+app chooser, with the `AppChooser` line above. Only sandboxed programs, such as Flatpaks, ask
+it, when they open a file or link with no default app. There it lists the apps the program
+offers, and the portal opens the one picked.
 
 ## Set as background
 
@@ -241,7 +285,25 @@ everything in the archive is inside one folder, that folder comes out as itself,
 another one. Extract is also in the right-click menu. It runs as a job you can stop, and Undo
 moves the folder to the Trash. A damaged archive, one with a password, or one with items that
 would land outside its folder or links that point outside it leaves nothing behind and says why. In Open and Save dialogs,
-opening an archive picks it, as any other file.
+opening an archive picks it, as any other file. To open one in another app, use Open with….
+
+## Pinned folders
+
+Drag a folder between places in the sidebar to pin it there, under Pinned: below Trash, or
+just above or below a pin. A bar shows where it will land. Dropping onto a place still moves
+the folder into it; pinning never moves or changes the folder. Files can't be pinned. Drag a
+pin up or down to put the pins in another order, and Escape puts it back. Right-click a pin
+to unpin it, which leaves the folder alone. Alt+1 to Alt+9 follow the sidebar, pins included.
+
+When the places don't fit, the sidebar scrolls with the wheel or its scroll bar. A drag held
+near its top or bottom edge scrolls it too, and Alt+1 to Alt+9 scroll the place they open
+into view.
+
+Pins are GTK's bookmarks, kept in `$XDG_CONFIG_HOME/gtk-3.0/bookmarks`, so they're shared
+with Nautilus and GTK's Open and Save dialogs, and every open Gannet window follows changes to
+that file. Gannet only shows local folders, and keeps every other line, like an `sftp://`
+bookmark, as it was. A standard folder like Documents that's also bookmarked shows once, in
+Places. A pinned folder that's gone stays in the sidebar until it's unpinned.
 
 ## Recent
 
@@ -375,6 +437,25 @@ own disks stay out of the way, as udisks2 marks them.
 This goes through udisks2, which most Linux desktops run. Polkit decides what's allowed, and
 asks for a password if the system says to. Before acting on a drive, Gannet checks it's still
 the one you picked, as another stick put in can take the same place.
+
+## Thumbnails
+
+Pictures and videos in the list show a small picture of themselves in place of their icon,
+cut to a square from the middle. The icon shows until the picture is ready, and stays for a
+file that can't be shown. Folders, and anything in the Trash, keep their icons.
+
+Thumbnails are kept in the freedesktop cache (`~/.cache/thumbnails`, or under
+`$XDG_CACHE_HOME`) that other apps share, so one another app made is used, and the ones Gannet
+makes, at the 128-pixel "normal" size, are there for other apps. A file that changes gets a new
+one. A file that can't be made into one is noted in `thumbnails/fail/gannet`, so it isn't tried
+again until it changes or Gannet is updated.
+
+Only the rows on screen get thumbnails, and scrolling past a row drops it from the queue, or
+stops it if it's being made, so scrolling never waits. They're made in the background, two at
+a time, at the lowest CPU priority and a low disk priority. Pictures are read by the preview's sandboxed
+decoder, and ones it can't read, like HEIC and SVG, by the system's thumbnailers. Videos get a
+frame from a tenth of the way in, from `ffmpeg`. Both run as the preview's do (see
+[Sandboxing](#sandboxing)).
 
 ## Preview
 

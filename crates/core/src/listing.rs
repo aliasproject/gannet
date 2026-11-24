@@ -79,6 +79,18 @@ pub struct Listing {
     trash: Option<Arc<TrashRows>>,
     /// Set for the Recent view, whose rows are files anywhere.
     recent: Option<Arc<Vec<PathBuf>>>,
+    /// Set for search results, whose rows are anywhere below `dir`.
+    search: Option<Arc<SearchRows>>,
+}
+
+/// What a search found: each row's path, and what was asked.
+pub struct SearchRows {
+    pub query: String,
+    paths: Vec<PathBuf>,
+    /// It stopped at the limit, so there may be more.
+    pub truncated: bool,
+    /// Folders below that couldn't be read.
+    pub unreadable: usize,
 }
 
 #[derive(Clone)]
@@ -131,7 +143,7 @@ impl Listing {
     pub fn path(&self, i: u32) -> PathBuf {
         match &self.trash {
             Some(t) => t.roots[t.root_of[i as usize] as usize].files().join(&t.file_names[i as usize]),
-            None => match &self.recent {
+            None => match self.paths() {
                 Some(paths) => paths[i as usize].clone(),
                 None => self.dir.join(self.os_name(i)),
             },
@@ -139,9 +151,10 @@ impl Listing {
     }
 
     /// What tells this row apart from the others, for finding it again after a reload.
-    /// It's the name, except in the Trash and Recent views, where two rows can share a name.
+    /// It's the name, except in the Trash and Recent views and search results, where two rows can
+    /// share a name.
     pub fn key(&self, i: u32) -> std::borrow::Cow<'_, [u8]> {
-        if self.trash.is_some() || self.recent.is_some() {
+        if self.trash.is_some() || self.paths().is_some() {
             std::borrow::Cow::Owned(self.path(i).into_os_string().into_vec())
         } else {
             std::borrow::Cow::Borrowed(self.name(i))
@@ -153,10 +166,30 @@ impl Listing {
         self.recent.is_some()
     }
 
+    /// What a search found, for search results.
+    pub fn search(&self) -> Option<&SearchRows> {
+        self.search.as_deref()
+    }
+
+    /// What a search asked for, for search results.
+    pub fn search_query(&self) -> Option<&str> {
+        self.search().map(|s| s.query.as_str())
+    }
+
+    /// Where each row is, for the views whose rows are files from anywhere.
+    fn paths(&self) -> Option<&[PathBuf]> {
+        match (&self.recent, &self.search) {
+            (Some(paths), _) => Some(paths),
+            (None, Some(s)) => Some(&s.paths),
+            (None, None) => None,
+        }
+    }
+
     /// The folder a row is in, for the views whose rows come from many: where a Trash item
-    /// was deleted from, if its info file could be read, or where a recent file is.
+    /// was deleted from, if its info file could be read, or where a recent file or a search's
+    /// match is.
     pub fn location(&self, i: u32) -> Option<&Path> {
-        match &self.recent {
+        match self.paths() {
             Some(paths) => paths[i as usize].parent(),
             None => self.original(i).and_then(Path::parent),
         }
@@ -282,6 +315,7 @@ impl Listing {
             slow_stat: self.slow_stat,
             trash: self.trash.clone(),
             recent: self.recent.clone(),
+            search: self.search.clone(),
         }
     }
 }
@@ -346,7 +380,12 @@ fn sort_known(l: &Listing, spec: SortSpec) -> Vec<u32> {
                 _ => keys[a as usize].cmp(&keys[b as usize]),
             };
             let by_key = if spec.descending { by_key.reverse() } else { by_key };
-            by_key.then_with(|| natural_cmp(l.name(a), l.name(b)))
+            // A search can find one name in many folders, which go in the order of their paths.
+            let by_path = || match &l.search {
+                Some(s) => natural_cmp(s.paths[a as usize].as_os_str().as_bytes(), s.paths[b as usize].as_os_str().as_bytes()),
+                None => Ordering::Equal,
+            };
+            by_key.then_with(|| natural_cmp(l.name(a), l.name(b))).then_with(by_path)
         })
     });
     v
@@ -381,9 +420,15 @@ pub fn name_contains(name: &[u8], needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if name.is_ascii() && needle.is_ascii() {
+    // Lowercase text with something other than ASCII in it can't be in a name that's all ASCII.
+    if name.is_ascii() && !needle.is_ascii() {
+        return false;
+    }
+    if name.is_ascii() {
         let n = needle.as_bytes();
-        n.len() <= name.len() && name.windows(n.len()).any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
+        // Only where the first letter matches, either way, is the rest compared.
+        let (lower, upper) = (n[0], n[0].to_ascii_uppercase());
+        n.len() <= name.len() && name.windows(n.len()).any(|w| (w[0] == lower || w[0] == upper) && w.eq_ignore_ascii_case(n))
     } else {
         String::from_utf8_lossy(name).to_lowercase().contains(needle)
     }
@@ -409,6 +454,11 @@ pub struct LoadRequest {
     pub trash: Option<TrashSpec>,
     /// List the recently used files instead, from the list at `dir`.
     pub recent: bool,
+    /// Search `dir` and below for names containing this, instead of listing it.
+    pub search: Option<String>,
+    /// The home Trash (`$XDG_DATA_HOME/Trash`) and the user's id, so that a search leaves out
+    /// every Trash folder, whose items have to stay paired with their info files.
+    pub search_skips_trash: Option<(PathBuf, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -479,6 +529,7 @@ pub fn spawn_load_watching(req: LoadRequest, watch: Option<Arc<Watch>>, sink: im
         let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match req.trash.clone() {
             Some(spec) => load_trash(req, &spec, watch.as_ref(), &c, &s2),
             None if req.recent => load_recent(req, watch.as_ref(), &c, &s2),
+            None if req.search.is_some() => load_search(req, watch.as_ref(), &c, &s2),
             None => {
                 if let Some(w) = &watch {
                     w.set_dirs_unless(std::slice::from_ref(&dir), || c.load(atomic::Ordering::Relaxed));
@@ -509,7 +560,7 @@ fn load(req: LoadRequest, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
             return;
         }
     };
-    let mut l = Listing { dir: req.dir.clone(), fd: Some(file.clone()), names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None };
+    let mut l = Listing { dir: req.dir.clone(), fd: Some(file.clone()), names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None, search: None };
     // Small enough that a slow disk returns often, and big enough to be cheap on a fast one.
     let mut buf: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); if req.slow_read.is_some() { 4096 } else { READ_BUFFER }];
     let mut iter = RawDir::new(file.as_fd(), &mut buf);
@@ -655,7 +706,7 @@ fn load_trash(req: LoadRequest, spec: &TrashSpec, watch: Option<&Arc<Watch>>, ca
     if let Some(w) = watch {
         w.set_dirs_unless(&[home.files()], stale);
     }
-    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None };
+    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None, search: None };
     let mut t = TrashRows { roots: Vec::new(), fds: Vec::new(), root_of: Vec::new(), file_names: Vec::new(), info: Vec::new() };
     match read_trash_root(&home, req.slow_read, cancel) {
         Ok((file, entries)) => add_trash_root(&mut l, &mut t, home, file, entries),
@@ -732,7 +783,7 @@ fn load_recent(req: LoadRequest, watch: Option<&Arc<Watch>>, cancel: &Arc<Atomic
     if let (Some(w), Some(parent)) = (watch, req.dir.parent()) {
         w.set_dirs_unless(&[parent], stale);
     }
-    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None };
+    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: false, read_error: None, slow_stat: req.slow_stat, trash: None, recent: None, search: None };
     let found = match read_list(&req.dir) {
         Ok(bytes) => crate::recent::parse(&bytes),
         // No list yet just means nothing's been used.
@@ -784,6 +835,73 @@ fn load_recent(req: LoadRequest, watch: Option<&Arc<Watch>>, cancel: &Arc<Atomic
     l.complete = true;
     l.recent = Some(Arc::new(paths));
     publish_final(Arc::new(l), &req, cancel, sink);
+}
+
+/// How soon a search shows what it's found so far, and how often after that. Soon enough to
+/// feel immediate, and seldom enough that the list doesn't churn while matches pour in.
+const SEARCH_FIRST_SHOW: Duration = Duration::from_millis(16);
+const SEARCH_SHOW_EVERY: Duration = Duration::from_millis(100);
+
+/// Searches `dir` and below, showing matches as they're found. Only `dir` is watched: a change
+/// in it runs the search again, as it would reload the folder.
+fn load_search(req: LoadRequest, watch: Option<&Arc<Watch>>, cancel: &Arc<AtomicBool>, sink: &LoadSink) {
+    let stale = || cancel.load(atomic::Ordering::Relaxed);
+    if let Some(w) = watch {
+        w.set_dirs_unless(std::slice::from_ref(&req.dir), stale);
+    }
+    let query = req.search.clone().unwrap_or_default();
+    let limit = crate::search::LIMIT;
+    let started = Instant::now();
+    let (mut found, mut shown, mut next_show) = (Vec::new(), 0, SEARCH_FIRST_SHOW);
+    let skip = |p: &Path| match &req.search_skips_trash {
+        Some((home, uid)) => p == home || p.file_name().is_some_and(|n| n == ".Trash" || n.as_bytes() == format!(".Trash-{uid}").as_bytes()),
+        None => false,
+    };
+    let result = crate::search::walk_skipping(&req.dir, &query, req.show_hidden, limit, &skip, &mut |step| {
+        match step {
+            crate::search::Step::Found(f) => {
+                found.push(f);
+                return !stale();
+            }
+            crate::search::Step::Tick if stale() => return false,
+            crate::search::Step::Tick => {
+                if let Some(d) = req.slow_read {
+                    std::thread::sleep(d);
+                }
+                if found.len() > shown && started.elapsed() >= next_show {
+                    shown = found.len();
+                    next_show = started.elapsed() + SEARCH_SHOW_EVERY;
+                    emit(Arc::new(search_listing(&req, &query, &found, None)), req.sort, &req, cancel, false, sink);
+                }
+            }
+        }
+        true
+    });
+    match result {
+        Ok(Some(walked)) => emit(Arc::new(search_listing(&req, &query, &found, Some(walked))), req.sort, &req, cancel, true, sink),
+        Ok(None) => {}
+        Err(e) if !stale() => sink(LoadEvent::Failed { generation: req.generation, dir: req.dir.clone(), error: describe(&e) }),
+        Err(_) => {}
+    }
+}
+
+/// The results so far as a listing, complete once the walk is `done`.
+fn search_listing(req: &LoadRequest, query: &str, found: &[crate::search::Found], done: Option<crate::search::Walked>) -> Listing {
+    let mut l = Listing { dir: req.dir.clone(), fd: None, names: Vec::new(), slots: Vec::new(), meta: Vec::new(), complete: done.is_some(), read_error: None, slow_stat: None, trash: None, recent: None, search: None };
+    let mut paths = Vec::with_capacity(found.len());
+    for f in found {
+        let Some(name) = f.path.file_name().map(|n| n.as_bytes()) else { continue };
+        if name.len() > u16::MAX as usize || l.names.len() + name.len() > u32::MAX as usize {
+            continue;
+        }
+        l.slots.push(Slot { off: l.names.len() as u32, len: name.len() as u16, kind: f.kind });
+        l.names.extend_from_slice(name);
+        l.meta.push(Meta { size: AtomicU64::new(f.size.unwrap_or(SIZE_FAILED)), mtime: AtomicI64::new(f.mtime) });
+        paths.push(f.path.clone());
+    }
+    let walked = done.unwrap_or_default();
+    l.search = Some(Arc::new(SearchRows { query: query.to_string(), paths, truncated: walked.truncated, unreadable: walked.unreadable }));
+    l
 }
 
 /// Reads the recent list, if it's a plain file of a size a list could be.
@@ -966,7 +1084,7 @@ mod tests {
     use std::path::Path;
 
     fn request(dir: &Path) -> LoadRequest {
-        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None, trash: None, recent: false }
+        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None, trash: None, recent: false, search: None, search_skips_trash: None }
     }
 
     /// Runs a load to completion, returning every event in order.
@@ -1489,5 +1607,93 @@ mod tests {
             }
         }
         assert!(started.elapsed() < Duration::from_secs(10), "finished without the other disk");
+    }
+
+    fn search_request(dir: &Path, query: &str) -> LoadRequest {
+        LoadRequest { search: Some(query.into()), filter: query.into(), ..request(dir) }
+    }
+
+    #[test]
+    fn a_search_lists_matches_from_below_with_where_each_is() {
+        let s = Scratch::new();
+        s.file("sub/deeper/Match.txt", b"xyz");
+        s.file("match-here", b"");
+        s.file("other", b"");
+        s.dir("a-match-dir");
+        let l = last(run(search_request(s.path(), "match")));
+        assert!(l.listing.complete);
+        assert_eq!(l.listing.search_query(), Some("match"));
+        let paths: Vec<PathBuf> = l.rows.iter().map(|&i| l.listing.path(i)).collect();
+        assert_eq!(paths, [s.path().join("a-match-dir"), s.path().join("match-here"), s.path().join("sub/deeper/Match.txt")], "folders first, then by name");
+        let deep = l.rows[2];
+        assert_eq!(l.listing.location(deep), Some(s.path().join("sub/deeper").as_path()));
+        assert_eq!(&*l.listing.key(deep), s.path().join("sub/deeper/Match.txt").as_os_str().as_bytes(), "two matches can share a name");
+        assert!(matches!(l.listing.stat(deep), Stat::Known { size: 3, .. }), "sizes are there from the start");
+    }
+
+    #[test]
+    fn a_search_leaves_out_every_trash_folder() {
+        let s = Scratch::new();
+        for p in ["data/Trash/files/hit", "data/Trash/info/hit.trashinfo", "disk/.Trash-1000/files/hit", "disk/.Trash/1000/files/hit", "keep/hit", "keep/.Trash-other/hit"] {
+            s.file(p, b"");
+        }
+        let req = LoadRequest { show_hidden: true, search_skips_trash: Some((s.path().join("data/Trash"), 1000)), ..search_request(s.path(), "hit") };
+        let l = last(run(req));
+        let paths: Vec<PathBuf> = l.rows.iter().map(|&i| l.listing.path(i)).collect();
+        assert_eq!(paths, [s.path().join("keep/.Trash-other/hit"), s.path().join("keep/hit")]);
+    }
+
+    #[test]
+    fn matches_of_one_name_go_in_the_order_of_their_folders() {
+        let s = Scratch::new();
+        for d in ["d10", "d2", "d1", "c"] {
+            s.file(&format!("{d}/same"), b"");
+        }
+        let l = last(run(search_request(s.path(), "same")));
+        let folders: Vec<PathBuf> = l.rows.iter().map(|&i| l.listing.location(i).unwrap().to_path_buf()).collect();
+        assert_eq!(folders, ["c", "d1", "d2", "d10"].map(|d| s.path().join(d)));
+    }
+
+    #[test]
+    fn a_search_shows_matches_before_it_has_finished() {
+        let s = Scratch::new();
+        for i in 0..30 {
+            s.file(&format!("d{i}/hit-{i}"), b"");
+        }
+        let req = LoadRequest { slow_read: Some(Duration::from_millis(5)), ..search_request(s.path(), "hit") };
+        let events = run(req);
+        let ready: Vec<&Loaded> = events.iter().filter_map(|e| if let LoadEvent::Ready(l) = e { Some(l) } else { None }).collect();
+        assert!(ready.len() >= 2, "only {} snapshots", ready.len());
+        assert!(!ready[0].settled && !ready[0].listing.complete && !ready[0].rows.is_empty(), "some before the end");
+        let end = ready.last().unwrap();
+        assert!(end.settled && end.listing.complete);
+        assert_eq!(end.rows.len(), 30);
+    }
+
+    #[test]
+    fn a_search_of_a_folder_that_isnt_there_fails_as_a_listing_would() {
+        let s = Scratch::new();
+        match run(search_request(&s.path().join("gone"), "x")).pop().unwrap() {
+            LoadEvent::Failed { error, .. } => assert!(error.contains("No such file"), "{error}"),
+            LoadEvent::Ready(_) => panic!("listed a missing folder"),
+        }
+    }
+
+    #[test]
+    fn a_search_cancelled_says_nothing_more() {
+        let s = Scratch::new();
+        for i in 0..200 {
+            s.file(&format!("d{i}/hit"), b"");
+        }
+        let (tx, rx) = mpsc::channel();
+        let req = LoadRequest { slow_read: Some(Duration::from_millis(5)), ..search_request(s.path(), "hit") };
+        let h = spawn_load(req, move |e| {
+            let _ = tx.send(e);
+        });
+        h.cancel();
+        let started = Instant::now();
+        // The walk notices at its next folder, and the thread ends without a word.
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Err(mpsc::RecvTimeoutError::Disconnected)));
+        assert!(started.elapsed() < Duration::from_millis(500), "took {:?}", started.elapsed());
     }
 }

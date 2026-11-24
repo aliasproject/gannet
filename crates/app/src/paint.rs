@@ -8,7 +8,7 @@ use gannet_core::time;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-use crate::app::{ActiveDrag, App, Dialog, DragGhost, Edit, FileDrag, Hit, icon_for};
+use crate::app::{ActiveDrag, App, Dialog, DragGhost, Edit, FileDrag, Hit, Pane, icon_for};
 use crate::canvas::{Canvas, Rect};
 use crate::field::Field;
 use crate::format;
@@ -184,6 +184,12 @@ impl App {
                 _ => Field::new(&self.filter),
             };
             self.paint_field(c, r, &f, focused);
+            // An empty box says how far it reaches.
+            if f.text.is_empty() {
+                let hint = if self.search_below { "Search here and below" } else { "Filter this folder" };
+                let by = self.baseline(r.y, r.h);
+                self.text.draw_fitted(c, hint, (r.x + self.px(10.0)) as f32, by, (r.w - self.px(18.0)) as f32, co.muted);
+            }
         }
     }
 
@@ -213,11 +219,33 @@ impl App {
         });
     }
 
+    /// A pane's scroll bar thumb, with its right edge at `right`.
+    fn paint_scrollbar(&mut self, c: &mut Canvas, pane: Pane, right: i32) {
+        let area = self.pane_rect(pane);
+        let (ty, th) = self.scrollbar_thumb(pane);
+        let w = self.px(5.0);
+        let co = self.colors;
+        let color = if self.hover == Hit::Scrollbar(pane) { co.muted } else { co.border };
+        c.rrect(Rect::new(right - w - self.px(3.0), area.y + ty, w, th), w / 2, color);
+    }
+
     fn paint_sidebar(&mut self, c: &mut Canvas) {
         let l = self.layout();
         let co = self.colors;
         c.fill(l.sidebar, co.surface);
         c.fill(Rect::new(l.sidebar.right() - 1, l.sidebar.y, 1, l.sidebar.h), co.border);
+        // Places scrolled out of view mustn't spill over the toolbar or the status bar.
+        Self::with_clip(c, l.sidebar, |c| self.paint_places(c));
+        if self.scrollbar_visible(Pane::Sidebar) {
+            self.paint_scrollbar(c, Pane::Sidebar, l.sidebar.right() - 1);
+        }
+    }
+
+    fn paint_places(&mut self, c: &mut Canvas) {
+        let l = self.layout();
+        let co = self.colors;
+        // The scroll bar's room, when there is one, comes off the rows' right.
+        let room = self.side_bar_room();
         let row = self.px(30.0);
         let icon = self.px(16.0);
         // Worked out while the places are still here: they're moved out while they're drawn.
@@ -226,14 +254,15 @@ impl App {
         let heading = self.px(crate::app::SIDEBAR_HEADING);
         for (h, label) in self.sidebar_headings() {
             let by = self.baseline(tops[h] - heading, heading);
-            self.text.draw_fitted(c, label, (l.sidebar.x + self.px(14.0)) as f32, by, (l.sidebar.w - self.px(28.0)) as f32, co.muted);
+            self.text.draw_fitted(c, label, (l.sidebar.x + self.px(14.0)) as f32, by, (l.sidebar.w - self.px(28.0) - room) as f32, co.muted);
         }
         // A drag that can't go to the Trash shows it dimmed, like a button that can't be pressed.
         let trash_off = self.trash_unavailable();
+        let carried = self.carried_pin().map(std::path::Path::to_path_buf);
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {
             let y = tops[i];
-            let r = Rect::new(l.sidebar.x + self.px(6.0), y, l.sidebar.w - self.px(13.0), row);
+            let r = Rect::new(l.sidebar.x + self.px(6.0), y, l.sidebar.w - self.px(13.0) - room, row);
             let here = p.path == self.dir;
             if self.is_drop_target(Hit::Place(i)) {
                 c.rrect(r, self.px(5.0), blend(co.accent, co.surface, 0.45));
@@ -253,8 +282,10 @@ impl App {
                 PlaceKind::Music => Icon::Audio,
                 PlaceKind::Pictures => Icon::Image,
                 PlaceKind::Videos => Icon::Video,
+                PlaceKind::Pinned => Icon::Folder,
             };
-            let off = trash_off && p.kind == PlaceKind::Trash;
+            // A pin being carried elsewhere is dimmed where it was, like the Trash a drag can't use.
+            let off = (trash_off && p.kind == PlaceKind::Trash) || (p.kind == PlaceKind::Pinned && carried.as_ref() == Some(&p.path));
             self.icons.draw(c, ic, r.x + self.px(8.0), y + (row - icon) / 2, icon, if here { co.on_selection } else if off { co.border } else { co.muted });
             let tx = (r.x + self.px(32.0)) as f32;
             // A drive that's busy, or not mounted yet, is quieter than the rest.
@@ -274,6 +305,11 @@ impl App {
             }
         }
         self.places = places;
+        // Where a pin or a dragged folder would land among the pins.
+        if let Some(y) = self.pin_bar() {
+            let h = self.px(2.0).max(2);
+            c.rrect(Rect::new(l.sidebar.x + self.px(8.0), y - h / 2, l.sidebar.w - self.px(17.0) - room, h), h / 2, co.accent);
+        }
     }
 
     fn paint_header(&mut self, c: &mut Canvas) {
@@ -288,7 +324,8 @@ impl App {
         let arrow = self.px(14.0);
         let trash = self.listing.as_ref().is_some_and(|l| l.is_trash());
         let recent = self.listing.as_ref().is_some_and(|l| l.is_recent());
-        if let Some((ox, _)) = self.origin_column(l.header, size_x).filter(|_| trash || recent) {
+        let search = self.listing.as_ref().is_some_and(|l| l.search().is_some());
+        if let Some((ox, _)) = self.origin_column(l.header, size_x).filter(|_| trash || recent || search) {
             self.text.draw_str(c, if trash { "Original location" } else { "Location" }, ox as f32, y, co.muted);
         }
         let sort = self.view_sort();
@@ -329,21 +366,30 @@ impl App {
         let Some(listing) = self.listing.clone() else {
             if let Some(e) = self.load_error.clone() {
                 self.paint_center(c, area, &format!("Can't open this folder: {e}"), co.danger);
+            } else if self.loading && self.hold_paint.is_none() && self.search_query().is_some() {
+                self.paint_center(c, area, "Searching…", co.muted);
             }
             return;
         };
         if self.rows.is_empty() {
-            if !self.loading {
-                let msg = if !self.filter.is_empty() {
-                    "Nothing matches the filter"
+            let searching = self.search_query().is_some();
+            if searching && self.loading {
+                self.paint_center(c, area, "Searching…", co.muted);
+            } else if !self.loading {
+                let msg = if searching {
+                    format!("Nothing found in {} or the folders in it", self.crumb_label(&self.dir))
+                } else if !self.filter.is_empty() && self.can_search() {
+                    "Nothing here matches. Ctrl+F searches the folders inside too".to_string()
+                } else if !self.filter.is_empty() {
+                    "Nothing matches the filter".to_string()
                 } else if listing.is_trash() {
-                    "The Trash is empty"
+                    "The Trash is empty".to_string()
                 } else if listing.is_recent() {
-                    "No recent files"
+                    "No recent files".to_string()
                 } else {
-                    "This folder is empty"
+                    "This folder is empty".to_string()
                 };
-                self.paint_center(c, area, msg, co.muted);
+                self.paint_center(c, area, &msg, co.muted);
             }
             return;
         }
@@ -354,13 +400,13 @@ impl App {
         let date_x = area.right() - self.px(14.0) - l.col_date;
         let size_x = date_x - l.col_size;
         let name_x = area.x + self.px(38.0);
-        let origin = self.origin_column(area, size_x).filter(|_| listing.is_trash() || listing.is_recent());
+        let origin = self.origin_column(area, size_x).filter(|_| listing.is_trash() || listing.is_recent() || listing.search().is_some());
         let name_max = (origin.map_or(size_x, |(ox, _)| ox) - self.px(10.0) - name_x) as f32;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let icon = self.px(16.0);
         let now = time::now();
         let hover_row = if let Hit::Row(r) = self.hover { Some(r) } else { None };
-        let thumb_room = if self.scrollbar_visible() { self.px(12.0) } else { 0 };
+        let thumb_room = if self.scrollbar_visible(Pane::List) { self.px(12.0) } else { 0 };
         Self::with_clip(c, area, |c| {
             let visible = (area.h + offset) / row_h.max(1) + 1;
             for vis in 0..visible as usize {
@@ -387,7 +433,14 @@ impl App {
                 let name = listing.name(id);
                 let kind = listing.kind(id);
                 let tint = if kind.is_dirlike() { if selected { co.on_selection } else { co.accent } } else { dim };
-                self.icons.draw(c, icon_for(kind, name), area.x + self.px(14.0), y + (row_h - icon) / 2, icon, tint);
+                // A thumbnail in the icon's place, centred where the icon would be.
+                if let Some(pic) = self.thumbnail(&listing, id) {
+                    let (cx, cy) = (area.x + self.px(14.0) + icon / 2, y + row_h / 2);
+                    let (w, h) = (pic.w as i32, pic.h as i32);
+                    c.image(&pic.rgba, w, h, Rect::new(cx - w / 2, cy - h / 2, w, h));
+                } else {
+                    self.icons.draw(c, icon_for(kind, name), area.x + self.px(14.0), y + (row_h - icon) / 2, icon, tint);
+                }
                 let shown = String::from_utf8_lossy(name);
                 let by = y + ((row_h as f32 + self.text.ascent - self.text.descent) / 2.0).round() as i32;
                 // Recent's and the Trash's rows are each somewhere of their own.
@@ -395,8 +448,10 @@ impl App {
                     let here = listing.path(id);
                     self.cut_paths.contains(&here)
                 };
-                if let Edit::Rename { name: editing, field, .. } = &self.edit
+                // Search results can have several rows of one name.
+                if let Edit::Rename { name: editing, field, path, .. } = &self.edit
                     && editing.as_slice() == name
+                    && (listing.search().is_none() || *path == listing.path(id))
                 {
                     let f = field.clone();
                     let box_h = (row_h - self.px(2.0)).max(1);
@@ -408,6 +463,7 @@ impl App {
                     && let Some(folder) = listing.location(id)
                 {
                     let shown = match home.as_deref().and_then(|h| folder.strip_prefix(h).ok()) {
+                        _ if listing.search().is_some() => self.search_location(folder),
                         Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
                         Some(rest) => format!("~/{}", rest.display()),
                         None => folder.display().to_string(),
@@ -436,10 +492,7 @@ impl App {
                 self.paint_field(c, Rect::new(name_x - self.px(4.0), area.y + 1, name_max as i32 + self.px(8.0), row_h - self.px(2.0)), &f, true);
             }
             if thumb_room > 0 {
-                let (ty, th) = self.scrollbar_thumb();
-                let w = self.px(5.0);
-                let color = if self.hover == Hit::Scrollbar { co.muted } else { co.border };
-                c.rrect(Rect::new(area.right() - w - self.px(3.0), area.y + ty, w, th), w / 2, color);
+                self.paint_scrollbar(c, Pane::List, area.right());
             }
         });
     }
@@ -688,14 +741,24 @@ impl App {
         self.text.draw_fitted(c, &msg, self.px(12.0) as f32, y, (l.status.w - self.px(24.0)) as f32, co.muted);
     }
 
-    fn status_text(&mut self) -> String {
+    pub(crate) fn status_text(&self) -> String {
         let total = self.rows.len();
-        let mut s = format::count(total, "item", "items");
-        if self.loading && self.listing.as_ref().is_some_and(|l| !l.complete) {
+        let found = self.listing.as_ref().and_then(|l| l.search()).filter(|_| self.search_query().is_some());
+        let mut s = match found {
+            Some(f) if f.truncated => format!("The first {} found. Type more to narrow it", format::count(total, "item", "items").replace(" items", "").replace(" item", "")),
+            Some(_) if self.loading => format!("{} found so far, searching…", format::count(total, "item", "items")),
+            Some(_) => format!("{} found in {} and the folders in it", format::count(total, "item", "items"), self.crumb_label(&self.dir)),
+            None if self.search_query().is_some() => "Searching…".to_string(),
+            None => format::count(total, "item", "items"),
+        };
+        if found.is_none() && self.loading && self.listing.as_ref().is_some_and(|l| !l.complete) {
             s.push_str(" so far, still reading…");
         }
-        if !self.filter.is_empty() {
+        if found.is_none() && !self.filter.is_empty() && self.search_query().is_none() {
             s.push_str(" matching the filter");
+        }
+        if let Some(n) = found.map(|f| f.unreadable).filter(|&n| n > 0) {
+            s.push_str(&format!(" · {} couldn't be read", format::count(n, "folder", "folders")));
         }
         if self.sel_count > 0 {
             s.push_str(&format!(" · {} selected", format::count(self.sel_count, "item", "items").replace(" items", "").replace(" item", "")));

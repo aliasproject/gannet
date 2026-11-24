@@ -13,6 +13,7 @@ mod field;
 mod format;
 mod icons;
 mod media;
+mod openwith;
 mod paint;
 mod portal;
 mod rename_many;
@@ -21,6 +22,7 @@ mod preview_window;
 mod session;
 mod service;
 mod text;
+mod thumbs;
 mod tools;
 mod wallpaper;
 mod wl;
@@ -54,6 +56,14 @@ struct Dirs {
     mime: Vec<PathBuf>,
     /// Where thumbnailers are described, first wins.
     thumbnailers: Vec<PathBuf>,
+    /// The installed apps' `applications` folders, and the `mimeapps.list` files that say
+    /// which open what, first wins.
+    apps: Vec<PathBuf>,
+    mimeapps: Vec<PathBuf>,
+    /// The desktop's names, from `XDG_CURRENT_DESKTOP`, like `Hyprland`.
+    desktops: Vec<String>,
+    /// Where programs are found, from `PATH`.
+    programs: Vec<PathBuf>,
 }
 
 /// The one place Gannet reads where things live. Everything else gets paths as arguments.
@@ -64,7 +74,14 @@ fn dirs() -> Dirs {
     let data_dirs = std::env::var_os("XDG_DATA_DIRS").filter(|d| !d.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
     let in_data = |name: &str| std::iter::once(data.join(name)).chain(std::env::split_paths(&data_dirs).filter(|p| p.is_absolute()).map(|p| p.join(name))).collect::<Vec<_>>();
     let (mime, thumbnailers) = (in_data("mime"), in_data("thumbnailers"));
-    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), state: var("XDG_STATE_HOME", ".local/state"), data, home, mime, thumbnailers }
+    let config = var("XDG_CONFIG_HOME", ".config");
+    let split = |name: &str, default: &str| std::env::var_os(name).filter(|d| !d.is_empty()).map_or_else(|| std::env::split_paths(default).collect::<Vec<_>>(), |d| std::env::split_paths(&d).filter(|p| p.is_absolute()).collect());
+    let (data_dirs, config_dirs) = (split("XDG_DATA_DIRS", "/usr/local/share:/usr/share"), split("XDG_CONFIG_DIRS", "/etc/xdg"));
+    let desktops: Vec<String> = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').filter(|d| !d.is_empty()).map(str::to_string).collect();
+    let apps = gannet_core::apps::app_dirs(&data, &data_dirs);
+    let mimeapps = gannet_core::apps::list_files(&config, &config_dirs, &data, &data_dirs, &desktops);
+    let programs = split("PATH", "/usr/local/bin:/usr/bin");
+    Dirs { cache: var("XDG_CACHE_HOME", ".cache"), state: var("XDG_STATE_HOME", ".local/state"), config, data, home, mime, thumbnailers, apps, mimeapps, desktops, programs }
 }
 
 /// The language messages are in, as GLib chooses it for GTK apps: the first of `LANGUAGE`, then
@@ -97,6 +114,9 @@ fn main() {
         if a == decode::ARG {
             decode::helper_main(std::env::args().nth(2).as_deref());
         }
+        if a == decode::THUMBNAIL_ARG {
+            decode::thumbnail_main();
+        }
         if a == media::ARG {
             media::helper_main(&std::env::args().skip(2).collect::<Vec<_>>());
         }
@@ -120,11 +140,14 @@ fn main() {
         if a == portal::ARG {
             portal::main();
         }
+        if a == openwith::ARG {
+            openwith::main();
+        }
         if a == service::CLAIM_ARG || a == service::RELEASE_ARG {
             service::claim_main(a == service::RELEASE_ARG);
         }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}\n       {}\n\nA folder named like a command opens as ./NAME. `gannet COMMAND --help` says more.", preview_window::USAGE, chooser::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG, gannet_core::cli::USAGE);
+            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}\n       {}\n\nA folder named like a command opens as ./NAME. `gannet COMMAND --help` says more.", preview_window::USAGE, chooser::USAGE, openwith::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG, gannet_core::cli::USAGE);
             return;
         }
         if a == "--version" {
@@ -185,6 +208,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // So Open With can sit over the list, as its child.
+    if viewing.is_none() && choosing.is_none() {
+        wl.export();
+    }
 
     let mut text = text::Text::new(text::UI_PX, text::UI_HINTED);
     text.set_contrast(colors.dark);
@@ -219,6 +246,13 @@ fn main() {
     app.terminal = gannet_core::terminal::Terminal::find(std::env::var_os("PATH").as_deref(), std::env::var_os("XDG_RUNTIME_DIR").as_deref().map(Path::new));
     app.kinds = Arc::new(preview::Kinds::new(d.mime.clone(), language()).with_thumbnailers(d.thumbnailers.clone()));
     let mut theme_watch = ThemeWatch::new(theme_paths.clone()).ok();
+    // Pins, shared with GTK through its bookmarks file. The preview window has no sidebar.
+    let mut bookmarks_watch = None;
+    if viewing.is_none() {
+        app.thumbs = Some(thumbs::Thumbs::new(hub.clone(), d.cache.clone(), app.kinds.clone()));
+        app.set_bookmarks(d.config.join(gannet_core::bookmarks::FILE));
+        bookmarks_watch = gannet_core::bookmarks::BookmarksWatch::new(d.config.clone()).ok();
+    }
     let mut theme_due: Option<Instant> = None;
     #[cfg(feature = "bench")]
     {
@@ -249,7 +283,7 @@ fn main() {
     } else if let Some(name) = saving_over {
         app.open_selecting(start_dir, vec![name]);
     } else if names.is_empty() {
-        app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None });
+        app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None, search: None });
     } else {
         app.open_selecting(start_dir, names);
     }
@@ -301,7 +335,7 @@ fn main() {
                 }
                 Cmd::CancelDrag => wl.cancel_drag(),
                 Cmd::AcceptDrop(accept) => wl.accept_drop(accept),
-                Cmd::ReadDrop { dest, trash, decided } => read_drop(&wl, &hub, dest, trash, decided),
+                Cmd::ReadDrop { dest, trash, decided, pin } => read_drop(&wl, &hub, dest, trash, decided, pin),
                 Cmd::FinishDrop => wl.finish_drop(),
                 Cmd::AbandonDrop => wl.abandon_drop(),
                 Cmd::OpenPreview { generation, path, hidden, sort } => {
@@ -326,6 +360,7 @@ fn main() {
                         preview_window::tell_the_list(&path);
                     }
                 }
+                Cmd::OpenWith(paths) => openwith::ask(hub.clone(), paths, wl.exported(), &d),
                 Cmd::Quit => {
                     // A chooser tells the service what was picked as it goes.
                     if let Some(c) = app.chooser.as_mut() {
@@ -407,6 +442,10 @@ fn main() {
             fds.push(PollFd::from_borrowed_fd(w.watch.as_fd(), PollFlags::IN));
             fds.len() - 1
         });
+        let bookmarks_at = bookmarks_watch.as_ref().map(|w| {
+            fds.push(PollFd::from_borrowed_fd(w.watch.as_fd(), PollFlags::IN));
+            fds.len() - 1
+        });
         let _ = poll(&mut fds, timeout.as_ref());
         let ready = |i: usize| fds[i].revents().intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP);
         let (wl_ready, wake_ready) = (ready(0), ready(1));
@@ -414,6 +453,7 @@ fn main() {
         let repeat_ready = repeat_at.is_some_and(ready);
         let dir_ready = dir_at.is_some_and(ready);
         let theme_ready = theme_at.is_some_and(ready);
+        let bookmarks_ready = bookmarks_at.is_some_and(ready);
         drop(fds);
         let read_error = if wl_ready { guard.read().err().filter(read_is_fatal) } else { None };
         if read_error.is_some() || wl_hup {
@@ -438,6 +478,9 @@ fn main() {
         }
         if dir_ready && dir_watch.as_ref().is_some_and(|w| w.drain()) {
             app.folder_changed();
+        }
+        if bookmarks_ready && bookmarks_watch.as_mut().is_some_and(gannet_core::bookmarks::BookmarksWatch::changed) {
+            app.bookmarks_changed();
         }
         if theme_ready && theme_watch.as_mut().is_some_and(ThemeWatch::changed) {
             // A swap deletes then moves; a short wait lets it finish.
@@ -511,13 +554,13 @@ fn read_clipboard(wl: &wl::Wl, hub: &Hub, purpose: app::Paste) {
 }
 
 /// Reads a dropped file list off the main thread, since the other program can stall.
-fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option<app::DropAction>) {
+fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option<app::DropAction>, pin: Option<gannet_core::bookmarks::Spot>) {
     const MAX: u64 = 64 * 1024 * 1024;
     /// The largest picture taken from a browser.
     const MAX_IMAGE: u64 = 256 * 1024 * 1024;
-    let nothing = |dest| app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false, saved: None, link: false };
+    let nothing = |dest, pin| app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false, saved: None, link: false, pin };
     let Some(read) = wl.read_drop() else {
-        hub.send(Msg::Dropped(nothing(dest)));
+        hub.send(Msg::Dropped(nothing(dest, pin)));
         return;
     };
     let (can_copy, can_move) = (read.can_copy, read.can_move);
@@ -553,7 +596,7 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
         });
     }
     let waiter = hub.clone();
-    let (wait_dest, wait_trash) = (dest.clone(), trash);
+    let (wait_dest, wait_trash, pin_back) = (dest.clone(), trash, pin.clone());
     let waiting = std::thread::Builder::new().name("gannet-drop-wait".into()).spawn(move || {
         let until = std::time::Instant::now() + PATIENCE;
         let data = list.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).ok().flatten().unwrap_or_default();
@@ -561,7 +604,7 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
         let all_local = clipboard::uri_list_is_all_local(&data, &paths);
         let address = gannet_core::webdrop::web_address(&data);
         // Files win: a picture is only kept when nothing else came.
-        let saved = image_mime.filter(|_| paths.is_empty()).map(|mime| {
+        let saved = image_mime.filter(|_| paths.is_empty() && pin.is_none()).map(|mime| {
             if wait_trash {
                 return Err("a picture from a browser can't go to the Trash".to_string());
             }
@@ -570,10 +613,10 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
             gannet_core::webdrop::save_new(&wait_dest, &name, &bytes).map_err(|e| gannet_core::listing::describe(&e).to_lowercase())
         });
         let link = paths.is_empty() && saved.is_none() && address.is_some();
-        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local, saved, link }));
+        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local, saved, link, pin }));
     });
     if waiting.is_err() {
-        hub.send(Msg::Dropped(nothing(dest)));
+        hub.send(Msg::Dropped(nothing(dest, pin_back)));
     }
 }
 
@@ -667,6 +710,9 @@ mod bench {
         /// The folder whose rows have been reported. A fast load can finish between two
         /// paints, so a paint that isn't ready can't be relied on to mark a new one.
         rows_stamped: Option<std::path::PathBuf>,
+        /// The search results last reported: what for, how many, and whether they were all.
+        search_stamped: Option<(String, usize, bool)>,
+        thumbs_stamped: (usize, usize),
     }
 
     pub fn mono_ms() -> f64 {
@@ -683,6 +729,8 @@ mod bench {
                 state_path: std::env::var("GANNET_STATE").ok().map(|p| format!("{p}{suffix}")),
                 last_state: String::new(),
                 rows_stamped: None,
+                search_stamped: None,
+                thumbs_stamped: (0, 0),
             }
         }
 
@@ -702,6 +750,14 @@ mod bench {
             if !ready {
                 self.rows_stamped = None;
             }
+            // Search results as they're painted, timed from when the search started.
+            if let Some((l, s)) = app.listing.as_ref().and_then(|l| Some((l, l.search()?))) {
+                let now = (s.query.clone(), app.rows.len(), l.complete);
+                if self.search_stamped.as_ref() != Some(&now) {
+                    self.stamp(format!("search {} {} {:.1} {}", now.2, now.1, app.load_elapsed().as_secs_f64() * 1000.0, now.0));
+                    self.search_stamped = Some(now);
+                }
+            }
         }
 
         /// The time spent on one pass of the main loop, which is how long the UI can't respond.
@@ -713,6 +769,15 @@ mod bench {
 
         /// Writes the visible state when it changes, for checks to wait on.
         pub fn idle(&mut self, app: &App) {
+            // How many rows have a thumbnail, and how many are still being looked for or made. A
+            // row just off screen can get one without a paint, so this isn't stamped there.
+            if self.log.is_some() {
+                let thumbs = (thumbnailed(app).len(), app.thumbs.as_ref().map_or(0, |t| t.waiting()));
+                if thumbs != self.thumbs_stamped {
+                    self.thumbs_stamped = thumbs;
+                    self.stamp(format!("thumbs {} {} {:.1}", thumbs.0, thumbs.1, mono_ms()));
+                }
+            }
             let Some(path) = self.state_path.clone() else { return };
             let state = dump(app);
             if state != self.last_state {
@@ -754,7 +819,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"chooser\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"side_scroll\":{},\"side_max\":{},\"chooser\":{},\"searching\":{},\"found\":{},\"locations\":{},\"status\":{},\"thumbs\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -798,8 +863,34 @@ mod bench {
             esc(&drag(a)),
             places(a),
             format!("[{}]", a.sidebar_headings().iter().map(|(i, _)| i.to_string()).collect::<Vec<_>>().join(",")),
+            a.side_scroll,
+            a.max_scroll_in(crate::app::Pane::Sidebar),
             chooser(a),
+            a.search_below,
+            found(a),
+            list(a.rows.iter().take(300).map(|&i| a.listing.as_ref().filter(|l| l.search().is_some()).and_then(|l| l.location(i).map(|f| a.search_location(f))).unwrap_or_default())),
+            esc(&a.status_text()),
+            thumbs(a),
         )
+    }
+
+    /// The names of the rows, of the first 300, that are drawn with a thumbnail, and each one's
+    /// picture size.
+    fn thumbnailed(a: &App) -> Vec<(String, u32, u32)> {
+        let Some(l) = a.listing.as_ref() else { return Vec::new() };
+        a.rows.iter().take(300).filter_map(|&id| a.thumbnail(l, id).map(|p| (String::from_utf8_lossy(l.name(id)).into_owned(), p.w, p.h))).collect()
+    }
+
+    fn thumbs(a: &App) -> String {
+        let shown: Vec<String> = thumbnailed(a).into_iter().map(|(name, w, h)| format!("[{},{w},{h}]", esc(&name))).collect();
+        format!("{{\"shown\":[{}],\"waiting\":{}}}", shown.join(","), a.thumbs.as_ref().map_or(0, |t| t.waiting()))
+    }
+
+    /// What a search shows: what it was for, and whether it has finished or stopped at the limit.
+    fn found(a: &App) -> String {
+        let Some(l) = &a.listing else { return "null".to_string() };
+        let Some(s) = l.search() else { return "null".to_string() };
+        format!("{{\"query\":{},\"complete\":{},\"truncated\":{},\"unreadable\":{}}}", esc(&s.query), l.complete, s.truncated, s.unreadable)
     }
 
     /// A chooser's name field, whether it has the keyboard, its filter and whether it can finish.
@@ -840,6 +931,13 @@ mod bench {
     }
 
     fn drag(a: &App) -> String {
+        if let Some(d) = &a.pin_drag {
+            return match (d.active, d.gap) {
+                (false, _) => "pressed".to_string(),
+                (true, Some(g)) => format!("pin to {g}"),
+                (true, None) => "pin".to_string(),
+            };
+        }
         match &a.file_drag {
             Some(crate::app::FileDrag::Active(d)) if d.is_out() => "out".to_string(),
             Some(crate::app::FileDrag::Active(d)) => a.drag_label(d),

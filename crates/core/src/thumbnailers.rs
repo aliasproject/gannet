@@ -97,7 +97,7 @@ fn parse(text: &str) -> Option<(Thumbnailer, Vec<String>)> {
 /// An `Exec` line as words, as the desktop entry spec quotes them: double quotes around a word
 /// that has spaces, with a backslash before `"`, `` ` ``, `$` and `\` inside. `None` if the
 /// quoting doesn't end.
-fn split_exec(line: &str) -> Option<Vec<String>> {
+pub(crate) fn split_exec(line: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let (mut quoted, mut started) = (false, false);

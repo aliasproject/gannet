@@ -269,7 +269,7 @@ fn load(req: LoadRequest) -> Result<Loaded, String> {
 }
 
 fn request(dir: PathBuf, sort: SortSpec, show_hidden: bool, trash: Option<TrashSpec>) -> LoadRequest {
-    LoadRequest { dir, generation: 0, sort, show_hidden, filter: String::new(), first_row: 0, row_count: 0, slow_read: None, slow_stat: None, trash, recent: false }
+    LoadRequest { dir, generation: 0, sort, show_hidden, filter: String::new(), first_row: 0, row_count: 0, slow_read: None, slow_stat: None, trash, recent: false, search: None, search_skips_trash: None }
 }
 
 fn list(env: &mut Env, o: &Opts, report: &mut Report) -> Doc {

@@ -211,7 +211,9 @@
         <p class="text-pretty text-muted">Start typing a name and you're there. Everything else is a key or two away, including the things most file managers bury in a menu.</p>
       </div>
       <dl class="flex flex-col">
-        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Filter the folder</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+F or /</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Search here and in the folders inside</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+F</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Filter the folder</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">/</kbd></dd></div>
+        <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Show a match in its folder</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Alt+Enter</kbd></dd></div>
         <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Type a path</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Ctrl+L</kbd></dd></div>
         <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Preview</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Space</kbd></dd></div>
         <div class="flex min-h-12 items-center justify-between gap-4 border-b border-line"><dt>Jump to a place in the sidebar</dt><dd><kbd class="rounded-md border border-line bg-surface px-2 py-[3px] font-mono text-sm whitespace-nowrap">Alt+1 to Alt+9</kbd></dd></div>
@@ -257,7 +259,7 @@
           </svg>
           <span class="text-[44px] font-bold tracking-[-0.03em]">Gannet</span>
         </div>
-        <p class="max-w-[460px] text-pretty text-muted">Build it from source with Rust. It needs libxkbcommon to link, and at run time fontconfig for fonts, xdg-open for opening files, xdg-terminal-exec for Open in terminal, libmpv and bubblewrap for video and sound previews, and poppler for PDFs.</p>
+        <p class="max-w-[460px] text-pretty text-muted">Build it from source with Rust. It needs libxkbcommon to link, and at run time fontconfig for fonts, xdg-open for opening files, xdg-terminal-exec for Open in terminal, libmpv and bubblewrap for video and sound previews, poppler for PDFs, and ffmpeg for videos' thumbnails.</p>
         <a href="https://github.com/aliasproject/gannet" class="flex min-h-[52px] items-center rounded-[10px] bg-accent px-6 font-semibold text-on-accent hover:opacity-85">Get Gannet 0.1.22</a>
       </div>
       <pre class="min-w-0 overflow-x-auto rounded-xl border border-line bg-surface p-6 font-mono text-[0.9375rem] leading-[1.8]">git clone https://github.com/aliasproject/gannet

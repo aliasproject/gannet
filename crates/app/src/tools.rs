@@ -134,6 +134,18 @@ pub fn thumbnailer(line: impl FnOnce(&Path, &Path) -> Option<Vec<OsString>>, ext
     Some(argv)
 }
 
+/// `ffmpeg` writing a frame from a tenth of the way into a video, as a PNG on stdout at most
+/// `size` pixels either way. `ffprobe` says how long it is; for one it can't measure, it's the
+/// first frame. One thread each, as this runs in the background. `ext` is the input's
+/// extension, as `jailed` binds it.
+pub fn video_frame(ext: &str, size: u32) -> Vec<OsString> {
+    let script = format!(
+        "d=$({PROGRAMS}/ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 \"$1\" 2>/dev/null); d=${{d%%.*}}; case $d in ''|*[!0-9]*) d=0;; esac; \
+         exec {PROGRAMS}/ffmpeg -nostdin -v error -threads 1 -filter_threads 1 -ss $((d / 10)) -i \"$1\" -map 0:v:0 -frames:v 1 -vf scale={size}:{size}:force_original_aspect_ratio=decrease -pix_fmt rgb24 -f image2pipe -c:v png -"
+    );
+    [SHELL, "-c", &script, "sh", &format!("{JAILED_INPUT}{ext}")].map(OsString::from).to_vec()
+}
+
 /// The extension to give the file inside the jail: its own, if it's a plain one.
 pub fn extension(path: &Path) -> String {
     match path.extension().and_then(|e| e.to_str()) {
@@ -238,6 +250,11 @@ mod tests {
         assert_eq!(pdftoppm(0, 800, true)[6..10], ["-scale-to-y", "800", "-scale-to-x", "-1"].map(OsString::from), "a turned page's height becomes its width");
         let line = thumbnailer(|i, o| Some(vec!["/usr/bin/t".into(), i.into(), o.into()]), ".svg").unwrap();
         assert_eq!(line, ["/usr/bin/sh", "-c", "\"$@\" >&2 && exec cat /tmp/picture.png", "sh", "/usr/bin/t", "/in/file.svg", "/tmp/picture.png"].map(OsString::from));
+        let frame = video_frame(".mkv", 128);
+        assert_eq!(frame[..2], ["/usr/bin/sh", "-c"].map(OsString::from));
+        assert_eq!(frame[3..], ["sh", "/in/file.mkv"].map(OsString::from), "the file is an argument, never part of the script");
+        let script = frame[2].to_str().unwrap();
+        assert!(script.contains("exec /usr/bin/ffmpeg ") && script.contains("-ss $((d / 10)) -i \"$1\"") && script.contains("scale=128:128:") && script.ends_with(" -"), "{script}");
         assert_eq!(extension(Path::new("/a/b.SVG")), ".SVG");
         assert_eq!(extension(Path::new("/a/b.$(x)")), "");
         assert_eq!(extension(Path::new("/a/noext")), "");

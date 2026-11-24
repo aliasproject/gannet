@@ -219,6 +219,13 @@ ROW_X = 235
 BESIDE_X = 900
 
 
+def menu_choose(a, label):
+    """Chooses an item in the open menu by keyboard, wherever it is in the list."""
+    items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+    assert label in items, items
+    a.key(*["Down"] * (items.index(label) + 1), "Return")
+
+
 @check
 def browse_sort_and_history(h):
     fs = fresh_fs()
@@ -307,8 +314,8 @@ def typed_path_filter_and_type_ahead(h):
     a = App(h, fs)
     a.wait(lambda s: s["count"] == 5)
     # Filter
-    a.key("f", mods=["ctrl"])
-    a.wait(lambda s: s["edit"].startswith("filter:"))
+    a.type("/")
+    a.wait(lambda s: s["edit"].startswith("filter:") and not s["searching"])
     a.type("BERRY")
     s = a.wait(lambda s: s["filter"] == "BERRY" and s["names"] == ["Blueberry.md", "cherry.txt"] or s["names"] == ["Blueberry.md"], "filter applied")
     a.shot("filter")
@@ -335,6 +342,80 @@ def typed_path_filter_and_type_ahead(h):
     a.shot("missing-folder")
     a.key("Left", mods=["alt"])
     a.wait(lambda s: s["dir"] == str(fs / "sub") and s["names"] == ["x"], "back from the error")
+    a.close()
+
+
+@check
+def searching_below_finds_opens_and_comes_back(h):
+    fs = fresh_fs()
+    tree(fs, {"notes.txt": "x", "other.txt": "", "a/b/notes-deep.md": "xyz", "a/notes-dir/inside": "", "a/c/plain": "", ".hid/notes-hidden": ""})
+    # Enough files below that the walk has something to do.
+    for i in range(40):
+        tree(fs, {f"many/d{i}/f{j}.txt": "" for j in range(50)})
+    a = App(h, fs)
+    a.wait(lambda s: not s["loading"] and s["count"] == 4, "first listing")
+    # / filters only here, and says the search is there.
+    a.type("/")
+    a.wait(lambda s: s["edit"] == "filter:" and not s["searching"], "filter box")
+    a.shot("filter-empty")
+    a.type("deep")
+    s = a.wait(lambda s: s["filter"] == "deep" and s["count"] == 0 and not s["searching"], "nothing here")
+    a.shot("search-filter-finds-nothing")
+    # Ctrl+F, in the box, takes it into every folder below, and back again.
+    a.key("f", mods=["ctrl"])
+    s = a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["names"] == ["notes-deep.md"], "found below")
+    assert s["locations"] == ["fs/a/b"], s["locations"]
+    a.key("f", mods=["ctrl"])
+    a.wait(lambda s: not s["searching"] and s["filter"] == "deep" and s["count"] == 0 and s["found"] is None, "a filter again")
+    a.key("f", mods=["ctrl"])
+    a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["names"] == ["notes-deep.md"], "and a search")
+    a.key("Escape")
+    a.wait(lambda s: not s["searching"] and s["filter"] == "" and s["count"] == 4 and s["found"] is None, "back to the folder")
+    # Straight from the list, an empty box says how far it reaches.
+    a.key("f", mods=["ctrl"])
+    a.wait(lambda s: s["edit"] == "filter:" and s["searching"], "search box")
+    a.shot("search-empty")
+    a.type("notes")
+    s = a.wait(lambda s: s["found"] and s["found"]["complete"] and s["found"]["query"] == "notes" and s["count"] == 3, "found")
+    assert s["names"] == ["notes-dir", "notes-deep.md", "notes.txt"], s["names"]
+    assert s["locations"] == ["fs/a", "fs/a/b", "fs"], s["locations"]
+    assert s["status"] == "3 items found in fs and the folders in it", s["status"]
+    a.shot("search-results")
+    # Into a folder found, and back to the search on it.
+    a.key("Down")
+    a.wait(lambda s: s["edit"] == "none" and s["selected"] == ["notes-dir"], "on the first")
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(fs / "a/notes-dir") and s["names"] == ["inside"] and not s["searching"], "opened")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs) and s["searching"] and s["found"] and s["found"]["complete"] and s["selected"] == ["notes-dir"], "back to the search")
+    # Alt+Enter goes to where a match is, with it selected.
+    a.key("Down")
+    a.wait(lambda s: s["selected"] == ["notes-deep.md"])
+    a.key("Return", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "a/b") and s["selected"] == ["notes-deep.md"], "shown in its folder")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["selected"] == ["notes-deep.md"], "back again")
+    # Hidden folders are searched while hidden files show.
+    a.key("h", mods=["ctrl"])
+    a.wait(lambda s: "notes-hidden" in s["names"], "hidden one found")
+    a.key("h", mods=["ctrl"])
+    a.wait(lambda s: "notes-hidden" not in s["names"] and s["found"]["complete"], "and gone again")
+    # The context menu has what fits a search.
+    a.key("Menu")
+    s = a.wait(lambda s: s["menu"], "menu")
+    assert "Show in folder" in s["menu_items"] and "Paste" not in s["menu_items"], s["menu_items"]
+    a.shot("search-menu")
+    a.key("Escape")
+    # A broad search stops at the limit, and says so.
+    a.key("f", mods=["ctrl"])
+    a.key("a", mods=["ctrl"])
+    a.type("f")
+    s = a.wait(lambda s: s["found"] and s["found"]["query"] == "f" and s["found"]["complete"], "broad search")
+    assert s["found"]["truncated"] and s["count"] == 1000, (s["found"], s["count"])
+    assert s["status"] == "The first 1,000 found. Type more to narrow it", s["status"]
+    a.shot("search-limit")
+    a.key("Escape")
+    a.wait(lambda s: not s["searching"] and s["count"] == 4 and s["found"] is None, "the folder at the end")
     a.close()
 
 
@@ -466,7 +547,7 @@ def opening_an_archive_extracts_it_in_gannet(h):
     items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
     assert items.index("Extract") == items.index("Preview") + 1, items
     a.shot("extract-menu")
-    a.key("Down", "Down", "Down", "Return")
+    menu_choose(a, "Extract")
     s = a.wait(lambda s: "project" in s["names"] and s["selected"] == ["project"] and not s["jobs"], "extracted from the menu")
     assert (fs / "project/readme").read_text() == "r"
     a.click(ROW_X, row_y(0), 0x111)
@@ -1143,10 +1224,11 @@ SIDEBAR_HEADING, SIDEBAR_GAP = 24, 10
 
 
 def place_y(s, label):
-    """The middle of a place's row, below the headings of its section and those before it."""
+    """The middle of a place's row, below the headings of its section and those before it, in
+    the sidebar as it's scrolled."""
     i = place_index(s, label)
     headings = sum(1 for h in s["headings"] if h <= i)
-    return BAR + 8 + 30 * i + headings * SIDEBAR_HEADING + max(headings - 1, 0) * SIDEBAR_GAP + 15
+    return BAR + 8 + 30 * i + headings * SIDEBAR_HEADING + max(headings - 1, 0) * SIDEBAR_GAP + 15 - int(s["side_scroll"])
 
 
 def click_place(a, s, label, eject=False):
@@ -1290,14 +1372,14 @@ def set_as_background_goes_through_the_desktop_portal(h):
             time.sleep(0.2)
         assert items.index("Set as background") == items.index("Preview") + 1, items
         a.shot("set-as-background-menu")
-        a.key("Down", "Down", "Down", "Return")
+        menu_choose(a, "Set as background")
         a.wait(lambda s: not s["menu"], "chosen")
         a.wait(lambda s: log.exists() and log.read_text().splitlines() == [str(fs / "dl/sunset.png")], "the portal was handed the picture")
         assert a.state()["notices"] == []
         assert "Set as background" not in menu_on(1), "not for a text file"
         a.key("Escape")
         menu_on(0)
-        a.key("Down", "Down", "Down", "Return")
+        menu_choose(a, "Set as background")
         a.wait(lambda s: s["notices"] == ["Couldn't set “fail.png” as the background"], "a refusal is shown")
         a.close()
     finally:
@@ -1545,9 +1627,9 @@ class Portal:
     """Gannet's file chooser backend on a private bus, started by the bus from its service
     file, as xdg-desktop-portal's calls would start it."""
 
-    def __init__(self, h):
+    def __init__(self, h, extra_env=None):
         self.h = h
-        self.watch = App(h, None, launch=False)
+        self.watch = App(h, None, launch=False, extra_env=extra_env)
         # Not --die-with-parent, for the same reason as the "Show in folder" service.
         service = "[D-BUS Service]\nName=org.freedesktop.impl.portal.desktop.gannet\nExec=" + " ".join(sandboxed(["--file-chooser-service"], die_with_parent=False)) + "\n"
         self.bus = PrivateBus({"org.freedesktop.impl.portal.desktop.gannet.service": service}, env=self.watch.env)
@@ -1635,6 +1717,21 @@ def open_and_save_dialogs_for_other_programs(h):
         a.key("Escape")
         assert p.answer() == (1, {}), "cancelled"
 
+        # In a Save dialog, / is part of the name, and Ctrl+F still searches below.
+        a = p.ask("SaveFile", "Save", current_folder=ay(docs), current_name=("s", "new.txt"))
+        a.wait(lambda s: s["chooser"] and s["chooser"]["name_focused"] and not s["loading"], "a save chooser to search from")
+        a.type("/")
+        a.wait(lambda s: "/" in s["chooser"]["name"] and s["edit"] == "none", "/ typed into the name")
+        a.key("f", mods=["ctrl"])
+        a.type("x.png")
+        s = a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["names"] == ["x.png"], "found from the dialog")
+        assert s["locations"] == ["docs/sub"], s["locations"]
+        a.shot("chooser-search")
+        a.key("Escape")
+        a.wait(lambda s: not s["searching"] and s["found"] is None, "the search ended")
+        a.key("Escape")
+        assert p.answer() == (1, {}), "cancelled from a search"
+
         # A folder opens on Enter, and Enter on a file picks it.
         a = p.ask("OpenFile", "Open", current_folder=ay(docs))
         a.wait(lambda s: s["dir"] == str(docs) and s["names"][0] == "sub", "the folder")
@@ -1718,6 +1815,159 @@ def open_and_save_dialogs_for_other_programs(h):
         assert r.returncode == 0, r.stderr
         code, _ = p.answer()
         assert code == 2, code
+    finally:
+        p.stop()
+
+
+def stand_in_apps():
+    """Installed apps of our own, which only log what they're asked to open, in a data folder
+    with the real file-type database. Returns the folder for XDG_DATA_DIRS, and the log."""
+    share = SCRATCH / "share"
+    shutil.rmtree(share, ignore_errors=True)
+    (share / "applications").mkdir(parents=True)
+    (share / "mime").symlink_to("/usr/share/mime")
+    bin_dir = SCRATCH / "appbin"
+    bin_dir.mkdir(exist_ok=True)
+    log = SCRATCH / "apps.log"
+    log.unlink(missing_ok=True)
+    for id, name, code, mimes in [("marked", "Marked", "%F", "text/markdown"), ("writer", "Writer", "%f", "text/plain"), ("unzipper", "Unzipper", "%U", "application/zip"), ("paint", "Paint", "%F", "image/png")]:
+        prog = bin_dir / f"app-{id}"
+        prog.write_text(f'#!/bin/sh\necho "{id} $*" >> {log}\n')
+        prog.chmod(0o755)
+        (share / f"applications/{id}.desktop").write_text(f"[Desktop Entry]\nType=Application\nName={name}\nExec={prog} {code}\nMimeType={mimes};\n")
+    return share, log
+
+
+def open_with_state():
+    try:
+        return json.loads((SCRATCH / "state.json.openwith").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def wait_open_with(pred, what, timeout=6):
+    end = time.monotonic() + timeout
+    s = {}
+    while time.monotonic() < end:
+        s = open_with_state()
+        if s and pred(s):
+            return s
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {what}: {json.dumps(s)[:1500]}")
+
+
+def wait_for_log(log, lines, what):
+    end = time.monotonic() + 5
+    while time.monotonic() < end and not (log.exists() and log.read_text().splitlines() == lines):
+        time.sleep(0.02)
+    assert log.exists() and log.read_text().splitlines() == lines, f"{what}: {log.read_text() if log.exists() else 'nothing'}"
+
+
+@check
+def open_with_picks_another_app_and_can_make_it_the_default(h):
+    fs = fresh_fs()
+    tree(fs, {"notes.md": "# hi", "photos.zip": b"PK\x05\x06" + bytes(18)})
+    share, log = stand_in_apps()
+    config = SCRATCH / "client/config"
+    config.mkdir(parents=True, exist_ok=True)
+    (config / "mimeapps.list").write_text("[Default Applications]\ntext/markdown=marked.desktop\n")
+    (SCRATCH / "state.json.openwith").unlink(missing_ok=True)
+    a = App(h, fs, extra_env={"XDG_DATA_DIRS": str(share)})
+    a.wait(lambda s: s["names"] == ["notes.md", "photos.zip"], "listed")
+
+    def open_with(row):
+        (SCRATCH / "state.json.openwith").unlink(missing_ok=True)
+        a.click(ROW_X, row_y(row), 0x111)
+        items = a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+        assert items.index("Open with…") == items.index("Open") + 1, items
+        menu_choose(a, "Open with…")
+        h.wait_window(10)
+
+    # The type's apps first, its default marked, then the rest.
+    open_with(0)
+    s = wait_open_with(lambda s: s["rows"], "the apps")
+    assert s["title"] == "Open “notes.md” with", s
+    assert s["rows"] == ["# For Markdown document", "marked.desktop|Marked|default", "writer.desktop|Writer", "# Other apps", "paint.desktop|Paint", "unzipper.desktop|Unzipper"], s["rows"]
+    assert s["picked"] == "marked.desktop" and s["can_always"], s
+    a.shot("open-with")
+    a.type("wri")
+    s = wait_open_with(lambda s: s["search"] == "wri" and s["picked"] == "writer.desktop", "the search")
+    assert s["rows"] == ["# For Markdown document", "writer.desktop|Writer"], s["rows"]
+    a.shot("open-with-search")
+    # Escape clears the search, Space ticks "Always use it", and Enter opens.
+    a.key("Escape")
+    wait_open_with(lambda s: s["search"] == "" and len(s["rows"]) == 6 and s["picked"] == "writer.desktop", "the search cleared")
+    a.key("space")
+    wait_open_with(lambda s: s["always"], "Always use it ticked")
+    a.shot("open-with-always")
+    a.key("Return")
+    wait_for_log(log, [f"writer {fs / 'notes.md'}"], "opened with Writer")
+    assert (config / "mimeapps.list").read_text() == "[Default Applications]\ntext/markdown=writer.desktop;\n", (config / "mimeapps.list").read_text()
+    s = a.wait(lambda s: s["notices"] == [], "no complaint")
+
+    # Now it's the default. Escape closes it without opening anything.
+    open_with(0)
+    s = wait_open_with(lambda s: s["rows"], "the apps again")
+    assert s["rows"][1] == "writer.desktop|Writer|default" and s["picked"] == "writer.desktop", s["rows"]
+    a.key("Escape")
+    a.wait(lambda s: not s["menu"], "back in the list")
+    time.sleep(0.5)
+    assert len(log.read_text().splitlines()) == 1, log.read_text()
+
+    # An archive extracts when opened, but Open With hands it to another app.
+    open_with(1)
+    s = wait_open_with(lambda s: s["rows"], "the apps for a zip")
+    assert s["rows"][:2] == ["# For Zip archive", "unzipper.desktop|Unzipper"], s["rows"]
+    a.shot("open-with-archive")
+    a.key("Return")
+    wait_for_log(log, [f"writer {fs / 'notes.md'}", f"unzipper {uri(fs / 'photos.zip')}"], "opened with Unzipper")
+    time.sleep(0.3)
+    s = a.state()
+    assert s["names"] == ["notes.md", "photos.zip"] and s["jobs"] == 0, s
+    a.close()
+
+
+@check
+def other_programs_open_with_goes_through_the_app_chooser_portal(h):
+    share, _ = stand_in_apps()
+    p = Portal(h, extra_env={"XDG_DATA_DIRS": str(share)})
+    iface = "org.freedesktop.impl.portal.AppChooser"
+
+    def ask(n, choices, **options):
+        (SCRATCH / "state.json.openwith").unlink(missing_ok=True)
+        args = []
+        for k, (sig, v) in options.items():
+            args += [k, sig, str(v)]
+        handle = f"/org/freedesktop/portal/desktop/request/1_1/a{n}"
+        cmd = ["busctl", f"--address={p.bus.address}", "--timeout=60", "--json=short", "call", PORTAL[0], PORTAL[1], iface, "ChooseApplication", "ossasa{sv}", handle, "test.app", "", str(len(choices)), *choices, str(len(options)), *args]
+        p.call = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        h.wait_window(10)
+        return handle
+
+    try:
+        # Only the program's own list, in its order, starting on the one it last chose.
+        handle = ask(1, ["marked", "writer", "not.installed"], content_type=("s", "text/markdown"), filename=("s", "notes.md"), last_choice=("s", "writer"))
+        s = wait_open_with(lambda s: s["rows"], "the apps")
+        assert s["title"] == "Open “notes.md” with", s
+        assert s["rows"] == ["# For Markdown document", "marked|Marked", "writer|Writer"] and s["picked"] == "writer" and not s["can_always"], s
+        a = p.watch
+        a.shot("open-with-portal")
+        # The program finds another app while the window is open.
+        r = p.bus.call("call", PORTAL[0], PORTAL[1], iface, "UpdateChoices", "oas", handle, "3", "marked", "writer", "paint")
+        assert r.returncode == 0, r.stderr
+        s = wait_open_with(lambda s: len(s["rows"]) == 4, "the new list")
+        assert s["rows"][3] == "paint|Paint" and s["picked"] == "writer", s
+        a.key("Down")
+        wait_open_with(lambda s: s["picked"] == "paint", "Paint")
+        a.key("Return")
+        code, results = p.answer()
+        assert code == 0 and results == {"choice": "paint"}, (code, results)
+
+        # Escape cancels.
+        ask(2, ["marked"], content_type=("s", "text/markdown"))
+        wait_open_with(lambda s: s["rows"] == ["# For Markdown document", "marked|Marked"], "the app")
+        a.key("Escape")
+        assert p.answer() == (1, {}), "cancelled"
     finally:
         p.stop()
 
@@ -2362,6 +2612,82 @@ def thumbnailers_show_what_nothing_else_can(h):
     a.close()
 
 
+def png_info(path):
+    """A PNG's width, height and text entries."""
+    data = path.read_bytes()
+    w, h = struct.unpack(">II", data[16:24])
+    text, at = {}, 8
+    while at + 8 <= len(data):
+        size, kind = struct.unpack(">I4s", data[at:at + 8])
+        if kind == b"tEXt":
+            key, _, value = data[at + 8:at + 8 + size].partition(b"\0")
+            text[key.decode()] = value.decode()
+        at += 12 + size
+    return w, h, text
+
+
+def thumbs_of(s):
+    return {name: (w, h) for name, w, h in s["thumbs"]["shown"]}
+
+
+@check
+def pictures_and_videos_show_thumbnails_in_their_rows(h):
+    fs = fresh_fs()
+    cache = SCRATCH / "client/cache"
+    normal, fail = cache / "thumbnails/normal", cache / "thumbnails/fail/gannet"
+    # Red over blue, so the row's picture has something in it to see.
+    (fs / "a-photo.png").write_bytes(png_bytes(400, 300, lambda y: (220, 50, 50) if y < 150 else (50, 50, 220)))
+    (fs / "b-broken.png").write_bytes(png_bytes(400, 300)[:300])
+    make_video(fs / "c-clip.mp4", seconds=3, size="320x240", audio=False)
+    (fs / "d-notes.txt").write_text("words")
+    (fs / "e-drawing.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="300" height="200"><rect width="300" height="200" fill="#c33"/><circle cx="150" cy="100" r="70" fill="#fff"/></svg>')
+    # Another program's thumbnail, already made: it's used rather than made again.
+    (fs / "f-cached.png").write_bytes(png_bytes(800, 600, (200, 200, 200)))
+    cache_thumbnail(cache, fs / "f-cached.png", 256, 192, int((fs / "f-cached.png").stat().st_mtime))
+    (fs / "folder.png").mkdir()
+    a = App(h, fs)
+    want = {"a-photo.png", "c-clip.mp4", "e-drawing.svg", "f-cached.png"}
+    s = a.wait(lambda s: s["count"] == 7 and set(thumbs_of(s)) >= want and s["thumbs"]["waiting"] == 0, "thumbnails in the rows", timeout=30)
+    shown = thumbs_of(s)
+    assert set(shown) == want, f"no picture for a broken file, text or a folder: {shown}"
+    assert all(size == (20, 20) for size in shown.values()), shown
+    a.shot("list-thumbnails")
+    # Each is in the shared cache at the normal size, saying what it's of. The broken one is noted,
+    # so it isn't tried again, and the one another program made isn't made again.
+    def uri(name):
+        return "file://" + quote(str(fs / name), safe="!$&'()*+,-./:=@_~")
+
+    def cached(folder, name):
+        return folder / (hashlib.md5(uri(name).encode()).hexdigest() + ".png")
+
+    made = {}
+    for name in ("a-photo.png", "c-clip.mp4", "e-drawing.svg"):
+        thumb = cached(normal, name)
+        w, h_, text = png_info(thumb)
+        assert max(w, h_) == 128 and text["Thumb::URI"] == uri(name) and text["Thumb::MTime"] == str(int((fs / name).stat().st_mtime)), (name, w, h_, text)
+        assert stat.S_IMODE(thumb.stat().st_mode) == 0o600
+        made[thumb] = thumb.stat().st_mtime_ns
+    assert png_info(cached(normal, "a-photo.png"))[:2] == (128, 96), "keeps its shape"
+    assert len(list(normal.iterdir())) == 3, sorted(p.name for p in normal.iterdir())
+    assert [p.name for p in fail.iterdir()] == [cached(fail, "b-broken.png").name]
+    a.close()
+    # Next time they all come from the cache, and nothing's made again.
+    a = App(h, fs)
+    a.wait(lambda s: set(thumbs_of(s)) == want and s["thumbs"]["waiting"] == 0, "from the cache", timeout=10)
+    assert {p: p.stat().st_mtime_ns for p in made} == made, "nothing made again"
+    # A picture that changes gets a new thumbnail.
+    photo = fs / "a-photo.png"
+    photo.write_bytes(png_bytes(300, 300, (40, 200, 40)))
+    later = int(time.time()) + 5
+    os.utime(photo, (later, later))
+    thumb = cached(normal, "a-photo.png")
+    end = time.monotonic() + 10
+    while time.monotonic() < end and png_info(thumb)[2].get("Thumb::MTime") != str(later):
+        time.sleep(0.05)
+    assert png_info(thumb)[:2] == (128, 128), "made again from the new picture"
+    a.close()
+
+
 @check
 def a_crash_in_the_preview_closes_only_the_preview_and_closing_the_list_closes_both(h):
     fs = fresh_fs()
@@ -2892,6 +3218,8 @@ def a_cached_thumbnail_shows_first_unless_its_out_of_date(h):
     shutil.rmtree(cache / "thumbnails", ignore_errors=True)
     cache_thumbnail(cache, photo, 128, 96, int(photo.stat().st_mtime))
     cache_thumbnail(cache, stale, 128, 96, int(stale.stat().st_mtime) - 100)
+    # The list would make an up-to-date one for its row, which the preview would rightly show.
+    (cache / "thumbnails/normal").mkdir(mode=0o500)
     a = App(h, fs, extra_env={"GANNET_SLOW_PREVIEW_MS": "500"})
     a.wait(lambda s: s["count"] == 2, "listing")
     a.key("space")
@@ -3608,10 +3936,7 @@ def recent_lists_used_files_newest_first_and_shows_them_in_their_folders(h):
     a.wait(lambda s: s["names"] == ["keep.txt", "new.txt", "middle.txt", "old.txt"], "the newly used file on top")
     # Show in folder goes to where the file is, with it selected; Back comes back.
     a.click(ROW_X, row_y(2), 0x111)
-    a.wait(lambda s: s["menu"], "the menu")
-    for _ in range(3):
-        a.key("Down")
-    a.key("Return")
+    menu_choose(a, "Show in folder")
     a.wait(lambda s: s["dir"] == str(fs / "a") and s["selected"] == ["middle.txt"], "middle.txt in its folder")
     a.key("Left", mods=["alt"])
     a.wait(lambda s: s["dir"] == str(listed), "back in Recent")
@@ -3826,6 +4151,189 @@ def a_conflict_from_another_window_asks_in_the_window_doing_the_work(h):
     assert (fs / "dst/a.txt").read_text() == "old" and (fs / "src/a.txt").read_text() == "new"
 
 
+def bookmarks_file(a):
+    return Path(a.env["XDG_CONFIG_HOME"]) / "gtk-3.0/bookmarks"
+
+
+def press(a, h, x, y):
+    a.move(x, y)
+    h.pointer(f"button {BTN_LEFT} 1")
+    time.sleep(0.03)
+
+
+@check
+def folders_pin_to_the_sidebar_by_dragging_and_reorder_there(h):
+    fs = fresh_fs()
+    tree(fs, {"work/Projects/p": "p", "work/Notes/n": "n", "work/a.txt": "A"})
+    shutil.rmtree(SCRATCH / "client/config/gtk-3.0", ignore_errors=True)
+    a = App(h, fs / "work")
+    a.wait(lambda s: s["count"] == 3)
+    # After a check with two windows, this one has to take the whole screen first.
+    time.sleep(0.3)
+    # A remote bookmark another app wrote, which Gannet doesn't show and has to keep.
+    conf = bookmarks_file(a)
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("sftp://server/srv Server\n")
+    s = a.wait(lambda s: "Trash" in [p.split("|")[0] for p in s["places"]])
+    below_trash = place_y(s, "Trash") + 15 + SIDEBAR_GAP // 2
+    # A file has nowhere to go between places.
+    press_and_carry(a, h, "a.txt", 60, below_trash)
+    a.wait(lambda s: s["drag"] == "“a.txt”", "a file isn't pinned")
+    release(a, h)
+    # A folder dropped just below Trash is pinned there.
+    press_and_carry(a, h, "Projects", 60, below_trash)
+    a.wait(lambda s: s["drag"] == "Pin “Projects”", "says it will pin")
+    a.shot("pin-a-folder")
+    release(a, h)
+    s = a.wait(lambda s: "Projects" in s["places"] and s["drag"] == "", "pinned")
+    assert s["headings"][1] == place_index(s, "Projects"), "under a heading of its own"
+    assert (fs / "work/Projects/p").exists(), "the folder stays where it is"
+    # The next one lands below it: near the bottom edge of the pin, not on it.
+    press_and_carry(a, h, "Notes", 60, place_y(s, "Projects") + 12)
+    a.wait(lambda s: s["drag"] == "Pin “Notes”", "says it will pin below")
+    release(a, h)
+    s = a.wait(lambda s: "Notes" in s["places"], "pinned second")
+    assert place_index(s, "Notes") == place_index(s, "Projects") + 1
+    text = conf.read_text()
+    assert text.startswith("sftp://server/srv Server\n") and text.count("file://") == 2, text
+    a.shot("pins-in-the-sidebar")
+    # Alt and a number follow the sidebar, pins included.
+    a.key(str(place_index(s, "Notes") + 1), mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work/Notes"), "Alt opens the pin")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work"), "back")
+    # Escape puts a carried pin back.
+    press(a, h, 60, place_y(s, "Projects"))
+    a.move(60, place_y(s, "Projects") + 10)
+    a.move(60, place_y(s, "Notes") + 12)
+    a.wait(lambda s: s["drag"] == "pin to 2", "carrying the first pin below the second")
+    a.shot("pin-reorder")
+    a.key("Escape")
+    a.wait(lambda s: s["drag"] == "", "Escape ends it")
+    release(a, h)
+    assert conf.read_text() == text, "nothing changed"
+    assert a.state()["dir"] == str(fs / "work"), "and the release doesn't open it"
+    # A click opens a pin.
+    a.click(60, place_y(s, "Projects"))
+    a.wait(lambda s: s["dir"] == str(fs / "work/Projects"), "a click opens it")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work"), "back")
+    a.close()
+
+    # Two windows share the pins, and one that changes them changes the other.
+    tree(fs, {"src/Extra/e": "e", "dst/keep": "k"})
+    a, b = two_windows(h, fs)
+    s = b.wait(lambda s: "Projects" in s["places"] and "Notes" in s["places"], "the other window has the pins")
+    sa = a.wait(lambda s: "Notes" in s["places"])
+    press(a, h, 60, place_y(sa, "Notes"))
+    a.move(60, place_y(sa, "Notes") - 10)
+    a.move(60, place_y(sa, "Projects") - 5)
+    a.wait(lambda s: s["drag"] == "pin to 0", "carrying the second pin above the first")
+    release(a, h)
+    reordered = lambda s: place_index(s, "Notes") < place_index(s, "Projects")
+    a.wait(reordered, "reordered here")
+    b.wait(reordered, "and in the other window")
+    assert conf.read_text().startswith("sftp://server/srv Server\n")
+    # A folder dragged from one window to between the other's places is pinned there.
+    sb = b.state()
+    carry_out(a, h, "Extra", OTHER_X + 60, place_y(sb, "Projects") + 12)
+    b.wait(lambda s: s["drag"] == "Pin to the sidebar", "the other window says it will pin")
+    b.shot("pin-from-another-window")
+    release(a, h)
+    b.wait(lambda s: "Extra" in s["places"], "pinned in the other window")
+    a.wait(lambda s: "Extra" in s["places"] and s["drag"] == "", "and in this one")
+    assert (fs / "src/Extra/e").exists(), "the folder stays where it was"
+    # Unpinning from a pin's menu leaves its folder and the other bookmarks alone.
+    sa = a.state()
+    y = place_y(sa, "Projects")
+    a.click(60, y, button=BTN_LEFT + 1)
+    assert a.wait(lambda s: s["menu"], "the pin's menu")["menu_items"] == ["Open", "Unpin"]
+    a.shot("pin-menu")
+    a.click(80, y + 4 + 28 + 14)
+    b.wait(lambda s: "Projects" not in s["places"], "unpinned in the other window too")
+    assert (fs / "work/Projects/p").exists()
+    assert conf.read_text().startswith("sftp://server/srv Server\n")
+    a.close()
+    b.close()
+
+
+@check
+def a_long_sidebar_scrolls_and_drags_near_its_edges_scroll_it(h):
+    fs = fresh_fs()
+    pins = [f"Pin{i:02}" for i in range(1, 26)]
+    tree(fs, {f"pins/{n}/x": "x" for n in pins} | {"work/Late/l": "l", "work/a.txt": "A"})
+    a = App(h, fs / "work")
+    a.wait(lambda s: s["count"] == 2)
+    # After a check with two windows, this one has to take the whole screen first.
+    time.sleep(0.3)
+    conf = bookmarks_file(a)
+    conf.parent.mkdir(parents=True, exist_ok=True)
+    conf.write_text("".join((fs / "pins" / n).as_uri() + "\n" for n in pins))
+    s = a.wait(lambda s: "Pin25" in [p.split("|")[0] for p in s["places"]] and s["side_max"] > 0, "the pins don't fit")
+    bottom = 800 - 26
+    assert place_y(s, "Pin25") > bottom, "the last pin is below the window's edge"
+    a.shot("sidebar-long-top")
+    # The wheel over the sidebar scrolls it, and not the list.
+    a.move(60, 400)
+    a.scroll(2)
+    s = a.wait(lambda s: s["side_scroll"] > 0, "the wheel scrolls the sidebar")
+    assert s["scroll"] == 0
+    a.scroll(50)
+    s = a.wait(lambda s: s["side_scroll"] == s["side_max"], "to the end")
+    assert place_y(s, "Pin25") + 15 <= bottom, "the last pin is in full view"
+    a.shot("sidebar-long-bottom")
+    # A click lands on the place drawn there, scrolled.
+    a.click(60, place_y(s, "Pin25"))
+    a.wait(lambda s: s["dir"] == str(fs / "pins/Pin25"), "a click opens the pin scrolled to")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work"), "back")
+    # Alt and a number bring a place scrolled out of view back into it.
+    digit = place_index(s, "Pin01") + 1
+    assert digit <= 9, digit
+    a.key(str(digit), mods=["alt"])
+    s = a.wait(lambda s: s["dir"] == str(fs / "pins/Pin01"), "Alt opens the first pin")
+    assert place_y(s, "Pin01") - 15 - SIDEBAR_HEADING >= BAR, "with it and its heading in view"
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "work"), "back")
+    a.move(60, 400)
+    a.scroll(-50)
+    a.wait(lambda s: s["side_scroll"] == 0, "back at the top")
+    # A folder held near the bottom edge scrolls the sidebar to the end. Just below the last
+    # pin, which was out of view, it's pinned.
+    press_and_carry(a, h, "Late", 60, bottom - 4)
+    s = a.wait(lambda s: s["side_scroll"] == s["side_max"], "the drag scrolled it to the end")
+    a.move(60, place_y(s, "Pin25") + 12)
+    a.wait(lambda s: s["drag"] == "Pin “Late”", "says it will pin below the last")
+    a.shot("sidebar-drag-scrolled")
+    release(a, h)
+    s = a.wait(lambda s: "Late" in [p.split("|")[0] for p in s["places"]] and s["drag"] == "", "pinned")
+    assert place_index(s, "Late") == place_index(s, "Pin25") + 1, s["places"]
+    # A pin carried up to the top edge scrolls it back, and goes first.
+    press(a, h, 60, place_y(s, "Late"))
+    a.move(60, place_y(s, "Late") - 10)
+    a.move(60, BAR + 4)
+    a.wait(lambda s: s["side_scroll"] == 0 and s["drag"] == "pin to 0", "carried to the top")
+    a.shot("sidebar-pin-carried-up")
+    release(a, h)
+    s = a.wait(lambda s: place_index(s, "Late") == place_index(s, "Pin01") - 1, "it's the first pin")
+    a.close()
+
+    # A drag from another window, held still at the edge, scrolls the sidebar it's over.
+    tree(fs, {"src/Extra/e": "e", "dst/keep": "k"})
+    a, b = two_windows(h, fs)
+    b.wait(lambda s: s["side_max"] > 0 and s["side_scroll"] == 0, "the other window's sidebar doesn't fit either")
+    carry_out(a, h, "Extra", OTHER_X + 60, bottom - 4)
+    s = b.wait(lambda s: s["side_scroll"] == s["side_max"], "the drag scrolled the other window's sidebar")
+    a.move(OTHER_X + 60, place_y(s, "Pin25") + 12)
+    b.wait(lambda s: s["drag"] == "Pin to the sidebar", "says it will pin below the last")
+    b.shot("sidebar-drag-from-another-window")
+    release(a, h)
+    s = b.wait(lambda s: "Extra" in [p.split("|")[0] for p in s["places"]], "pinned there")
+    assert place_index(s, "Extra") == place_index(s, "Pin25") + 1, s["places"]
+    a.close()
+    b.close()
+
+
 def main():
     want = sys.argv[1] if len(sys.argv) > 1 else ""
     assert BIN.exists(), "run: CARGO_TARGET_DIR=target/bench cargo build --release -p gannet --features bench"
@@ -3839,6 +4347,10 @@ def main():
                 continue
             # The scratch folders are reused, so every check starts with no folder sorts saved.
             shutil.rmtree(SCRATCH / "client/state/gannet", ignore_errors=True)
+            # Nor any pins: they're in GTK's bookmarks file, which every window shares.
+            shutil.rmtree(SCRATCH / "client/config/gtk-3.0", ignore_errors=True)
+            # Nor thumbnails, which the list makes of any picture or video it shows.
+            shutil.rmtree(SCRATCH / "client/cache/thumbnails", ignore_errors=True)
             try:
                 t(h)
                 print(f"ok    {t.__name__}", flush=True)

@@ -89,7 +89,7 @@ unsafe impl Sync for ImageBuf {}
 
 impl ImageBuf {
     /// Checks what the decoder wrote, as it may have been handed a hostile file.
-    fn from_memfd(fd: &OwnedFd) -> Option<Self> {
+    pub(crate) fn from_memfd(fd: &OwnedFd) -> Option<Self> {
         // Without this, a truncated file would fault when read rather than fail here.
         fcntl_add_seals(fd, SealFlags::SHRINK | SealFlags::GROW).ok()?;
         let len = usize::try_from(fstat(fd).ok()?.st_size).ok()?;
@@ -194,11 +194,11 @@ impl Kinds {
         self
     }
 
-    fn thumbnailers(&self) -> &Thumbnailers {
+    pub(crate) fn thumbnailers(&self) -> &Thumbnailers {
         self.thumbnailers.get_or_init(|| Thumbnailers::load(&self.thumbnailer_dirs))
     }
 
-    fn db(&self) -> &MimeDb {
+    pub(crate) fn db(&self) -> &MimeDb {
         self.db.get_or_init(|| MimeDb::load(&self.dirs))
     }
 }
@@ -251,18 +251,18 @@ pub struct Event {
 }
 
 /// One running decoder process.
-struct Helper {
+pub(crate) struct Helper {
     child: Child,
     /// Its stderr. Nothing's read from this but the end of it, which means it has exited.
     gone: OwnedFd,
-    output: OwnedFd,
+    pub(crate) output: OwnedFd,
     status: Option<ExitStatus>,
     /// The pipe has ended. That nearly always means it has exited, but a process can close its
     /// stderr and carry on, so it still gets asked rather than waited on.
     pipe_ended: bool,
 }
 
-enum Waited {
+pub(crate) enum Waited {
     Exited(ExitStatus),
     Cancelled,
     TimedOut,
@@ -278,6 +278,14 @@ impl Helper {
         Self::run(command, output)
     }
 
+    /// Decodes `input` as a list row's thumbnail (see `decode::thumbnail`).
+    pub(crate) fn spawn_thumbnail(input: File) -> std::io::Result<Self> {
+        let output = memfd_create("gannet-thumbnail", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
+        let mut command = Command::new("/proc/self/exe");
+        command.arg(decode::THUMBNAIL_ARG).env_clear().current_dir("/").stdin(Stdio::from(input));
+        Self::run(command, output)
+    }
+
     fn run(mut command: Command, output: OwnedFd) -> std::io::Result<Self> {
         let (gone, stderr) = pipe_with(PipeFlags::CLOEXEC)?;
         let child = command.stdout(Stdio::from(output.try_clone()?)).stderr(Stdio::from(stderr)).spawn()?;
@@ -287,7 +295,7 @@ impl Helper {
         Ok(Self { child, gone, output, status: None, pipe_ended: false })
     }
 
-    fn wait(&mut self, cancel: &OwnedFd, limit: Duration) -> Waited {
+    pub(crate) fn wait(&mut self, cancel: &OwnedFd, limit: Duration) -> Waited {
         if let Some(status) = self.status {
             return Waited::Exited(status);
         }
@@ -574,20 +582,20 @@ fn is_pdf(at: &Place, head: Option<&[u8]>) -> bool {
 }
 
 /// Opens the file again for a program outside, as long as it's still a file.
-fn reopen(path: &Path) -> Option<File> {
+pub(crate) fn reopen(path: &Path) -> Option<File> {
     let file = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(path).ok()?;
     file.metadata().is_ok_and(|m| m.is_file()).then_some(file)
 }
 
 /// Why a jailed program didn't get to end by itself.
-enum NotRun {
+pub(crate) enum NotRun {
     NoBubblewrap,
     /// It couldn't start, took too long or was cancelled.
     Stopped,
 }
 
 /// Runs a jailed program and waits for it: how it ended, and what it wrote to stdout.
-fn run_tool(argv: &[OsString], input: File, bind: Option<&str>, cancel: &OwnedFd) -> Result<(ExitStatus, OwnedFd), NotRun> {
+pub(crate) fn run_tool(argv: &[OsString], input: File, bind: Option<&str>, cancel: &OwnedFd) -> Result<(ExitStatus, OwnedFd), NotRun> {
     let output = memfd_create("gannet-tool", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING).map_err(|_| NotRun::Stopped)?;
     let command = tools::jailed(argv, input, bind).map_err(|_| NotRun::Stopped)?;
     let mut helper = Helper::run(command, output).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { NotRun::NoBubblewrap } else { NotRun::Stopped })?;
@@ -788,7 +796,7 @@ fn answer(status: ExitStatus, output: &OwnedFd, size: u64) -> Option<Found> {
     }
 }
 
-fn cancelled_within(cancel: &OwnedFd, limit: Duration) -> bool {
+pub(crate) fn cancelled_within(cancel: &OwnedFd, limit: Duration) -> bool {
     let timeout = Timespec { tv_sec: limit.as_secs() as _, tv_nsec: limit.subsec_nanos() as _ };
     let mut fds = [PollFd::new(cancel, PollFlags::IN)];
     let _ = poll(&mut fds, Some(&timeout));
@@ -2037,7 +2045,7 @@ impl App {
             self.show_hidden = true;
         }
         self.previewer = Some(path.clone());
-        self.go(Stop { dir, cursor_name: name });
+        self.go(Stop { dir, cursor_name: name, search: None });
         self.preview_begin(path, false);
     }
 
@@ -2060,7 +2068,7 @@ impl App {
         match row {
             Some(row) if !resort => self.move_cursor(row, Mods::default()),
             // Read again in the new order, for the arrows to walk.
-            _ => self.go(Stop { dir, cursor_name: name }),
+            _ => self.go(Stop { dir, cursor_name: name, search: None }),
         }
         if self.preview.as_ref().is_some_and(|p| p.path == path) {
             return;
@@ -2102,12 +2110,15 @@ impl App {
             return;
         }
         self.previewer = Some(path.clone());
-        if path.parent() != Some(self.dir.as_path()) {
+        // A search's rows are anywhere below, and found by their paths.
+        let search = self.listing.as_ref().is_some_and(|l| l.search().is_some());
+        if !search && path.parent() != Some(self.dir.as_path()) {
             return;
         }
         let Some(name) = path.file_name().map(|n| n.as_encoded_bytes()) else { return };
+        let key = if search { path.as_os_str().as_encoded_bytes() } else { name };
         // A file the list doesn't show (its filter hides it, say) leaves the cursor where it is.
-        let Some(row) = self.listing.as_ref().and_then(|l| self.rows.iter().position(|&i| *l.key(i) == *name)) else { return };
+        let Some(row) = self.listing.as_ref().and_then(|l| self.rows.iter().position(|&i| *l.key(i) == *key)) else { return };
         if row != self.cursor || !self.cursor_shown {
             self.move_cursor(row, Mods { ctrl: self.sel_count > 1, ..Mods::default() });
         }
