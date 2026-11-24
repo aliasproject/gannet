@@ -601,7 +601,7 @@ impl Ctx {
                         true
                     }
                     // An entry, or an item of another list, which moving to picks.
-                    Target::Fixed(n) if matches!(n.role, Role::Entry | Role::ListItem) && n.enabled => {
+                    Target::Fixed(n) if matches!(n.role, Role::Entry | Role::ListItem) && n.enabled && n.parent != a11y::RENAME_NAMES => {
                         self.hub.send(Msg::A11y(Act::Focus(n.id)));
                         true
                     }

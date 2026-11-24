@@ -1782,6 +1782,25 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         assert sr.ask("grab [\"Save the report\", \"Name\"]") is True
         a.wait(lambda s: s["chooser"]["name_focused"], "the keyboard back in the name")
         sr.until("dump [\"Save the report\"]", lambda w: a11y_focus(w) == ["Name"], "focus back on the name")
+        # Saving onto a file that's there asks first, in an alert the screen reader hears, and
+        # the Save dialog behind it can't be used.
+        a.key("a", mods=("ctrl",))
+        a.type("a.txt")
+        sr.ask("events")
+        assert sr.ask("do [\"Save the report\", \"Save\"]") is True
+        a.wait(lambda s: s["dialog"] == "replace", "asked about replacing")
+        ask = "Replace “a.txt”?"
+        w = sr.until("dump [\"Save the report\"]", lambda w: a11y_find(w, ask, "alert"), "the alert")
+        alert = a11y_find(w, ask, "alert")
+        assert alert["description"] == "It's already in “docs”. Replacing it overwrites what's there." and [c["name"] for c in alert["children"]] == ["Replace", "Cancel"], alert
+        assert "enabled" not in a11y_find(w, "File type", "list")["states"], "the bar is behind the alert"
+        heard = sr.until("events", lambda e: announced(e), "the alert announced")
+        assert announced(heard) == [f"{ask} {alert['description']}"], heard
+        assert sr.ask("select [\"Save the report\", \"File type\", 0]") is False, "behind the alert"
+        assert sr.ask(f"do {json.dumps(['Save the report', ask, 'Cancel'])}") is True
+        a.wait(lambda s: s["dialog"] == "" and s["chooser"], "kept the dialog open")
+        a.key("a", mods=("ctrl",))
+        a.type("report.txt")
         # Save, through its action.
         assert sr.ask("do [\"Save the report\", \"Save\"]") is True
         out = said(a)
