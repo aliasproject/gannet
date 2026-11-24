@@ -5,6 +5,7 @@
 pub mod bus;
 pub mod clipboard;
 pub mod disks;
+pub mod folder_sorts;
 pub mod foldersize;
 pub mod history;
 pub mod listing;

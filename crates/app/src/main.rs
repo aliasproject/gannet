@@ -45,6 +45,7 @@ struct Dirs {
     config: PathBuf,
     cache: PathBuf,
     data: PathBuf,
+    state: PathBuf,
     /// The shared-mime-info folders, first wins.
     mime: Vec<PathBuf>,
     /// Where thumbnailers are described, first wins.
@@ -59,7 +60,7 @@ fn dirs() -> Dirs {
     let data_dirs = std::env::var_os("XDG_DATA_DIRS").filter(|d| !d.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
     let in_data = |name: &str| std::iter::once(data.join(name)).chain(std::env::split_paths(&data_dirs).filter(|p| p.is_absolute()).map(|p| p.join(name))).collect::<Vec<_>>();
     let (mime, thumbnailers) = (in_data("mime"), in_data("thumbnailers"));
-    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), data, home, mime, thumbnailers }
+    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), state: var("XDG_STATE_HOME", ".local/state"), data, home, mime, thumbnailers }
 }
 
 /// The language messages are in, as GLib chooses it for GTK apps: the first of `LANGUAGE`, then
@@ -203,6 +204,7 @@ fn main() {
     let trash = TrashConfig::new(&d.data, rustix::process::geteuid().as_raw());
     let engine = Engine::new(trash, Arc::new(move |e| op_hub.send(Msg::Op(e))));
     let mut app = App::new(hub.clone(), engine, d.data.join("Trash/files"), colors, source, text, places, start_dir.clone(), w, h, wl.scale());
+    app.folder_sorts = gannet_core::folder_sorts::FolderSorts::new(d.state.join("gannet/sorts"), gannet_core::places::newest_first_dirs(&d.home, &d.config));
     let dir_watch = Watch::new().ok().map(Arc::new);
     app.watch = dir_watch.clone();
     app.cache_home = Some(d.cache.clone());
@@ -225,7 +227,12 @@ fn main() {
     let following = viewing.as_ref().is_some_and(|v| v.follow);
     if let Some(v) = viewing {
         app.show_hidden = v.hidden;
-        app.sort = v.sort;
+        // Opened by the list, it's told the list's order; on its own, the folder's own.
+        if let Some(sort) = v.sort {
+            app.sort = sort;
+        }
+        // Following the list, the order always comes from the list, never from what's saved.
+        app.fixed_sort = v.sort.is_some() || v.follow;
         app.start_viewer(v.path);
         if v.follow {
             preview_window::listen_to_the_list(hub.clone());
@@ -298,9 +305,9 @@ fn main() {
                     }
                 }
                 Cmd::ClosePreview => previewer = None,
-                Cmd::PreviewShow(path) => {
+                Cmd::PreviewShow(path, sort) => {
                     if let Some(p) = previewer.as_mut() {
-                        p.show(&path);
+                        p.show(&path, sort);
                     }
                 }
                 Cmd::PreviewStepped(path) => {

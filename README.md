@@ -110,6 +110,18 @@ To add it to your app launcher:
 | Context menu | Menu key or F10 |
 | Reload, new window, close | F5 or Ctrl+R, Ctrl+N, Ctrl+Q or Ctrl+W |
 
+## Sorting
+
+Each folder keeps the order you last sorted it in, and a folder you haven't sorted takes the
+order of the nearest folder above it that you have. So sorting `~/Projects` by date sorts every
+project in it too. Sorting a folder the same way as the folder above it makes it follow that
+folder again. Downloads, Pictures and Videos start newest first, and stay that way when a
+folder above them is sorted, until you sort them yourself. Names sort A to Z at first, dates
+newest first and sizes biggest first; sorting by the same column again reverses it. Folders
+always come first. The preview window walks a folder in the order the list shows it, and Open
+and Save dialogs from other apps read and save the same orders. The orders are kept in
+`$XDG_STATE_HOME/gannet/sorts`, which is `~/.local/state/gannet/sorts` by default.
+
 ## Dragging
 
 Drag files onto a folder in the list or a place in the sidebar. Dragging one selected item
