@@ -18,6 +18,7 @@ use gannet_core::trash;
 use gannet_core::ops::{self, Answer, Choice, Conflict, Engine, Job, Request, Undo};
 use gannet_core::watch::Watch;
 use gannet_core::disks::{DiskError, Volume};
+use gannet_core::bookmarks::{self, Spot};
 use gannet_core::places::{Place, PlaceKind};
 use crate::drives::Doing;
 use gannet_core::theme::{Colors, Source};
@@ -108,6 +109,8 @@ pub enum Msg {
     Dropped(Dropped),
     DragSource { drag: u64, facts: Option<(u64, bool)> },
     DragDevice { drag: u64, path: PathBuf, device: Option<u64> },
+    /// The folders among what was dropped to pin, and how many items weren't folders.
+    PinDropped { folders: Vec<PathBuf>, at: Spot, not_folders: usize },
 }
 
 #[derive(Clone)]
@@ -126,6 +129,8 @@ pub struct Dropped {
     pub saved: Option<Result<PathBuf, String>>,
     /// No files and no picture, but a web address.
     pub link: bool,
+    /// Where to pin what was dropped, rather than moving it.
+    pub pin: Option<Spot>,
 }
 
 /// What a clipboard read is for.
@@ -149,7 +154,7 @@ pub enum Cmd {
     StartDrag { formats: Vec<(&'static str, Vec<u8>)>, marker: Option<clipboard::DragMarker>, move_only: bool, icon: Option<crate::wl::DragIcon> },
     CancelDrag,
     AcceptDrop(bool),
-    ReadDrop { dest: PathBuf, trash: bool, decided: Option<DropAction> },
+    ReadDrop { dest: PathBuf, trash: bool, decided: Option<DropAction>, pin: Option<Spot> },
     FinishDrop,
     AbandonDrop,
     /// Starts the preview window on a file, sorted and filtered as this list is.
@@ -238,6 +243,9 @@ pub enum Hit {
     Place(usize),
     /// A drive's eject button in the sidebar.
     Eject(usize),
+    /// Between pins, where a drag of folders would pin them: in front of the pin this far down
+    /// the pins, or after the last. Only a drop target, never under the pointer otherwise.
+    PinGap(usize),
     Header(SortKey),
     Row(usize),
     ListEmpty,
@@ -262,6 +270,20 @@ pub enum Hit {
 const DRAG_START: f64 = 6.0;
 /// How long pointer events can keep arriving after a drag is handed to the compositor.
 const WAYLAND_DRAG_GRACE: Duration = Duration::from_millis(300);
+/// How near the top or bottom of a pin a dragged folder has to be to go between pins rather than
+/// into that pin's folder, in logical pixels. A sidebar row is 30.
+const PIN_EDGE: f64 = 7.0;
+
+/// A pin pressed in the sidebar. It opens on the release, unless the pointer moves far enough
+/// first, and then it's carried up or down the pins to put them in another order.
+pub(crate) struct PinDrag {
+    at: (i32, i32),
+    /// Which pin, by its folder, so another window changing the pins can't swap it for another.
+    path: PathBuf,
+    pub(crate) active: bool,
+    /// Where it would land among the pins, if that moves it.
+    pub(crate) gap: Option<usize>,
+}
 
 /// A drag of files inside the window. It's pointer state and not a Wayland drag, because
 /// compositors may keep keys from the app during one, and Escape and the keys held at the
@@ -339,6 +361,8 @@ pub(crate) struct ActiveDrag {
     /// The pointer has really moved since it came back. See `drag_entered`.
     moved_inside: bool,
     accepting: bool,
+    /// Everything carried is a folder, which can be pinned. Not from the Trash.
+    folders: bool,
 }
 
 impl ActiveDrag {
@@ -383,6 +407,8 @@ pub(crate) struct DropTarget {
     pub hit: Hit,
     pub dest: PathBuf,
     trash: bool,
+    /// Where the folders would be pinned, for a drop between pins. `dest` means nothing then.
+    pin: Option<Spot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,6 +417,7 @@ pub enum DropAction {
     Copy,
     Link,
     Trash,
+    Pin,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Copy)]
@@ -420,6 +447,9 @@ pub enum Action {
     Extract,
     /// Opens the person's terminal in the folder selected, or the one on screen.
     OpenTerminal,
+    /// For the pin whose menu it is.
+    OpenPin,
+    Unpin,
     /// For the drive whose menu it is.
     OpenDrive,
     Unmount,
@@ -525,6 +555,13 @@ pub struct App {
     pub volumes: Vec<Volume>,
     /// The drive a sidebar menu is open for.
     drive_menu: Option<Volume>,
+    /// GTK's bookmarks file, where pins are kept. `None` in a window with no sidebar to pin to.
+    pub bookmarks: Option<PathBuf>,
+    /// The pinned folders, in order. They follow the standard places in the sidebar.
+    pins: Vec<Place>,
+    /// The pin a sidebar menu is open for, by its folder.
+    pin_menu: Option<PathBuf>,
+    pub(crate) pin_drag: Option<PinDrag>,
     /// The drive whose eject button was pressed, by its block. Ejecting can't be taken back, so
     /// it happens on the release, and only if the pointer is still on that drive's button: the
     /// sidebar can change in between, putting another drive in that row.
@@ -680,6 +717,10 @@ impl App {
             terminal: None,
             volumes: Vec::new(),
             drive_menu: None,
+            bookmarks: None,
+            pins: Vec::new(),
+            pin_menu: None,
+            pin_drag: None,
             eject_pressed: None,
             drives_busy: Vec::new(),
             opening: None,
@@ -1157,6 +1198,14 @@ impl App {
             Msg::PreviewShow(path, sort) => self.on_preview_show(path, sort),
             Msg::ListGone => self.cmds.push(Cmd::Quit),
             Msg::Dropped(d) => self.on_dropped(d),
+            Msg::PinDropped { folders, at, not_folders } => {
+                if not_folders > 0 {
+                    self.notice("Only folders can be pinned".into());
+                }
+                if !folders.is_empty() {
+                    self.pin_folders(folders, at);
+                }
+            }
             Msg::DragSource { drag, facts } => {
                 if let Some(FileDrag::Active(d)) = &mut self.file_drag
                     && d.id == drag
@@ -1508,6 +1557,14 @@ impl App {
             Action::Trash => self.trash_selection(),
             Action::DeleteForGood => self.ask_delete(),
             Action::NewFolder => self.start_new_folder(),
+            Action::OpenPin | Action::Unpin => {
+                let Some(path) = self.pin_menu.take() else { return };
+                if a == Action::Unpin {
+                    self.change_pins(|text| bookmarks::without(text, &path));
+                } else {
+                    self.navigate(path, None);
+                }
+            }
             Action::OpenDrive | Action::Unmount | Action::Eject => {
                 let Some(v) = self.drive_menu.take() else { return };
                 match a {
@@ -2411,6 +2468,7 @@ impl App {
             self.close_dialog();
         }
         let mut places = self.standard_places.clone();
+        places.extend(self.pins.iter().cloned());
         places.extend(gannet_core::places::all_disk_places(&volumes, &mounts, Self::drive_name));
         // While udisks2 is away, what it last said is kept, so a drive pulled out meanwhile is
         // noticed when it's back.
@@ -2489,14 +2547,227 @@ impl App {
         self.invalidate_all();
     }
 
+    // ---- Pins ----
+
+    /// Pins are kept in GTK's bookmarks file at `file`, which is read now and whenever
+    /// `bookmarks_changed` says it changed.
+    pub fn set_bookmarks(&mut self, file: PathBuf) {
+        self.bookmarks = Some(file);
+        self.bookmarks_changed();
+    }
+
+    /// Reads the pins again, as this window or another program has changed them.
+    pub fn bookmarks_changed(&mut self) {
+        let Some(file) = &self.bookmarks else { return };
+        // A standard place pinned too, as some desktops do for GTK's dialogs, shows once.
+        let mut pins = gannet_core::places::pinned_places(&bookmarks::read(file));
+        pins.retain(|p| !self.standard_places.iter().any(|s| s.path == p.path));
+        if pins == self.pins {
+            return;
+        }
+        self.pins = pins;
+        let mut places = self.standard_places.clone();
+        places.extend(self.pins.iter().cloned());
+        places.extend(self.places.iter().filter(|p| p.kind == PlaceKind::Disk).cloned());
+        self.places = places;
+        // A pin being carried that's gone has nothing left to move.
+        // One that's still there is placed among the pins as they are now.
+        match &self.pin_drag {
+            Some(d) if self.pin_index(&d.path).is_none() => self.cancel_pin_drag(),
+            Some(d) if d.active => {
+                let (x, y) = self.pointer;
+                self.pin_drag_moved(x, y);
+            }
+            // The row under the pointer can be another place now. A menu or dialog has its own
+            // highlight, which follows the pointer only as it moves.
+            _ if self.pointer.0 >= 0 && self.menu.is_none() && self.dialog.is_none() => {
+                let (x, y) = self.pointer;
+                let h = self.hit(x, y);
+                self.set_hover(h);
+            }
+            _ => {}
+        }
+        self.invalidate_all();
+    }
+
+    /// Where the pins are in the sidebar: the first one's place, and how many there are. With
+    /// none, where the first would go.
+    pub fn pins_at(&self) -> (usize, usize) {
+        let first = self.places.iter().position(|p| matches!(p.kind, PlaceKind::Pinned | PlaceKind::Disk)).unwrap_or(self.places.len());
+        (first, self.pins.len())
+    }
+
+    /// Whether a folder already has a row in the sidebar's top sections, pinned or standard.
+    fn in_sidebar(&self, path: &Path) -> bool {
+        self.pin_index(path).is_some() || self.standard_places.iter().any(|p| p.path == path)
+    }
+
+    fn pin_index(&self, path: &Path) -> Option<usize> {
+        self.pins.iter().position(|p| p.path == path)
+    }
+
+    /// The pin that a pin put at `gap` goes in front of.
+    fn spot(&self, gap: usize) -> Spot {
+        self.pins.get(gap).map_or(Spot::End, |p| Spot::Before(p.path.clone()))
+    }
+
+    /// Changes the bookmarks file, reading it first so nothing another program wrote is lost,
+    /// and shows the pins it ends up with.
+    fn change_pins(&mut self, change: impl FnOnce(&[u8]) -> Option<Vec<u8>>) {
+        let Some(file) = self.bookmarks.clone() else { return };
+        if let Err(e) = bookmarks::edit(&file, change) {
+            self.notice(format!("Couldn't save the pins in {}: {}", file.display(), gannet_core::listing::describe(&e).to_lowercase()));
+        }
+        self.bookmarks_changed();
+    }
+
+    fn pin_folders(&mut self, mut paths: Vec<PathBuf>, at: Spot) {
+        paths.retain(|p| !self.standard_places.iter().any(|s| s.path == *p));
+        self.change_pins(|text| bookmarks::with_added(text, &paths, &at));
+    }
+
+    /// Where a drag of folders at `y` would pin them, if it's between places rather than on
+    /// one: near the top or bottom edge of a pin, or of the place just above the pins, or in
+    /// the space around the Pinned heading or below the last pin, before the next section.
+    fn pin_gap_at(&self, x: i32, y: i32) -> Option<usize> {
+        let l = self.layout();
+        // A dialog, menu or preview has the pointer, and nothing underneath takes a drop.
+        if self.bookmarks.is_none() || self.places.is_empty() || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some() || !l.sidebar.contains(x, y) {
+            return None;
+        }
+        let (first, n) = self.pins_at();
+        let (row, edge) = (self.px(30.0), self.px(PIN_EDGE));
+        let above = if first > 0 { self.place_top(first - 1) + row - edge } else { l.sidebar.y };
+        let below = if first + n < self.places.len() { self.place_top(first + n) } else { l.sidebar.bottom() };
+        if n == 0 {
+            return (above..below).contains(&y).then_some(0);
+        }
+        if (above..self.place_top(first)).contains(&y) {
+            return Some(0);
+        }
+        for j in 0..n {
+            let top = self.place_top(first + j);
+            if (top..top + edge).contains(&y) {
+                return Some(j);
+            }
+            if (top + row - edge..top + row).contains(&y) {
+                return Some(j + 1);
+            }
+        }
+        (self.place_top(first + n - 1) + row..below).contains(&y).then_some(n)
+    }
+
+    /// Where a pin carried to `y` would land among the pins: in front of the first whose middle
+    /// is below it. It only moves among the pins, wherever the pointer goes.
+    fn reorder_gap_at(&self, y: i32) -> usize {
+        let (first, n) = self.pins_at();
+        let half = self.px(15.0);
+        (0..n).filter(|&j| y >= self.place_top(first + j) + half).count()
+    }
+
+    /// The height of the bar that marks where pins would land, `gap` pins down.
+    pub fn pin_bar_y(&self, gap: usize) -> i32 {
+        let (first, n) = self.pins_at();
+        let row = self.px(30.0);
+        match (n, gap) {
+            (0, _) if first > 0 => self.place_top(first - 1) + row + self.px(SIDEBAR_GAP) / 2,
+            (0, _) => self.layout().sidebar.y + self.px(8.0),
+            (_, g) if g < n => self.place_top(first + g),
+            _ => self.place_top(first + n - 1) + row,
+        }
+    }
+
+    /// Where the bar is drawn, if a drag of folders or a pin has a place to land among the pins.
+    pub fn pin_bar(&self) -> Option<i32> {
+        let gap = match (&self.pin_drag, &self.file_drag, &self.incoming) {
+            (Some(d), _, _) => d.gap,
+            (_, Some(FileDrag::Active(ActiveDrag { target: Some(t), .. })), _) | (_, _, Some(IncomingDrag { target: Some(t), .. })) => match t.hit {
+                Hit::PinGap(g) => Some(g),
+                _ => None,
+            },
+            _ => None,
+        }?;
+        Some(self.pin_bar_y(gap))
+    }
+
+    /// The pin being carried, which is drawn dimmed.
+    pub fn carried_pin(&self) -> Option<&Path> {
+        self.pin_drag.as_ref().filter(|d| d.active).map(|d| d.path.as_path())
+    }
+
+    fn press_pin(&mut self, i: usize, x: i32, y: i32) {
+        if let Some(p) = self.places.get(i) {
+            self.pin_drag = Some(PinDrag { at: (x, y), path: p.path.clone(), active: false, gap: None });
+        }
+    }
+
+    /// Follows the pointer with a pin pressed or carried. Returns whether the move was its.
+    fn pin_drag_moved(&mut self, x: i32, y: i32) -> bool {
+        let reach = self.px(DRAG_START);
+        let Some(d) = &self.pin_drag else { return false };
+        let (at, from) = (d.at, self.pin_index(&d.path));
+        let Some(from) = from else {
+            self.cancel_pin_drag();
+            return false;
+        };
+        if !d.active && (x - at.0).abs() < reach && (y - at.1).abs() < reach {
+            return false;
+        }
+        let gap = Some(self.reorder_gap_at(y)).filter(|&g| g != from && g != from + 1);
+        if let Some(d) = &mut self.pin_drag {
+            if !d.active {
+                // A drag wasn't a click, so the next press can't be the second half of a double-click.
+                self.last_click = None;
+            }
+            d.active = true;
+            d.gap = gap;
+        }
+        self.set_hover(Hit::None);
+        self.set_cursor(Cursor::Move);
+        self.invalidate(self.layout().sidebar);
+        true
+    }
+
+    /// The button's up: a pin that wasn't carried opens, and one that was lands where its bar is.
+    fn pin_released(&mut self) {
+        let Some(d) = self.pin_drag.take() else { return };
+        self.end_pin_drag();
+        if !d.active {
+            if self.pin_index(&d.path).is_some() {
+                self.navigate(d.path, None);
+            }
+            return;
+        }
+        let Some(gap) = d.gap else { return };
+        let at = self.spot(gap);
+        self.change_pins(|text| bookmarks::with_moved(text, &d.path, &at));
+    }
+
+    fn end_pin_drag(&mut self) {
+        self.invalidate(self.layout().sidebar);
+        let (x, y) = self.pointer;
+        let h = self.hit(x, y);
+        self.set_hover(h);
+        self.set_cursor(cursor_for(h));
+    }
+
+    fn open_pin_menu(&mut self, path: PathBuf, x: i32, y: i32) {
+        let items = vec![MenuItem { label: "Open", keys: "", action: Action::OpenPin, enabled: true }, MenuItem { label: "Unpin", keys: "", action: Action::Unpin, enabled: true }];
+        self.pin_menu = Some(path);
+        self.menu = Some(Menu { items, x, y, at: usize::MAX });
+        self.invalidate_all();
+    }
+
     /// The sidebar's sections, as the place each starts at and its heading: Places from the
-    /// top, and Devices from the first drive or mount, if there is one.
+    /// top, Pinned from the first pin, and Devices from the first drive or mount, if there are any.
     pub fn sidebar_headings(&self) -> Vec<(usize, &'static str)> {
         if self.places.is_empty() {
             return Vec::new();
         }
         let mut out = vec![(0, "Places")];
-        out.extend(self.places.iter().position(|p| p.kind == PlaceKind::Disk).filter(|&i| i > 0).map(|i| (i, "Devices")));
+        for (kind, heading) in [(PlaceKind::Pinned, "Pinned"), (PlaceKind::Disk, "Devices")] {
+            out.extend(self.places.iter().position(|p| p.kind == kind).filter(|&i| i > 0).map(|i| (i, heading)));
+        }
         out
     }
 
@@ -2811,6 +3082,15 @@ impl App {
     }
 
     fn key(&mut self, sym: u32, utf8: &str, m: Mods) {
+        if let Some(d) = &self.pin_drag {
+            let active = d.active;
+            if sym == k::KEY_Escape {
+                self.cancel_pin_drag();
+            }
+            if active || sym == k::KEY_Escape {
+                return;
+            }
+        }
         if matches!(self.file_drag, Some(FileDrag::Band(_))) {
             if sym == k::KEY_Escape {
                 self.band_put_back();
@@ -3301,7 +3581,7 @@ impl App {
     fn pointer_moved(&mut self, x: f64, y: f64) {
         self.set_pointer(x, y);
         let (px, py) = self.pointer;
-        if self.preview_drag(px, py) {
+        if self.preview_drag(px, py) || self.pin_drag_moved(px, py) {
             return;
         }
         if let Some(FileDrag::Pressed { at, band, .. }) = &self.file_drag {
@@ -3367,6 +3647,7 @@ impl App {
             if button == BTN_LEFT {
                 self.drag_scroll = None;
                 self.preview_release();
+                self.pin_released();
                 self.finish_file_drag();
                 if let Some(block) = self.eject_pressed.take()
                     && let Hit::Eject(i) = self.hit(self.pointer.0, self.pointer.1)
@@ -3438,6 +3719,10 @@ impl App {
                 && let Some(v) = self.places.get(i).and_then(|p| p.volume.clone())
             {
                 self.open_drive_menu(v, x, y);
+            } else if let Hit::Place(i) = self.hit(x, y)
+                && let Some(p) = self.places.get(i).filter(|p| p.kind == PlaceKind::Pinned)
+            {
+                self.open_pin_menu(p.path.clone(), x, y);
             }
             return;
         }
@@ -3484,6 +3769,8 @@ impl App {
                     self.start_filter("");
                 }
             }
+            // A pin opens on the release, as the press can turn into carrying it elsewhere.
+            Hit::Place(i) if self.places.get(i).is_some_and(|p| p.kind == PlaceKind::Pinned) => self.press_pin(i, x, y),
             Hit::Place(i) => self.open_place(i),
             Hit::Eject(i) => self.eject_pressed = self.places.get(i).and_then(|p| p.volume.as_ref()).map(|v| v.block.clone()),
             Hit::Header(key) => self.action(Action::SortBy(key)),
@@ -3511,7 +3798,7 @@ impl App {
                     j.job.cancel();
                 }
             }
-            Hit::DialogButton(_) | Hit::DialogCheck | Hit::DialogField(_) | Hit::PreviewBody => {}
+            Hit::DialogButton(_) | Hit::DialogCheck | Hit::DialogField(_) | Hit::PreviewBody | Hit::PinGap(_) => {}
             Hit::ChooserName | Hit::ChooserFilter | Hit::ChooserAccept | Hit::ChooserCancel => self.chooser_click(hit, x),
             Hit::Row(row) => {
                 self.chooser_clicked_list(Some(row));
@@ -3771,6 +4058,7 @@ impl App {
         }
         let kind = self.listing.as_ref().map_or(Kind::File, |l| l.kind(self.rows[row]));
         let ghost = DragGhost { name, kind, count: paths.len() };
+        let folders = !self.in_trash() && self.listing.as_ref().is_some_and(|l| self.selected_ids().iter().all(|&i| l.kind(i).is_dirlike()));
         // A drag wasn't a click, so the next press can't be the second half of a double-click.
         self.last_click = None;
         self.set_hover(Hit::None);
@@ -3787,7 +4075,7 @@ impl App {
                 hub.send(Msg::DragDevice { drag: id, path, device });
             }
         });
-        self.file_drag = Some(FileDrag::Active(ActiveDrag { paths, dir: from, probe, id, source: None, devices: HashMap::new(), target: None, label: Rect::default(), ghost, ghost_at: Rect::default(), wayland: false, handed_over: None, inside: false, moved_inside: false, accepting: false }));
+        self.file_drag = Some(FileDrag::Active(ActiveDrag { paths, dir: from, probe, id, source: None, devices: HashMap::new(), target: None, label: Rect::default(), ghost, ghost_at: Rect::default(), wayland: false, handed_over: None, inside: false, moved_inside: false, accepting: false, folders }));
     }
 
     /// The folder a drop here would land in. Dropping on what's being dragged, on the folder
@@ -3797,6 +4085,16 @@ impl App {
         if self.chooser.is_some() {
             return None;
         }
+        // Between places, folders are pinned. Ones pinned already stay where they are, so there's
+        // nothing to do with only those.
+        // Folders that are in the sidebar already, as a pin or a standard place, fall through to
+        // whatever's under them.
+        if d.folders
+            && !d.paths.iter().all(|p| self.in_sidebar(p))
+            && let Some(gap) = self.pin_gap_at(x, y)
+        {
+            return Some(DropTarget { hit: Hit::PinGap(gap), dest: PathBuf::new(), trash: false, pin: Some(self.spot(gap)) });
+        }
         let hit = self.hit(x, y);
         match hit {
             Hit::Row(row) => {
@@ -3805,7 +4103,7 @@ impl App {
                 if self.in_trash() || self.is_recent_view() || !l.kind(id).is_dirlike() || self.is_selected(id) {
                     return None;
                 }
-                Some(DropTarget { hit, dest: l.path(id), trash: false })
+                Some(DropTarget { hit, dest: l.path(id), trash: false, pin: None })
             }
             Hit::Place(i) => {
                 let place = self.places.get(i)?;
@@ -3822,7 +4120,7 @@ impl App {
                 if inside_itself {
                     return None;
                 }
-                Some(DropTarget { hit, dest: place.path.clone(), trash })
+                Some(DropTarget { hit, dest: place.path.clone(), trash, pin: None })
             }
             _ => None,
         }
@@ -3832,6 +4130,9 @@ impl App {
         use gannet_core::ops::{DropVerb, drop_verb};
         if t.trash {
             return DropAction::Trash;
+        }
+        if t.pin.is_some() {
+            return DropAction::Pin;
         }
         // The Trash's items can only leave as copies, as with cut and paste, and so can Recent's.
         if self.copies_only() {
@@ -3853,12 +4154,16 @@ impl App {
             many => format!("{} items", many.len()),
         };
         let Some(t) = &d.target else { return what };
+        if t.pin.is_some() {
+            return if d.paths.len() == 1 { format!("Pin {what}") } else { format!("Pin {} folders", d.paths.len()) };
+        }
         let folder = t.dest.file_name().map_or_else(|| t.dest.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
         match self.drop_action(d, t) {
             DropAction::Move => format!("Move {what} to {folder}"),
             DropAction::Copy => format!("Copy {what} to {folder}"),
             DropAction::Link => format!("Link {what} in {folder}"),
             DropAction::Trash => format!("Move {what} to Trash"),
+            DropAction::Pin => format!("Pin {what}"),
         }
     }
 
@@ -3939,6 +4244,7 @@ impl App {
         d.target = target;
         if let Some(t) = &d.target
             && !t.trash
+            && t.pin.is_none()
             && !d.devices.contains_key(&t.dest)
         {
             d.devices.insert(t.dest.clone(), None);
@@ -3947,7 +4253,7 @@ impl App {
         let cursor = d.target.as_ref().map_or(Cursor::NoDrop, |t| match self.drop_action(&d, t) {
             DropAction::Move | DropAction::Trash => Cursor::Move,
             DropAction::Copy => Cursor::Copy,
-            DropAction::Link => Cursor::Alias,
+            DropAction::Link | DropAction::Pin => Cursor::Alias,
         });
         if d.wayland {
             // The compositor draws the cursor during its drags, and it decides by this.
@@ -4002,6 +4308,7 @@ impl App {
     }
 
     pub(crate) fn cancel_file_drag(&mut self) {
+        self.cancel_pin_drag();
         match self.file_drag.take() {
             Some(FileDrag::Active(d)) => {
                 if d.wayland {
@@ -4011,6 +4318,13 @@ impl App {
             }
             Some(FileDrag::Band(b)) => self.band_ended(&b),
             _ => {}
+        }
+    }
+
+    /// Puts a pin being carried back where it was, and forgets a press on one.
+    fn cancel_pin_drag(&mut self) {
+        if self.pin_drag.take().is_some() {
+            self.end_pin_drag();
         }
     }
 
@@ -4050,6 +4364,7 @@ impl App {
         if matches!(self.file_drag, Some(FileDrag::Band(_) | FileDrag::Pressed { .. })) {
             self.cancel_file_drag();
         }
+        self.cancel_pin_drag();
         if let Some(FileDrag::Active(d)) = &mut self.file_drag
             && d.wayland
         {
@@ -4115,7 +4430,7 @@ impl App {
         }
         if !i.moved {
             let refused = self.in_trash() || self.is_recent_view() || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some();
-            return (!refused).then(|| DropTarget { hit: Hit::None, dest: self.dir.clone(), trash: false });
+            return (!refused).then(|| DropTarget { hit: Hit::None, dest: self.dir.clone(), trash: false, pin: None });
         }
         let (x, y) = self.pointer;
         self.incoming_target_at(self.incoming_can_trash(i), x, y)
@@ -4124,6 +4439,10 @@ impl App {
     /// Where a drop from elsewhere would land. A folder or place under the pointer, and
     /// otherwise the folder showing.
     fn incoming_target_at(&mut self, can_trash: bool, x: i32, y: i32) -> Option<DropTarget> {
+        // Between places, it's pinned. Whether it's folders is only known once it's dropped.
+        if let Some(gap) = self.pin_gap_at(x, y) {
+            return Some(DropTarget { hit: Hit::PinGap(gap), dest: PathBuf::new(), trash: false, pin: Some(self.spot(gap)) });
+        }
         let hit = self.hit(x, y);
         match hit {
             Hit::Row(_) | Hit::ListEmpty if self.in_trash() || self.is_recent_view() => None,
@@ -4131,11 +4450,11 @@ impl App {
                 let l = self.listing.as_ref()?;
                 let id = *self.rows.get(row)?;
                 if l.kind(id).is_dirlike() {
-                    return Some(DropTarget { hit, dest: l.path(id), trash: false });
+                    return Some(DropTarget { hit, dest: l.path(id), trash: false, pin: None });
                 }
-                Some(DropTarget { hit: Hit::ListEmpty, dest: self.dir.clone(), trash: false })
+                Some(DropTarget { hit: Hit::ListEmpty, dest: self.dir.clone(), trash: false, pin: None })
             }
-            Hit::ListEmpty => Some(DropTarget { hit, dest: self.dir.clone(), trash: false }),
+            Hit::ListEmpty => Some(DropTarget { hit, dest: self.dir.clone(), trash: false, pin: None }),
             Hit::Place(i) => {
                 let place = self.places.get(i)?;
                 // A drive that isn't mounted has no folder to drop into yet, and Recent isn't a folder.
@@ -4147,7 +4466,7 @@ impl App {
                 if trash && !can_trash {
                     return None;
                 }
-                Some(DropTarget { hit, dest: place.path.clone(), trash })
+                Some(DropTarget { hit, dest: place.path.clone(), trash, pin: None })
             }
             _ => None,
         }
@@ -4178,6 +4497,9 @@ impl App {
         if t.trash {
             return DropAction::Trash;
         }
+        if t.pin.is_some() {
+            return DropAction::Pin;
+        }
         let Some(m) = &i.marker else {
             return if verb_is_move(i.can_copy, i.can_move) { DropAction::Move } else { DropAction::Copy };
         };
@@ -4194,6 +4516,7 @@ impl App {
         let folder = t.dest.file_name().map_or_else(|| t.dest.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
         match self.incoming_action(i, t) {
             DropAction::Trash => "Move to Trash".to_string(),
+            DropAction::Pin => "Pin to the sidebar".to_string(),
             DropAction::Move => format!("Move to {folder}"),
             DropAction::Copy => format!("Copy to {folder}"),
             DropAction::Link => format!("Link in {folder}"),
@@ -4211,6 +4534,7 @@ impl App {
         i.target = target;
         if let (Some(probe), Some(t)) = (&i.probe, &i.target)
             && !t.trash
+            && t.pin.is_none()
             && !i.devices.contains_key(&t.dest)
         {
             i.devices.insert(t.dest.clone(), None);
@@ -4259,7 +4583,7 @@ impl App {
         match self.incoming_target(&i) {
             Some(t) => {
                 let decided = i.marker.is_some().then(|| self.incoming_action(&i, &t));
-                self.cmds.push(Cmd::ReadDrop { dest: t.dest, trash: t.trash, decided });
+                self.cmds.push(Cmd::ReadDrop { dest: t.dest, trash: t.trash, decided, pin: t.pin });
             }
             None => self.cmds.push(Cmd::AbandonDrop),
         }
@@ -4270,6 +4594,28 @@ impl App {
     /// rule inside a window applies. A drop from another program copies unless that program
     /// only offers a move, because its keys and disks can't be seen from here.
     fn on_dropped(&mut self, d: Dropped) {
+        if let Some(at) = d.pin {
+            // Pinning leaves everything where it was. Hearing the drop finished, a program that
+            // only offered a move may delete its side, so only one that allows a copy, or another
+            // Gannet window, hears that. It's answered first: asking whether each item is a folder
+            // can hang on a disk that's stopped answering, and some compositors keep the pointer
+            // from every window until a drop is answered.
+            self.cmds.push(if d.can_copy || d.decided.is_some() { Cmd::FinishDrop } else { Cmd::AbandonDrop });
+            if d.paths.is_empty() {
+                self.notice("Couldn't get any folders from that drag".into());
+                return;
+            }
+            let hub = self.hub.clone();
+            let started = std::thread::Builder::new().name("gannet-pin".into()).spawn(move || {
+                let total = d.paths.len();
+                let folders: Vec<PathBuf> = d.paths.into_iter().filter(|p| p.is_dir()).collect();
+                hub.send(Msg::PinDropped { not_folders: total - folders.len(), folders, at });
+            });
+            if let Err(e) = started {
+                self.notice(format!("Couldn't pin those folders: {e}"));
+            }
+            return;
+        }
         match d.saved {
             Some(Ok(path)) => {
                 let name = path.file_name().map(|n| std::os::unix::ffi::OsStrExt::as_bytes(n).to_vec()).unwrap_or_default();
@@ -4362,6 +4708,9 @@ impl App {
                 let target = self.drop_target_at(&d, x, y);
                 self.end_active_drag(&d);
                 let Some(t) = target else { return };
+                if let Some(at) = t.pin {
+                    return self.pin_folders(d.paths, at);
+                }
                 let action = self.drop_action(&d, &t);
                 let (sources, dest) = (d.paths, t.dest);
                 self.start_job(match action {
@@ -4369,6 +4718,8 @@ impl App {
                     DropAction::Copy => Request::Copy { sources, dest },
                     DropAction::Link => Request::Link { sources, dest },
                     DropAction::Trash => Request::Trash { paths: sources },
+                    // Handled above, as it isn't a job.
+                    DropAction::Pin => return,
                 });
             }
             _ => {}
@@ -5412,7 +5763,7 @@ mod tests {
     }
 
     fn dropped(r: &Rig, names: &[&str], can_copy: bool, can_move: bool) -> Dropped {
-        Dropped { paths: names.iter().map(|n| r.root.join(n)).collect(), dest: r.root.join("work"), trash: false, can_copy, can_move, decided: None, all_local: true, saved: None, link: false }
+        Dropped { paths: names.iter().map(|n| r.root.join(n)).collect(), dest: r.root.join("work"), trash: false, can_copy, can_move, decided: None, all_local: true, saved: None, link: false, pin: None }
     }
 
     #[test]
@@ -5421,7 +5772,7 @@ mod tests {
         r.open(r.work());
         let saved = r.work().join("columns.png");
         fs::write(&saved, b"png").unwrap();
-        let base = Dropped { paths: Vec::new(), dest: r.work(), trash: false, can_copy: true, can_move: false, decided: None, all_local: false, saved: Some(Ok(saved)), link: false };
+        let base = Dropped { paths: Vec::new(), dest: r.work(), trash: false, can_copy: true, can_move: false, decided: None, all_local: false, saved: Some(Ok(saved)), link: false, pin: None };
         r.app.cmds.clear();
         r.app.on_msg(Msg::Dropped(base.clone()));
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::FinishDrop)), "the browser hears it was taken");
@@ -7819,5 +8170,387 @@ mod tests {
         assert!(r.app.cursor_shown);
         let l = r.app.listing.clone().unwrap();
         assert_eq!(l.name(r.app.rows[r.app.cursor]), b".h");
+    }
+
+    // ---- Pins ----
+
+    /// A window with Home, the folders in `pins` pinned in GTK's bookmarks file beside an
+    /// `sftp://` bookmark it doesn't show, and folders `d` and `e` and a file `f` showing.
+    fn pin_rig(tag: &str, pins: &[&str]) -> Rig {
+        let mut r = Rig::new(tag);
+        let home = r.root.join("home");
+        fs::create_dir_all(&home).unwrap();
+        r.app.standard_places = vec![Place { label: "Home".into(), path: home, kind: PlaceKind::Home, volume: None }];
+        r.app.places = r.app.standard_places.clone();
+        let mut text = String::new();
+        for (i, p) in pins.iter().enumerate() {
+            let dir = r.root.join("pins").join(p);
+            fs::create_dir_all(&dir).unwrap();
+            text.push_str(&format!("{}\n", gannet_core::uri::to_file_uri(&dir)));
+            if i == 0 {
+                text.push_str("sftp://server/srv Server\n");
+            }
+        }
+        fs::create_dir_all(r.root.join("config/gtk-3.0")).unwrap();
+        fs::write(r.bookmarks_file(), text).unwrap();
+        r.app.set_bookmarks(r.bookmarks_file());
+        for d in ["d", "e"] {
+            fs::create_dir_all(r.work().join(d)).unwrap();
+        }
+        fs::write(r.work().join("f"), b"f").unwrap();
+        r.open(r.work());
+        r
+    }
+
+    impl Rig {
+        fn bookmarks_file(&self) -> PathBuf {
+            self.root.join("config/gtk-3.0/bookmarks")
+        }
+
+        fn bookmarks(&self) -> String {
+            fs::read_to_string(self.bookmarks_file()).unwrap_or_default()
+        }
+
+        /// The pins, by name, as the file has them.
+        fn pinned(&self) -> Vec<String> {
+            gannet_core::bookmarks::read(&self.bookmarks_file()).iter().map(|p| p.name()).collect()
+        }
+
+        fn labels(&self) -> Vec<String> {
+            self.app.places.iter().map(|p| p.label.clone()).collect()
+        }
+
+        fn sidebar_x(&self) -> f64 {
+            (self.app.layout().sidebar.x + self.app.px(60.0)) as f64
+        }
+
+        /// The middle of place `i`'s row.
+        fn place_y(&self, i: usize) -> f64 {
+            (self.app.place_top(i) + self.app.px(15.0)) as f64
+        }
+
+        fn row_named(&self, name: &str) -> usize {
+            let l = self.app.listing.clone().unwrap();
+            self.app.rows.iter().position(|&i| l.name(i) == name.as_bytes()).unwrap()
+        }
+
+        /// Presses on a row and carries it into the window's sidebar, at `y`.
+        fn carry_to_sidebar(&mut self, name: &str, y: f64) {
+            let row = self.row_named(name);
+            press_on_row(self, row);
+            self.app.input(Input::Move { x: 540.0, y: 500.0 });
+            let x = self.sidebar_x();
+            self.app.input(Input::Move { x, y });
+        }
+
+        fn release(&mut self) {
+            self.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        }
+
+        fn drop_target(&self) -> Option<Hit> {
+            match &self.app.file_drag {
+                Some(FileDrag::Active(d)) => d.target.as_ref().map(|t| t.hit),
+                _ => None,
+            }
+        }
+
+        fn alt(&mut self, digit: &str) {
+            self.app.key(0, digit, Mods { alt: true, ..Mods::default() });
+        }
+    }
+
+    #[test]
+    fn pins_follow_the_standard_places_under_their_own_heading_and_alt_numbers_follow_them() {
+        let mut r = pin_rig("pins-shown", &["Projects", "Notes"]);
+        assert_eq!(r.labels(), ["Home", "Projects", "Notes"], "the sftp bookmark isn't shown");
+        assert_eq!(r.app.sidebar_headings(), [(0, "Places"), (1, "Pinned")]);
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        assert_eq!(&r.labels()[..4], ["Home", "Projects", "Notes", "PHOTOS"], "drives come after the pins");
+        assert_eq!(&r.app.sidebar_headings()[..3], [(0, "Places"), (1, "Pinned"), (3, "Devices")]);
+        r.alt("3");
+        assert_eq!(r.app.dir, r.root.join("pins/Notes"));
+        r.alt("4");
+        assert_eq!(r.app.dir, mount);
+    }
+
+    #[test]
+    fn a_pin_thats_gone_stays_in_the_sidebar_and_says_so_when_opened() {
+        let mut r = pin_rig("pins-missing", &["Projects", "Gone"]);
+        fs::remove_dir(r.root.join("pins/Gone")).unwrap();
+        r.app.bookmarks_changed();
+        assert_eq!(r.labels(), ["Home", "Projects", "Gone"]);
+        r.alt("3");
+        r.pump_until("tried", |a| !a.loading);
+        assert!(r.app.load_error.is_some(), "it says the folder can't be read");
+        r.alt("2");
+        r.pump_until("loaded", |a| !a.loading);
+        assert_eq!((r.app.dir.clone(), r.app.load_error.clone()), (r.root.join("pins/Projects"), None), "and the rest still work");
+    }
+
+    #[test]
+    fn dropping_a_folder_between_places_pins_it_and_leaves_it_where_it_is() {
+        let mut r = pin_rig("pins-drop", &[]);
+        // Just below Home, where the Pinned heading would be.
+        let below_home = (r.app.place_top(0) + r.app.px(30.0) + r.app.px(SIDEBAR_GAP) / 2) as f64;
+        r.carry_to_sidebar("d", below_home);
+        assert_eq!(r.drop_target(), Some(Hit::PinGap(0)));
+        let Some(FileDrag::Active(d)) = &r.app.file_drag else { panic!("no drag") };
+        assert_eq!(r.app.drag_label(d), "Pin “d”");
+        assert!(r.app.pin_bar().is_some(), "a bar marks where it lands");
+        r.release();
+        r.idle();
+        assert_eq!(r.pinned(), ["d"]);
+        assert!(r.work().join("d").is_dir(), "pinning never moves the folder");
+        assert_eq!(r.labels(), ["Home", "d"]);
+        assert_eq!(r.app.pin_bar(), None, "the bar goes with the drag");
+        // Over the middle of the pin, the folder goes into it as with any place.
+        let y = r.place_y(1);
+        r.carry_to_sidebar("e", y);
+        assert_eq!(r.drop_target(), Some(Hit::Place(1)));
+        // Near its top edge, it's pinned in front of it.
+        let (x, y) = (r.sidebar_x(), (r.app.place_top(1) + 2) as f64);
+        r.app.input(Input::Move { x, y });
+        assert_eq!(r.drop_target(), Some(Hit::PinGap(0)));
+        r.release();
+        assert_eq!(r.pinned(), ["e", "d"]);
+    }
+
+    #[test]
+    fn files_cant_be_pinned_and_a_folder_is_pinned_once() {
+        let mut r = pin_rig("pins-only-folders", &[]);
+        let gap = (r.app.place_top(0) + r.app.px(30.0) + r.app.px(SIDEBAR_GAP)) as f64;
+        r.carry_to_sidebar("f", gap);
+        assert_eq!(r.drop_target(), None, "a file has nowhere to go there");
+        r.release();
+        assert_eq!(r.pinned(), Vec::<String>::new());
+        r.carry_to_sidebar("d", gap);
+        r.release();
+        r.carry_to_sidebar("d", gap);
+        assert_eq!(r.drop_target(), None, "already pinned");
+        r.release();
+        assert_eq!(r.pinned(), ["d"]);
+        // A file and a folder together aren't pinned either.
+        r.select("e");
+        let f = r.row_named("f");
+        r.app.move_cursor(f, Mods { ctrl: true, ..Mods::default() });
+        r.carry_to_sidebar("f", gap + 40.0);
+        assert!(!matches!(r.drop_target(), Some(Hit::PinGap(_))));
+    }
+
+    #[test]
+    fn unpinning_from_its_menu_leaves_the_folder_and_other_bookmarks_alone() {
+        let mut r = pin_rig("pins-unpin", &["Projects", "Notes"]);
+        let (x, y) = (r.sidebar_x(), r.place_y(1));
+        r.app.input(Input::Move { x, y });
+        r.app.input(Input::Button { button: BTN_RIGHT, pressed: true });
+        let items: Vec<&str> = r.app.menu.as_ref().unwrap().items.iter().map(|i| i.label).collect();
+        assert_eq!(items, ["Open", "Unpin"]);
+        r.app.action(Action::Unpin);
+        assert_eq!(r.pinned(), ["Notes"]);
+        assert!(r.bookmarks().contains("sftp://server/srv Server"), "a line Gannet doesn't show is kept: {}", r.bookmarks());
+        assert!(r.root.join("pins/Projects").is_dir());
+        assert_eq!(r.labels(), ["Home", "Notes"]);
+    }
+
+    #[test]
+    fn another_program_changing_the_file_shows_in_the_sidebar() {
+        let mut r = pin_rig("pins-watch", &["Projects"]);
+        fs::create_dir_all(r.root.join("pins/New")).unwrap();
+        let more = format!("{}file://{} Named\n", r.bookmarks(), r.root.join("pins/New").display());
+        gannet_core::bookmarks::save(&r.bookmarks_file(), more.as_bytes()).unwrap();
+        r.app.bookmarks_changed();
+        assert_eq!(r.labels(), ["Home", "Projects", "Named"]);
+    }
+
+    /// Presses pin `i` (counting from the first pin) and carries it to `y`.
+    fn carry_pin(r: &mut Rig, i: usize, y: f64) {
+        let (first, _) = r.app.pins_at();
+        let (x, from) = (r.sidebar_x(), r.place_y(first + i));
+        r.app.input(Input::Move { x, y: from });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.input(Input::Move { x, y: from + 3.0 });
+        assert!(r.app.pin_drag.as_ref().is_some_and(|d| !d.active), "a small wobble isn't a drag");
+        r.app.input(Input::Move { x, y });
+    }
+
+    #[test]
+    fn a_click_on_a_pin_opens_it_and_a_drag_puts_it_elsewhere() {
+        let mut r = pin_rig("pins-reorder", &["A", "B", "C"]);
+        let (x, y) = (r.sidebar_x(), r.place_y(2));
+        r.app.input(Input::Move { x, y });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        assert_eq!(r.app.dir, r.work(), "not on the press, which may be a drag");
+        r.app.input(Input::Move { x: x + 2.0, y: y + 2.0 });
+        r.release();
+        assert_eq!(r.app.dir, r.root.join("pins/B"), "a click opens it");
+        // A to below C.
+        let below_c = r.place_y(3) + 12.0;
+        carry_pin(&mut r, 0, below_c);
+        assert!(r.app.carried_pin().is_some(), "it's dimmed while carried");
+        assert_eq!(r.app.pin_drag.as_ref().unwrap().gap, Some(3));
+        assert_eq!(r.app.pin_bar(), Some(r.app.place_top(3) + r.app.px(30.0)));
+        r.release();
+        assert_eq!(r.pinned(), ["B", "C", "A"]);
+        assert_eq!(r.app.dir, r.root.join("pins/B"), "carrying it didn't open it");
+        assert!(r.bookmarks().contains("sftp://server/srv Server"));
+        // The numbers follow the new order.
+        r.alt("4");
+        assert_eq!(r.app.dir, r.root.join("pins/A"));
+    }
+
+    #[test]
+    fn a_pin_only_moves_among_the_pins_and_never_moves_its_folder() {
+        let mut r = pin_rig("pins-stay", &["A", "B"]);
+        // Up over Home, which a folder dropped there would go into.
+        let home = r.place_y(0);
+        carry_pin(&mut r, 1, home);
+        assert_eq!(r.app.pin_drag.as_ref().unwrap().gap, Some(0), "it's held to the top of the pins");
+        r.release();
+        assert_eq!(r.pinned(), ["B", "A"]);
+        assert!(r.root.join("pins/A").is_dir() && !r.root.join("home/A").exists());
+        // Out over the list, it goes to the end.
+        carry_pin(&mut r, 0, 500.0);
+        r.app.input(Input::Move { x: 540.0, y: 500.0 });
+        r.release();
+        assert_eq!(r.pinned(), ["A", "B"]);
+        assert!(r.app.jobs.is_empty());
+    }
+
+    #[test]
+    fn escape_puts_a_carried_pin_back() {
+        let mut r = pin_rig("pins-escape", &["A", "B"]);
+        let below = r.place_y(2) + 12.0;
+        carry_pin(&mut r, 0, below);
+        r.key(k::KEY_Escape, "");
+        assert!(r.app.pin_drag.is_none() && r.app.pin_bar().is_none());
+        r.release();
+        assert_eq!(r.pinned(), ["A", "B"]);
+        assert_eq!(r.app.dir, r.work(), "and the release doesn't open it");
+    }
+
+    #[test]
+    fn pins_changed_elsewhere_during_a_drag_are_kept() {
+        let mut r = pin_rig("pins-meanwhile", &["A", "B"]);
+        let below = r.place_y(2) + 12.0;
+        carry_pin(&mut r, 0, below);
+        // Another window pins C at the end meanwhile.
+        fs::create_dir_all(r.root.join("pins/C")).unwrap();
+        let more = format!("{}file://{}\n", r.bookmarks(), r.root.join("pins/C").display());
+        gannet_core::bookmarks::save(&r.bookmarks_file(), more.as_bytes()).unwrap();
+        r.app.bookmarks_changed();
+        assert_eq!(r.app.hover, Hit::None, "the carried pin keeps the pointer");
+        assert_eq!(r.app.pointer_cursor, Cursor::Move);
+        r.release();
+        assert_eq!(r.pinned(), ["B", "A", "C"], "A lands where its bar was, and C stays");
+        // The pin carried being unpinned elsewhere ends the drag, and doesn't bring it back.
+        let below = r.place_y(3) + 12.0;
+        carry_pin(&mut r, 0, below);
+        let fewer = r.bookmarks().lines().filter(|l| !l.ends_with("/pins/B")).map(|l| format!("{l}\n")).collect::<String>();
+        gannet_core::bookmarks::save(&r.bookmarks_file(), fewer.as_bytes()).unwrap();
+        r.app.bookmarks_changed();
+        assert!(r.app.pin_drag.is_none());
+        r.release();
+        assert_eq!(r.pinned(), ["A", "C"]);
+    }
+
+    #[test]
+    fn a_drag_from_elsewhere_pins_only_after_it_has_really_moved() {
+        // Hyprland reports the middle of the window when a drag arrives (DataDevice.cpp:713),
+        // which can be anywhere. Here it says the space below Home, where a drop would pin.
+        let mut r = pin_rig("pins-incoming", &[]);
+        let (x, gap) = (r.sidebar_x(), (r.app.place_top(0) + r.app.px(40.0)) as f64);
+        r.app.input(Input::DragEnter { picture: false, x, y: gap, files: true, can_copy: true, can_move: true, marker: None });
+        assert!(r.app.pin_bar().is_none(), "nothing lights up from that first position");
+        r.app.cmds.clear();
+        r.app.input(Input::DragDrop);
+        let work = r.work();
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadDrop { dest, pin: None, .. } if *dest == work)), "a drop right away goes to the folder showing");
+        // With a real motion there, it pins.
+        r.app.input(Input::DragEnter { picture: false, x, y: gap, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragMove { x, y: gap });
+        let i = r.app.incoming.as_ref().unwrap();
+        assert_eq!(r.app.incoming_label(i, i.target.as_ref().unwrap()), "Pin to the sidebar");
+        assert!(r.app.pin_bar().is_some());
+        r.app.cmds.clear();
+        r.app.input(Input::DragDrop);
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadDrop { pin: Some(Spot::End), .. })));
+    }
+
+    #[test]
+    fn a_drop_from_elsewhere_pins_its_folders_and_answers_at_once() {
+        let mut r = pin_rig("pins-dropped", &[]);
+        let dropped = |r: &Rig, names: &[&str], can_copy: bool| Dropped { paths: names.iter().map(|n| r.work().join(n)).collect(), dest: PathBuf::new(), trash: false, can_copy, can_move: true, decided: None, all_local: true, saved: None, link: false, pin: Some(Spot::End) };
+        // Hyprland refuses the pointer to every window until a drop is finished
+        // (SeatManager.cpp:352), so the answer goes out before anything is asked of the disk,
+        // which could hang.
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::Dropped(dropped(&r, &["d", "f"], true)));
+        assert_eq!(answered(&r.app), (true, false));
+        assert_eq!(r.pinned(), Vec::<String>::new(), "the folders are only known a moment later");
+        r.pump_until("pinned", |a| a.pins.len() == 1);
+        assert_eq!(r.pinned(), ["d"]);
+        assert_eq!(r.app.notices, ["Only folders can be pinned"]);
+        assert!(r.work().join("d").is_dir() && r.work().join("f").is_file());
+        // An app that only offers a move could delete its side on hearing the drop worked.
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::Dropped(dropped(&r, &["e"], false)));
+        assert_eq!(answered(&r.app), (false, true));
+        r.pump_until("pinned", |a| a.pins.len() == 2);
+        assert_eq!(r.pinned(), ["d", "e"]);
+    }
+
+    #[test]
+    fn nothing_is_pinned_under_a_dialog() {
+        let mut r = pin_rig("pins-modal", &[]);
+        let (x, gap) = (r.sidebar_x(), (r.app.place_top(0) + r.app.px(40.0)) as f64);
+        r.app.dialog = Some(Dialog::ConfirmQuit { at: 1 });
+        r.app.input(Input::DragEnter { picture: false, x, y: gap, files: true, can_copy: true, can_move: true, marker: None });
+        r.app.input(Input::DragMove { x, y: gap });
+        assert!(r.app.incoming.as_ref().unwrap().target.is_none(), "the dialog takes no drop");
+        assert!(r.app.pin_bar().is_none());
+    }
+
+    #[test]
+    fn a_folder_already_in_the_sidebar_drops_on_whats_under_it() {
+        let mut r = pin_rig("pins-already", &[]);
+        let trash = r.root.join("data/Trash/files");
+        r.app.places.push(Place { label: "Trash".into(), path: trash, kind: PlaceKind::Trash, volume: None });
+        r.app.standard_places = r.app.places.clone();
+        r.app.bookmarks_changed();
+        // Near Trash's bottom edge a new folder is pinned, and a pinned one goes to the Trash.
+        let edge = (r.app.place_top(1) + r.app.px(30.0) - 2) as f64;
+        r.carry_to_sidebar("d", edge);
+        assert_eq!(r.drop_target(), Some(Hit::PinGap(0)));
+        r.release();
+        r.carry_to_sidebar("d", edge);
+        assert_eq!(r.drop_target(), Some(Hit::Place(1)), "it's already pinned");
+        r.app.cancel_file_drag();
+        // A standard place pinned in the file, as some desktops do for GTK's dialogs, shows once.
+        let home = gannet_core::uri::to_file_uri(&r.root.join("home"));
+        let text = format!("{home}\n{}", r.bookmarks());
+        gannet_core::bookmarks::save(&r.bookmarks_file(), text.as_bytes()).unwrap();
+        r.app.bookmarks_changed();
+        assert_eq!(r.labels(), ["Home", "Trash", "d"]);
+    }
+
+    #[test]
+    fn a_folder_carried_out_and_back_pins_only_after_a_motion() {
+        let mut r = pin_rig("pins-back", &[]);
+        let row = r.row_named("d");
+        press_on_row(&mut r, row);
+        r.app.input(Input::Move { x: -5.0, y: 200.0 });
+        r.app.input(Input::Leave);
+        let (x, gap) = (r.sidebar_x(), (r.app.place_top(0) + r.app.px(40.0)) as f64);
+        r.app.input(Input::DragEnter { picture: false, x, y: gap, files: true, can_copy: true, can_move: true, marker: None });
+        assert!(r.app.pin_bar().is_none());
+        r.app.input(Input::DragMove { x, y: gap });
+        assert_eq!(r.drop_target(), Some(Hit::PinGap(0)));
+        r.app.cmds.clear();
+        r.app.input(Input::DragDrop);
+        assert_eq!(r.pinned(), ["d"]);
+        assert_eq!(answered(&r.app), (true, false));
+        assert!(r.work().join("d").is_dir());
     }
 }
