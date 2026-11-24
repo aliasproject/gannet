@@ -1669,6 +1669,154 @@ def a_screen_reader_hears_pins_scrolled_places_and_search_results(h):
         sr.stop()
 
 
+@check
+def a_screen_reader_reads_and_edits_the_text_fields(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"docs/apple.txt": "a", "docs/apricot.txt": "a", "docs/banana.txt": "b", "other/x.txt": "x"})
+    sr = ScreenReader()
+
+    def heard(kind, timeout=8):
+        got = sr.until("events", lambda e: any(x["type"].startswith(kind) for x in e), f"{kind} heard", timeout)
+        time.sleep(0.2)
+        return got + sr.ask("events")
+
+    def one(name):
+        return next(f for f in sr.ask("fields") if f["name"].startswith(name))
+
+    try:
+        env = {"DBUS_SESSION_BUS_ADDRESS": sr.session.address}
+        a = App(h, fs / "docs", extra_env=env)
+        a.wait(lambda s: s["names"] == ["apple.txt", "apricot.txt", "banana.txt"], "listed")
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered")
+        assert sr.ask("fields") == [], "no field shows until one's opened"
+
+        # The filter box: its role, what it does, and focus moving into it.
+        sr.ask("events")
+        a.key("slash")
+        a.wait(lambda s: s["edit"] == "filter:", "the filter box")
+        e = heard("object:state-changed:focused")
+        assert [x["source"] for x in e if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Filter"], e
+        assert any(x["type"].startswith("object:children-changed:add") and x["source"] == "docs - Gannet" for x in e), e
+        f = one("Filter")
+        assert (f["role"], f["description"], f["text"], f["editable"], f["single_line"], f["focused"]) == ("entry", "Filter this folder", "", True, True, True), f
+        assert "Text" in f["interfaces"] and "EditableText" in f["interfaces"], f["interfaces"]
+
+        # Typing is heard as text going in, and the caret moving after it.
+        a.type("ap")
+        a.wait(lambda s: s["names"] == ["apple.txt", "apricot.txt"], "filtered")
+        e = heard("object:text-caret-moved")
+        assert [x["text"] for x in e if x["type"].startswith("object:text-changed:insert")] == ["a", "p"], e
+        assert [x["detail1"] for x in e if x["type"] == "object:text-caret-moved"][-1] == 2, e
+        f = one("Filter")
+        assert (f["text"], f["count"], f["caret"], f["selections"]) == ("ap", 2, 2, []), f
+        # Each character has its box, left to right on the box's line.
+        boxes, (fx, fy, fw, fh) = f["boxes"], f["rect"]
+        assert len(boxes) == 2 and boxes[0][0] >= fx and boxes[0][0] + boxes[0][2] <= boxes[1][0] and boxes[1][0] + boxes[1][2] <= fx + fw, (boxes, f["rect"])
+        assert all(b[2] > 0 and fy <= b[1] and b[1] + b[3] <= fy + fh for b in boxes), (boxes, f["rect"])
+
+        # Changing it through AT-SPI is as typing: the list follows, and the change is heard.
+        sr.ask("events")
+        assert sr.ask("insert Filter 2 r") is True
+        a.wait(lambda s: s["edit"] == "filter:apr" and s["names"] == ["apricot.txt"], "the filter typed into through AT-SPI")
+        e = heard("object:text-changed:insert")
+        assert [(x["text"], x["detail1"], x["detail2"]) for x in e if x["type"].startswith("object:text-changed:insert")] == [("r", 2, 1)], e
+        assert sr.ask("delete Filter 0 3") is True
+        a.wait(lambda s: s["edit"] == "filter:" and len(s["names"]) == 3, "the filter emptied through AT-SPI")
+        e = heard("object:text-changed:delete")
+        assert [(x["text"], x["detail1"]) for x in e if x["type"].startswith("object:text-changed:delete")] == [("apr", 0)], e
+
+        # Ctrl+F in the box makes it a search: its name and description say so.
+        sr.ask("events")
+        a.key("f", mods=["ctrl"])
+        e = heard("object:property-change:accessible-description")
+        f = one("Search")
+        assert (f["name"], f["description"]) == ("Search", "Search here and below"), f
+        a.key("f", mods=["ctrl"])
+        sr.until("fields", lambda fs: [x["name"] for x in fs] == ["Filter"], "a filter again")
+
+        # Leaving the box with Down leaves it showing what it filters by, and moves focus out;
+        # moving a screen reader to it opens it again.
+        a.type("b")
+        a.wait(lambda s: s["names"] == ["banana.txt"], "filtered to b")
+        sr.ask("events")
+        a.key("Down")
+        a.wait(lambda s: s["edit"] == "none" and s["cursor_shown"], "in the list")
+        e = heard("object:state-changed:focused")
+        focus = [(x["source"], x["detail1"]) for x in e if x["type"] == "object:state-changed:focused"]
+        assert ("banana.txt", 1) in focus and ("Filter", 0) in focus, focus
+        f = one("Filter")
+        assert (f["text"], f["focused"]) == ("b", False), f
+        assert sr.ask("focus_field Filter") is True
+        a.wait(lambda s: s["edit"] == "filter:b", "the box opened through AT-SPI")
+        sr.until("fields", lambda fs: fs[0]["focused"], "the box focused")
+        a.key("Escape")
+        a.wait(lambda s: s["edit"] == "none" and len(s["names"]) == 3, "the filter ended")
+        sr.until("fields", lambda fs: fs == [], "the box gone")
+
+        # Renaming: the field says what's renamed, starts with the name's stem selected, and
+        # reads by word.
+        a.key("Home")
+        a.wait(lambda s: s["cursor"] == 0 and s["cursor_shown"], "on apple.txt")
+        sr.ask("events")
+        a.key("F2")
+        a.wait(lambda s: s["edit"] == "rename:apple.txt", "renaming")
+        e = heard("object:state-changed:focused")
+        assert [x["source"] for x in e if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Rename apple.txt"], e
+        f = one("Rename")
+        assert (f["text"], f["selections"], f["caret"]) == ("apple.txt", [[0, 5]], 5), f
+        assert sr.ask("word Rename 1") == ["apple.", 0, 6], "a word and what follows it up to the next"
+        # A row's field is on its row, where it's drawn, and its characters are in it.
+        (rx, ry, rw, rh) = f["rect"]
+        assert row_y(0) - 20 < ry < row_y(0) < ry + rh and rx < ROW_X < rx + rw, (f["rect"], row_y(0))
+        assert all(rx < b[0] and b[0] + b[2] < rx + rw and ry <= b[1] and b[1] + b[3] <= ry + rh for b in f["boxes"]), f
+        a.shot("a11y-rename-field")
+
+        # Moving the caret and selecting through AT-SPI is heard, and typing then replaces
+        # what's selected, as on the keyboard.
+        sr.ask("events")
+        assert sr.ask("caret Rename 0") is True
+        e = heard("object:text-caret-moved")
+        assert [x["detail1"] for x in e if x["type"] == "object:text-caret-moved"] == [0], e
+        assert any(x["type"] == "object:text-selection-changed" for x in e), e
+        assert sr.ask("select Rename 0 5") is True
+        sr.until("fields", lambda fs: fs[0]["selections"] == [[0, 5]], "selected through AT-SPI")
+        a.type("pear")
+        a.wait(lambda s: s["edit"] == "rename:pear.txt", "typed over the selection")
+        assert one("Rename")["text"] == "pear.txt"
+        a.key("Return")
+        a.wait(lambda s: "pear.txt" in s["names"], "renamed")
+        sr.until("fields", lambda fs: fs == [], "the field gone")
+
+        # A new folder's name, set whole through AT-SPI, then made with Enter.
+        a.key("n", mods=["ctrl", "shift"])
+        a.wait(lambda s: s["edit"] == "newfolder:New Folder", "naming a new folder")
+        assert one("New folder")["selections"] == [[0, 10]]
+        assert sr.ask("set_text New Report") is True
+        a.wait(lambda s: s["edit"] == "newfolder:Report", "named through AT-SPI")
+        a.key("Return")
+        a.wait(lambda s: "Report" in s["names"], "the folder made")
+
+        # The typed path: all of it selected to start with, and replaced through AT-SPI.
+        a.key("l", mods=["ctrl"])
+        a.wait(lambda s: s["edit"].startswith("path:"), "typing a path")
+        f = one("Path")
+        assert (f["text"], f["selections"], f["focused"]) == (str(fs / "docs"), [[0, len(str(fs / "docs"))]], True), f
+        assert f["description"] == "Enter a full path, starting with / or ~", f
+        assert sr.ask(f"set_text Path {fs / 'other'}") is True
+        a.wait(lambda s: s["edit"] == f"path:{fs / 'other'}", "the path set through AT-SPI")
+        sr.ask("events")
+        a.key("Return")
+        a.wait(lambda s: s["names"] == ["x.txt"], "went there")
+        e = heard("object:children-changed:remove")
+        assert any(x["source"] == "other - Gannet" or x["source"] == "docs - Gannet" for x in e if x["type"].startswith("object:children-changed:remove")), e
+        assert sr.ask("fields") == []
+        a.close()
+    finally:
+        sr.stop()
+
+
 PORTAL = ["org.freedesktop.impl.portal.desktop.gannet", "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser"]
 
 

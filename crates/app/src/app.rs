@@ -1387,11 +1387,7 @@ impl App {
                 }
                 if let Some(f) = self.field_mut() {
                     f.insert(&line);
-                    self.apply_filter_field();
-                    if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
-                        d.update();
-                    }
-                    self.invalidate_all();
+                    self.field_edited();
                 }
             }
         }
@@ -1501,7 +1497,7 @@ impl App {
     /// Does what a screen reader asked. A request about a row in a folder the window has
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
-        use crate::a11y::{Act, BACK};
+        use crate::a11y::{Act, BACK, FILTER, NAME_FIELD, PATH_FIELD};
         // As with the pointer: nothing behind a dialog can be used, and anything outside a menu
         // only closes it, so the menu never acts on a selection changed under it.
         if self.dialog.is_some() || matches!(act, Act::Wake) {
@@ -1515,7 +1511,35 @@ impl App {
             let l = app.listing.as_ref().filter(|_| app.dir == dir)?;
             app.rows.iter().position(|&e| *l.key(e) == *key)
         };
+        // Pressing something, or moving to a row, ends an edit as clicking there would.
+        if matches!(act, Act::Press(_) | Act::OpenPlace(_) | Act::FocusRow(..) | Act::SelectRow(..)) {
+            self.leave_field();
+        }
         match act {
+            Act::Focus(FILTER) => {
+                if !matches!(self.edit, Edit::Filter(_)) && self.filter_rect().is_some() {
+                    self.leave_field();
+                    self.start_filter("");
+                }
+            }
+            // The other fields show only while they have the keyboard.
+            Act::Focus(_) => {}
+            Act::EditText(id, edit_gen, op) => {
+                let ours = match (&self.edit, id) {
+                    (Edit::Path(_), PATH_FIELD) | (Edit::Filter(_), FILTER) => true,
+                    (Edit::Rename { .. } | Edit::NewFolder(_), NAME_FIELD) => edit_gen == self.edit_gen,
+                    _ => false,
+                };
+                // Changing the filter box's text while it shows but isn't typed in opens it first,
+                // as clicking it does.
+                if !ours && id == FILTER && self.filter_rect().is_some() {
+                    self.leave_field();
+                    self.start_filter("");
+                } else if !ours {
+                    return;
+                }
+                self.a11y_edit(op);
+            }
             Act::Press(BACK) => self.go_back(),
             Act::Press(_) | Act::Wake => {}
             Act::OpenPlace(i) => {
@@ -1545,6 +1569,42 @@ impl App {
                 }
             }
         }
+    }
+
+    /// A screen reader's change to the field with the keyboard, made as the keys making it
+    /// would be.
+    fn a11y_edit(&mut self, op: crate::a11y::TextEdit) {
+        use crate::a11y::TextEdit;
+        let edit_gen = self.edit_gen;
+        let Some(f) = self.field_mut() else { return };
+        match op {
+            TextEdit::Caret(at) => f.select_chars(at, at),
+            TextEdit::Select(from, to) => f.select_chars(from, to),
+            TextEdit::Replace(from, to, with) => f.replace_chars(from, to, &with),
+            TextEdit::Copy(from, to) | TextEdit::Cut(from, to) => {
+                let (a, b) = (f.byte_of(from.min(to)), f.byte_of(from.max(to)));
+                let text = f.text[a..b].to_string();
+                if matches!(op, TextEdit::Cut(..)) {
+                    f.replace_chars(from, to, "");
+                }
+                if !text.is_empty() {
+                    self.copy_text(text);
+                }
+                if matches!(op, TextEdit::Copy(..)) {
+                    return;
+                }
+            }
+            TextEdit::Paste(at) => {
+                f.select_chars(at, at);
+                self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: edit_gen }));
+            }
+        }
+        self.field_edited();
+    }
+
+    /// Which rename or new folder is under way: each starts a new one.
+    pub fn edit_gen(&self) -> u64 {
+        self.edit_gen
     }
 
     pub fn is_selected(&self, id: u32) -> bool {
@@ -3609,14 +3669,12 @@ impl App {
             f.text[a..b].to_string()
         });
         if m.ctrl && matches!(sym, k::KEY_c | k::KEY_x) && selected.as_ref().is_some_and(|t| !t.is_empty()) {
-            let t = selected.unwrap_or_default().into_bytes();
-            self.cmds.push(Cmd::SetClipboard(vec![(clipboard::TEXT, t.clone()), (clipboard::TEXT_PLAIN, t.clone()), (clipboard::UTF8_STRING, t)]));
+            self.copy_text(selected.unwrap_or_default());
             if sym == k::KEY_x
                 && let Some(f) = self.field_mut()
             {
                 f.backspace(false);
-                self.apply_filter_field();
-                self.invalidate_all();
+                self.field_edited();
             }
             return;
         }
@@ -3656,8 +3714,34 @@ impl App {
                 }
             }
         }
+        self.field_edited();
+    }
+
+    /// Puts a field's text on the clipboard, as Ctrl+C in one does.
+    fn copy_text(&mut self, t: String) {
+        let t = t.into_bytes();
+        self.cmds.push(Cmd::SetClipboard(vec![(clipboard::TEXT, t.clone()), (clipboard::TEXT_PLAIN, t.clone()), (clipboard::UTF8_STRING, t)]));
+    }
+
+    /// Follows a change to the text, caret or selection of the field with the keyboard,
+    /// whatever made it: the filter narrows the list, and the rename dialog shows the new names.
+    fn field_edited(&mut self) {
         self.apply_filter_field();
+        if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
+            d.update();
+        }
         self.invalidate_all();
+    }
+
+    /// Ends an edit as a click elsewhere does. That commits a rename or new folder, as other
+    /// file managers do, drops a typed path, and keeps what was typed for a filter.
+    fn leave_field(&mut self) {
+        match self.edit {
+            Edit::None => {}
+            Edit::Path(_) => self.field_cancel(),
+            Edit::Rename { .. } | Edit::NewFolder(_) => self.field_commit(),
+            Edit::Filter(_) => self.set_edit(Edit::None),
+        }
     }
 
     fn field_cancel(&mut self) {
@@ -4175,13 +4259,8 @@ impl App {
             _ => {}
         }
         // A click anywhere else ends an edit and keeps what was typed for a filter.
-        if !matches!(hit, Hit::PathBar | Hit::FilterBox) && !matches!(self.edit, Edit::None) {
-            // A click away commits a rename or new folder, as other file managers do.
-            match self.edit {
-                Edit::Path(_) => self.field_cancel(),
-                Edit::Rename { .. } | Edit::NewFolder(_) => self.field_commit(),
-                _ => self.set_edit(Edit::None),
-            }
+        if !matches!(hit, Hit::PathBar | Hit::FilterBox) {
+            self.leave_field();
         }
         if button == BTN_RIGHT {
             if self.menu.is_some() {
@@ -4317,12 +4396,10 @@ impl App {
 
     fn click_in_field(&mut self, x: i32) {
         let r = if matches!(self.edit, Edit::Filter(_)) { self.filter_rect().unwrap_or_default() } else { self.path_box() };
-        let text = self.field_mut().map(|f| (f.text.clone(), f.caret));
-        let Some((text, caret)) = text else { return };
+        let Some(f) = self.field_mut().map(|f| f.clone()) else { return };
         // The same scroll the painter applies when the text is longer than the box.
-        let inner = r.w - self.px(16.0);
-        let shift = (self.text.measure(&text[..caret]) - inner as f32 + 2.0).max(0.0);
-        let at = self.text.offset_at(&text, (x - r.x - self.px(8.0)) as f32 + shift);
+        let x0 = self.field_text_x(r, &f);
+        let at = self.text.offset_at(&f.text, x as f32 - x0);
         if let Some(f) = self.field_mut() {
             f.move_to(at, false);
         }
@@ -5866,6 +5943,123 @@ mod tests {
         r.app.on_msg(Msg::Clipboard(Some(b"junk".to_vec()), clipboard::TEXT.to_string(), asked));
         let Edit::Rename { field, .. } = &r.app.edit else { panic!() };
         assert_eq!(field.text, "a");
+    }
+
+    // ---- Screen readers and text fields ----
+
+    fn a11y_edit(r: &mut Rig, id: u64, op: crate::a11y::TextEdit) {
+        let edit_gen = r.app.edit_gen;
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(id, edit_gen, op)));
+    }
+
+    fn field_text(r: &Rig) -> (String, usize, usize) {
+        let f = match &r.app.edit {
+            Edit::Path(f) | Edit::Filter(f) | Edit::NewFolder(f) | Edit::Rename { field: f, .. } => f,
+            Edit::None => panic!("no field open"),
+        };
+        (f.text.clone(), f.anchor, f.caret)
+    }
+
+    #[test]
+    fn a_screen_reader_edits_a_rename_as_typing_would() {
+        use crate::a11y::{NAME_FIELD, TextEdit};
+        let mut r = Rig::new("a11y-rename");
+        fs::write(r.work().join("café.txt"), "x").unwrap();
+        r.open(r.work());
+        r.select("café.txt");
+        r.key(k::KEY_F2, "");
+        // Counted in characters: é is two bytes.
+        assert_eq!(field_text(&r), ("café.txt".into(), 0, 5), "the stem selected, as for typing");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Replace(0, 4, "tea\n".into()));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 3, 3), "the stem replaced, and no line break in a name");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Select(4, 7));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 4, 7));
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Copy(4, 7));
+        assert!(matches!(r.app.cmds.last(), Some(Cmd::SetClipboard(offers)) if offers[0].1 == b"txt"), "copied as Ctrl+C copies");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Caret(99));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 7, 7), "a caret past the end stays at the end");
+        // A request about an earlier rename is dropped.
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(NAME_FIELD, r.app.edit_gen - 1, TextEdit::Replace(0, 7, "no".into()))));
+        assert_eq!(field_text(&r).0, "tea.txt");
+        // Moving to a row ends the rename as clicking there does: it's made.
+        let key = r.app.listing.as_ref().unwrap().key(r.app.rows[0]).into_owned();
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::FocusRow(Arc::new(r.work()), key)));
+        assert!(matches!(r.app.edit, Edit::None));
+        r.idle();
+        assert!(r.work().join("tea.txt").exists());
+    }
+
+    #[test]
+    fn a_screen_reader_types_in_the_filter_box() {
+        use crate::a11y::{FILTER, PATH_FIELD, TextEdit};
+        let mut r = Rig::new("a11y-filter");
+        for n in ["apple", "apricot", "banana"] {
+            fs::write(r.work().join(n), "x").unwrap();
+        }
+        r.open(r.work());
+        // No box showing: nothing to type in.
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "ap".into()));
+        assert!(matches!(r.app.edit, Edit::None) && r.app.filter.is_empty());
+        r.key(0, "/");
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "ap".into()));
+        assert_eq!(r.row_names(), ["apple", "apricot"], "the list narrows as it does for typing");
+        // Left showing with what it filters by, the box opens again when it's changed.
+        r.key(k::KEY_Down, "");
+        assert!(matches!(r.app.edit, Edit::None));
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(1, 2, "".into()));
+        assert_eq!((field_text(&r).0.as_str(), r.row_names().len()), ("a", 3));
+        // A path request goes nowhere while the path isn't being typed.
+        a11y_edit(&mut r, PATH_FIELD, TextEdit::Replace(0, 1, "/".into()));
+        assert_eq!(field_text(&r).0, "a");
+        // Moving to the box opens it, as clicking it does.
+        r.key(k::KEY_Tab, "");
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::Focus(FILTER)));
+        assert!(matches!(r.app.edit, Edit::Filter(_)));
+    }
+
+    #[test]
+    fn the_snapshot_has_the_fields_and_where_their_characters_are() {
+        use crate::a11y::{FILTER, FRAME, Focus, Link, NAME_FIELD, PATH_FIELD, Role};
+        let mut r = Rig::new("a11y-fields");
+        fs::write(r.work().join("notes.txt"), "x").unwrap();
+        r.open(r.work());
+        let mut link = Link::new();
+        let s = link.build(&mut r.app);
+        assert!(s.get(PATH_FIELD).is_none() && s.get(FILTER).is_none() && s.get(NAME_FIELD).is_none());
+
+        r.ctrl(k::KEY_f);
+        let s = link.build(&mut r.app);
+        let n = s.get(FILTER).expect("the search box");
+        assert_eq!((n.role, n.name.as_str(), n.description.as_str()), (Role::Entry, "Search", "Search here and below"));
+        assert_eq!(s.focus, Focus::Node(FILTER));
+        r.ctrl(k::KEY_f);
+        let s = link.build(&mut r.app);
+        let n = s.get(FILTER).unwrap();
+        assert_eq!((n.name.as_str(), n.description.as_str()), ("Filter", "Filter this folder"), "Ctrl+F in the box turns it to a filter");
+        r.key(k::KEY_Escape, "");
+
+        r.select("notes.txt");
+        r.key(k::KEY_F2, "");
+        let s = link.build(&mut r.app);
+        let n = s.get(NAME_FIELD).expect("the rename field");
+        assert_eq!((n.name.as_str(), n.field.as_ref().unwrap().text.as_str()), ("Rename notes.txt", "notes.txt"));
+        assert_eq!(s.focus, Focus::Node(NAME_FIELD));
+        assert_eq!(s.get(FRAME).unwrap().children.last(), Some(&NAME_FIELD));
+        // Its characters are on its row. Tests have no fonts to measure them with: the e2e
+        // check sees them left to right.
+        let g = s.geometry(NAME_FIELD).unwrap();
+        assert_eq!(g.edges.len(), "notes.txt".len() + 1);
+        let row = r.app.layout().list;
+        assert!(n.rect.y >= row.y && n.rect.bottom() <= row.y + r.app.layout().row_h + 1, "{:?}", n.rect);
+        assert!(g.edges[0] >= n.rect.x && *g.edges.last().unwrap() <= n.rect.right());
+        r.key(k::KEY_Escape, "");
+
+        r.ctrl(k::KEY_l);
+        let s = link.build(&mut r.app);
+        let n = s.get(PATH_FIELD).expect("the typed path");
+        assert_eq!(n.field.as_ref().unwrap().text, r.work().to_string_lossy());
+        assert_eq!(s.focus, Focus::Node(PATH_FIELD));
+        assert_eq!(&s.get(FRAME).unwrap().children[..2], &[crate::a11y::BACK, PATH_FIELD]);
     }
 
     fn type_in(r: &mut Rig, text: &str) {

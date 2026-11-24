@@ -23,8 +23,9 @@ use gannet_core::bus::{Bus, zbus};
 use zbus::message::{Body, Header, Type};
 use zbus::{MatchRule, Message, OwnedObjectPath, Variant};
 
-use crate::a11y::{self, Act, Node, Role, Rows, Shared, Snapshot, ToServer};
+use crate::a11y::{self, Act, Node, Role, Rows, Shared, Snapshot, TextEdit, ToServer};
 use crate::app::{Hub, Msg};
+use crate::field::Field;
 
 const ROOT: &str = "/org/a11y/atspi/accessible/root";
 const PREFIX: &str = "/org/a11y/atspi/accessible/";
@@ -36,6 +37,8 @@ const APPLICATION: &str = "org.a11y.atspi.Application";
 const COMPONENT: &str = "org.a11y.atspi.Component";
 const ACTION: &str = "org.a11y.atspi.Action";
 const SELECTION: &str = "org.a11y.atspi.Selection";
+const TEXT: &str = "org.a11y.atspi.Text";
+const EDITABLE_TEXT: &str = "org.a11y.atspi.EditableText";
 const PROPS: &str = "org.freedesktop.DBus.Properties";
 const OBJECT_EVENT: &str = "org.a11y.atspi.Event.Object";
 const WINDOW_EVENT: &str = "org.a11y.atspi.Event.Window";
@@ -45,6 +48,9 @@ const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 // AtspiRole and AtspiStateType numbers.
 const ROLE_APPLICATION: u32 = 75;
 const STATE_ACTIVE: u32 = 1;
+const STATE_EDITABLE: u32 = 7;
+const STATE_SINGLE_LINE: u32 = 26;
+const STATE_SELECTABLE_TEXT: u32 = 38;
 const STATE_ENABLED: u32 = 8;
 const STATE_FOCUSABLE: u32 = 11;
 const STATE_FOCUSED: u32 = 12;
@@ -197,7 +203,70 @@ fn role_of(r: Role) -> (u32, &'static str) {
         Role::List => (31, "list"),
         Role::ListItem => (32, "list item"),
         Role::PushButton => (43, "push button"),
+        Role::Entry => (79, "entry"),
     }
+}
+
+/// How much of a field's text a screen reader asks for at a time.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Unit {
+    Char,
+    /// A word and what follows it up to the next one.
+    Word,
+    /// All of it.
+    Line,
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric()
+}
+
+/// The piece of text around a character, in characters: where it starts and where it ends.
+/// Past the last character there's nothing.
+fn segment(chars: &[char], at: usize, unit: Unit) -> (usize, usize) {
+    let len = chars.len();
+    if at >= len {
+        return if unit == Unit::Line { (0, len) } else { (len, len) };
+    }
+    match unit {
+        Unit::Char => (at, at + 1),
+        Unit::Line => (0, len),
+        Unit::Word => {
+            let starts = |i: usize| i < len && is_word(chars[i]) && (i == 0 || !is_word(chars[i - 1]));
+            let a = (0..=at).rev().find(|&i| starts(i)).unwrap_or(0);
+            let b = (at + 1..len).find(|&i| starts(i)).unwrap_or(len);
+            (a, b)
+        }
+    }
+}
+
+/// The piece before the one around a character.
+fn before(chars: &[char], at: usize, unit: Unit) -> (usize, usize) {
+    // Past the end, the last piece is the one before.
+    let start = if at >= chars.len() { chars.len() } else { segment(chars, at, unit).0 };
+    if unit == Unit::Line || start == 0 {
+        return (0, 0);
+    }
+    segment(chars, start - 1, unit)
+}
+
+/// The piece after the one around a character.
+fn after(chars: &[char], at: usize, unit: Unit) -> (usize, usize) {
+    let (_, b) = segment(chars, at, unit);
+    if unit == Unit::Line || b >= chars.len() {
+        return (chars.len(), chars.len());
+    }
+    segment(chars, b, unit)
+}
+
+/// What a change to a field's text took out and put in, and where: the text that differs
+/// between what the two have in common at their starts and their ends.
+fn text_change(old: &str, new: &str) -> (usize, String, String) {
+    let (o, n): (Vec<char>, Vec<char>) = (old.chars().collect(), new.chars().collect());
+    let head = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let room = o.len().min(n.len()) - head;
+    let tail = o.iter().rev().zip(n.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    (head, o[head..o.len() - tail].iter().collect(), n[head..n.len() - tail].iter().collect())
 }
 
 fn bits(on: &[u32]) -> Vec<u32> {
@@ -252,7 +321,12 @@ impl Ctx {
 
     /// An AT-SPI event: its kind and a number, and a value.
     fn event(&self, path: &str, iface: &str, member: &str, (kind, d1): (&str, i32), data: Variant<'_>) {
-        self.signal(path, iface, member, &(kind, d1, 0i32, data, HashMap::<&str, Variant<'_>>::new()));
+        self.event2(path, iface, member, (kind, d1, 0), data);
+    }
+
+    /// An event with two numbers, as a text change says where and how long.
+    fn event2(&self, path: &str, iface: &str, member: &str, (kind, d1, d2): (&str, i32, i32), data: Variant<'_>) {
+        self.signal(path, iface, member, &(kind, d1, d2, data, HashMap::<&str, Variant<'_>>::new()));
     }
 
     fn dispatch(&self, m: &Message) {
@@ -311,6 +385,8 @@ impl Ctx {
             (COMPONENT, m) => self.component(&h, m, &body, &target, &snap),
             (ACTION, m) => self.action(&h, m, &body, &target, &snap),
             (SELECTION, m) => self.selection(&h, m, &body, &target, &snap),
+            (TEXT, m) => self.text(&h, m, &body, &target, &snap),
+            (EDITABLE_TEXT, m) => self.editable_text(&h, m, &body, &target, &snap),
             (APPLICATION, "GetLocale") => self.reply(&h, &("",)),
             (APPLICATION, "GetApplicationBusAddress") => self.reply(&h, &("",)),
             _ => self.error(&h, UNKNOWN_METHOD, member.as_str()),
@@ -365,7 +441,8 @@ impl Ctx {
     fn description(&self, target: &Target<'_>, snap: &Snapshot) -> String {
         match target {
             Target::Row(e, _) => snap.rows.location(*e).unwrap_or_default(),
-            _ => String::new(),
+            Target::Fixed(n) => n.description.clone(),
+            Target::Root => String::new(),
         }
     }
 
@@ -393,6 +470,7 @@ impl Ctx {
                     Role::Frame if snap.window_focused => on.push(STATE_ACTIVE),
                     Role::ListItem => on.extend([STATE_SELECTABLE, STATE_FOCUSABLE]),
                     Role::PushButton => on.push(STATE_FOCUSABLE),
+                    Role::Entry => on.extend([STATE_FOCUSABLE, STATE_EDITABLE, STATE_SINGLE_LINE, STATE_SELECTABLE_TEXT]),
                     Role::List if n.id == a11y::LIST => on.extend([STATE_FOCUSABLE, STATE_MULTISELECTABLE, STATE_MANAGES_DESCENDANTS]),
                     Role::List => on.push(STATE_FOCUSABLE),
                     _ => {}
@@ -461,6 +539,7 @@ impl Ctx {
             ],
             (ACTION, _) if self.action_of(target).is_some() => vec![("NActions", Variant::from(1i32))],
             (SELECTION, Target::Fixed(n)) if n.role == Role::List => vec![("NSelectedChildren", Variant::from(self.selected_children(n, snap).len() as i32))],
+            (TEXT, Target::Fixed(Node { field: Some(f), .. })) => vec![("CharacterCount", Variant::from(f.text.chars().count() as i32)), ("CaretOffset", Variant::from(f.chars_before(f.caret) as i32))],
             _ => Vec::new(),
         }
     }
@@ -493,6 +572,9 @@ impl Ctx {
                 }
                 if matches!(target, Target::Fixed(n) if n.role == Role::List) {
                     v.push(SELECTION);
+                }
+                if matches!(target, Target::Fixed(n) if n.field.is_some()) {
+                    v.extend([TEXT, EDITABLE_TEXT]);
                 }
                 self.reply(h, &(v,))
             }
@@ -533,6 +615,10 @@ impl Ctx {
                     // The keyboard doesn't go to the sidebar, but a place a screen reader moves
                     // to is shown.
                     Target::Fixed(n) if Self::is_place(n) => self.show_place(n, snap),
+                    Target::Fixed(n) if n.role == Role::Entry => {
+                        self.hub.send(Msg::A11y(Act::Focus(n.id)));
+                        true
+                    }
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -643,6 +729,183 @@ impl Ctx {
         }
     }
 
+    /// Asks the app to change a field, through what typing in it does.
+    fn edit_text(&self, n: &Node, snap: &Snapshot, op: TextEdit) -> bool {
+        self.hub.send(Msg::A11y(Act::EditText(n.id, snap.edit_gen, op)));
+        true
+    }
+
+    /// A field's Text interface: reading it, and moving its caret and selection.
+    fn text(&self, h: &Header<'_>, m: &str, body: &Body, target: &Target<'_>, snap: &Snapshot) {
+        let Target::Fixed(n @ Node { field: Some(f), .. }) = target else { return self.error(h, UNKNOWN_METHOD, m) };
+        let chars: Vec<char> = f.text.chars().collect();
+        let len = chars.len();
+        let at = |i: i32| usize::try_from(i).unwrap_or(0).min(len);
+        let part = |a: usize, b: usize| chars[a.min(b)..b].iter().collect::<String>();
+        let caret = f.chars_before(f.caret);
+        let (sa, sb) = f.selection();
+        let (sa, sb) = (f.chars_before(sa), f.chars_before(sb));
+        let geometry = snap.geometry(n.id);
+        let extents = |a: usize, b: usize| match geometry {
+            // An empty range is where its place is, as wide as nothing.
+            Some(g) => {
+                let (first, last) = (g.char_rect(a), g.char_rect(b.max(a + 1) - 1));
+                let right = if b > a { last.x + last.w } else { first.x };
+                (first.x, first.y, right - first.x, first.h)
+            }
+            None => (0, 0, 0, 0),
+        };
+        match m {
+            "GetText" => {
+                let (a, b): (i32, i32) = body.deserialize().unwrap_or((0, -1));
+                let b = if b < 0 { len } else { at(b) };
+                self.reply(h, &(part(at(a).min(b), b),))
+            }
+            "GetStringAtOffset" | "GetTextAtOffset" | "GetTextBeforeOffset" | "GetTextAfterOffset" => {
+                let (i, kind): (i32, u32) = body.deserialize().unwrap_or((0, 0));
+                // The newer call counts characters, words, sentences, lines and paragraphs;
+                // the older ones characters, then the starts and ends of each of the rest.
+                let unit = match kind {
+                    0 => Unit::Char,
+                    1 => Unit::Word,
+                    2 if m != "GetStringAtOffset" => Unit::Word,
+                    // A field is one line, and one sentence as far as anyone can tell.
+                    _ => Unit::Line,
+                };
+                let (a, b) = match m {
+                    "GetTextBeforeOffset" => before(&chars, at(i), unit),
+                    "GetTextAfterOffset" => after(&chars, at(i), unit),
+                    _ => segment(&chars, at(i), unit),
+                };
+                self.reply(h, &(part(a, b), a as i32, b as i32))
+            }
+            "GetCharacterAtOffset" => {
+                let i: i32 = body.deserialize().unwrap_or(-1);
+                self.reply(h, &(usize::try_from(i).ok().and_then(|i| chars.get(i)).map_or(0, |&c| c as i32),))
+            }
+            "SetCaretOffset" => {
+                let i: i32 = body.deserialize().unwrap_or(0);
+                self.reply(h, &(self.edit_text(n, snap, TextEdit::Caret(at(i))),))
+            }
+            "GetNSelections" => self.reply(h, &(f.has_selection() as i32,)),
+            "GetSelection" => {
+                let i: i32 = body.deserialize().unwrap_or(-1);
+                self.reply(h, &(if i == 0 && f.has_selection() { (sa as i32, sb as i32) } else { (0, 0) }))
+            }
+            "AddSelection" => {
+                // A field has one selection at most.
+                let (a, b): (i32, i32) = body.deserialize().unwrap_or((0, 0));
+                let ok = !f.has_selection() && self.edit_text(n, snap, TextEdit::Select(at(a), at(b)));
+                self.reply(h, &(ok,))
+            }
+            "SetSelection" => {
+                let (i, a, b): (i32, i32, i32) = body.deserialize().unwrap_or((-1, 0, 0));
+                let ok = i == 0 && self.edit_text(n, snap, TextEdit::Select(at(a), at(b)));
+                self.reply(h, &(ok,))
+            }
+            "RemoveSelection" => {
+                let i: i32 = body.deserialize().unwrap_or(-1);
+                let ok = i == 0 && f.has_selection() && self.edit_text(n, snap, TextEdit::Caret(caret));
+                self.reply(h, &(ok,))
+            }
+            "GetCharacterExtents" => {
+                let (i, _): (i32, u32) = body.deserialize().unwrap_or((0, 0));
+                let a = at(i);
+                self.reply(h, &extents(a, (a + 1).min(len).max(a)))
+            }
+            "GetRangeExtents" => {
+                let (a, b, _): (i32, i32, u32) = body.deserialize().unwrap_or((0, 0, 0));
+                let (a, b) = (at(a.min(b)), at(a.max(b)));
+                self.reply(h, &extents(a, b))
+            }
+            "GetOffsetAtPoint" => {
+                let (x, y, _): (i32, i32, u32) = body.deserialize().unwrap_or((-1, -1, 0));
+                self.reply(h, &(geometry.and_then(|g| g.char_at(x, y)).map_or(-1, |i| i as i32),))
+            }
+            // Every character looks the same, as far as anything here says.
+            "GetAttributes" | "GetAttributeRun" => self.reply(h, &(HashMap::<String, String>::new(), 0i32, len as i32)),
+            "GetDefaultAttributes" | "GetDefaultAttributeSet" => self.reply(h, &(HashMap::<String, String>::new(),)),
+            "GetAttributeValue" => self.reply(h, &("",)),
+            "GetBoundedRanges" => self.reply(h, &(Vec::<(i32, i32, String, Variant<'_>)>::new(),)),
+            "ScrollSubstringTo" | "ScrollSubstringToPoint" => self.reply(h, &(false,)),
+            _ => self.error(h, UNKNOWN_METHOD, m),
+        }
+    }
+
+    /// A field's EditableText interface: each change is made as typing it would be.
+    fn editable_text(&self, h: &Header<'_>, m: &str, body: &Body, target: &Target<'_>, snap: &Snapshot) {
+        let Target::Fixed(n @ Node { field: Some(f), .. }) = target else { return self.error(h, UNKNOWN_METHOD, m) };
+        let len = f.text.chars().count();
+        let at = |i: i32| usize::try_from(i).unwrap_or(0).min(len);
+        let range = |(a, b): (i32, i32)| {
+            let b = if b < 0 { len } else { at(b) };
+            (at(a).min(b), b)
+        };
+        match m {
+            "SetTextContents" => {
+                let text: String = body.deserialize().unwrap_or_default();
+                self.reply(h, &(self.edit_text(n, snap, TextEdit::Replace(0, len, text)),))
+            }
+            "InsertText" => {
+                let (i, mut text, bytes): (i32, String, i32) = body.deserialize().unwrap_or_default();
+                // The length is in bytes, and only cuts the text short.
+                if let Ok(bytes) = usize::try_from(bytes)
+                    && bytes < text.len()
+                {
+                    let mut end = bytes;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                }
+                self.reply(h, &(self.edit_text(n, snap, TextEdit::Replace(at(i), at(i), text)),))
+            }
+            "CopyText" => {
+                let (a, b) = range(body.deserialize().unwrap_or((0, 0)));
+                self.edit_text(n, snap, TextEdit::Copy(a, b));
+                self.reply(h, &())
+            }
+            "CutText" => {
+                let (a, b) = range(body.deserialize().unwrap_or((0, 0)));
+                self.reply(h, &(self.edit_text(n, snap, TextEdit::Cut(a, b)),))
+            }
+            "DeleteText" => {
+                let (a, b) = range(body.deserialize().unwrap_or((0, 0)));
+                self.reply(h, &(self.edit_text(n, snap, TextEdit::Replace(a, b, String::new())),))
+            }
+            "PasteText" => {
+                let i: i32 = body.deserialize().unwrap_or(0);
+                self.reply(h, &(self.edit_text(n, snap, TextEdit::Paste(at(i))),))
+            }
+            _ => self.error(h, UNKNOWN_METHOD, m),
+        }
+    }
+
+    /// Says how a field's text changed, then where its caret went and what's selected, so a
+    /// screen reader reads what was typed or deleted and what the caret moved over.
+    fn emit_text_changes(&self, path: &str, old: &Field, new: &Field) {
+        if old.text != new.text {
+            let (at, gone, came) = text_change(&old.text, &new.text);
+            if !gone.is_empty() {
+                self.event2(path, OBJECT_EVENT, "TextChanged", ("delete", at as i32, gone.chars().count() as i32), Variant::from(gone));
+            }
+            if !came.is_empty() {
+                self.event2(path, OBJECT_EVENT, "TextChanged", ("insert", at as i32, came.chars().count() as i32), Variant::from(came));
+            }
+        }
+        let caret = |f: &Field| f.chars_before(f.caret);
+        if caret(old) != caret(new) {
+            self.event(path, OBJECT_EVENT, "TextCaretMoved", ("", caret(new) as i32), Variant::from(0i32));
+        }
+        let selected = |f: &Field| {
+            let (a, b) = f.selection();
+            (a != b).then(|| (f.chars_before(a), f.chars_before(b)))
+        };
+        if selected(old) != selected(new) {
+            self.event(path, OBJECT_EVENT, "TextSelectionChanged", ("", 0), Variant::from(0i32));
+        }
+    }
+
     /// Tells listeners what changed between two snapshots.
     fn emit_changes(&self, old: &Snapshot, new: &Snapshot) {
         let state = |path: &str, what: &str, on: bool| self.event(path, OBJECT_EVENT, "StateChanged", (what, on as i32), Variant::from(0i32));
@@ -660,6 +923,13 @@ impl Ctx {
             if o.name != n.name {
                 self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-name", 0), Variant::from(n.name.clone()));
             }
+            // The filter box turning into a search, and back.
+            if o.description != n.description {
+                self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-description", 0), Variant::from(n.description.clone()));
+            }
+            if let (Some(of), Some(nf)) = (&o.field, &n.field) {
+                self.emit_text_changes(&path, of, nf);
+            }
             if o.enabled != n.enabled {
                 state(&path, "enabled", n.enabled);
                 state(&path, "sensitive", n.enabled);
@@ -675,13 +945,15 @@ impl Ctx {
                 state(&path, "selected", n.selected);
             }
         }
-        if let (Some(o), Some(n)) = (old.get(a11y::SIDEBAR), new.get(a11y::SIDEBAR)) {
-            let sidebar = fixed_path(a11y::SIDEBAR);
+        // The sidebar's places, and the fields that come and go in the frame.
+        for n in new.fixed.iter().filter(|n| n.id != a11y::LIST) {
+            let Some(o) = old.get(n.id).filter(|o| o.children != n.children) else { continue };
+            let path = fixed_path(n.id);
             for (i, id) in o.children.iter().enumerate().rev().filter(|(_, id)| !n.children.contains(id)) {
-                self.event(&sidebar, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
+                self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
             }
             for (i, id) in n.children.iter().enumerate().filter(|(_, id)| !o.children.contains(id)) {
-                self.event(&sidebar, OBJECT_EVENT, "ChildrenChanged", ("add", i as i32), Variant::from(self.fixed_ref(*id)));
+                self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("add", i as i32), Variant::from(self.fixed_ref(*id)));
             }
         }
 
@@ -757,5 +1029,39 @@ mod tests {
         assert_eq!(parse_row("x_61"), None);
         assert_eq!(fixed_path(a11y::LIST), "/org/a11y/atspi/accessible/3");
         assert_eq!(bits(&[STATE_FOCUSED, STATE_MANAGES_DESCENDANTS, STATE_VISIBLE]), vec![(1 << 12) | (1 << 31) | (1 << 30), 0]);
+        assert_eq!(bits(&[STATE_SELECTABLE_TEXT]), vec![0, 1 << 6]);
+    }
+
+    #[test]
+    fn a_field_is_read_by_character_word_and_line() {
+        let c: Vec<char> = "my report.pdf".chars().collect();
+        assert_eq!(segment(&c, 4, Unit::Char), (4, 5));
+        assert_eq!(segment(&c, 13, Unit::Char), (13, 13), "nothing past the end");
+        assert_eq!(segment(&c, 0, Unit::Word), (0, 3), "a word and the space after it");
+        assert_eq!(segment(&c, 2, Unit::Word), (0, 3));
+        assert_eq!(segment(&c, 5, Unit::Word), (3, 10));
+        assert_eq!(segment(&c, 11, Unit::Word), (10, 13));
+        assert_eq!(segment(&c, 4, Unit::Line), (0, 13));
+        assert_eq!(segment(&c, 13, Unit::Line), (0, 13));
+        assert_eq!(before(&c, 5, Unit::Word), (0, 3));
+        assert_eq!(before(&c, 1, Unit::Word), (0, 0), "nothing before the first word");
+        assert_eq!(before(&c, 13, Unit::Word), (10, 13), "past the end, the last word is before");
+        assert_eq!(before(&c, 4, Unit::Char), (3, 4));
+        assert_eq!(after(&c, 1, Unit::Word), (3, 10));
+        assert_eq!(after(&c, 11, Unit::Word), (13, 13));
+        assert_eq!(after(&c, 12, Unit::Char), (13, 13));
+        let c: Vec<char> = "..ab".chars().collect();
+        assert_eq!(segment(&c, 0, Unit::Word), (0, 2), "what comes before the first word stands alone");
+        assert_eq!(segment(&[], 0, Unit::Word), (0, 0));
+        assert_eq!(before(&[], 0, Unit::Char), (0, 0));
+    }
+
+    #[test]
+    fn text_changes_say_what_went_and_came_in_characters() {
+        assert_eq!(text_change("report", "reports"), (6, String::new(), "s".into()));
+        assert_eq!(text_change("aé日b", "ab"), (1, "é日".into(), String::new()));
+        assert_eq!(text_change("report.pdf", "x.pdf"), (0, "report".into(), "x".into()));
+        assert_eq!(text_change("aa", "aaa"), (2, String::new(), "a".into()));
+        assert_eq!(text_change("same", "same"), (4, String::new(), String::new()));
     }
 }

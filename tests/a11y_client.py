@@ -13,7 +13,17 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   focus_place N        moves to place N in the sidebar through its Component interface
   select_place N       selects place N in the sidebar, which opens it
   press_back           does the Back button's action
+  fields               the window's text fields: name, description, text, caret, selection,
+                       states, and each character's box
+  focus_field NAME     moves the keyboard to a field through its Component interface
+  set_text NAME TEXT   replaces a field's text through its EditableText interface
+  insert NAME AT TEXT  inserts text at a character's place
+  delete NAME A B      deletes the characters from A to B
+  caret NAME AT        moves the caret through the Text interface
+  select NAME A B      selects from A to B
+  word NAME AT         the word at a character's place, as Orca reads one: [text, start, end]
   events               the events heard since last asked
+A field is found by its name, or the start of its name.
 """
 import json
 import os
@@ -35,11 +45,14 @@ def on_event(e):
         src = e.source.get_name()
     except GLib.Error as ex:
         src = f"? {ex.message}"
-    events.append({"type": e.type, "detail1": e.detail1, "source": src})
+    heard = {"type": e.type, "detail1": e.detail1, "detail2": e.detail2, "source": src}
+    if e.type.startswith("object:text-changed"):
+        heard["text"] = e.any_data
+    events.append(heard)
 
 
 listener = Atspi.EventListener.new(on_event)
-for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:active-descendant-changed", "window:activate"]:
+for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:active-descendant-changed", "window:activate", "object:text-changed", "object:text-caret-moved", "object:text-selection-changed", "object:property-change:accessible-description"]:
     listener.register(t)
 
 
@@ -92,6 +105,41 @@ def tree():
     }
 
 
+def entries():
+    frame = gannet().get_child_at_index(0)
+    return [k for k in children(frame) if k.get_role() == Atspi.Role.ENTRY]
+
+
+def field(name):
+    found = [k for k in entries() if k.get_name() == name] or [k for k in entries() if k.get_name().startswith(name)]
+    if not found:
+        raise LookupError(f"no field {name!r} among {[k.get_name() for k in entries()]}")
+    return found[0]
+
+
+def describe(f):
+    n = Atspi.Text.get_character_count(f)
+    states = f.get_state_set()
+    boxes = [Atspi.Text.get_character_extents(f, i, Atspi.CoordType.WINDOW) for i in range(n)]
+    selections = [Atspi.Text.get_selection(f, i) for i in range(Atspi.Text.get_n_selections(f))]
+    ext = f.get_extents(Atspi.CoordType.WINDOW)
+    return {
+        "name": f.get_name(),
+        "description": f.get_description(),
+        "role": f.get_role_name(),
+        "text": Atspi.Text.get_text(f, 0, -1),
+        "count": n,
+        "caret": Atspi.Text.get_caret_offset(f),
+        "selections": [[r.start_offset, r.end_offset] for r in selections],
+        "editable": states.contains(Atspi.StateType.EDITABLE),
+        "single_line": states.contains(Atspi.StateType.SINGLE_LINE),
+        "focused": states.contains(Atspi.StateType.FOCUSED),
+        "rect": [ext.x, ext.y, ext.width, ext.height],
+        "boxes": [[b.x, b.y, b.width, b.height] for b in boxes],
+        "interfaces": f.get_interfaces(),
+    }
+
+
 def run(cmd, arg):
     if cmd == "apps":
         return apps()
@@ -119,6 +167,29 @@ def run(cmd, arg):
         return parts()[2].select_child(int(arg))
     if cmd == "press_back":
         return parts()[1].do_action(0)
+    if cmd == "fields":
+        return [describe(f) for f in entries()]
+    if cmd == "focus_field":
+        return field(arg).grab_focus()
+    if cmd == "set_text":
+        name, _, text = arg.partition(" ")
+        return Atspi.EditableText.set_text_contents(field(name), text)
+    if cmd == "insert":
+        name, at, text = arg.split(" ", 2)
+        return Atspi.EditableText.insert_text(field(name), int(at), text, len(text.encode()))
+    if cmd == "delete":
+        name, a, b = arg.split(" ")
+        return Atspi.EditableText.delete_text(field(name), int(a), int(b))
+    if cmd == "caret":
+        name, at = arg.split(" ")
+        return Atspi.Text.set_caret_offset(field(name), int(at))
+    if cmd == "select":
+        name, a, b = arg.split(" ")
+        return Atspi.Text.set_selection(field(name), 0, int(a), int(b))
+    if cmd == "word":
+        name, at = arg.split(" ")
+        r = Atspi.Text.get_string_at_offset(field(name), int(at), Atspi.TextGranularity.WORD)
+        return [r.content, r.start_offset, r.end_offset]
     if cmd == "events":
         out = list(events)
         events.clear()
