@@ -664,6 +664,10 @@ impl Ctx {
                 state(&path, "enabled", n.enabled);
                 state(&path, "sensitive", n.enabled);
             }
+            // A place scrolling into or out of the sidebar.
+            if o.showing != n.showing {
+                state(&path, "showing", n.showing);
+            }
             // A place is "selected" while the window is in it, which only marks it: announcing
             // that would read out the sidebar each time the folder changes, while the keyboard
             // is in the list. A screen reader asking still hears it.

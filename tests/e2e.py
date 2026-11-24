@@ -1642,10 +1642,17 @@ def a_screen_reader_hears_pins_scrolled_places_and_search_results(h):
         t = sr.until("tree", lambda t: "Pin25" in t["places"], "the pins")
         assert all(n in t["places"] for n in pins), t["places"]
         assert "Pin00" in t["places_showing"] and "Pin25" not in t["places_showing"], t["places_showing"]
+        sr.ask("events")
         assert sr.ask(f"focus_place {t['places'].index('Pin25')}") is True
         a.wait(lambda s: s["side_scroll"] > 0, "scrolled to the last pin")
         t = sr.until("tree", lambda t: "Pin25" in t["places_showing"], "the last pin showing")
         assert "Pin00" not in t["places_showing"], t["places_showing"]
+        # And a screen reader that kept the places' states hears them change.
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:showing" for x in e), "showing heard")
+        time.sleep(0.3)
+        heard += sr.ask("events")
+        shown = {x["source"]: x["detail1"] for x in heard if x["type"] == "object:state-changed:showing"}
+        assert shown.get("Pin25") == 1 and shown.get("Pin00") == 0, shown
 
         # Search results come from many folders: each row is its own, and says where it is.
         a.key("f", mods=["ctrl"])

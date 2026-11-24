@@ -39,7 +39,7 @@ def on_event(e):
 
 
 listener = Atspi.EventListener.new(on_event)
-for t in ["object:state-changed:focused", "object:state-changed:selected", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:active-descendant-changed", "window:activate"]:
+for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:active-descendant-changed", "window:activate"]:
     listener.register(t)
 
 
