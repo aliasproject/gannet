@@ -735,7 +735,9 @@ impl App {
             ch.drawn = (b.accept, b.cancel, b.filter);
         }
         let Some(ch) = self.chooser.as_ref() else { return };
-        let (name, focused, accept_label) = (ch.name.clone(), ch.name_focused, ch.spec.accept_label());
+        // The path or filter box, while open, has the keyboard before the name does.
+        let focused = ch.name_focused && matches!(self.edit, crate::app::Edit::None);
+        let (name, accept_label) = (ch.name.clone(), ch.spec.accept_label());
         let filter_label = ch.filter.and_then(|i| ch.labels.get(i).copied());
         if let Some((r, label_x)) = b.name {
             let by = self.baseline(r.y, r.h);

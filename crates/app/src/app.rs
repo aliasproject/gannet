@@ -1768,13 +1768,14 @@ impl App {
         self.invalidate(self.layout().status);
     }
 
-    /// Opens the filter on this folder only, as Ctrl+F and / do, even after a search.
+    /// Opens the filter on this folder only, as / does, even after a search.
     fn start_filter_here(&mut self) {
         self.start_filter("");
         self.set_search_below(false);
     }
 
-    /// Opens the filter as a search of this folder and every folder below it.
+    /// Opens the filter as a search of this folder and every folder below it, as Ctrl+F does,
+    /// even after a filter. Where there's nothing below, as in the Trash, it only filters.
     fn start_search(&mut self) {
         self.start_filter("");
         self.set_search_below(true);
@@ -3020,9 +3021,10 @@ impl App {
             self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: self.edit_gen }));
             return;
         }
-        // In the filter, Ctrl+Shift+F reaches into the folders below, and Ctrl+F comes back.
-        if is_filter && m.ctrl && matches!(sym, k::KEY_f | k::KEY_F) {
-            self.set_search_below(m.shift);
+        // In the box, Ctrl+F turns a filter into a search and back, keeping the text. / can't,
+        // as it's typed.
+        if is_filter && m.ctrl && !m.shift && sym == k::KEY_f {
+            self.set_search_below(!self.search_below);
             return;
         }
         let Some(f) = self.field_mut() else { return };
@@ -3168,8 +3170,7 @@ impl App {
             (k::KEY_F10, _, _) | (k::KEY_Menu, _, _) => self.keyboard_menu(),
             (k::KEY_h, true, _) => self.action(Action::ToggleHidden),
             (k::KEY_l, true, _) => self.start_path_edit(),
-            (k::KEY_f | k::KEY_F, true, _) if m.shift => self.start_search(),
-            (k::KEY_f, true, _) => self.start_filter_here(),
+            (k::KEY_f, true, _) if !m.shift => self.start_search(),
             (k::KEY_a, true, _) => self.select_all(),
             (k::KEY_n, true, _) if !m.shift => self.action(Action::NewWindow),
             (k::KEY_q | k::KEY_w, true, _) => self.request_close(),
@@ -4759,7 +4760,7 @@ mod tests {
 
         /// Starts a search for `q` and waits for all of it.
         fn search(&mut self, q: &str) {
-            self.app.key(k::KEY_F, "", CTRL_SHIFT);
+            self.ctrl(k::KEY_f);
             self.type_text(q);
             self.settle_search(q);
         }
@@ -4838,21 +4839,22 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_f_in_a_search_filters_only_this_folder_and_ctrl_shift_f_searches_again() {
+    fn ctrl_f_in_the_box_turns_a_search_into_a_filter_and_back() {
         let mut r = search_rig("search-toggle");
         r.search("notes");
         r.ctrl(k::KEY_f);
         assert!(!r.app.search_below && r.app.filter == "notes");
         r.pump_until("the folder, filtered", |a| !a.loading && a.listing.as_ref().is_some_and(|l| l.search().is_none()));
         assert_eq!(r.row_names(), ["notes.txt"]);
-        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        r.ctrl(k::KEY_f);
         r.settle_search("notes");
         assert_eq!(r.row_names().len(), 3);
-        // The filter with nothing found says the search is there.
-        r.ctrl(k::KEY_f);
-        r.type_text("-deep");
-        r.pump_until("filtered", |a| !a.loading && a.rows.is_empty());
-        assert!(!r.app.search_below);
+        // Ctrl+Shift+F is nothing, in the box or out of it.
+        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        assert!(r.app.search_below && r.app.filter == "notes");
+        r.key(k::KEY_Escape, "");
+        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        assert!(matches!(r.app.edit, Edit::None));
     }
 
     #[test]
@@ -4954,21 +4956,29 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_f_and_slash_filter_only_here_even_after_a_search() {
+    fn slash_filters_only_here_and_ctrl_f_searches_whatever_came_before() {
         let mut r = search_rig("search-then-filter");
-        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        r.ctrl(k::KEY_f);
         // Enter on the empty search box, then a plain filter.
         r.key(k::KEY_Return, "");
-        r.ctrl(k::KEY_f);
+        r.key(0, "/");
         r.type_text("notes");
         assert!(!r.app.search_below && r.app.search_query().is_none());
         r.pump_until("filtered", |a| !a.loading);
         assert_eq!(r.row_names(), ["notes.txt"]);
-        r.key(k::KEY_Escape, "");
-        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        // Out of the box, Ctrl+F searches for what the filter has.
+        r.key(k::KEY_Return, "");
+        r.ctrl(k::KEY_f);
+        assert!(matches!(r.app.edit, Edit::Filter(_)));
+        r.settle_search("notes");
+        assert_eq!(r.row_names().len(), 3);
+        // And / after a search filters the folder for it.
         r.key(k::KEY_Return, "");
         r.key(0, "/");
-        assert!(matches!(r.app.edit, Edit::Filter(_)) && !r.app.search_below);
+        assert!(matches!(r.app.edit, Edit::Filter(_)) && !r.app.search_below && r.app.filter == "notes");
+        r.key(k::KEY_Escape, "");
+        r.ctrl(k::KEY_f);
+        assert!(matches!(r.app.edit, Edit::Filter(_)) && r.app.search_below);
     }
 
     #[test]
@@ -5031,9 +5041,11 @@ mod tests {
         let t = r.app.trash_dir.clone();
         fs::create_dir_all(&t).unwrap();
         r.open(t);
-        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        r.ctrl(k::KEY_f);
         assert!(matches!(r.app.edit, Edit::Filter(_)));
         assert!(!r.app.search_below, "the Trash has no folders below to search");
+        r.ctrl(k::KEY_f);
+        assert!(!r.app.search_below, "nor does Ctrl+F in the box turn it into one");
     }
 
     #[test]

@@ -186,7 +186,7 @@ impl App {
             self.paint_field(c, r, &f, focused);
             // An empty box says how far it reaches.
             if f.text.is_empty() {
-                let hint = if self.search_below { "Search folders inside too" } else { "Filter this folder" };
+                let hint = if self.search_below { "Search here and below" } else { "Filter this folder" };
                 let by = self.baseline(r.y, r.h);
                 self.text.draw_fitted(c, hint, (r.x + self.px(10.0)) as f32, by, (r.w - self.px(18.0)) as f32, co.muted);
             }
@@ -349,7 +349,7 @@ impl App {
                 let msg = if searching {
                     format!("Nothing found in {} or the folders in it", self.crumb_label(&self.dir))
                 } else if !self.filter.is_empty() && self.can_search() {
-                    "Nothing here matches. Ctrl+Shift+F searches the folders inside too".to_string()
+                    "Nothing here matches. Ctrl+F searches the folders inside too".to_string()
                 } else if !self.filter.is_empty() {
                     "Nothing matches the filter".to_string()
                 } else if listing.is_trash() {
