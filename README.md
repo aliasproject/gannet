@@ -405,7 +405,7 @@ again until it changes or Gannet is updated.
 
 Only the rows on screen get thumbnails, and scrolling past a row drops it from the queue, or
 stops it if it's being made, so scrolling never waits. They're made in the background, two at
-a time, at the lowest CPU and disk priority. Pictures are read by the preview's sandboxed
+a time, at the lowest CPU priority and a low disk priority. Pictures are read by the preview's sandboxed
 decoder, and ones it can't read, like HEIC and SVG, by the system's thumbnailers. Videos get a
 frame from a tenth of the way in, from `ffmpeg`. Both run as the preview's do (see
 [Sandboxing](#sandboxing)).

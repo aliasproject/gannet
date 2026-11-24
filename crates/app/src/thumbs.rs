@@ -3,7 +3,8 @@
 //! Only the rows on screen are asked for, and a row scrolled past before its turn is dropped
 //! from the queue, or stopped if it's being made. One thread looks in the freedesktop cache,
 //! which other programs share, and two more make what isn't there, so a slow video never holds
-//! up a thumbnail that's ready. They run at the lowest priority, as do the programs they start.
+//! up a thumbnail that's ready. They run at the lowest CPU priority and a low disk one, as do
+//! the programs they start.
 //!
 //! What's made is written to the cache at the "normal" size, and a file that can't be made into
 //! one is noted in the cache's failures folder, so it isn't tried again until it changes. Nothing
@@ -37,7 +38,7 @@ const MAKERS: usize = 2;
 /// Rows' pictures kept, which is many screens of them. Each is a few kilobytes.
 const KEEP: usize = 512;
 /// A cached thumbnail is small, so taking longer than this means something's wrong with it.
-const READ_LIMIT: Duration = Duration::from_secs(2);
+const READ_LIMIT: Duration = Duration::from_secs(10);
 const MAKE_LIMIT: Duration = Duration::from_secs(30);
 /// What a failure note says made it. A newer Gannet may manage what this one couldn't, so it
 /// only believes its own.
@@ -198,7 +199,8 @@ impl Thumbs {
                     }
                     _ => {}
                 }
-            } else {
+            } else if !self.order.contains(path) {
+                // One stopped or dropped is forgotten but can still be in the order.
                 self.order.push_back(path.clone());
             }
             self.known.insert(path.clone(), Known { asked_for: *mtime, state: State::Asked });
@@ -299,7 +301,7 @@ fn lower_priority() {
 fn read_loop(shared: &Shared, hub: &Hub, cx: &Cx) {
     lower_priority();
     // Looking in the cache isn't stopped part way: it's quick.
-    let Ok(never) = eventfd(0, EventfdFlags::CLOEXEC) else { return };
+    let never = eventfd(0, EventfdFlags::CLOEXEC).ok();
     loop {
         let job = {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -310,7 +312,12 @@ fn read_loop(shared: &Shared, hub: &Hub, cx: &Cx) {
                 queue = shared.more.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
-        match look(&job, cx, &never) {
+        // Without one, every row is answered, so none waits forever.
+        let looked = match &never {
+            Some(never) => look(&job, cx, never),
+            None => Some(Outcome::Nothing),
+        };
+        match looked {
             Some(outcome) => hub.send(Msg::Thumbnail(Done { path: job.path, side: job.side, outcome })),
             None => {
                 let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -335,13 +342,19 @@ fn make_loop(shared: &Shared, hub: &Hub, cx: &Cx) {
             let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 if let Some(job) = queue.making.pop_front() {
-                    let Ok(stop) = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK) else { return };
-                    let stop = Arc::new(stop);
-                    queue.running.push((job.path.clone(), stop.clone()));
+                    let stop = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).ok().map(Arc::new);
+                    if let Some(stop) = &stop {
+                        queue.running.push((job.path.clone(), stop.clone()));
+                    }
                     break (job, stop);
                 }
                 queue = shared.more.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
+        };
+        // Out of descriptors: answered anyway, so the row doesn't wait forever.
+        let Some(stop) = stop else {
+            hub.send(Msg::Thumbnail(Done { path: job.path, side: job.side, outcome: Outcome::Nothing }));
+            continue;
         };
         let outcome = make(&job, cx, &stop);
         shared.queue.lock().unwrap_or_else(|e| e.into_inner()).running.retain(|(_, s)| !Arc::ptr_eq(s, &stop));
@@ -368,8 +381,12 @@ fn look(job: &Job, cx: &Cx, cancel: &OwnedFd) -> Option<Outcome> {
         }
         // From a copy, so it can't be swapped for something else between the check and the decode.
         let Some(copy) = in_memory(&bytes) else { continue };
-        if let Ok(image) = decode(copy, cancel, READ_LIMIT) {
-            return Some(Outcome::Shown(Arc::new(fit(&image, job.side))));
+        match decode(copy, cancel, READ_LIMIT) {
+            Ok(image) => return Some(shown(&image, job.side)),
+            // The computer is busy, or the decoder can't run: making one wouldn't do better, and
+            // would replace one that's fine.
+            Err(Why::CantRun) => return Some(Outcome::Nothing),
+            Err(_) => {}
         }
     }
     failed_before(cx, &job.path, mtime).then_some(Outcome::Nothing)
@@ -423,7 +440,9 @@ fn decode(input: File, cancel: &OwnedFd, limit: Duration) -> Result<ImageBuf, Wh
             _ => Why::Failed,
         }),
         Waited::Cancelled => Err(Why::Stopped),
-        Waited::TimedOut => Err(Why::Failed),
+        // These run at the lowest priority, so a busy computer can be why. Its CPU limit is what
+        // stops a file that's really too much work.
+        Waited::TimedOut => Err(Why::CantRun),
     }
 }
 
@@ -451,7 +470,7 @@ fn make(job: &Job, cx: &Cx, stop: &OwnedFd) -> Outcome {
                     let _ = write_new(&thumbcache::normal(&cx.cache_home, &job.path), &png);
                 }
             }
-            Outcome::Shown(Arc::new(fit(&image, job.side)))
+            shown(&image, job.side)
         }
         Err(Why::Failed) => {
             if keep && let Some(note) = encode(1, 1, &[0; 4], &thumbcache::thumbnail_uri(&job.path), mtime, SOFTWARE) {
@@ -471,7 +490,8 @@ fn ran(result: Result<(std::process::ExitStatus, OwnedFd), NotRun>, stop: &Owned
         Ok(_) => Err(Why::Failed),
         Err(NotRun::NoBubblewrap) => Err(Why::CantRun),
         Err(NotRun::Stopped) if preview::cancelled_within(stop, Duration::ZERO) => Err(Why::Stopped),
-        Err(NotRun::Stopped) => Err(Why::Failed),
+        // It couldn't start, or ran out of time on a busy computer: neither is the file's fault.
+        Err(NotRun::Stopped) => Err(Why::CantRun),
     }
 }
 
@@ -562,14 +582,23 @@ fn write_new(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     written
 }
 
-/// The middle square of a thumbnail, shrunk to `side` if it's bigger.
-fn fit(image: &ImageBuf, side: u32) -> Pic {
-    fit_pixels(image.w, image.h, image.pixels(), side)
+/// The row's picture of a thumbnail, or its icon if the picture would be too small to make out.
+fn shown(image: &ImageBuf, side: u32) -> Outcome {
+    match fit_pixels(image.w, image.h, image.pixels(), side) {
+        Some(pic) => Outcome::Shown(Arc::new(pic)),
+        None => Outcome::Nothing,
+    }
 }
 
-fn fit_pixels(w: u32, h: u32, rgba: &[u8], side: u32) -> Pic {
+/// The middle square of a thumbnail, shrunk to `side` if it's bigger. `None` if it's less than
+/// half that, like a thin banner's middle or a tiny picture, which would be a dot in the icon's
+/// place.
+fn fit_pixels(w: u32, h: u32, rgba: &[u8], side: u32) -> Option<Pic> {
     let (w, h) = (w as usize, h as usize);
     let s = w.min(h);
+    if s * 2 < side as usize {
+        return None;
+    }
     let (x0, y0) = ((w - s) / 2, (h - s) / 2);
     let mut square = Vec::with_capacity(s * s * 4);
     for y in y0..y0 + s {
@@ -577,10 +606,10 @@ fn fit_pixels(w: u32, h: u32, rgba: &[u8], side: u32) -> Pic {
     }
     let side = (side as usize).max(1);
     if s <= side {
-        return Pic { w: s as u32, h: s as u32, rgba: square };
+        return Some(Pic { w: s as u32, h: s as u32, rgba: square });
     }
-    let rgba = preview::box_scale(&square, s, s, side, side, &AtomicBool::new(false)).unwrap_or_default();
-    Pic { w: side as u32, h: side as u32, rgba }
+    let rgba = preview::box_scale(&square, s, s, side, side, &AtomicBool::new(false))?;
+    Some(Pic { w: side as u32, h: side as u32, rgba })
 }
 
 #[cfg(test)]
@@ -738,15 +767,31 @@ mod tests {
         for _ in 0..2 {
             px.extend_from_slice(&[[255, 0, 0, 255], [255, 0, 0, 255], [0, 0, 255, 255], [0, 0, 255, 255]].concat());
         }
-        let p = fit_pixels(4, 2, &px, 20);
+        let p = fit_pixels(4, 2, &px, 4).unwrap();
         assert_eq!((p.w, p.h), (2, 2), "small ones aren't made bigger");
         assert_eq!(&p.rgba[..8], [255, 0, 0, 255, 0, 0, 255, 255]);
         let big = vec![200u8; 100 * 60 * 4];
-        let p = fit_pixels(100, 60, &big, 20);
+        let p = fit_pixels(100, 60, &big, 20).unwrap();
         assert_eq!((p.w, p.h, p.rgba.len()), (20, 20, 20 * 20 * 4));
         assert_eq!(p.rgba[0], 200);
-        let p = fit_pixels(10, 300, &vec![9u8; 10 * 300 * 4], 20);
+        let p = fit_pixels(10, 300, &vec![9u8; 10 * 300 * 4], 20).unwrap();
         assert_eq!((p.w, p.h), (10, 10), "a thin strip is its middle, not stretched");
+        // Less than half the size would be a dot where the icon was.
+        assert!(fit_pixels(1000, 3, &vec![9u8; 1000 * 3 * 4], 20).is_none(), "a banner");
+        assert!(fit_pixels(1, 1, &[9; 4], 20).is_none(), "a single pixel");
+    }
+
+    #[test]
+    fn a_row_scrolled_away_and_back_is_in_the_order_once() {
+        let mut t = thumbs();
+        // Stopped while being made, and asked for again, several times.
+        for _ in 0..5 {
+            t.plan(&[row("a", None)], 20);
+            t.shared.queue.lock().unwrap().reading.clear();
+            assert!(!done(&mut t, "a", Outcome::Stopped));
+        }
+        t.plan(&[row("a", None)], 20);
+        assert_eq!(t.order.iter().filter(|p| p.ends_with("a")).count(), 1, "{:?}", t.order);
     }
 
     #[test]
