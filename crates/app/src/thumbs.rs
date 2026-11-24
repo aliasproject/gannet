@@ -126,6 +126,8 @@ struct Known {
 pub struct Thumbs {
     shared: Arc<Shared>,
     started: bool,
+    /// How many making threads are running.
+    makers: usize,
     hub: Hub,
     cache_home: PathBuf,
     kinds: Arc<Kinds>,
@@ -138,7 +140,7 @@ pub struct Thumbs {
 impl Thumbs {
     /// Nothing starts until a picture or a video is on screen.
     pub fn new(hub: Hub, cache_home: PathBuf, kinds: Arc<Kinds>) -> Self {
-        Self { shared: Arc::default(), started: false, hub, cache_home, kinds, known: HashMap::new(), order: VecDeque::new(), side: 0 }
+        Self { shared: Arc::default(), started: false, makers: 0, hub, cache_home, kinds, known: HashMap::new(), order: VecDeque::new(), side: 0 }
     }
 
     /// The rows on screen that could have a thumbnail, top first, with their modified times if
@@ -268,14 +270,26 @@ impl Thumbs {
         if self.started {
             return;
         }
-        self.started = true;
         let cx = Arc::new(Cx { cache_home: self.cache_home.clone(), kinds: self.kinds.clone() });
-        let (shared, hub, reader_cx) = (self.shared.clone(), self.hub.clone(), cx.clone());
-        let _ = std::thread::Builder::new().name("gannet-thumbs".into()).spawn(move || read_loop(&shared, &hub, &reader_cx));
-        for _ in 0..MAKERS {
+        // Makers first: the reader passes them what isn't in the cache, so it needs one at least.
+        while self.makers < MAKERS {
             let (shared, hub, cx) = (self.shared.clone(), self.hub.clone(), cx.clone());
-            let _ = std::thread::Builder::new().name("gannet-thumbs".into()).spawn(move || make_loop(&shared, &hub, &cx));
+            if std::thread::Builder::new().name("gannet-thumbs".into()).spawn(move || make_loop(&shared, &hub, &cx)).is_err() {
+                break;
+            }
+            self.makers += 1;
         }
+        let (shared, hub, reader_cx) = (self.shared.clone(), self.hub.clone(), cx.clone());
+        if self.makers == 0 || std::thread::Builder::new().name("gannet-thumbs".into()).spawn(move || read_loop(&shared, &hub, &reader_cx)).is_err() {
+            // Out of threads: nothing would answer, so what was asked for is let go, to be asked
+            // for again, and starting is tried again then.
+            let dropped: Vec<PathBuf> = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).reading.drain(..).map(|job| job.path).collect();
+            for path in dropped {
+                self.known.remove(&path);
+            }
+            return;
+        }
+        self.started = true;
     }
 }
 
@@ -300,7 +314,8 @@ fn lower_priority() {
 
 fn read_loop(shared: &Shared, hub: &Hub, cx: &Cx) {
     lower_priority();
-    // Looking in the cache isn't stopped part way: it's quick.
+    // Looking in the cache isn't stopped part way: a cached thumbnail is small, and one that
+    // takes more than `READ_LIMIT` is given up on.
     let never = eventfd(0, EventfdFlags::CLOEXEC).ok();
     loop {
         let job = {
