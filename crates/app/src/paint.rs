@@ -574,52 +574,8 @@ impl App {
             self.dialog = Some(d);
             return;
         }
-        let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
-        let (title, line2, at) = match &d {
-            Dialog::Conflict { conflict, at, .. } => {
-                let t = if conflict.both_folders { format!("A folder named “{}” is already here", name(&conflict.target)) } else { format!("“{}” is already here", name(&conflict.target)) };
-                let body = if conflict.both_folders {
-                    "Merge puts the contents together and asks about any clashes."
-                } else if conflict.can_replace {
-                    "Replace trashes the old one. Keep both renames the new one."
-                } else {
-                    "One's a file and the other's a folder, so it can't be replaced."
-                };
-                (t, body.to_string(), *at)
-            }
-            Dialog::ConfirmDelete { paths, at, empty: true } => {
-                let t = match paths.len() {
-                    1 => "Delete the one item in the Trash for good?".to_string(),
-                    n => format!("Delete all {n} items in the Trash for good?"),
-                };
-                // A disk that didn't answer keeps its items, and the question shouldn't hide that.
-                let more = if self.load_error.is_some() { " A disk that couldn't be read keeps its items." } else { "" };
-                (t, format!("This can't be undone.{more}"), *at)
-            }
-            Dialog::ConfirmDelete { paths, at, .. } => {
-                let t = match paths.as_slice() {
-                    [one] => format!("Delete “{}” for good?", name(one)),
-                    many => format!("Delete {} for good?", format::count(many.len(), "item", "items")),
-                };
-                (t, "This can't be undone.".to_string(), *at)
-            }
-            Dialog::ConfirmReplace { paths, existing, at } => {
-                let t = match existing.as_slice() {
-                    [one] => format!("Replace “{}”?", crate::chooser::shown_name(one)),
-                    many => format!("Replace {} of the {} files?", many.len(), paths.len()),
-                };
-                let folder = existing.first().and_then(|p| p.parent()).map_or_else(String::new, |d| self.crumb_label(d));
-                let body = if existing.len() == 1 { format!("It's already in “{folder}”. Replacing it overwrites what's there.") } else { format!("They're already in “{folder}”. Replacing them overwrites what's there.") };
-                (t, body, *at)
-            }
-            Dialog::ConfirmQuit { at } => ("Operations are still running".to_string(), "Closing stops them. Whatever's finished stays finished.".to_string(), *at),
-            Dialog::Unlock { volume, error, waiting, at, .. } => {
-                let line = if *waiting { "Unlocking…".to_string() } else { error.clone().unwrap_or_else(|| "It's encrypted. Type its passphrase to open it.".to_string()) };
-                (format!("Unlock “{}”", App::drive_name(volume)), line, *at)
-            }
-            // Drawn above.
-            Dialog::RenameMany(_) => (String::new(), String::new(), 0),
-        };
+        let (title, line2) = self.dialog_text(&d);
+        let at = App::dialog_default(&d);
         let x = (r.x + self.px(16.0)) as f32;
         let max = (r.w - self.px(32.0)) as f32;
         let row = self.px(26.0);
@@ -683,8 +639,7 @@ impl App {
         let l = self.rename_layout(d.names.len());
         let x = (r.x + self.px(16.0)) as f32;
         let max = (r.w - self.px(32.0)) as f32;
-        let title = format!("Rename {}", format::count(d.names.len(), "item", "items"));
-        self.text.draw_fitted(c, &title, x, self.baseline(r.y + self.px(12.0), self.px(26.0)), max, co.foreground);
+        self.text.draw_fitted(c, &d.title(), x, self.baseline(r.y + self.px(12.0), self.px(26.0)), max, co.foreground);
         for (label, field, focus) in [("Find", &l.find, Focus::Find), ("Replace with", &l.replace, Focus::Replace)] {
             self.text.draw_fitted(c, label, x, self.baseline(field.y, field.h), (field.x - r.x) as f32 - self.px(24.0) as f32, co.muted);
             let f = if focus == Focus::Find { &d.find } else { &d.replace };

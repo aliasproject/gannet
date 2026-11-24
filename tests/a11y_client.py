@@ -13,11 +13,23 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   focus_place N        moves to place N in the sidebar through its Component interface
   select_place N       selects place N in the sidebar, which opens it
   press_back           does the Back button's action
-  events               the events heard since last asked
+  events               the events heard since last asked, an announcement with what it said
+
+For the other windows (the preview, Open and Save dialogs, Open With), a window is the one of
+Gannet's whose name has the first of a JSON list's strings in it, and a part is found in it by
+its name, the rest of the list being the names on the way down:
+
+  dump ["WINDOW"]               the window's parts: role, name, description, states, children
+  do ["WINDOW", "NAME"...]      does that part's action
+  grab ["WINDOW", "NAME"...]    moves to that part through its Component interface
+  select ["WINDOW", "NAME"..., N]  selects child N of that list through its Selection interface
+
+A menu has no name, so its items are found under "".
 """
 import json
 import os
 import sys
+import warnings
 
 import gi
 
@@ -25,6 +37,8 @@ gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi, GLib  # noqa: E402
 
 assert os.environ.get("AT_SPI_BUS_ADDRESS", "").startswith("unix:path=/tmp/gne2e/"), "only ever the suite's private bus"
+# get_action_name is deprecated for get_name, which an Accessible already has.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 Atspi.init()
 events = []
 kept = {}
@@ -35,11 +49,14 @@ def on_event(e):
         src = e.source.get_name()
     except GLib.Error as ex:
         src = f"? {ex.message}"
-    events.append({"type": e.type, "detail1": e.detail1, "source": src})
+    heard = {"type": e.type, "detail1": e.detail1, "source": src}
+    if e.type == "object:announcement":
+        heard["said"] = e.any_data
+    events.append(heard)
 
 
 listener = Atspi.EventListener.new(on_event)
-for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:active-descendant-changed", "window:activate"]:
+for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:state-changed:checked", "object:state-changed:sensitive", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:property-change:accessible-description", "object:active-descendant-changed", "window:activate", "object:announcement"]:
     listener.register(t)
 
 
@@ -92,7 +109,53 @@ def tree():
     }
 
 
+STATES = {"focused": Atspi.StateType.FOCUSED, "selected": Atspi.StateType.SELECTED, "enabled": Atspi.StateType.SENSITIVE, "showing": Atspi.StateType.SHOWING, "checked": Atspi.StateType.CHECKED, "editable": Atspi.StateType.EDITABLE, "active": Atspi.StateType.ACTIVE}
+STATES |= {"default": Atspi.StateType.IS_DEFAULT, "modal": Atspi.StateType.MODAL}
+
+
+def window(sub):
+    d = Atspi.get_desktop(0)
+    for i in range(d.get_child_count()):
+        a = d.get_child_at_index(i)
+        if a is not None and a.get_name() == "Gannet" and a.get_child_count() > 0:
+            w = a.get_child_at_index(0)
+            if sub in w.get_name():
+                return w
+    raise LookupError(f"no window of Gannet's named like {sub!r}")
+
+
+def part(names):
+    o = window(names[0])
+    for name in names[1:]:
+        found = [c for c in children(o) if c.get_name() == name]
+        if not found:
+            raise LookupError(f"no {name!r} in {o.get_name()!r}")
+        o = found[0]
+    return o
+
+
+def dump(o, depth=0):
+    states = o.get_state_set()
+    out = {"role": o.get_role_name(), "name": o.get_name(), "description": o.get_description(), "states": [k for k, v in STATES.items() if states.contains(v)]}
+    if o.get_role_name() not in ("list item", "label", "heading", "button", "check box", "entry"):
+        out["children"] = [dump(c, depth + 1) for c in children(o)]
+    try:
+        out["action"] = o.get_action_name(0) if o.get_n_actions() > 0 else None
+    except GLib.Error:
+        out["action"] = None
+    return out
+
+
 def run(cmd, arg):
+    if cmd == "dump":
+        return dump(window(json.loads(arg)[0]))
+    if cmd == "do":
+        return part(json.loads(arg)).do_action(0)
+    if cmd == "grab":
+        return part(json.loads(arg)).grab_focus()
+    if cmd == "select":
+        a = json.loads(arg)
+        return part(a[:-1]).select_child(a[-1])
     if cmd == "apps":
         return apps()
     if cmd == "tree":

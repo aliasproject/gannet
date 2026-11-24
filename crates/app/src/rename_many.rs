@@ -79,6 +79,25 @@ impl RenameMany {
         self.changing() > 0 && self.problems.iter().all(Option::is_none)
     }
 
+    /// What the dialog's called.
+    pub fn title(&self) -> String {
+        format!("Rename {}", crate::format::count(self.names.len(), "item", "items"))
+    }
+
+    /// What becomes of the item at `i`, for a screen reader: its new name, or that it keeps
+    /// its name, and what's wrong with the new one.
+    pub fn outcome(&self, i: usize) -> String {
+        let shown = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let (old, new) = (&self.names[i], &self.new[i]);
+        let to = if old == new { "unchanged".to_string() } else { format!("becomes “{}”", shown(new)) };
+        match self.problems[i] {
+            None => to,
+            Some(Problem::Invalid(why)) => format!("{to}, which can't be: {why}"),
+            Some(Problem::Twice(j)) => format!("{to}, as “{}” would", shown(&self.names[j])),
+            Some(Problem::Taken) => format!("{to}, which is already in this folder"),
+        }
+    }
+
     /// The line under the preview: the first thing stopping the rename, naming the items, or
     /// how many change. True when it's a problem.
     pub fn summary(&self) -> (String, bool) {
