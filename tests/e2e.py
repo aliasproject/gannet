@@ -1459,8 +1459,20 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         assert not any(x["type"] == "object:state-changed:focused" for x in heard), f"the row with focus was announced again: {heard}"
         assert sr.ask("kept") == {"role": "list item", "name": "b.txt"}
 
-        # A place opens when it's selected.
+        # While a dialog is open, a screen reader can't act behind it, as the pointer can't.
         places = sr.ask("tree")["places"]
+        a.key("a", mods=("ctrl",))
+        a.key("F2")
+        a.wait(lambda s: s["dialog"].startswith("rename-many"), "the dialog")
+        assert sr.ask(f"select_place {places.index('Home')}") is True, "select_place"
+        assert sr.ask("deselect_row 0") is True, "deselect_row"
+        time.sleep(0.5)
+        s = a.state()
+        assert s["dir"] == str(fs / "docs") and s["dialog"].startswith("rename-many") and len(s["selected"]) == 5, s
+        a.key("Escape")
+        a.wait(lambda s: s["dialog"] == "", "the dialog closed")
+
+        # A place opens when it's selected.
         assert sr.ask(f"select_place {places.index('Home')}") is True
         a.wait(lambda s: s["dir"] == str(SCRATCH / "client/home"), "home")
 

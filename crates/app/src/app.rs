@@ -1327,6 +1327,10 @@ impl App {
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
         use crate::a11y::{Act, BACK};
+        // Nothing behind a dialog can be used, by the pointer or by a screen reader.
+        if self.dialog.is_some() {
+            return;
+        }
         let row = |app: &Self, dir: &Path, key: &[u8]| {
             let l = app.listing.as_ref().filter(|_| app.dir == dir)?;
             app.rows.iter().position(|&e| *l.key(e) == *key)
