@@ -8,7 +8,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
@@ -170,7 +170,7 @@ impl Opts {
                 "--sort" if verb == "list" => {
                     let v = match value {
                         Some(v) => v,
-                        None => it.next().ok_or("--sort needs name, size or modified")?.to_string_lossy().into_owned(),
+                        None => it.next().filter(|n| !n.as_bytes().starts_with(b"-")).ok_or("--sort needs name, size or modified")?.to_string_lossy().into_owned(),
                     };
                     o.sort = Some(match v.as_str() {
                         "name" => SortKey::Name,
@@ -189,7 +189,9 @@ impl Opts {
             return Err("an empty PATH names nothing".into());
         }
         // As rm does: trashing `.` or `..` is almost always a mistake in a script.
-        if verb == "trash" && o.paths.iter().any(|p| is_dot(p.as_bytes())) {
+        // A `file://` URI is checked as it decodes: `%2E` is a dot too.
+        let decoded = |p: &OsString| p.to_str().and_then(from_file_uri).map_or_else(|| p.as_bytes().to_vec(), |d| d.into_os_string().into_vec());
+        if verb == "trash" && o.paths.iter().any(|p| is_dot(&decoded(p))) {
             return Err("refusing to move “.” or “..” to the Trash".into());
         }
         match verb {
@@ -344,6 +346,8 @@ fn run_job(env: &Env, request: Request, report: &mut Report) -> Option<Outcome> 
         let _ = tx.send(e);
     }));
     engine.start(request);
+    // Only the job's thread can send now, so a job that dies ends the wait instead of hanging it.
+    drop(engine);
     while let Ok(e) = rx.recv() {
         match e {
             Event::Progress(_) => {}
@@ -483,6 +487,15 @@ impl Item {
         Item { name, path, meta, target, target_kind, trash }
     }
 
+    /// When it was made, in seconds since the epoch, where the filesystem records it.
+    fn created(&self) -> Option<i64> {
+        let t = self.meta.as_ref()?.created().ok()?;
+        Some(match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_secs() as i64,
+            Err(e) => -(e.duration().as_secs() as i64),
+        })
+    }
+
     fn kind(&self) -> &'static str {
         self.meta.as_ref().map_or("missing", kind_word)
     }
@@ -490,10 +503,7 @@ impl Item {
     fn json(&self) -> J {
         let m = self.meta.as_ref();
         let time = |t: Option<i64>| t.map_or(J::Null, J::Int);
-        let created = m.and_then(|m| m.created().ok()).map(|t| match t.duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => d.as_secs() as i64,
-            Err(e) => -(e.duration().as_secs() as i64),
-        });
+        let created = self.created();
         let trash = match &self.trash {
             None => J::Null,
             Some(info) => J::Obj(vec![
@@ -563,8 +573,8 @@ impl Item {
             row("modified", date(m.mtime()));
             row("accessed", date(m.atime()));
             row("changed", date(m.ctime()));
-            if let Some(t) = m.created().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()) {
-                row("created", date(t.as_secs() as i64));
+            if let Some(t) = self.created() {
+                row("created", date(t));
             }
             row("mode", format!("{:04o}", m.mode() & 0o7777));
         }
@@ -924,7 +934,7 @@ mod tests {
     #[test]
     fn bad_arguments_say_how_to_use_it() {
         let mut t = setup();
-        for (verb, args) in [("list", &["--bogus"][..]), ("info", &[]), ("trash", &[]), ("list", &["a", "b"]), ("list", &["--sort", "colour"]), ("trash", &["--json=yes", "x"]), ("trash", &["--hidden", "x"])] {
+        for (verb, args) in [("list", &["--sort", "--hidden"][..]), ("list", &["--bogus"]), ("info", &[]), ("trash", &[]), ("list", &["a", "b"]), ("list", &["--sort", "colour"]), ("trash", &["--json=yes", "x"]), ("trash", &["--hidden", "x"])] {
             let (code, out, err) = t.run(verb, args);
             assert_eq!((code, out.as_str()), (1, ""), "{verb} {args:?}");
             assert!(err.contains(&format!("usage: gannet {verb}")), "{err}");
@@ -941,7 +951,9 @@ mod tests {
     fn an_empty_or_dot_path_never_trashes_the_current_folder() {
         let mut t = setup();
         std::fs::write(t.env.cwd.join("keep"), b"").unwrap();
-        for arg in ["", ".", "./", "..", "../", "sub/.", "sub/.."] {
+        let uri = |tail: &str| format!("file://{}/{tail}", crate::uri::encode_path(&t.env.cwd));
+        let (dot, dotdot) = (uri("%2E"), uri("sub/%2e%2E/"));
+        for arg in ["", ".", "./", "..", "../", "sub/.", "sub/..", &dot, &dotdot] {
             let (code, out, err) = t.run("trash", &[arg]);
             assert_eq!((code, out.as_str()), (1, ""), "{arg:?}");
             assert!(err.contains("usage: gannet trash"), "{arg:?}: {err}");
