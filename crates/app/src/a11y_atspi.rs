@@ -438,7 +438,8 @@ impl Ctx {
                 if matches!(n.role, Role::Dialog | Role::Alert) && n.parent != 0 {
                     on.push(STATE_MODAL);
                 }
-                if snap.modal.is_some_and(|m| m.default == Some(n.id)) {
+                // Only while it can be pressed: Enter does nothing otherwise.
+                if n.enabled && snap.modal.is_some_and(|m| m.default == Some(n.id)) {
                     on.push(STATE_IS_DEFAULT);
                 }
                 if n.selected {
@@ -861,6 +862,7 @@ impl Ctx {
                 self.event(&frame, OBJECT_EVENT, "Announcement", ("", POLITE), Variant::from(said));
                 if old.focus == new.focus
                     && let a11y::Focus::Node(id) = new.focus
+                    && old.window_focused
                     && new.window_focused
                 {
                     self.event(&fixed_path(id), OBJECT_EVENT, "StateChanged", ("focused", 1), Variant::from(0i32));
