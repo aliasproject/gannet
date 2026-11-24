@@ -6,6 +6,7 @@
 //! app's listing and row order, and the server reads each row from them when it's asked, so a
 //! folder of a hundred thousand files costs no more than one of ten.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -50,15 +51,17 @@ pub struct Node {
 /// The file list's rows, read from the app's own listing.
 #[derive(Clone, Default)]
 pub struct Rows {
-    /// Changes whenever the window shows another folder. A row is known by this and its file's
-    /// name, which stay the same however often the folder is read again, so a screen reader
-    /// isn't told of a new row every time a file in the folder changes. Its name is part of
-    /// what it's known by, so a screen reader that kept it can't be handed another file's.
+    /// Changes whenever the window shows another folder. A row is known by this and its key
+    /// (`Listing::key`: the file's name, or its path in the Trash and Recent views, where two
+    /// rows can share a name), which stay the same however often the folder is read again, so a
+    /// screen reader isn't told of a new row every time a file in the folder changes. The key
+    /// is part of what it's known by, so a screen reader that kept it can't be handed another
+    /// file's.
     pub era: u64,
     pub listing: Option<Arc<Listing>>,
     /// Listing entries, in the order shown.
     pub order: Arc<Vec<u32>>,
-    /// Where each name is in `order`.
+    /// Where each key is in `order`.
     pub index: Arc<HashMap<Box<[u8]>, u32>>,
     /// One bit for each listing entry, as the app keeps them.
     pub selected: Arc<Vec<u64>>,
@@ -104,22 +107,27 @@ impl Rows {
         String::from_utf8_lossy(self.raw_name(entry)).into_owned()
     }
 
-    /// Where the file of that name is in the list, if it's shown.
-    pub fn position_of(&self, name: &[u8]) -> Option<usize> {
-        self.index.get(name).map(|&at| at as usize)
+    /// What tells a listing entry's row apart from the others: `Listing::key`.
+    pub fn key(&self, entry: u32) -> Cow<'_, [u8]> {
+        self.listing.as_deref().filter(|l| (entry as usize) < l.len()).map_or(Cow::Borrowed(&[]), |l| l.key(entry))
+    }
+
+    /// Where the row of that key is in the list, if it's shown.
+    pub fn position_of(&self, key: &[u8]) -> Option<usize> {
+        self.index.get(key).map(|&at| at as usize)
     }
 
     /// Where a listing entry is in the list, if it's shown.
     pub fn position(&self, entry: u32) -> Option<usize> {
-        self.position_of(self.raw_name(entry)).filter(|&at| self.entry(at) == Some(entry))
+        self.position_of(&self.key(entry)).filter(|&at| self.entry(at) == Some(entry))
     }
 
     pub fn is_selected(&self, entry: u32) -> bool {
         self.selected.get(entry as usize / 64).is_some_and(|w| w >> (entry % 64) & 1 == 1)
     }
 
-    /// The names of the selected rows.
-    pub fn selected_names(&self) -> HashSet<&[u8]> {
+    /// The keys of the selected rows.
+    pub fn selected_keys(&self) -> HashSet<Cow<'_, [u8]>> {
         let mut out = HashSet::new();
         for (w, &word) in self.selected.iter().enumerate() {
             let mut bits = word;
@@ -127,7 +135,7 @@ impl Rows {
                 let e = w as u32 * 64 + bits.trailing_zeros();
                 bits &= bits - 1;
                 if self.position(e).is_some() {
-                    out.insert(self.raw_name(e));
+                    out.insert(self.key(e));
                 }
             }
         }
@@ -178,9 +186,12 @@ pub enum Act {
     Press(u64),
     /// Open a place in the sidebar.
     OpenPlace(usize),
-    /// Put the cursor on a row, selecting it as a plain move does: the row of that file name
-    /// in that folder. A request about a folder the window has left is dropped.
+    /// Put the cursor on a row without changing the selection: the row of that key
+    /// (`Listing::key`) in that folder. A request about a folder the window has left is dropped,
+    /// here and for each request about a row.
     FocusRow(Arc<PathBuf>, Vec<u8>),
+    /// Add a row to the selection (true) or take it out, leaving the rest as it is.
+    SelectRow(Arc<PathBuf>, Vec<u8>, bool),
     /// Scroll a row into view without moving the cursor.
     ShowRow(Arc<PathBuf>, Vec<u8>),
     /// Someone started listening: hand over a snapshot.
@@ -195,6 +206,8 @@ pub enum ToServer {
     Embed,
     /// Stop serving: the screen reader has gone.
     Stop,
+    /// The connection to the accessibility bus closed.
+    Lost,
 }
 
 /// Shared by the UI thread's `Link`, the session watcher and the server, while there is one.
@@ -306,7 +319,7 @@ impl Link {
             Some(r) if same_listing(r) && r.order.as_slice() == app.rows.as_slice() => (r.order.clone(), r.index.clone()),
             _ => {
                 let names = app.listing.as_deref();
-                let index: HashMap<Box<[u8]>, u32> = app.rows.iter().enumerate().filter_map(|(at, &e)| Some((Box::from(names.filter(|l| (e as usize) < l.len())?.name(e)), at as u32))).collect();
+                let index: HashMap<Box<[u8]>, u32> = app.rows.iter().enumerate().filter_map(|(at, &e)| Some((Box::from(&*names.filter(|l| (e as usize) < l.len())?.key(e)), at as u32))).collect();
                 (Arc::new(app.rows.clone()), Arc::new(index))
             }
         };

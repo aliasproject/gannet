@@ -7,7 +7,9 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   tree                 Gannet's window: the frame, the places, the rows and what has focus
   keep N               holds on to row N of the file list, as a screen reader would
   kept                 what the kept row says now: its name, or the error asking gave
-  select_row N         selects row N through the list's Selection interface
+  select_row N         adds row N to the selection through the list's Selection interface
+  deselect_row N       takes row N out of the selection, the same way
+  focus_row N          moves the keyboard to row N through its Component interface
   select_place N       selects place N in the sidebar, which opens it
   press_back           does the Back button's action
   events               the events heard since last asked
@@ -102,6 +104,10 @@ def run(cmd, arg):
             return {"error": e.message}
     if cmd == "select_row":
         return parts()[3].select_child(int(arg))
+    if cmd == "deselect_row":
+        return parts()[3].deselect_child(int(arg))
+    if cmd == "focus_row":
+        return parts()[3].get_child_at_index(int(arg)).grab_focus()
     if cmd == "select_place":
         return parts()[2].select_child(int(arg))
     if cmd == "press_back":

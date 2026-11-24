@@ -1285,21 +1285,28 @@ impl App {
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
         use crate::a11y::{Act, BACK};
-        let row = |app: &Self, dir: &Path, name: &[u8]| {
+        let row = |app: &Self, dir: &Path, key: &[u8]| {
             let l = app.listing.as_ref().filter(|_| app.dir == dir)?;
-            app.rows.iter().position(|&e| l.name(e) == name)
+            app.rows.iter().position(|&e| *l.key(e) == *key)
         };
         match act {
             Act::Press(BACK) => self.go_back(),
             Act::Press(_) | Act::Wake => {}
             Act::OpenPlace(i) => self.open_place(i),
-            Act::FocusRow(dir, name) => {
-                if let Some(at) = row(self, &dir, &name) {
-                    self.move_cursor(at, Mods::default());
+            Act::FocusRow(dir, key) => {
+                if let Some(at) = row(self, &dir, &key) {
+                    self.move_cursor(at, Mods { ctrl: true, ..Mods::default() });
                 }
             }
-            Act::ShowRow(dir, name) => {
-                if let Some(at) = row(self, &dir, &name) {
+            Act::SelectRow(dir, key, on) => {
+                if let Some(at) = row(self, &dir, &key) {
+                    self.selection_epoch += 1;
+                    self.set_selected(self.rows[at], on);
+                    self.invalidate_list();
+                }
+            }
+            Act::ShowRow(dir, key) => {
+                if let Some(at) = row(self, &dir, &key) {
                     let l = self.layout();
                     let top = at as f64 * l.row_h as f64;
                     if top < self.scroll || top + l.row_h as f64 > self.scroll + l.list.h as f64 {

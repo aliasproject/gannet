@@ -7,12 +7,14 @@
 //! the UI thread handed over, so the UI never waits on them. Its other thread turns each new
 //! snapshot into the events that say what changed.
 //!
-//! A row's object path is the folder visit (`a11y::Rows::era`) and its file's name, in hex.
+//! A row's object path is the folder visit (`a11y::Rows::era`) and its key (`Listing::key`:
+//! its file's name, or its path in the Trash and Recent views), in hex.
 //! The same file keeps its path however often the folder is read again, and a path can never
 //! stand for another file, so a screen reader can't be handed a name it kept from before. The
 //! list says it manages its descendants, so screen readers don't keep its children either,
 //! and a big change needn't be announced row by row.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
@@ -66,16 +68,33 @@ type Ref = (String, OwnedObjectPath);
 /// An object as the Cache interface describes it, though nothing is ever cached here.
 type CacheItem = (Ref, Ref, Ref, i32, i32, Vec<String>, String, u32, String, Vec<u32>);
 
-/// Serves the app on the accessibility bus at `address` until `shared` is disconnected or the
-/// bus goes away. Returns at once; the work is on threads of its own.
-pub fn start(shared: Arc<Shared>, hub: Hub, address: String) {
+/// Serves the app on the accessibility bus at `address` until `shared` is disconnected, the
+/// connection closes or it can't start. Returns the server's number at once; the work is on
+/// threads of its own. `stopped` is called with that number once it has stopped, however it
+/// stopped.
+pub fn start(shared: Arc<Shared>, hub: Hub, address: String, stopped: impl FnOnce(u64) + Send + 'static) -> u64 {
     let epoch = shared.next_epoch();
-    let _ = std::thread::Builder::new().name("gannet-a11y".into()).spawn(move || {
+    let spawned = std::thread::Builder::new().name("gannet-a11y".into()).spawn(move || {
         if let Err(e) = run(&shared, epoch, hub, &address) {
             eprintln!("gannet: accessibility: {e}");
         }
         shared.stopped(epoch);
+        stopped(epoch);
     });
+    if spawned.is_err() {
+        eprintln!("gannet: accessibility: couldn't start a thread");
+    }
+    epoch
+}
+
+/// Tells the server its connection closed: the thread following the bus drops it when the
+/// connection ends, whether or not anything was said first.
+struct Lost(std::sync::mpsc::Sender<ToServer>);
+
+impl Drop for Lost {
+    fn drop(&mut self) {
+        let _ = self.0.send(ToServer::Lost);
+    }
 }
 
 fn run(shared: &Shared, epoch: u64, hub: Hub, address: &str) -> zbus::Result<()> {
@@ -86,13 +105,14 @@ fn run(shared: &Shared, epoch: u64, hub: Hub, address: &str) -> zbus::Result<()>
     let calls = MatchRule::builder().msg_type(Type::MethodCall).build()?;
     // The registry starting again forgets every app, so it's introduced again.
     let registry = MatchRule::builder().msg_type(Type::Signal).sender("org.freedesktop.DBus").member("NameOwnerChanged").arg(0, REGISTRY).build()?;
-    let (ctx2, tx2) = (ctx.clone(), tx.clone());
+    let (ctx2, lost) = (ctx.clone(), Lost(tx.clone()));
     let _following = bus.follow_all(vec![calls, registry], Some(CALL_QUEUE), move |m| {
-        let Ok(m) = m else { return true };
+        // zbus hands over an error only as the connection closes.
+        let Ok(m) = m else { return false };
         if m.message_type() == Type::MethodCall {
             ctx2.dispatch(&m);
         } else if m.body().deserialize::<(String, String, String)>().is_ok_and(|(_, _, new)| !new.is_empty()) {
-            let _ = tx2.send(ToServer::Embed);
+            let _ = lost.0.send(ToServer::Embed);
         }
         true
     })?;
@@ -118,6 +138,7 @@ fn run(shared: &Shared, epoch: u64, hub: Hub, address: &str) -> zbus::Result<()>
                 }
             }
             ToServer::Stop => break,
+            ToServer::Lost => return Err(zbus::Error::Failure("lost the accessibility bus".into())),
         }
     }
     Ok(())
@@ -139,10 +160,10 @@ fn fixed_path(id: u64) -> String {
     format!("{PREFIX}{id}")
 }
 
-fn row_path(era: u64, name: &[u8]) -> String {
+fn row_path(era: u64, key: &[u8]) -> String {
     use std::fmt::Write;
     let mut p = format!("{PREFIX}r{era}_");
-    for b in name {
+    for b in key {
         let _ = write!(p, "{b:02x}");
     }
     p
@@ -202,7 +223,7 @@ impl Ctx {
     }
 
     fn row_ref(&self, rows: &Rows, entry: u32) -> Ref {
-        self.at(&row_path(rows.era, rows.raw_name(entry)))
+        self.at(&row_path(rows.era, &rows.key(entry)))
     }
 
     fn reply<B: zbus::export::serde::Serialize + zbus::DynamicType>(&self, h: &Header<'_>, body: &B) {
@@ -238,7 +259,7 @@ impl Ctx {
         } else if let Some(rest) = path.strip_prefix(PREFIX) {
             match rest.strip_prefix('r') {
                 Some(row) => {
-                    let found = parse_row(row).filter(|(era, _)| *era == snap.rows.era).and_then(|(_, name)| snap.rows.position_of(&name)).and_then(|at| Some((snap.rows.entry(at)?, at)));
+                    let found = parse_row(row).filter(|(era, _)| *era == snap.rows.era).and_then(|(_, key)| snap.rows.position_of(&key)).and_then(|at| Some((snap.rows.entry(at)?, at)));
                     match found {
                         Some((e, at)) => Target::Row(e, at),
                         None => return self.error(&h, UNKNOWN_OBJECT, "gone"),
@@ -484,14 +505,14 @@ impl Ctx {
             }
             "GrabFocus" => {
                 let ok = match target {
-                    Target::Row(e, _) => self.tell_row(snap, *e, false),
+                    Target::Row(e, _) => self.tell_row(snap, *e, Act::FocusRow),
                     _ => false,
                 };
                 self.reply(h, &(ok,))
             }
             "ScrollTo" | "ScrollToPoint" => {
                 let ok = match target {
-                    Target::Row(e, _) => self.tell_row(snap, *e, true),
+                    Target::Row(e, _) => self.tell_row(snap, *e, Act::ShowRow),
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -501,10 +522,9 @@ impl Ctx {
         }
     }
 
-    /// Asks the app to move the cursor to a row, or only to show it.
-    fn tell_row(&self, snap: &Snapshot, entry: u32, show: bool) -> bool {
-        let (dir, name) = (snap.dir.clone(), snap.rows.raw_name(entry).to_vec());
-        self.hub.send(Msg::A11y(if show { Act::ShowRow(dir, name) } else { Act::FocusRow(dir, name) }));
+    /// Asks the app to do something to a row, named by its folder and key.
+    fn tell_row(&self, snap: &Snapshot, entry: u32, act: impl FnOnce(Arc<std::path::PathBuf>, Vec<u8>) -> Act) -> bool {
+        self.hub.send(Msg::A11y(act(snap.dir.clone(), snap.rows.key(entry).into_owned())));
         true
     }
 
@@ -559,16 +579,23 @@ impl Ctx {
                 self.reply(h, &(on,))
             }
             "SelectChild" => {
-                // Selecting a row moves the cursor to it, as a plain arrow-key move does;
-                // selecting a place opens it, as clicking one does.
+                // Selecting a row adds it to the selection, as Ctrl+click does, leaving the
+                // rest and the cursor as they are; selecting a place opens it, as clicking one
+                // does.
                 let ok = match i {
-                    Some(at) if n.id == a11y::LIST => snap.rows.entry(at).is_some_and(|e| self.tell_row(snap, e, false)),
+                    Some(at) if n.id == a11y::LIST => snap.rows.entry(at).is_some_and(|e| self.tell_row(snap, e, |d, k| Act::SelectRow(d, k, true))),
                     Some(at) if at < n.children.len() => {
                         self.hub.send(Msg::A11y(Act::OpenPlace(at)));
                         true
                     }
                     _ => false,
                 };
+                self.reply(h, &(ok,))
+            }
+            "DeselectChild" | "DeselectSelectedChild" if n.id == a11y::LIST => {
+                // One counts among all the rows, the other among the selected ones.
+                let at = if m == "DeselectChild" { i } else { i.and_then(|i| self.selected_children(n, snap).get(i).copied()) };
+                let ok = at.and_then(|at| snap.rows.entry(at)).is_some_and(|e| snap.rows.is_selected(e) && self.tell_row(snap, e, |d, k| Act::SelectRow(d, k, false)));
                 self.reply(h, &(ok,))
             }
             "DeselectSelectedChild" | "DeselectChild" | "SelectAll" | "ClearSelection" => self.reply(h, &(false,)),
@@ -618,8 +645,8 @@ impl Ctx {
         let list = fixed_path(a11y::LIST);
         let same_folder = old.rows.era == new.rows.era;
         if same_folder && !Arc::ptr_eq(&old.rows.order, &new.rows.order) {
-            let gone: Vec<(usize, u32)> = old.rows.order.iter().enumerate().filter(|(_, e)| new.rows.position_of(old.rows.raw_name(**e)).is_none()).map(|(at, e)| (at, *e)).take(ROW_EVENTS + 1).collect();
-            let came: Vec<(usize, u32)> = new.rows.order.iter().enumerate().filter(|(_, e)| old.rows.position_of(new.rows.raw_name(**e)).is_none()).map(|(at, e)| (at, *e)).take(ROW_EVENTS + 1).collect();
+            let gone: Vec<(usize, u32)> = old.rows.order.iter().enumerate().filter(|(_, e)| new.rows.position_of(&old.rows.key(**e)).is_none()).map(|(at, e)| (at, *e)).take(ROW_EVENTS + 1).collect();
+            let came: Vec<(usize, u32)> = new.rows.order.iter().enumerate().filter(|(_, e)| old.rows.position_of(&new.rows.key(**e)).is_none()).map(|(at, e)| (at, *e)).take(ROW_EVENTS + 1).collect();
             if gone.len() + came.len() <= ROW_EVENTS {
                 for &(at, e) in gone.iter().rev() {
                     self.event(&list, OBJECT_EVENT, "ChildrenChanged", ("remove", at as i32), Variant::from(self.row_ref(&old.rows, e)));
@@ -632,11 +659,11 @@ impl Ctx {
 
         // Selection, by name. Rows that left the list aren't told they're no longer selected.
         if same_folder {
-            let (was, is) = (old.rows.selected_names(), new.rows.selected_names());
-            let changed: Vec<&[u8]> = was.symmetric_difference(&is).copied().filter(|n| new.rows.position_of(n).is_some()).collect();
+            let (was, is) = (old.rows.selected_keys(), new.rows.selected_keys());
+            let changed: Vec<&Cow<'_, [u8]>> = was.symmetric_difference(&is).filter(|k| new.rows.position_of(k).is_some()).collect();
             if changed.len() <= ROW_EVENTS {
-                for n in &changed {
-                    state(&row_path(new.rows.era, n), "selected", is.contains(n));
+                for k in &changed {
+                    state(&row_path(new.rows.era, k), "selected", is.contains(*k));
                 }
             }
             if !changed.is_empty() {
@@ -649,7 +676,7 @@ impl Ctx {
         // Focus last, so a screen reader reads the row as it is now.
         let path_of = |s: &Snapshot| match s.focus {
             a11y::Focus::Node(id) => fixed_path(id),
-            a11y::Focus::Row(e) => row_path(s.rows.era, s.rows.raw_name(e)),
+            a11y::Focus::Row(e) => row_path(s.rows.era, &s.rows.key(e)),
         };
         let had = old.window_focused.then(|| path_of(old));
         let has = new.window_focused.then(|| path_of(new));
@@ -657,7 +684,7 @@ impl Ctx {
             if let Some(p) = &had {
                 let still_there = match old.focus {
                     a11y::Focus::Node(id) => new.get(id).is_some(),
-                    a11y::Focus::Row(e) => same_folder && new.rows.position_of(old.rows.raw_name(e)).is_some(),
+                    a11y::Focus::Row(e) => same_folder && new.rows.position_of(&old.rows.key(e)).is_some(),
                 };
                 if still_there {
                     state(p, "focused", false);

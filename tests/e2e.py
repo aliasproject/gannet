@@ -1099,12 +1099,32 @@ class ScreenReader:
 
     def __init__(self):
         self.a11y = PrivateBus(name="a11y")
-        launcher = f"[D-BUS Service]\nName=org.a11y.Bus\nExec=/usr/bin/python3 -B {ROOT / 'tests/a11y_bus.py'} {self.a11y.address}\n"
+        # Without the bus's id, so the address still works once the bus is started again.
+        address = self.a11y.address.split(",guid=")[0]
+        launcher = f"[D-BUS Service]\nName=org.a11y.Bus\nExec=/usr/bin/python3 -B {ROOT / 'tests/a11y_bus.py'} {address}\n"
         self.session = PrivateBus({"org.a11y.Bus.service": launcher}, name="session")
-        self.env = {"PATH": "/usr/bin", "LANG": "C.UTF-8", "HOME": str(SCRATCH / "client/home"), "DBUS_SESSION_BUS_ADDRESS": self.session.address, "AT_SPI_BUS_ADDRESS": self.a11y.address}
+        self.env = {"PATH": "/usr/bin", "LANG": "C.UTF-8", "HOME": str(SCRATCH / "client/home"), "DBUS_SESSION_BUS_ADDRESS": self.session.address, "AT_SPI_BUS_ADDRESS": address}
         self.registry = None
         self.start_registry()
+        self.start_client()
+
+    def start_client(self):
         self.client = subprocess.Popen(["python3", "-B", str(ROOT / "tests/a11y_client.py")], env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(SCRATCH / "stderr.log", "a"), text=True)
+
+    def restart_bus(self):
+        """Stops the accessibility bus, and everything on it, and starts it again at the same address."""
+        self.client.kill()
+        self.client.wait()
+        self.stop_registry()
+        self.a11y.stop()
+        self.a11y = PrivateBus(name="a11y")
+        self.start_registry()
+        self.start_client()
+
+    def launcher_running(self):
+        r = self.session.call("call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", "org.a11y.Bus")
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip() == "b true"
 
     def start_registry(self):
         self.registry = subprocess.Popen([str(REGISTRYD)], env=self.env, stdout=subprocess.DEVNULL, stderr=open(SCRATCH / "stderr.log", "a"))
@@ -1153,14 +1173,22 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         raise AssertionError("needs at-spi2-core and python-gobject")
     assert REGISTRYD.exists(), "needs at-spi2-core"
     fs = fresh_fs()
-    tree(fs, {"docs/sub/x.txt": "x", "docs/a.txt": "a", "docs/b.txt": "b", "docs/c.txt": "c"})
+    tree(fs, {"docs/sub/x.txt": "x", "docs/a.txt": "a", "docs/b.txt": "b", "docs/c.txt": "c", "one/README.md": "1", "two/README.md": "2"})
     sr = ScreenReader()
     try:
-        a = App(h, fs / "docs", extra_env={"DBUS_SESSION_BUS_ADDRESS": sr.session.address})
+        env = {"DBUS_SESSION_BUS_ADDRESS": sr.session.address}
+        # Two recently used files of the same name, for the Recent view.
+        data = Path(App(h, fs / "docs", launch=False, extra_env=env).env["XDG_DATA_HOME"])
+        data.mkdir(parents=True, exist_ok=True)
+        marks = "".join(f'<bookmark href="file://{fs / d}/README.md" added="{t}" modified="{t}" visited="{t}"/>' for d, t in [("one", "2026-01-01T00:00:00Z"), ("two", "2026-02-01T00:00:00Z")])
+        (data / "recently-used.xbel").write_text(f'<?xml version="1.0"?><xbel version="1.0">{marks}</xbel>')
+        a = App(h, fs / "docs", extra_env=env)
         a.wait(lambda s: s["names"] == ["sub", "a.txt", "b.txt", "c.txt"], "listed")
         # With no screen reader on, the window stays off the accessibility bus altogether.
         time.sleep(0.5)
         assert sr.ask("apps") == [], "registered with no screen reader on"
+        # Nor does it start at-spi-bus-launcher by asking it: it says when it starts.
+        assert not sr.launcher_running(), "the window started at-spi-bus-launcher"
 
         sr.screen_reader(True)
         sr.until("apps", lambda x: x == ["Gannet"], "registered once a screen reader is on")
@@ -1192,10 +1220,19 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         heard = sr.until("events", lambda e: any(x["type"] == "object:property-change:accessible-name" for x in e), "the window's new name is heard")
         assert sr.ask("tree")["frame"] == "docs - Gannet"
 
-        # Selecting a row through AT-SPI moves the cursor there.
+        # Through AT-SPI, selecting a row adds it to the selection, and moving the keyboard to
+        # a row leaves the selection as it is: neither narrows a selection about to be deleted.
+        a.key("Home")
+        a.wait(lambda s: s["cursor"] == 0 and s["selected"] == ["sub"], "the first row")
         assert sr.ask("select_row 2") is True
-        a.wait(lambda s: s["selected"] == ["b.txt"], "selected through AT-SPI")
-        assert sr.until("tree", lambda t: t["selected"] == ["b.txt"], "selection")["focus"] == ["b.txt"]
+        a.wait(lambda s: s["selected"] == ["sub", "b.txt"], "b.txt added through AT-SPI")
+        assert sr.ask("focus_row 3") is True
+        a.wait(lambda s: s["cursor"] == 3, "the cursor on c.txt")
+        t = sr.until("tree", lambda t: t["focus"] == ["c.txt"], "focus on c.txt")
+        assert t["selected"] == ["sub", "b.txt"] and a.state()["selected"] == ["sub", "b.txt"], t
+        assert sr.ask("deselect_row 0") is True
+        a.wait(lambda s: s["selected"] == ["b.txt"], "sub taken out through AT-SPI")
+        sr.until("tree", lambda t: t["selected"] == ["b.txt"], "the selection heard")
 
         # The same row keeps its object as the folder is read again, and a new file is announced.
         assert sr.ask("keep 2") == "b.txt"
@@ -1223,10 +1260,38 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         heard += sr.ask("events")
         assert not [x for x in heard if x["source"] in places], f"the sidebar was announced: {heard}"
 
+        # In Recent, two rows can share a name: each is still its own object, and selecting
+        # the second selects that one, not the first.
+        assert sr.ask(f"select_place {places.index('Recent')}") is True
+        a.wait(lambda s: s["names"] == ["README.md", "README.md"], "Recent")
+        sr.until("tree", lambda t: t["rows"] == ["README.md", "README.md"], "Recent's rows")
+        assert sr.ask("select_row 1") is True
+        assert sr.ask("focus_row 1") is True
+        a.wait(lambda s: s["cursor"] == 1 and s["cursor_shown"] and s["selected"] == ["README.md"], "the second README.md selected")
+        t = sr.until("tree", lambda t: t["focus"] != ["Files"], "focus on a row")
+        assert t["focus"] == ["README.md"] and t["selected"] == ["README.md"], f"both rows answered as one: {t}"
+
         # The registry starting again forgets every app: the window joins it again.
         sr.stop_registry()
         sr.start_registry()
         sr.until("apps", lambda x: x == ["Gannet"], "registered again after the registry restarted")
+
+        # The accessibility bus going away ends the server, and the next change starts one on
+        # the new bus.
+        sr.restart_bus()
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered on the new accessibility bus")
+
+        # A server that couldn't start, here for want of a registry, is tried again on the next
+        # change.
+        sr.screen_reader(False)
+        sr.until("apps", lambda x: x == [], "gone once the screen reader is off")
+        sr.stop_registry()
+        sr.screen_reader(True)
+        time.sleep(1)
+        sr.start_registry()
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered once a start that failed is tried again")
 
         # Once the screen reader goes, so does the window from the bus; and back when it's on,
         # or when assistive technologies in general are.
