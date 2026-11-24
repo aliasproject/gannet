@@ -26,13 +26,59 @@ pub const SIDEBAR: u64 = 2;
 pub const LIST: u64 = 3;
 pub const BACK: u64 = 4;
 pub const PLACE0: u64 = 100;
+// The Open and Save dialog's bar. Its file types are by their place among the request's.
+pub const CHOOSER_ACCEPT: u64 = 20;
+pub const CHOOSER_CANCEL: u64 = 21;
+pub const CHOOSER_SAVE_NAME: u64 = 22;
+pub const CHOOSER_INFO: u64 = 23;
+pub const CHOOSER_TYPES: u64 = 24;
+pub const CHOOSER_TYPE0: u64 = 40;
+// The preview window.
+pub const PREVIEW: u64 = 50;
+pub const PREVIEW_NAME: u64 = 51;
+pub const PREVIEW_KIND: u64 = 52;
+pub const PREVIEW_SHOWS: u64 = 53;
+pub const PREVIEW_PREVIOUS: u64 = 54;
+pub const PREVIEW_NEXT: u64 = 55;
+pub const PREVIEW_CLOSE: u64 = 56;
+// The Open With window. Its apps and headings are numbered from `OPEN_WITH_ROW0`, each keeping
+// its number while the window is open.
+pub const OPEN_WITH_SEARCH: u64 = 60;
+pub const OPEN_WITH_APPS: u64 = 61;
+pub const OPEN_WITH_ALWAYS: u64 = 62;
+pub const OPEN_WITH_CANCEL: u64 = 63;
+pub const OPEN_WITH_OPEN: u64 = 64;
+pub const OPEN_WITH_ROW0: u64 = 1 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Frame,
+    Dialog,
     List,
     ListItem,
     PushButton,
+    CheckBox,
+    /// A line of text that can be typed in. Its text is the node's `field`.
+    Entry,
+    Label,
+    Heading,
+    /// What the preview window shows.
+    Document,
+}
+
+/// The one thing a part does when a screen reader asks: its name and description, as AT-SPI
+/// has them, and the key that does it too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Action {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub keys: &'static str,
+}
+
+impl Action {
+    pub const fn new(name: &'static str, description: &'static str, keys: &'static str) -> Self {
+        Self { name, description, keys }
+    }
 }
 
 /// One of the window's fixed parts: everything but the file list's rows.
@@ -41,6 +87,8 @@ pub struct Node {
     pub id: u64,
     pub role: Role,
     pub name: String,
+    /// Said after the name: an app being the default, or what the preview shows.
+    pub description: String,
     /// In the window's own pixels. Wayland never says where a window is on screen.
     pub rect: Rect,
     pub children: Vec<u64>,
@@ -50,6 +98,53 @@ pub struct Node {
     pub enabled: bool,
     /// Whether any of it is in view: a place can be scrolled out of the sidebar.
     pub showing: bool,
+    pub action: Option<Action>,
+    /// A check box's state.
+    pub checked: Option<bool>,
+    /// An entry's text, caret and selection.
+    pub field: Option<crate::field::Field>,
+}
+
+impl Node {
+    /// A part with nothing selected, checked or typed in, enabled and showing.
+    pub fn new(id: u64, role: Role, name: impl Into<String>, rect: Rect, parent: u64) -> Self {
+        Node { id, role, name: name.into(), description: String::new(), rect, children: Vec::new(), parent, selected: false, enabled: true, showing: true, action: None, checked: None, field: None }
+    }
+
+    pub fn described(mut self, d: impl Into<String>) -> Self {
+        self.description = d.into();
+        self
+    }
+
+    pub fn with_children(mut self, c: Vec<u64>) -> Self {
+        self.children = c;
+        self
+    }
+
+    pub fn doing(mut self, a: Action) -> Self {
+        self.action = Some(a);
+        self
+    }
+
+    pub fn enabled(mut self, on: bool) -> Self {
+        self.enabled = on;
+        self
+    }
+
+    pub fn selected(mut self, on: bool) -> Self {
+        self.selected = on;
+        self
+    }
+
+    pub fn showing(mut self, on: bool) -> Self {
+        self.showing = on;
+        self
+    }
+}
+
+/// A push button's action.
+pub const fn click(description: &'static str, keys: &'static str) -> Action {
+    Action::new("click", description, keys)
 }
 
 /// The folder shown, and what's needed to say where a row of Recent, the Trash or a search is.
@@ -205,8 +300,11 @@ impl Snapshot {
 
 /// Something a screen reader asked for.
 pub enum Act {
-    /// Press a button.
+    /// Do a part's action: press a button, tick a box, or open with an app.
     Press(u64),
+    /// Give a part the keyboard: an entry, or an item of a list other than the file list, which
+    /// picks it, as moving to it does with the keyboard.
+    Focus(u64),
     /// Open a place in the sidebar.
     OpenPlace(usize),
     /// Scroll the sidebar to show a place.
@@ -300,25 +398,41 @@ pub struct Link {
     dir: Arc<PathBuf>,
     era: u64,
     here: Arc<Here>,
+    no_rows: Rows,
 }
 
 impl Link {
     pub fn new() -> Self {
-        Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0, here: Arc::default() }
+        Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0, here: Arc::default(), no_rows: Rows::default() }
     }
 
-    /// Hands the server a snapshot if anything changed. Costs nothing while no one listens.
+    /// Hands the server a snapshot of the app's window if anything changed. Costs nothing
+    /// while no one listens.
     pub fn update(&mut self, app: &App) {
+        if self.listening() {
+            let snap = self.build(app);
+            self.offer(snap);
+        }
+    }
+
+    /// Whether a screen reader is listening, so a snapshot is wanted. Forgets the last one
+    /// when not, and when a new server started, which is sent the next one whole.
+    pub fn listening(&mut self) -> bool {
         if !self.shared.is_live() {
             self.last = None;
-            return;
+            return false;
         }
         let epoch = self.shared.current_epoch();
         if epoch != self.epoch {
             self.epoch = epoch;
             self.last = None;
         }
-        let snap = self.build(app);
+        true
+    }
+
+    /// Hands the server a snapshot built elsewhere, as the Open With window's is, if it isn't
+    /// the same as the last. Ask `listening` first.
+    pub fn offer(&mut self, snap: Snapshot) {
         if self.last.as_ref() == Some(&snap) {
             return;
         }
@@ -328,7 +442,15 @@ impl Link {
         self.last = Some(snap);
     }
 
+    /// No rows, the same each time, so a window without a file list compares as unchanged.
+    pub fn no_rows(&self) -> Rows {
+        self.no_rows.clone()
+    }
+
     fn build(&mut self, app: &App) -> Snapshot {
+        if app.viewer {
+            return self.build_viewer(app);
+        }
         if *self.dir != app.dir {
             self.dir = Arc::new(app.dir.clone());
             self.era += 1;
@@ -363,25 +485,71 @@ impl Link {
                 // Placed as drawn, with the sidebar scrolled.
                 let rect = Rect::new(l.sidebar.x, app.place_top(i), l.sidebar.w, place_h);
                 let showing = rect.y + rect.h > l.sidebar.y && rect.y < l.sidebar.y + l.sidebar.h;
-                Node { id: PLACE0 + i as u64, role: Role::ListItem, name: p.label.clone(), rect, children: Vec::new(), parent: SIDEBAR, selected: p.path == app.dir, enabled: true, showing }
+                Node::new(PLACE0 + i as u64, Role::ListItem, p.label.clone(), rect, SIDEBAR).selected(p.path == app.dir).showing(showing).doing(Action::new("activate", "Open", ""))
             })
             .collect();
         let b = app.px(36.0);
         // As the window's title says it, so Recent and the Trash are called that.
         let title = app.crumb_label(&app.dir);
         let mut fixed = vec![
-            Node { id: FRAME, role: Role::Frame, name: format!("{title} - Gannet"), rect: Rect::new(0, 0, app.w, app.h), children: vec![BACK, SIDEBAR, LIST], parent: 0, selected: false, enabled: true, showing: true },
-            Node { id: BACK, role: Role::PushButton, name: "Back".into(), rect: Rect::new(app.px(6.0), 0, b, l.toolbar.h), children: Vec::new(), parent: FRAME, selected: false, enabled: app.history.can_go_back(), showing: true },
-            Node { id: SIDEBAR, role: Role::List, name: "Places".into(), rect: l.sidebar, children: places.iter().map(|n| n.id).collect(), parent: FRAME, selected: false, enabled: true, showing: true },
-            Node { id: LIST, role: Role::List, name: "Files".into(), rect: l.list, children: Vec::new(), parent: FRAME, selected: false, enabled: true, showing: true },
+            Node::new(FRAME, Role::Frame, format!("{title} - Gannet"), Rect::new(0, 0, app.w, app.h), 0).with_children(vec![BACK, SIDEBAR, LIST]),
+            Node::new(BACK, Role::PushButton, "Back", Rect::new(app.px(6.0), 0, b, l.toolbar.h), FRAME).enabled(app.history.can_go_back()).doing(click("Go back", "<Alt>Left")),
+            Node::new(SIDEBAR, Role::List, "Places", l.sidebar, FRAME).with_children(places.iter().map(|n| n.id).collect()),
+            Node::new(LIST, Role::List, "Files", l.list, FRAME),
         ];
         fixed.extend(places);
-        let focus = match rows.entry(app.cursor) {
+        let mut focus = match rows.entry(app.cursor) {
             Some(e) if app.cursor_shown => Focus::Row(e),
             _ => Focus::Node(LIST),
         };
+        if let Some(c) = app.chooser.as_ref() {
+            // A dialog for another program, named for what it asked, and where it is.
+            fixed[0].role = Role::Dialog;
+            fixed[0].name = format!("{} - {title}", c.spec.title());
+            let parts = app.a11y_chooser_parts();
+            fixed[0].children.extend(parts.iter().filter(|n| n.parent == FRAME).map(|n| n.id));
+            if parts.iter().any(|n| n.id == CHOOSER_SAVE_NAME && n.field.is_some()) && app.a11y_name_has_keyboard() {
+                focus = Focus::Node(CHOOSER_SAVE_NAME);
+            }
+            fixed.extend(parts);
+        }
         Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone() }
     }
+
+    /// The preview window: the file's name, its kind and what's shown of it, and buttons to
+    /// walk its folder and close it.
+    fn build_viewer(&mut self, app: &App) -> Snapshot {
+        let s = app.a11y_preview();
+        let r = Rect::new(0, 0, app.w, app.h);
+        let fixed = vec![
+            Node::new(FRAME, Role::Frame, format!("{} - Preview", s.name), r, 0).with_children(vec![PREVIEW, PREVIEW_PREVIOUS, PREVIEW_NEXT, PREVIEW_CLOSE]),
+            // What has the keyboard, so moving to another file reads out its name, and the rest
+            // is there to be read.
+            Node::new(PREVIEW, Role::Document, s.name.clone(), s.area, FRAME).described([s.kind.as_str(), s.shows.as_str()].into_iter().filter(|t| !t.is_empty()).collect::<Vec<_>>().join(", ")).with_children(vec![PREVIEW_NAME, PREVIEW_KIND, PREVIEW_SHOWS]),
+            Node::new(PREVIEW_NAME, Role::Label, s.name, s.title, PREVIEW),
+            Node::new(PREVIEW_KIND, Role::Label, s.kind, s.area, PREVIEW),
+            Node::new(PREVIEW_SHOWS, Role::Label, s.shows, s.foot, PREVIEW),
+            // Placed as the keys that do the same: there are no buttons on screen.
+            Node::new(PREVIEW_PREVIOUS, Role::PushButton, "Previous file", Rect::default(), FRAME).enabled(s.can_step.0).doing(click("Show the previous file in the folder", "Left")),
+            Node::new(PREVIEW_NEXT, Role::PushButton, "Next file", Rect::default(), FRAME).enabled(s.can_step.1).doing(click("Show the next file in the folder", "Right")),
+            Node::new(PREVIEW_CLOSE, Role::PushButton, "Close", Rect::default(), FRAME).doing(click("Close the preview", "Escape")),
+        ];
+        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone() }
+    }
+}
+
+/// What the preview window says about the file it shows.
+pub struct PreviewText {
+    pub name: String,
+    /// Its kind, like "PNG image".
+    pub kind: String,
+    /// What's shown of it: a picture's size, a document's lines, or why it can't be shown.
+    pub shows: String,
+    pub title: Rect,
+    pub area: Rect,
+    pub foot: Rect,
+    /// Whether there's a file before it and after it.
+    pub can_step: (bool, bool),
 }
 
 #[cfg(test)]

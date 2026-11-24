@@ -45,6 +45,8 @@ const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 // AtspiRole and AtspiStateType numbers.
 const ROLE_APPLICATION: u32 = 75;
 const STATE_ACTIVE: u32 = 1;
+const STATE_CHECKED: u32 = 4;
+const STATE_EDITABLE: u32 = 7;
 const STATE_ENABLED: u32 = 8;
 const STATE_FOCUSABLE: u32 = 11;
 const STATE_FOCUSED: u32 = 12;
@@ -53,8 +55,11 @@ const STATE_SELECTABLE: u32 = 22;
 const STATE_SELECTED: u32 = 23;
 const STATE_SENSITIVE: u32 = 24;
 const STATE_SHOWING: u32 = 25;
+const STATE_SINGLE_LINE: u32 = 26;
 const STATE_VISIBLE: u32 = 30;
 const STATE_MANAGES_DESCENDANTS: u32 = 31;
+const STATE_CHECKABLE: u32 = 41;
+const STATE_READ_ONLY: u32 = 43;
 
 /// More rows than this changing at once aren't announced one by one. The list manages its
 /// descendants, so screen readers don't rely on hearing each.
@@ -194,9 +199,15 @@ fn parse_row(rest: &str) -> Option<(u64, Vec<u8>)> {
 fn role_of(r: Role) -> (u32, &'static str) {
     match r {
         Role::Frame => (23, "frame"),
+        Role::Dialog => (16, "dialog"),
         Role::List => (31, "list"),
         Role::ListItem => (32, "list item"),
         Role::PushButton => (43, "push button"),
+        Role::CheckBox => (7, "check box"),
+        Role::Entry => (79, "entry"),
+        Role::Label => (29, "label"),
+        Role::Heading => (83, "heading"),
+        Role::Document => (82, "document frame"),
     }
 }
 
@@ -361,11 +372,13 @@ impl Ctx {
         }
     }
 
-    /// Where a row of Recent, the Trash or a search is, so two of one name can be told apart.
+    /// Where a row of Recent, the Trash or a search is, so two of one name can be told apart,
+    /// or what a part says besides its name.
     fn description(&self, target: &Target<'_>, snap: &Snapshot) -> String {
         match target {
             Target::Row(e, _) => snap.rows.location(*e).unwrap_or_default(),
-            _ => String::new(),
+            Target::Fixed(n) => n.description.clone(),
+            Target::Root => String::new(),
         }
     }
 
@@ -390,15 +403,21 @@ impl Ctx {
                     on.extend([STATE_ENABLED, STATE_SENSITIVE]);
                 }
                 match n.role {
-                    Role::Frame if snap.window_focused => on.push(STATE_ACTIVE),
+                    Role::Frame | Role::Dialog if snap.window_focused => on.push(STATE_ACTIVE),
                     Role::ListItem => on.extend([STATE_SELECTABLE, STATE_FOCUSABLE]),
                     Role::PushButton => on.push(STATE_FOCUSABLE),
+                    Role::CheckBox => on.extend([STATE_FOCUSABLE, STATE_CHECKABLE]),
+                    Role::Entry => on.extend([STATE_FOCUSABLE, STATE_EDITABLE, STATE_SINGLE_LINE]),
+                    Role::Document => on.extend([STATE_FOCUSABLE, STATE_READ_ONLY]),
                     Role::List if n.id == a11y::LIST => on.extend([STATE_FOCUSABLE, STATE_MULTISELECTABLE, STATE_MANAGES_DESCENDANTS]),
                     Role::List => on.push(STATE_FOCUSABLE),
                     _ => {}
                 }
                 if n.selected {
                     on.push(STATE_SELECTED);
+                }
+                if n.checked == Some(true) {
+                    on.push(STATE_CHECKED);
                 }
                 if focused(a11y::Focus::Node(n.id)) {
                     on.push(STATE_FOCUSED);
@@ -433,11 +452,10 @@ impl Ctx {
         n.parent == a11y::SIDEBAR
     }
 
-    /// The single action an object has: its name and description.
-    fn action_of(&self, target: &Target<'_>) -> Option<(&'static str, &'static str)> {
+    /// The single action an object has.
+    fn action_of(&self, target: &Target<'_>) -> Option<a11y::Action> {
         match target {
-            Target::Fixed(n) if n.id == a11y::BACK => Some(("click", "Go back")),
-            Target::Fixed(n) if Self::is_place(n) => Some(("activate", "Open")),
+            Target::Fixed(n) => n.action,
             _ => None,
         }
     }
@@ -507,7 +525,7 @@ impl Ctx {
             "GetExtents" => self.reply(h, &((r.x, r.y, r.w, r.h),)),
             "GetPosition" => self.reply(h, &(r.x, r.y)),
             "GetSize" => self.reply(h, &(r.w, r.h)),
-            "GetLayer" => self.reply(h, &(if matches!(target, Target::Fixed(n) if n.role == Role::Frame) { 7u32 } else { 3u32 },)),
+            "GetLayer" => self.reply(h, &(if matches!(target, Target::Fixed(n) if matches!(n.role, Role::Frame | Role::Dialog)) { 7u32 } else { 3u32 },)),
             "GetMDIZOrder" => self.reply(h, &(0i16,)),
             "GetAlpha" => self.reply(h, &(1.0f64,)),
             "Contains" => {
@@ -533,6 +551,11 @@ impl Ctx {
                     // The keyboard doesn't go to the sidebar, but a place a screen reader moves
                     // to is shown.
                     Target::Fixed(n) if Self::is_place(n) => self.show_place(n, snap),
+                    // An entry, or an item of another list, which moving to picks.
+                    Target::Fixed(n) if matches!(n.role, Role::Entry | Role::ListItem) && n.enabled => {
+                        self.hub.send(Msg::A11y(Act::Focus(n.id)));
+                        true
+                    }
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -569,13 +592,13 @@ impl Ctx {
     }
 
     fn action(&self, h: &Header<'_>, m: &str, body: &Body, target: &Target<'_>, snap: &Snapshot) {
-        let Some((name, description)) = self.action_of(target) else { return self.error(h, UNKNOWN_METHOD, m) };
+        let Some(a) = self.action_of(target) else { return self.error(h, UNKNOWN_METHOD, m) };
         let Target::Fixed(n) = target else { return self.error(h, UNKNOWN_METHOD, m) };
         match m {
-            "GetActions" => self.reply(h, &(vec![(name, description, "")],)),
-            "GetName" | "GetLocalizedName" => self.reply(h, &(name,)),
-            "GetDescription" => self.reply(h, &(description,)),
-            "GetKeyBinding" => self.reply(h, &(if n.id == a11y::BACK { "<Alt>Left" } else { "" },)),
+            "GetActions" => self.reply(h, &(vec![(a.name, a.description, a.keys)],)),
+            "GetName" | "GetLocalizedName" => self.reply(h, &(a.name,)),
+            "GetDescription" => self.reply(h, &(a.description,)),
+            "GetKeyBinding" => self.reply(h, &(a.keys,)),
             "DoAction" => {
                 let i: i32 = body.deserialize().unwrap_or(-1);
                 let ok = i == 0 && n.enabled;
@@ -621,13 +644,17 @@ impl Ctx {
             "SelectChild" => {
                 // Selecting a row adds it to the selection, as Ctrl+click does, leaving the
                 // rest and the cursor as they are; selecting a place opens it, as clicking one
-                // does.
+                // does; and in the other lists, which pick one thing, it picks it.
                 let ok = match i {
                     Some(at) if n.id == a11y::LIST => snap.rows.entry(at).is_some_and(|e| self.tell_row(snap, e, |d, k| Act::SelectRow(d, k, true))),
-                    Some(at) if at < n.children.len() => {
+                    Some(at) if n.id == a11y::SIDEBAR && at < n.children.len() => {
                         self.hub.send(Msg::A11y(Act::OpenPlace(at)));
                         true
                     }
+                    Some(at) => n.children.get(at).and_then(|&c| snap.get(c)).filter(|c| c.role == Role::ListItem && c.enabled).is_some_and(|c| {
+                        self.hub.send(Msg::A11y(Act::Focus(c.id)));
+                        true
+                    }),
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -660,6 +687,12 @@ impl Ctx {
             if o.name != n.name {
                 self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-name", 0), Variant::from(n.name.clone()));
             }
+            if o.description != n.description {
+                self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-description", 0), Variant::from(n.description.clone()));
+            }
+            if o.checked != n.checked {
+                state(&path, "checked", n.checked == Some(true));
+            }
             if o.enabled != n.enabled {
                 state(&path, "enabled", n.enabled);
                 state(&path, "sensitive", n.enabled);
@@ -673,15 +706,21 @@ impl Ctx {
             // is in the list. A screen reader asking still hears it.
             if o.selected != n.selected && n.parent != a11y::SIDEBAR {
                 state(&path, "selected", n.selected);
+                if n.role == Role::ListItem {
+                    self.event(&fixed_path(n.parent), OBJECT_EVENT, "SelectionChanged", ("", 0), Variant::from(0i32));
+                }
             }
         }
-        if let (Some(o), Some(n)) = (old.get(a11y::SIDEBAR), new.get(a11y::SIDEBAR)) {
-            let sidebar = fixed_path(a11y::SIDEBAR);
+        // Parts coming and going: places, and the Open With window's apps as a search narrows
+        // them.
+        for n in &new.fixed {
+            let Some(o) = old.get(n.id).filter(|o| o.children != n.children) else { continue };
+            let path = fixed_path(n.id);
             for (i, id) in o.children.iter().enumerate().rev().filter(|(_, id)| !n.children.contains(id)) {
-                self.event(&sidebar, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
+                self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
             }
             for (i, id) in n.children.iter().enumerate().filter(|(_, id)| !o.children.contains(id)) {
-                self.event(&sidebar, OBJECT_EVENT, "ChildrenChanged", ("add", i as i32), Variant::from(self.fixed_ref(*id)));
+                self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("add", i as i32), Variant::from(self.fixed_ref(*id)));
             }
         }
 

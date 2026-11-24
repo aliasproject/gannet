@@ -41,11 +41,11 @@ impl Drop for Gone {
     }
 }
 
-/// Starts watching the session bus at `address`. Sends `Msg::CanSetBackground` whenever
-/// that changes, and serves the window to screen readers while one is running, through
-/// `a11y`. `a11y_address` is `AT_SPI_BUS_ADDRESS`, which, when set, says where the
+/// Starts watching the session bus at `address`. With `offers_background`, sends
+/// `Msg::CanSetBackground` whenever that changes; only a file manager window offers it. Serves
+/// the window to screen readers while one is running, through `a11y`. `a11y_address` is `AT_SPI_BUS_ADDRESS`, which, when set, says where the
 /// accessibility bus is instead of asking. Without a session bus it gives up quietly.
-pub fn watch(hub: Hub, address: String, a11y: Arc<Shared>, a11y_address: Option<String>) {
+pub fn watch(hub: Hub, address: String, offers_background: bool, a11y: Arc<Shared>, a11y_address: Option<String>) {
     let _ = std::thread::Builder::new().name("gannet-session".into()).spawn(move || {
         let Ok(bus) = Bus::connect_with_limit(&address, CONNECT_LIMIT) else { return };
         let (tx, rx) = channel();
@@ -78,7 +78,7 @@ pub fn watch(hub: Hub, address: String, a11y: Arc<Shared>, a11y_address: Option<
         let mut check_portal = true;
         let mut restart = false;
         loop {
-            if check_portal {
+            if check_portal && offers_background {
                 let can = portal_there && wallpaper::offered(&bus);
                 if sent != Some(can) {
                     sent = Some(can);
