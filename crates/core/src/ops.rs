@@ -709,8 +709,8 @@ impl Run {
     /// undo reverses them all, in reverse order, through the same names. If a rename fails or
     /// the job is cancelled, the ones done are put back and nothing is left to undo.
     fn rename_many(&mut self, renames: Vec<(PathBuf, OsString)>) {
-        self.job.progress.total_items.store(renames.len() as u64, Ordering::Relaxed);
         let Some((moves, case_only)) = self.plan_renames(&renames) else { return };
+        self.job.progress.total_items.store(moves.len() as u64, Ordering::Relaxed);
         for (from, _) in &moves {
             self.touch_parent(from);
         }
@@ -721,7 +721,7 @@ impl Run {
         // changes case can't go straight there without replacing. It steps aside first.
         for &i in &case_only {
             let temp = rename_temp_name(&at[i]);
-            if !self.rename_step(&at[i], &temp, &moves[i].0, &mut done) {
+            if self.job.is_cancelled() || !self.rename_step(&at[i], &temp, &moves[i].0, &mut done) {
                 return self.unrename(done);
             }
             at[i] = temp;
@@ -823,8 +823,11 @@ impl Run {
         let moving: std::collections::HashSet<&Path> = moves.iter().map(|(from, _)| from.as_path()).collect();
         let mut case_only = Vec::new();
         for (i, (from, to)) in moves.iter().enumerate() {
-            let itself = Identity::of(to).ok().zip(Identity::of(from).ok()).is_some_and(|(a, b)| a.same_item(&b));
-            if itself || from.file_name().zip(to.file_name()).is_some_and(|(a, b)| a.as_bytes().eq_ignore_ascii_case(b.as_bytes())) {
+            // Only a name that differs in case: a hard link under another name is the same
+            // item too, but it's another name, and taken.
+            let same_but_case = from.file_name().zip(to.file_name()).is_some_and(|(a, b)| a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase());
+            let itself = same_but_case && Identity::of(to).ok().zip(Identity::of(from).ok()).is_some_and(|(a, b)| a.same_item(&b));
+            if same_but_case {
                 case_only.push(i);
             }
             if !itself && !moving.contains(to.as_path()) && fs::symlink_metadata(to).is_ok() {
@@ -3445,9 +3448,12 @@ mod tests {
         for n in ["a", "b", "c", "taken"] {
             fs::write(w.join(n), n).unwrap();
         }
+        // Another name for the same file is still another name.
+        fs::hard_link(w.join("c"), w.join("c-link")).unwrap();
         let before = contents_in(&w);
-        let cases: [(&[(&str, &str)], &str); 5] = [
+        let cases: [(&[(&str, &str)], &str); 6] = [
             (&[("a", "x"), ("b", "taken")], "Something already has this name"),
+            (&[("c", "c-link"), ("b", "x")], "Something already has this name"),
             (&[("a", "x"), ("b", "x")], "Two items would get this name"),
             // b keeps its name, so a can't have it.
             (&[("a", "b"), ("b", "b")], "Two items would get this name"),
