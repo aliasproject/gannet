@@ -1518,7 +1518,11 @@ impl App {
         match act {
             Act::Press(BACK) => self.go_back(),
             Act::Press(_) | Act::Wake => {}
-            Act::OpenPlace(i) => self.open_place(i),
+            Act::OpenPlace(i) => {
+                self.reveal_place(i);
+                self.open_place(i);
+            }
+            Act::ShowPlace(i) => self.reveal_place(i),
             Act::FocusRow(dir, key) => {
                 if let Some(at) = row(self, &dir, &key) {
                     self.move_cursor(at, Mods { ctrl: true, ..Mods::default() });
@@ -3999,12 +4003,7 @@ impl App {
     /// Where a search's match is, starting from the folder searched: "Documents/photos" for one
     /// in ~/Documents/photos when ~/Documents was searched, and "Documents" for one in it.
     pub fn search_location(&self, folder: &Path) -> String {
-        let top = self.crumb_label(&self.dir);
-        match folder.strip_prefix(&self.dir) {
-            Ok(rest) if rest.as_os_str().is_empty() => top,
-            Ok(rest) => format!("{}/{}", top.trim_end_matches('/'), rest.display()),
-            Err(_) => folder.display().to_string(),
-        }
+        search_location(folder, &self.dir, &self.crumb_label(&self.dir))
     }
 
     fn crumb_at(&mut self, x: i32) -> Option<usize> {
@@ -5257,6 +5256,24 @@ fn next_enabled(items: &[MenuItem], from: usize, step: usize) -> usize {
         }
     }
     usize::MAX
+}
+
+/// Where a search found something, from the folder searched, which is called `top`.
+pub fn search_location(folder: &Path, dir: &Path, top: &str) -> String {
+    match folder.strip_prefix(dir) {
+        Ok(rest) if rest.as_os_str().is_empty() => top.to_string(),
+        Ok(rest) => format!("{}/{}", top.trim_end_matches('/'), rest.display()),
+        Err(_) => folder.display().to_string(),
+    }
+}
+
+/// The folder a row of Recent or the Trash is in, with the home folder as `~`.
+pub fn home_location(folder: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| folder.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => folder.display().to_string(),
+    }
 }
 
 fn title_for(dir: &Path) -> String {

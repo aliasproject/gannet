@@ -10,6 +10,7 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   select_row N         adds row N to the selection through the list's Selection interface
   deselect_row N       takes row N out of the selection, the same way
   focus_row N          moves the keyboard to row N through its Component interface
+  focus_place N        moves to place N in the sidebar through its Component interface
   select_place N       selects place N in the sidebar, which opens it
   press_back           does the Back button's action
   events               the events heard since last asked
@@ -80,11 +81,13 @@ def tree():
         "frame": frame.get_name(),
         "back_enabled": back.get_state_set().contains(Atspi.StateType.SENSITIVE),
         "places": [p.get_name() for p in children(places)],
+        "places_showing": [p.get_name() for p in children(places) if p.get_state_set().contains(Atspi.StateType.SHOWING)],
         "rows": [r.get_name() for r in rows],
         "selected": [r.get_name() for r in rows if r.get_state_set().contains(Atspi.StateType.SELECTED)],
         "selected_at": [i for i, r in enumerate(rows) if r.get_state_set().contains(Atspi.StateType.SELECTED)],
         "focus_at": [i for i, r in enumerate(rows) if focused(r)],
         "focus": focus,
+        "descriptions": [r.get_description() for r in rows],
         "manages_descendants": files.get_state_set().contains(Atspi.StateType.MANAGES_DESCENDANTS),
     }
 
@@ -108,6 +111,8 @@ def run(cmd, arg):
         return parts()[3].select_child(int(arg))
     if cmd == "deselect_row":
         return parts()[3].deselect_child(int(arg))
+    if cmd == "focus_place":
+        return parts()[2].get_child_at_index(int(arg)).grab_focus()
     if cmd == "focus_row":
         return parts()[3].get_child_at_index(int(arg)).grab_focus()
     if cmd == "select_place":

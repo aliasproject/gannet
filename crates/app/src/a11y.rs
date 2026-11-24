@@ -48,14 +48,25 @@ pub struct Node {
     pub parent: u64,
     pub selected: bool,
     pub enabled: bool,
+    /// Whether any of it is in view: a place can be scrolled out of the sidebar.
+    pub showing: bool,
+}
+
+/// The folder shown, and what's needed to say where a row of Recent, the Trash or a search is.
+#[derive(Default, Debug)]
+pub struct Here {
+    pub dir: PathBuf,
+    /// What the folder's called, as the window's title says it.
+    pub title: String,
+    pub home: Option<PathBuf>,
 }
 
 /// The file list's rows, read from the app's own listing.
 #[derive(Clone, Default)]
 pub struct Rows {
     /// Changes whenever the window shows another folder. A row is known by this and its key
-    /// (`Listing::key`: the file's name, or its path in the Trash and Recent views, where two
-    /// rows can share a name), which stay the same however often the folder is read again, so a
+    /// (`Listing::key`: the file's name, or its path in the Trash, Recent and search results,
+    /// where two rows can share a name), which stay the same however often the folder is read again, so a
     /// screen reader isn't told of a new row every time a file in the folder changes. The key
     /// is part of what it's known by, so a screen reader that kept it can't be handed another
     /// file's.
@@ -71,6 +82,8 @@ pub struct Rows {
     pub area: Rect,
     pub row_h: i32,
     pub scroll: f64,
+    /// Changes only with `era`.
+    pub here: Arc<Here>,
 }
 
 impl std::fmt::Debug for Rows {
@@ -107,6 +120,14 @@ impl Rows {
 
     pub fn name(&self, entry: u32) -> String {
         String::from_utf8_lossy(self.raw_name(entry)).into_owned()
+    }
+
+    /// Where a row is, as the list's Location column says it, in the views whose rows come
+    /// from many folders: Recent, the Trash and search results.
+    pub fn location(&self, entry: u32) -> Option<String> {
+        let l = self.listing.as_deref().filter(|l| (entry as usize) < l.len())?;
+        let folder = l.location(entry)?;
+        Some(if l.search().is_some() { crate::app::search_location(folder, &self.here.dir, &self.here.title) } else { crate::app::home_location(folder, self.here.home.as_deref()) })
     }
 
     /// What tells a listing entry's row apart from the others: `Listing::key`.
@@ -188,6 +209,8 @@ pub enum Act {
     Press(u64),
     /// Open a place in the sidebar.
     OpenPlace(usize),
+    /// Scroll the sidebar to show a place.
+    ShowPlace(usize),
     /// Put the cursor on a row without changing the selection: the row of that key
     /// (`Listing::key`) in that folder. A request about a folder the window has left is dropped,
     /// here and for each request about a row.
@@ -276,11 +299,12 @@ pub struct Link {
     epoch: u64,
     dir: Arc<PathBuf>,
     era: u64,
+    here: Arc<Here>,
 }
 
 impl Link {
     pub fn new() -> Self {
-        Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0 }
+        Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0, here: Arc::default() }
     }
 
     /// Hands the server a snapshot if anything changed. Costs nothing while no one listens.
@@ -308,6 +332,8 @@ impl Link {
         if *self.dir != app.dir {
             self.dir = Arc::new(app.dir.clone());
             self.era += 1;
+            // The same home as the Location column uses.
+            self.here = Arc::new(Here { dir: app.dir.clone(), title: app.crumb_label(&app.dir), home: std::env::var_os("HOME").map(PathBuf::from) });
         }
         let prev = self.last.as_ref().map(|s| &s.rows).filter(|r| r.era == self.era);
         let same_listing = |r: &Rows| match (&r.listing, &app.listing) {
@@ -330,18 +356,24 @@ impl Link {
             _ => Arc::new(app.selected_bits().to_vec()),
         };
         let l = app.layout();
-        let rows = Rows { era: self.era, listing: app.listing.clone(), order, index, selected, area: l.list, row_h: l.row_h.max(1), scroll: app.scroll };
+        let rows = Rows { era: self.era, listing: app.listing.clone(), order, index, selected, area: l.list, row_h: l.row_h.max(1), scroll: app.scroll, here: self.here.clone() };
 
         let place_h = app.px(30.0);
-        let places: Vec<Node> = app.places.iter().enumerate().map(|(i, p)| Node { id: PLACE0 + i as u64, role: Role::ListItem, name: p.label.clone(), rect: Rect::new(l.sidebar.x, app.place_top(i), l.sidebar.w, place_h), children: Vec::new(), parent: SIDEBAR, selected: p.path == app.dir, enabled: true }).collect();
+        let places: Vec<Node> = app.places.iter().enumerate().map(|(i, p)| {
+                // Placed as drawn, with the sidebar scrolled.
+                let rect = Rect::new(l.sidebar.x, app.place_top(i), l.sidebar.w, place_h);
+                let showing = rect.y + rect.h > l.sidebar.y && rect.y < l.sidebar.y + l.sidebar.h;
+                Node { id: PLACE0 + i as u64, role: Role::ListItem, name: p.label.clone(), rect, children: Vec::new(), parent: SIDEBAR, selected: p.path == app.dir, enabled: true, showing }
+            })
+            .collect();
         let b = app.px(36.0);
         // As the window's title says it, so Recent and the Trash are called that.
         let title = app.crumb_label(&app.dir);
         let mut fixed = vec![
-            Node { id: FRAME, role: Role::Frame, name: format!("{title} - Gannet"), rect: Rect::new(0, 0, app.w, app.h), children: vec![BACK, SIDEBAR, LIST], parent: 0, selected: false, enabled: true },
-            Node { id: BACK, role: Role::PushButton, name: "Back".into(), rect: Rect::new(app.px(6.0), 0, b, l.toolbar.h), children: Vec::new(), parent: FRAME, selected: false, enabled: app.history.can_go_back() },
-            Node { id: SIDEBAR, role: Role::List, name: "Places".into(), rect: l.sidebar, children: places.iter().map(|n| n.id).collect(), parent: FRAME, selected: false, enabled: true },
-            Node { id: LIST, role: Role::List, name: "Files".into(), rect: l.list, children: Vec::new(), parent: FRAME, selected: false, enabled: true },
+            Node { id: FRAME, role: Role::Frame, name: format!("{title} - Gannet"), rect: Rect::new(0, 0, app.w, app.h), children: vec![BACK, SIDEBAR, LIST], parent: 0, selected: false, enabled: true, showing: true },
+            Node { id: BACK, role: Role::PushButton, name: "Back".into(), rect: Rect::new(app.px(6.0), 0, b, l.toolbar.h), children: Vec::new(), parent: FRAME, selected: false, enabled: app.history.can_go_back(), showing: true },
+            Node { id: SIDEBAR, role: Role::List, name: "Places".into(), rect: l.sidebar, children: places.iter().map(|n| n.id).collect(), parent: FRAME, selected: false, enabled: true, showing: true },
+            Node { id: LIST, role: Role::List, name: "Files".into(), rect: l.list, children: Vec::new(), parent: FRAME, selected: false, enabled: true, showing: true },
         ];
         fixed.extend(places);
         let focus = match rows.entry(app.cursor) {
@@ -358,7 +390,7 @@ mod tests {
 
     fn rows(n: usize, scroll: f64) -> Rows {
         let order: Vec<u32> = (0..n as u32).rev().collect();
-        Rows { era: 1, listing: None, order: Arc::new(order), index: Arc::default(), selected: Arc::new(vec![0b100]), area: Rect::new(10, 100, 300, 200), row_h: 20, scroll }
+        Rows { era: 1, listing: None, order: Arc::new(order), index: Arc::default(), selected: Arc::new(vec![0b100]), area: Rect::new(10, 100, 300, 200), row_h: 20, scroll, here: Arc::default() }
     }
 
     #[test]

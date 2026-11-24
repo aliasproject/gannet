@@ -1620,6 +1620,48 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         sr.stop()
 
 
+@check
+def a_screen_reader_hears_pins_scrolled_places_and_search_results(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    pins = [f"Pin{i:02}" for i in range(26)]
+    tree(fs, {f"pins/{n}/x": "x" for n in pins} | {"docs/one/README.md": "1", "docs/two/README.md": "2", "docs/a.txt": "a"})
+    sr = ScreenReader()
+    try:
+        env = {"DBUS_SESSION_BUS_ADDRESS": sr.session.address}
+        conf = bookmarks_file(App(h, fs / "docs", launch=False, extra_env=env))
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text("".join((fs / "pins" / n).as_uri() + "\n" for n in pins))
+        a = App(h, fs / "docs", extra_env=env)
+        a.wait(lambda s: s["count"] == 3 and s["side_max"] > 0, "the pins don't fit")
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered")
+
+        # Pins are places, by name. Those scrolled out of the sidebar aren't showing, and one a
+        # screen reader moves to is scrolled into view.
+        t = sr.until("tree", lambda t: "Pin25" in t["places"], "the pins")
+        assert all(n in t["places"] for n in pins), t["places"]
+        assert "Pin00" in t["places_showing"] and "Pin25" not in t["places_showing"], t["places_showing"]
+        assert sr.ask(f"focus_place {t['places'].index('Pin25')}") is True
+        a.wait(lambda s: s["side_scroll"] > 0, "scrolled to the last pin")
+        t = sr.until("tree", lambda t: "Pin25" in t["places_showing"], "the last pin showing")
+        assert "Pin00" not in t["places_showing"], t["places_showing"]
+
+        # Search results come from many folders: each row is its own, and says where it is.
+        a.key("f", mods=["ctrl"])
+        a.type("README")
+        a.wait(lambda s: s["found"] and s["found"]["complete"] and s["names"] == ["README.md", "README.md"], "found")
+        t = sr.until("tree", lambda t: t["rows"] == ["README.md", "README.md"], "the results")
+        assert t["descriptions"] == ["docs/one", "docs/two"], t["descriptions"]
+        assert sr.ask("select_row 1") is True and sr.ask("focus_row 1") is True
+        a.wait(lambda s: s["cursor"] == 1 and s["selected"] == ["README.md"], "the second result")
+        t = sr.until("tree", lambda t: t["focus_at"] == [1], "focus on the second result")
+        assert t["selected_at"] == [1], t
+        a.close()
+    finally:
+        sr.stop()
+
+
 PORTAL = ["org.freedesktop.impl.portal.desktop.gannet", "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser"]
 
 

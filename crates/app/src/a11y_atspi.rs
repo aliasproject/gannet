@@ -361,6 +361,14 @@ impl Ctx {
         }
     }
 
+    /// Where a row of Recent, the Trash or a search is, so two of one name can be told apart.
+    fn description(&self, target: &Target<'_>, snap: &Snapshot) -> String {
+        match target {
+            Target::Row(e, _) => snap.rows.location(*e).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
     fn role(&self, target: &Target<'_>) -> (u32, &'static str) {
         match target {
             Target::Root => (ROLE_APPLICATION, "application"),
@@ -374,7 +382,10 @@ impl Ctx {
         match target {
             Target::Root => bits(&[]),
             Target::Fixed(n) => {
-                let mut on = vec![STATE_VISIBLE, STATE_SHOWING];
+                let mut on = vec![STATE_VISIBLE];
+                if n.showing {
+                    on.push(STATE_SHOWING);
+                }
                 if n.enabled {
                     on.extend([STATE_ENABLED, STATE_SENSITIVE]);
                 }
@@ -435,7 +446,7 @@ impl Ctx {
         match (iface, target) {
             (ACCESSIBLE, _) => vec![
                 ("Name", Variant::from(self.name(target, snap))),
-                ("Description", Variant::from(String::new())),
+                ("Description", Variant::from(self.description(target, snap))),
                 ("Parent", Variant::from(self.parent(target))),
                 ("ChildCount", Variant::from(self.child_count(target, snap) as i32)),
                 ("Locale", Variant::from(String::new())),
@@ -510,7 +521,8 @@ impl Ctx {
                         .then(|| ((y - r.y) as f64 + snap.rows.scroll) / snap.rows.row_h as f64)
                         .and_then(|at| snap.rows.entry(at as usize))
                         .map(|e| self.row_ref(&snap.rows, e)),
-                    Target::Fixed(n) => n.children.iter().filter_map(|&c| snap.get(c)).find(|c| c.rect.contains(x, y)).map(|c| self.fixed_ref(c.id)),
+                    // A place scrolled out of the sidebar isn't there to point at.
+                    Target::Fixed(n) => n.children.iter().filter_map(|&c| snap.get(c)).find(|c| r.contains(x, y) && c.rect.contains(x, y)).map(|c| self.fixed_ref(c.id)),
                     _ => None,
                 };
                 self.reply(h, &(hit.unwrap_or_else(null),))
@@ -518,6 +530,9 @@ impl Ctx {
             "GrabFocus" => {
                 let ok = match target {
                     Target::Row(e, _) => self.tell_row(snap, *e, Act::FocusRow),
+                    // The keyboard doesn't go to the sidebar, but a place a screen reader moves
+                    // to is shown.
+                    Target::Fixed(n) if Self::is_place(n) => self.show_place(n, snap),
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -525,6 +540,7 @@ impl Ctx {
             "ScrollTo" | "ScrollToPoint" => {
                 let ok = match target {
                     Target::Row(e, _) => self.tell_row(snap, *e, Act::ShowRow),
+                    Target::Fixed(n) if Self::is_place(n) => self.show_place(n, snap),
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -532,6 +548,18 @@ impl Ctx {
             "SetExtents" | "SetPosition" | "SetSize" => self.reply(h, &(false,)),
             _ => self.error(h, UNKNOWN_METHOD, m),
         }
+    }
+
+    /// A place's index among the sidebar's places.
+    fn place_index(n: &Node, snap: &Snapshot) -> Option<usize> {
+        snap.get(a11y::SIDEBAR).and_then(|s| s.children.iter().position(|&c| c == n.id))
+    }
+
+    fn show_place(&self, n: &Node, snap: &Snapshot) -> bool {
+        Self::place_index(n, snap).is_some_and(|i| {
+            self.hub.send(Msg::A11y(Act::ShowPlace(i)));
+            true
+        })
     }
 
     /// Asks the app to do something to a row, named by its folder and key.
@@ -552,7 +580,7 @@ impl Ctx {
                 let i: i32 = body.deserialize().unwrap_or(-1);
                 let ok = i == 0 && n.enabled;
                 if ok {
-                    let act = if Self::is_place(n) { Act::OpenPlace(snap.get(a11y::SIDEBAR).and_then(|s| s.children.iter().position(|&c| c == n.id)).unwrap_or(usize::MAX)) } else { Act::Press(n.id) };
+                    let act = if Self::is_place(n) { Act::OpenPlace(Self::place_index(n, snap).unwrap_or(usize::MAX)) } else { Act::Press(n.id) };
                     self.hub.send(Msg::A11y(act));
                 }
                 self.reply(h, &(ok,))
