@@ -74,6 +74,7 @@ At run time, Gannet uses these:
 | `fc-match` (fontconfig) | Finding fonts | Gannet can't find a font, so install this |
 | `xdg-open` | Opening files in other apps | Opening files fails |
 | `bsdtar` (libarchive) | Extracting archives | Extracting says it's missing |
+| `xdg-terminal-exec` | Open in terminal, in whichever terminal is set up | Open in terminal isn't offered |
 | `libmpv` (part of `mpv` on many systems) and `bubblewrap` | Video and sound previews | Videos show a message saying what's needed |
 | `udisks2` | Mounting, unlocking and ejecting drives | Only drives that are already mounted show |
 | `shared-mime-info` | Saying what a file is, like "PDF document" | Previews name types like `application/pdf` |
@@ -106,7 +107,7 @@ To add it to your app launcher:
 | Sort by name, size, modified (again to reverse) | Ctrl+1, Ctrl+2, Ctrl+3 |
 | Copy, cut, paste | Ctrl+C, Ctrl+X, Ctrl+V |
 | Copy path as text | Ctrl+Shift+C |
-| Rename, new folder | F2, Ctrl+Shift+N |
+| Rename (several at once too), new folder | F2, Ctrl+Shift+N |
 | Move to Trash, delete for good | Delete, Shift+Delete |
 | Undo, redo | Ctrl+Z, Ctrl+Shift+Z |
 | Stop the newest operation | Ctrl+. |
@@ -242,6 +243,15 @@ portals can, and so can aliasOS's once it has its Wallpaper portal backend. Else
 on sway with only the GTK and wlr portals, it stays hidden rather than doing nothing. It shows
 up without restarting Gannet once the portal starts with one that can.
 
+## Open in terminal
+
+Right-click a folder, or the empty space in a folder, and choose Open in terminal. Gannet asks
+`xdg-terminal-exec` for it, so it opens whichever terminal `~/.config/xdg-terminals.list` names,
+in that folder. Where a systemd user manager runs, the terminal gets a scope of its own, as apps
+started from a launcher do, so it stays open when Gannet closes. It isn't offered for files, in the Trash or Recent, in
+Open and Save dialogs, or where `xdg-terminal-exec` isn't installed. If the terminal can't
+start, the window says so.
+
 ## Archives
 
 Opening a zip, tar (`.tar.gz`, `.tar.zst` and the others), 7z, rar or cpio archive extracts it
@@ -275,6 +285,20 @@ When a paste or a drop meets a name that's taken, Replace moves the item already
 the Trash rather than overwriting it. If it can't go to the Trash, both are left as they
 were.
 
+## Renaming several files
+
+Select several items and press F2, or choose Rename from the right-click menu, to rename them
+all at once. Type text in Find and what to put in its place in Replace with: every place it
+appears in each name changes. Leave Find empty and Replace with becomes the whole new name, and
+files keep their extensions. `{n}` in Replace with counts 1, 2, 3 in the order the list shows,
+with zeros in front so they sort in order (01 to 12 for twelve items).
+
+Each old name shows beside its new one before anything changes. Rename stays off while two
+items would get the same name, or one would take the name of something else in the folder, and
+the line under the names says which. Items can take each other's names, so a↔b swaps work.
+It's all or nothing: if one rename fails partway, the ones already done are put back. One undo
+puts every name back.
+
 ## Undo and redo
 
 Ctrl+Z undoes a copy, move, rename, new folder, link, restore, extract or move to the Trash, and
@@ -283,6 +307,77 @@ new folder that something has been put in. An empty one is just removed. Undoing
 brings back the item it replaced. Gannet checks that each item is still the one the change
 left there, so if something else has taken its name since, that item is left alone and
 Gannet says so. A merge of two folders, and deleting for good, can't be undone.
+
+## Command line
+
+Scripts and agents can handle files the way the window does, with no display and without
+D-Bus:
+
+    gannet list [--json] [--hidden] [--sort name|size|modified] [--reverse] [FOLDER]
+    gannet info [--json] PATH...
+    gannet trash [--json] PATH...
+    gannet restore [--json] [PATH...]
+
+- `list` lists a folder, or the current one, in the window's order: folders first, then the
+  order last chosen for that folder in the window (see [Sorting](#sorting)), or names A to Z.
+  `--sort` picks an order instead, the way a first press in the window would: names A to Z,
+  sizes biggest first, dates newest first. `--reverse` turns it round. Listing never changes
+  the saved orders. Names starting with a dot are left out unless `--hidden` is given.
+- `info` says what each path is: its kind, size, times and permissions, where a link leads, and
+  for an item in the Trash, where it came from and when it was deleted. Links aren't followed.
+- `trash` moves each path to the Trash, on its own disk when it's not on the home disk, as the
+  window does.
+- `restore` with no paths lists the Trash on every disk. With paths, it puts those items back.
+  A path is an item's path in the Trash or the path it came from. If several items came from
+  the same path, the one deleted last comes back. Restoring never overwrites anything: an item
+  whose place is taken stays in the Trash and that's reported as an error.
+
+A path can also be a `file://` URI. Use `--` before paths that start with `-`. These four
+words are commands, so to open a folder called `list` in the window, run `gannet ./list`.
+
+Without `--json`, the output is for people and may change. The exit code is 0 when everything
+asked for was done and 1 otherwise, including bad arguments. Each error is also written to
+stderr as `gannet COMMAND: PATH: message`. That's for people: a path can hold a newline, so
+read errors from the JSON. `trash` refuses an empty path and one ending in `.` or `..`, as
+`rm` does, and every command refuses an empty path.
+
+### JSON output
+
+With `--json`, each command prints one JSON object on one line. It's stable within a
+`version`. New fields can be added in the same version, so ignore ones you don't know. A
+field is only renamed, removed or changed in meaning with a new version number. Every object
+has:
+
+| Field | |
+|---|---|
+| `version` | `1` |
+| `command` | `"list"`, `"info"`, `"trash"` or `"restore"` |
+| `errors` | `[{"path", "message"}]`, empty on success; `path` is `null` for an error with no path |
+
+Bad arguments give only these three fields, with the reason and the usage in `errors`.
+Otherwise there are more, by command:
+
+| Command | Fields |
+|---|---|
+| `list` | `folder`, `folder_uri`, `sort` (`{"key": "name"\|"size"\|"modified", "descending"}`), `hidden`, `items` |
+| `info` | `items`, one for each path that exists, in order |
+| `trash` | `trashed`: `[{"path", "uri", "trash_path", "trash_uri"}]`, where each item was and where it is now |
+| `restore` with no paths | `items`, everything in the Trash, in the window's order for the Trash |
+| `restore` with paths | `restored`: `[{"path", "uri", "trash_path", "trash_uri"}]`, where each item is now and where it was in the Trash |
+
+Each of `items` has every one of these fields, `null` where it doesn't apply:
+
+| Field | |
+|---|---|
+| `name` | The name. In `restore`'s list, the name it had before it was deleted |
+| `path`, `uri` | Where it is. `path` is text; a name that isn't UTF-8 has `U+FFFD` in place of the bytes that aren't, so use `uri` (exact, percent-encoded) to pass it back |
+| `kind` | `"file"`, `"folder"`, `"symlink"` or `"other"` (devices, pipes and sockets) |
+| `size` | Bytes, for files only |
+| `modified`, `accessed`, `changed`, `created` | Seconds since 1970-01-01 UTC. `created` is `null` where the filesystem doesn't record it |
+| `mode` | Permissions in octal, like `"0644"` |
+| `hidden` | Whether the name starts with a dot |
+| `target`, `target_kind` | For a symlink: where it points, as written, and what's there: `"file"`, `"folder"`, `"other"` or `"missing"` |
+| `trash` | For an item in the Trash: `{"original", "original_uri", "deleted"}`, where it came from and when it was deleted (seconds since 1970). `original` is `null` if its record in the Trash can't be read, and then it can't be restored |
 
 ## Drives
 

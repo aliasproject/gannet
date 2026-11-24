@@ -4,6 +4,7 @@
 
 pub mod archive;
 pub mod bus;
+pub mod cli;
 pub mod clipboard;
 pub mod disks;
 pub mod folder_sorts;
@@ -16,8 +17,10 @@ pub mod open;
 pub mod ops;
 pub mod places;
 pub mod recent;
+pub mod rename_many;
 pub mod search;
 pub mod sort;
+pub mod terminal;
 pub mod theme;
 pub mod thumbcache;
 pub mod thumbnailers;

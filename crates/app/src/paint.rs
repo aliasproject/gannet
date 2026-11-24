@@ -13,6 +13,7 @@ use crate::canvas::{Canvas, Rect};
 use crate::field::Field;
 use crate::format;
 use crate::icons::Icon;
+use crate::rename_many::{Focus, RenameMany};
 
 impl App {
     pub fn paint(&mut self, c: &mut Canvas) {
@@ -532,9 +533,18 @@ impl App {
     fn paint_dialog(&mut self, c: &mut Canvas) {
         let Some(d) = self.dialog.take() else { return };
         let co = self.colors;
-        let r = self.dialog_rect();
+        let r = self.dialog_rect_for(&d);
         c.rrect(r, self.px(8.0), co.surface);
         c.frame(r, 1, co.border);
+        if let Dialog::RenameMany(rm) = &d {
+            self.paint_rename_many(c, rm);
+            // Enter renames from the fields, so Rename shows as the default there, unless
+            // something stops it.
+            let at = if let Focus::Button(i) = rm.focus { i } else { 0 };
+            self.paint_dialog_buttons(c, &d, at, rm.focus != Focus::Button(1) && !rm.can_rename());
+            self.dialog = Some(d);
+            return;
+        }
         let name = |p: &std::path::Path| p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
         let (title, line2, at) = match &d {
             Dialog::Conflict { conflict, at, .. } => {
@@ -578,6 +588,8 @@ impl App {
                 let line = if *waiting { "Unlocking…".to_string() } else { error.clone().unwrap_or_else(|| "It's encrypted. Type its passphrase to open it.".to_string()) };
                 (format!("Unlock “{}”", App::drive_name(volume)), line, *at)
             }
+            // Drawn above.
+            Dialog::RenameMany(_) => (String::new(), String::new(), 0),
         };
         let x = (r.x + self.px(16.0)) as f32;
         let max = (r.w - self.px(32.0)) as f32;
@@ -612,18 +624,74 @@ impl App {
             let by = self.baseline(cr.y, cr.h);
             self.text.draw_str(c, "Do the same for the rest (A)", (cr.x + s + self.px(8.0)) as f32, by, co.foreground);
         }
-        let buttons = App::dialog_buttons(&d);
-        let rects = self.dialog_button_rects(&d);
+        self.paint_dialog_buttons(c, &d, at, false);
+        self.dialog = Some(d);
+    }
+
+    /// The dialog's buttons, with the one at `at` focused. `first_off` shows the first one can't
+    /// be pressed now.
+    fn paint_dialog_buttons(&mut self, c: &mut Canvas, d: &Dialog, at: usize, first_off: bool) {
+        let co = self.colors;
+        let buttons = App::dialog_buttons(d);
+        let rects = self.dialog_button_rects(d);
         for (i, (b, br)) in buttons.iter().zip(&rects).enumerate() {
-            let focused = i == at;
+            let off = first_off && i == 0;
+            let focused = i == at && !off;
             let bg = if focused { if b.danger { co.danger } else { co.accent } } else { co.hover };
             c.rrect(*br, self.px(5.0), bg);
-            let fg = if focused { co.on_accent } else if b.danger { co.danger } else { co.foreground };
+            let fg = if off { co.muted } else if focused { co.on_accent } else if b.danger { co.danger } else { co.foreground };
             let w = self.text.measure(b.label);
             let by = self.baseline(br.y, br.h);
             self.text.draw_str(c, b.label, br.x as f32 + (br.w as f32 - w) / 2.0, by, fg);
         }
-        self.dialog = Some(d);
+    }
+
+    /// The rename dialog: its title, Find and Replace, each old name beside its new one, and the
+    /// line saying what will happen or what's stopping it.
+    fn paint_rename_many(&mut self, c: &mut Canvas, d: &RenameMany) {
+        let co = self.colors;
+        let r = self.rename_rect(d.names.len());
+        let l = self.rename_layout(d.names.len());
+        let x = (r.x + self.px(16.0)) as f32;
+        let max = (r.w - self.px(32.0)) as f32;
+        let title = format!("Rename {}", format::count(d.names.len(), "item", "items"));
+        self.text.draw_fitted(c, &title, x, self.baseline(r.y + self.px(12.0), self.px(26.0)), max, co.foreground);
+        for (label, field, focus) in [("Find", &l.find, Focus::Find), ("Replace with", &l.replace, Focus::Replace)] {
+            self.text.draw_fitted(c, label, x, self.baseline(field.y, field.h), (field.x - r.x) as f32 - self.px(24.0) as f32, co.muted);
+            let f = if focus == Focus::Find { &d.find } else { &d.replace };
+            self.paint_field(c, *field, f, d.focus == focus);
+        }
+        // The names in two columns, old on the left, new on the right after an arrow.
+        let half = l.headings.w / 2;
+        let new_x = l.headings.x + half + self.px(12.0);
+        let col_w = (half - self.px(20.0)) as f32;
+        let hy = self.baseline(l.headings.y, l.headings.h);
+        self.text.draw_fitted(c, "Old name", l.headings.x as f32, hy, col_w, co.muted);
+        self.text.draw_fitted(c, "New name", new_x as f32, hy, col_w, co.muted);
+        c.fill(Rect::new(l.headings.x, l.headings.bottom() - 1, l.headings.w, 1), co.border);
+        let shown = (l.list.h / l.row_h).max(1) as usize;
+        let arrow_x = (l.headings.x + half - self.px(4.0)) as f32;
+        for (k, i) in (d.scroll..d.names.len().min(d.scroll + shown)).enumerate() {
+            let top = l.list.y + k as i32 * l.row_h;
+            let by = self.baseline(top, l.row_h);
+            let (problem, same) = (d.problems[i].is_some(), d.names[i] == d.new[i]);
+            if problem {
+                c.fill(Rect::new(l.list.x, top, l.list.w, l.row_h), blend(co.surface, co.danger, 0.14));
+            }
+            self.text.draw_fitted(c, &String::from_utf8_lossy(&d.names[i]), l.list.x as f32, by, col_w, if same { co.muted } else { co.foreground });
+            self.text.draw_str(c, "→", arrow_x, by, co.muted);
+            let color = if problem { co.danger } else if same { co.muted } else { co.foreground };
+            self.text.draw_fitted(c, &String::from_utf8_lossy(&d.new[i]), new_x as f32, by, col_w, color);
+        }
+        if d.names.len() > shown {
+            // Where the rows shown are in the whole list.
+            let track = Rect::new(l.list.right() - self.px(3.0), l.list.y, self.px(3.0), l.list.h);
+            let thumb_h = ((track.h as usize * shown / d.names.len()) as i32).max(self.px(16.0)).min(track.h);
+            let thumb_y = track.y + ((track.h - thumb_h).max(0) as usize * d.scroll / (d.names.len() - shown).max(1)) as i32;
+            c.rrect(Rect::new(track.x, thumb_y, track.w, thumb_h), self.px(1.5), co.muted);
+        }
+        let (line, problem) = d.summary();
+        self.text.draw_fitted(c, &line, l.summary.x as f32, self.baseline(l.summary.y, l.summary.h), l.summary.w as f32, if problem { co.danger } else { co.muted });
     }
 
     fn paint_status(&mut self, c: &mut Canvas) {

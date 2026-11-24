@@ -205,6 +205,11 @@ impl Listing {
         self.trash.as_ref()?.info[i as usize].as_ref().map(|inf| inf.original.as_path())
     }
 
+    /// What a row of the Trash view's info file says, if it could be read.
+    pub fn trash_info(&self, i: u32) -> Option<&Info> {
+        self.trash.as_ref()?.info[i as usize].as_ref()
+    }
+
     /// What restoring a row of the Trash view needs, if its info file could be read.
     pub fn trashed(&self, i: u32) -> Option<Trashed> {
         let t = self.trash.as_ref()?;
