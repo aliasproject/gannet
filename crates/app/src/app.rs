@@ -608,8 +608,6 @@ pub struct App {
     /// The last few jobs to end, each with whether it did all it was asked: not stopped, and
     /// without errors. A screen reader announces only those as finished.
     pub jobs_ended: Vec<(u64, bool)>,
-    /// The path bar's parts as last laid out: (start x, width, folder).
-    crumbs_laid: Vec<(i32, i32, PathBuf)>,
 
     pub engine: Engine,
     pub trash_dir: PathBuf,
@@ -627,6 +625,8 @@ pub struct App {
     selection_epoch: u64,
     /// Counts the changes started, each of which clears redo.
     change_epoch: u64,
+    /// Which field is open: each one opened or closed, and each rename or new folder, is a new
+    /// one, so a late paste or screen reader request about an earlier one is dropped.
     edit_gen: u64,
     paste_in_flight: bool,
     /// When an unasked-for dialog appeared. Input right after that was meant for
@@ -773,7 +773,6 @@ impl App {
             notices: Vec::new(),
             notices_posted: 0,
             jobs_ended: Vec::new(),
-            crumbs_laid: Vec::new(),
             engine,
             recent_file: trash_dir.parent().and_then(Path::parent).map_or_else(PathBuf::new, |d| d.join(gannet_core::recent::FILE)),
             trash_dir,
@@ -1147,7 +1146,7 @@ impl App {
             _ => false,
         };
         if l.settled && renaming_gone {
-            self.edit = Edit::None;
+            self.set_edit(Edit::None);
         }
         // Settings changed while this was loading: it was built for the old ones.
         if l.sort != self.view_sort() {
@@ -1397,11 +1396,7 @@ impl App {
                 }
                 if let Some(f) = self.field_mut() {
                     f.insert(&line);
-                    self.apply_filter_field();
-                    if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
-                        d.update();
-                    }
-                    self.invalidate_all();
+                    self.field_edited();
                 }
             }
         }
@@ -1512,7 +1507,7 @@ impl App {
     /// Does what a screen reader asked. A request about a row in a folder the window has
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
-        use crate::a11y::{Act, BACK, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, STOP0};
+        use crate::a11y::{Act, BACK, CHOOSER_SAVE_NAME, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, FILTER, NAME_FIELD, PATH_FIELD, STOP0};
         // As with the pointer: nothing behind a dialog can be used, and anything outside a menu
         // only closes it, so the menu never acts on a selection changed under it.
         if self.dialog.is_some() || matches!(act, Act::Wake) {
@@ -1522,12 +1517,58 @@ impl App {
             self.close_menu();
             return;
         }
+        if self.a11y_chooser_act(&act) {
+            return;
+        }
         let row = |app: &Self, dir: &Path, key: &[u8]| {
             let l = app.listing.as_ref().filter(|_| app.dir == dir)?;
             app.rows.iter().position(|&e| *l.key(e) == *key)
         };
+        // Pressing something, or moving to a row, ends an edit as clicking there would. A request
+        // about a row of a folder the window has left is dropped, and leaves the edit alone.
+        let clicks = match &act {
+            Act::Press(_) | Act::OpenPlace(_) | Act::OpenCrumb(..) | Act::Eject(..) | Act::Dismiss(..) => true,
+            Act::FocusRow(dir, key) | Act::SelectRow(dir, key, _) => row(self, dir, key).is_some(),
+            _ => false,
+        };
+        if clicks {
+            self.leave_field();
+        }
         match act {
-            Act::Press(BACK) => self.go_back(),
+            Act::Focus(FILTER) => {
+                if !matches!(self.edit, Edit::Filter(_)) && self.filter_rect().is_some() {
+                    self.leave_field();
+                    self.start_filter("");
+                }
+            }
+            // The other fields show only while they have the keyboard.
+            Act::Focus(_) => {}
+            Act::EditText(id, edit_gen, op) => {
+                // A request about a field since closed, or opened again, is dropped.
+                if edit_gen != self.edit_gen {
+                    return;
+                }
+                let ours = matches!((&self.edit, id), (Edit::Path(_), PATH_FIELD) | (Edit::Filter(_), FILTER) | (Edit::Rename { .. } | Edit::NewFolder(_), NAME_FIELD)) || (id == CHOOSER_SAVE_NAME && self.a11y_name_has_keyboard());
+                let saving = self.chooser.as_ref().is_some_and(|c| c.spec.mode == crate::chooser::Mode::Save);
+                // Changing the text of a field that shows but isn't typed in gives it the
+                // keyboard first, as clicking it does: the filter box, or the Save dialog's name.
+                if !ours && id == FILTER && matches!(self.edit, Edit::None) && self.filter_rect().is_some() {
+                    self.leave_field();
+                    self.start_filter("");
+                } else if !ours && id == CHOOSER_SAVE_NAME && saving {
+                    self.leave_field();
+                    if let Some(c) = self.chooser.as_mut() {
+                        c.name_focused = true;
+                    }
+                } else if !ours {
+                    return;
+                }
+                self.a11y_edit(op);
+            }
+            Act::Press(BACK) if !self.viewer => self.go_back(),
+            Act::Press(crate::a11y::PREVIEW_PREVIOUS) if self.viewer => self.preview_move(-1),
+            Act::Press(crate::a11y::PREVIEW_NEXT) if self.viewer => self.preview_move(1),
+            Act::Press(crate::a11y::PREVIEW_CLOSE) if self.viewer => self.close_preview(),
             // A column's heading sorts by it, as clicking it does, except in Recent.
             Act::Press(id @ (COLUMN_NAME | COLUMN_SIZE | COLUMN_MODIFIED)) if !self.is_recent_view() => {
                 self.action(Action::SortBy(match id {
@@ -1591,6 +1632,42 @@ impl App {
                 }
             }
         }
+    }
+
+    /// A screen reader's change to the field with the keyboard, made as the keys making it
+    /// would be.
+    fn a11y_edit(&mut self, op: crate::a11y::TextEdit) {
+        use crate::a11y::TextEdit;
+        let edit_gen = self.edit_gen;
+        let Some(f) = self.field_mut() else { return };
+        match op {
+            TextEdit::Caret(at) => f.select_chars(at, at),
+            TextEdit::Select(from, to) => f.select_chars(from, to),
+            TextEdit::Replace(from, to, with) => f.replace_chars(from, to, &with),
+            TextEdit::Copy(from, to) | TextEdit::Cut(from, to) => {
+                let (a, b) = (f.byte_of(from.min(to)), f.byte_of(from.max(to)));
+                let text = f.text[a..b].to_string();
+                if matches!(op, TextEdit::Cut(..)) {
+                    f.replace_chars(from, to, "");
+                }
+                if !text.is_empty() {
+                    self.copy_text(text);
+                }
+                if matches!(op, TextEdit::Copy(..)) {
+                    return;
+                }
+            }
+            TextEdit::Paste(at) => {
+                f.select_chars(at, at);
+                self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: edit_gen }));
+            }
+        }
+        self.field_edited();
+    }
+
+    /// Which field is open: each opened or closed, and each rename or new folder, is a new one.
+    pub fn edit_gen(&self) -> u64 {
+        self.edit_gen
     }
 
     pub fn is_selected(&self, id: u32) -> bool {
@@ -2031,6 +2108,11 @@ impl App {
     }
 
     fn set_edit(&mut self, e: Edit) {
+        // Each field opened or closed is a new one, so a late paste or a screen reader's request
+        // about the last can't land in it.
+        if e != self.edit {
+            self.edit_gen += 1;
+        }
         self.edit = e;
         self.invalidate(self.layout().toolbar);
     }
@@ -3659,14 +3741,12 @@ impl App {
             f.text[a..b].to_string()
         });
         if m.ctrl && matches!(sym, k::KEY_c | k::KEY_x) && selected.as_ref().is_some_and(|t| !t.is_empty()) {
-            let t = selected.unwrap_or_default().into_bytes();
-            self.cmds.push(Cmd::SetClipboard(vec![(clipboard::TEXT, t.clone()), (clipboard::TEXT_PLAIN, t.clone()), (clipboard::UTF8_STRING, t)]));
+            self.copy_text(selected.unwrap_or_default());
             if sym == k::KEY_x
                 && let Some(f) = self.field_mut()
             {
                 f.backspace(false);
-                self.apply_filter_field();
-                self.invalidate_all();
+                self.field_edited();
             }
             return;
         }
@@ -3706,8 +3786,34 @@ impl App {
                 }
             }
         }
+        self.field_edited();
+    }
+
+    /// Puts a field's text on the clipboard, as Ctrl+C in one does.
+    fn copy_text(&mut self, t: String) {
+        let t = t.into_bytes();
+        self.cmds.push(Cmd::SetClipboard(vec![(clipboard::TEXT, t.clone()), (clipboard::TEXT_PLAIN, t.clone()), (clipboard::UTF8_STRING, t)]));
+    }
+
+    /// Follows a change to the text, caret or selection of the field with the keyboard,
+    /// whatever made it: the filter narrows the list, and the rename dialog shows the new names.
+    fn field_edited(&mut self) {
         self.apply_filter_field();
+        if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
+            d.update();
+        }
         self.invalidate_all();
+    }
+
+    /// Ends an edit as a click elsewhere does. That commits a rename or new folder, as other
+    /// file managers do, drops a typed path, and keeps what was typed for a filter.
+    fn leave_field(&mut self) {
+        match self.edit {
+            Edit::None => {}
+            Edit::Path(_) => self.field_cancel(),
+            Edit::Rename { .. } | Edit::NewFolder(_) => self.field_commit(),
+            Edit::Filter(_) => self.set_edit(Edit::None),
+        }
     }
 
     fn field_cancel(&mut self) {
@@ -4013,13 +4119,7 @@ impl App {
             out.push((x as i32, widths[i] as i32, path));
             x += widths[i] + gap;
         }
-        self.crumbs_laid.clone_from(&out);
         out
-    }
-
-    /// The path bar's parts as they were last laid out, for a screen reader.
-    pub fn crumbs_laid(&self) -> &[(i32, i32, PathBuf)] {
-        &self.crumbs_laid
     }
 
     /// Every part of the path, from the top, as its label and folder, whether or not it fits.
@@ -4286,13 +4386,8 @@ impl App {
             _ => {}
         }
         // A click anywhere else ends an edit and keeps what was typed for a filter.
-        if !matches!(hit, Hit::PathBar | Hit::FilterBox) && !matches!(self.edit, Edit::None) {
-            // A click away commits a rename or new folder, as other file managers do.
-            match self.edit {
-                Edit::Path(_) => self.field_cancel(),
-                Edit::Rename { .. } | Edit::NewFolder(_) => self.field_commit(),
-                _ => self.set_edit(Edit::None),
-            }
+        if !matches!(hit, Hit::PathBar | Hit::FilterBox) {
+            self.leave_field();
         }
         if button == BTN_RIGHT {
             if self.menu.is_some() {
@@ -4420,12 +4515,10 @@ impl App {
 
     fn click_in_field(&mut self, x: i32) {
         let r = if matches!(self.edit, Edit::Filter(_)) { self.filter_rect().unwrap_or_default() } else { self.path_box() };
-        let text = self.field_mut().map(|f| (f.text.clone(), f.caret));
-        let Some((text, caret)) = text else { return };
+        let Some(f) = self.field_mut().map(|f| f.clone()) else { return };
         // The same scroll the painter applies when the text is longer than the box.
-        let inner = r.w - self.px(16.0);
-        let shift = (self.text.measure(&text[..caret]) - inner as f32 + 2.0).max(0.0);
-        let at = self.text.offset_at(&text, (x - r.x - self.px(8.0)) as f32 + shift);
+        let x0 = self.field_text_x(r, &f);
+        let at = self.text.offset_at(&f.text, x as f32 - x0);
         if let Some(f) = self.field_mut() {
             f.move_to(at, false);
         }
@@ -5969,6 +6062,146 @@ mod tests {
         r.app.on_msg(Msg::Clipboard(Some(b"junk".to_vec()), clipboard::TEXT.to_string(), asked));
         let Edit::Rename { field, .. } = &r.app.edit else { panic!() };
         assert_eq!(field.text, "a");
+    }
+
+    // ---- Screen readers and text fields ----
+
+    fn a11y_edit(r: &mut Rig, id: u64, op: crate::a11y::TextEdit) {
+        let edit_gen = r.app.edit_gen;
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(id, edit_gen, op)));
+    }
+
+    fn field_text(r: &Rig) -> (String, usize, usize) {
+        let f = match &r.app.edit {
+            Edit::Path(f) | Edit::Filter(f) | Edit::NewFolder(f) | Edit::Rename { field: f, .. } => f,
+            Edit::None => panic!("no field open"),
+        };
+        (f.text.clone(), f.anchor, f.caret)
+    }
+
+    #[test]
+    fn a_screen_reader_edits_a_rename_as_typing_would() {
+        use crate::a11y::{NAME_FIELD, TextEdit};
+        let mut r = Rig::new("a11y-rename");
+        fs::write(r.work().join("café.txt"), "x").unwrap();
+        r.open(r.work());
+        r.select("café.txt");
+        r.key(k::KEY_F2, "");
+        // Counted in characters: é is two bytes.
+        assert_eq!(field_text(&r), ("café.txt".into(), 0, 5), "the stem selected, as for typing");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Replace(0, 4, "tea\n".into()));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 3, 3), "the stem replaced, and no line break in a name");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Select(4, 7));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 4, 7));
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Copy(4, 7));
+        assert!(matches!(r.app.cmds.last(), Some(Cmd::SetClipboard(offers)) if offers[0].1 == b"txt"), "copied as Ctrl+C copies");
+        a11y_edit(&mut r, NAME_FIELD, TextEdit::Caret(99));
+        assert_eq!(field_text(&r), ("tea.txt".into(), 7, 7), "a caret past the end stays at the end");
+        // A request about an earlier rename is dropped.
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(NAME_FIELD, r.app.edit_gen - 1, TextEdit::Replace(0, 7, "no".into()))));
+        assert_eq!(field_text(&r).0, "tea.txt");
+        // A request about a row of another folder is dropped, and leaves the rename alone.
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::FocusRow(Arc::new(r.root.clone()), b"work".to_vec())));
+        assert_eq!(field_text(&r).0, "tea.txt");
+        // Moving to a row ends the rename as clicking there does: it's made.
+        let key = r.app.listing.as_ref().unwrap().key(r.app.rows[0]).into_owned();
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::FocusRow(Arc::new(r.work()), key)));
+        assert!(matches!(r.app.edit, Edit::None));
+        r.idle();
+        assert!(r.work().join("tea.txt").exists());
+    }
+
+    #[test]
+    fn a_screen_reader_types_in_the_filter_box() {
+        use crate::a11y::{FILTER, PATH_FIELD, TextEdit};
+        let mut r = Rig::new("a11y-filter");
+        for n in ["apple", "apricot", "banana"] {
+            fs::write(r.work().join(n), "x").unwrap();
+        }
+        r.open(r.work());
+        // No box showing: nothing to type in.
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "ap".into()));
+        assert!(matches!(r.app.edit, Edit::None) && r.app.filter.is_empty());
+        r.key(0, "/");
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "ap".into()));
+        assert_eq!(r.row_names(), ["apple", "apricot"], "the list narrows as it does for typing");
+        // Left showing with what it filters by, the box opens again when it's changed.
+        r.key(k::KEY_Down, "");
+        assert!(matches!(r.app.edit, Edit::None));
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(1, 2, "".into()));
+        assert_eq!((field_text(&r).0.as_str(), r.row_names().len()), ("a", 3));
+        // A path request goes nowhere while the path isn't being typed.
+        a11y_edit(&mut r, PATH_FIELD, TextEdit::Replace(0, 1, "/".into()));
+        assert_eq!(field_text(&r).0, "a");
+        // Moving to the box opens it, as clicking it does.
+        r.key(k::KEY_Tab, "");
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::Focus(FILTER)));
+        assert!(matches!(r.app.edit, Edit::Filter(_)));
+    }
+
+    #[test]
+    fn a_late_paste_or_request_doesnt_land_in_a_field_opened_since() {
+        use crate::a11y::{FILTER, TextEdit};
+        let mut r = Rig::new("a11y-late");
+        fs::write(r.work().join("a"), "x").unwrap();
+        r.open(r.work());
+        r.key(0, "/");
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        let stale = r.app.edit_gen;
+        // The box closes and opens again before the answers come.
+        r.key(k::KEY_Escape, "");
+        r.key(0, "/");
+        r.app.on_msg(Msg::Clipboard(Some(b"junk".to_vec()), clipboard::TEXT.to_string(), asked));
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(FILTER, stale, TextEdit::Replace(0, 0, "old".into()))));
+        assert_eq!(field_text(&r).0, "");
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "new".into()));
+        assert_eq!(field_text(&r).0, "new");
+    }
+
+    #[test]
+    fn the_snapshot_has_the_fields_and_where_their_characters_are() {
+        use crate::a11y::{FILTER, FRAME, Focus, Link, NAME_FIELD, PATH_FIELD, Role};
+        let mut r = Rig::new("a11y-fields");
+        fs::write(r.work().join("notes.txt"), "x").unwrap();
+        r.open(r.work());
+        let mut link = Link::new();
+        let s = link.build(&mut r.app);
+        assert!(s.get(PATH_FIELD).is_none() && s.get(FILTER).is_none() && s.get(NAME_FIELD).is_none());
+
+        r.ctrl(k::KEY_f);
+        let s = link.build(&mut r.app);
+        let n = s.get(FILTER).expect("the search box");
+        assert_eq!((n.role, n.name.as_str(), n.description.as_str()), (Role::Entry, "Search", "Search here and below"));
+        assert_eq!(s.focus, Focus::Node(FILTER));
+        r.ctrl(k::KEY_f);
+        let s = link.build(&mut r.app);
+        let n = s.get(FILTER).unwrap();
+        assert_eq!((n.name.as_str(), n.description.as_str()), ("Filter", "Filter this folder"), "Ctrl+F in the box turns it to a filter");
+        r.key(k::KEY_Escape, "");
+
+        r.select("notes.txt");
+        r.key(k::KEY_F2, "");
+        let s = link.build(&mut r.app);
+        let n = s.get(NAME_FIELD).expect("the rename field");
+        assert_eq!((n.name.as_str(), n.field.as_ref().unwrap().text.as_str()), ("Rename notes.txt", "notes.txt"));
+        assert_eq!(s.focus, Focus::Node(NAME_FIELD));
+        assert_eq!(s.get(FRAME).unwrap().children.last(), Some(&NAME_FIELD));
+        // Its characters are on its row. Tests have no fonts to measure them with: the e2e
+        // check sees them left to right.
+        let g = s.geometry(NAME_FIELD).unwrap();
+        assert_eq!(g.edges.len(), "notes.txt".len() + 1);
+        let row = r.app.layout().list;
+        assert!(n.rect.y >= row.y && n.rect.bottom() <= row.y + r.app.layout().row_h + 1, "{:?}", n.rect);
+        assert!(g.edges[0] >= n.rect.x && *g.edges.last().unwrap() <= n.rect.right());
+        r.key(k::KEY_Escape, "");
+
+        r.ctrl(k::KEY_l);
+        let s = link.build(&mut r.app);
+        let n = s.get(PATH_FIELD).expect("the typed path");
+        assert_eq!(n.field.as_ref().unwrap().text, r.work().to_string_lossy());
+        assert_eq!(s.focus, Focus::Node(PATH_FIELD));
+        assert_eq!(&s.get(FRAME).unwrap().children[..2], &[crate::a11y::BACK, PATH_FIELD]);
     }
 
     fn type_in(r: &mut Rig, text: &str) {
@@ -9692,7 +9925,7 @@ mod tests {
     }
 
     /// What a screen reader would be handed now, as a server that just started gets it.
-    fn a11y_snapshot(app: &App) -> crate::a11y::Snapshot {
+    fn a11y_snapshot(app: &mut App) -> crate::a11y::Snapshot {
         let mut link = crate::a11y::Link::new();
         let (tx, rx) = channel();
         assert!(link.shared.connect(link.shared.next_epoch(), tx));
@@ -9716,7 +9949,7 @@ mod tests {
         fs::create_dir(r.work().join("sub")).unwrap();
         r.open(r.work());
         r.pump_until("sizes known", |a| a.listing.as_ref().is_some_and(|l| a.rows.iter().all(|&e| matches!(l.stat(e), Stat::Known { .. }))));
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         assert_eq!(s.get(LIST).map(|n| n.role), Some(Role::Table));
         assert_eq!(s.rows.columns.iter().map(|c| c.name).collect::<Vec<_>>(), ["Name", "Size", "Modified"]);
         let frame = &s.get(FRAME).unwrap().children;
@@ -9736,13 +9969,13 @@ mod tests {
         // A heading sorts by its column, as a click does, and the new order is news.
         r.app.on_msg(Msg::A11y(Act::Press(COLUMN_SIZE)));
         r.pump_until("sorted by size", |a| a.sort.key == SortKey::Size && !a.rows.is_empty());
-        let t = a11y_snapshot(&r.app);
+        let t = a11y_snapshot(&mut r.app);
         assert_eq!(t.rows.sort, (Column::Size, SortKey::Size.first_order().descending));
         let said = if t.rows.sort.1 { "Sorted by size, descending" } else { "Sorted by size, ascending" };
         assert_eq!(t.news_since(&s), [(said.to_string(), false)]);
         // Where search results are has a column of its own, which nothing sorts by.
         r.search("a.txt");
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         assert_eq!(s.rows.columns.iter().map(|c| c.name).collect::<Vec<_>>(), ["Name", "Location", "Size", "Modified"]);
         assert!(s.get(COLUMN_LOCATION).is_some_and(|n| n.action.is_none()));
         let e = s.rows.entry(0).unwrap();
@@ -9756,7 +9989,7 @@ mod tests {
         fs::create_dir_all(r.work().join("x/y")).unwrap();
         r.open(r.work().join("x/y"));
         paint_once(&mut r.app);
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         let links: Vec<_> = s.get(PATH).unwrap().children.iter().map(|&c| s.get(c).unwrap()).collect();
         assert!(links.iter().all(|n| n.role == Role::Link && n.parent == PATH));
         let names: Vec<&str> = links.iter().map(|n| n.name.as_str()).collect();
@@ -9773,7 +10006,7 @@ mod tests {
         assert!(r.app.cursor_shown && r.app.cursor == 0, "the cursor on the folder come from");
         // While the path is typed, the links aren't showing.
         r.app.start_path_edit();
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         assert!(!s.get(PATH).unwrap().showing);
     }
 
@@ -9784,7 +10017,7 @@ mod tests {
         let mount = r.root.join("media/PHOTOS");
         fs::create_dir_all(&mount).unwrap();
         r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         let side = &s.get(SIDEBAR).unwrap().children;
         assert_eq!(side[..4], [HEADING_PLACES, PLACE0, HEADING_DEVICES, PLACE0 + 1], "each heading before its section's first place");
         let devices = s.get(HEADING_DEVICES).unwrap();
@@ -9806,12 +10039,12 @@ mod tests {
         use crate::a11y::{Act, Role, DISMISS0, JOB0, LIST, NOTICE0, NOTICES, STOP0};
         let mut r = Rig::new("a11y-news");
         r.open(r.work());
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         assert_eq!(s.get(LIST).unwrap().description, "This folder is empty");
         // The same notice twice is two notices.
         r.app.notice("Something broke".into());
         r.app.notice("Something broke".into());
-        let t = a11y_snapshot(&r.app);
+        let t = a11y_snapshot(&mut r.app);
         assert_eq!(t.news_since(&s), [("Something broke".to_string(), true), ("Something broke".to_string(), true)]);
         assert_eq!(t.get(NOTICES).unwrap().children, [NOTICE0, DISMISS0, NOTICE0 + 1, DISMISS0 + 1]);
         assert_eq!(t.get(DISMISS0 + 1).unwrap().description, "Something broke");
@@ -9819,7 +10052,7 @@ mod tests {
         r.app.on_msg(Msg::A11y(Act::Dismiss(0, "Something else".into())));
         assert_eq!(r.app.notices.len(), 2);
         r.app.on_msg(Msg::A11y(Act::Dismiss(0, "Something broke".into())));
-        let u = a11y_snapshot(&r.app);
+        let u = a11y_snapshot(&mut r.app);
         assert_eq!(r.app.notices.len(), 1);
         assert!(u.news_since(&t).is_empty(), "dismissing one isn't news");
         r.app.notices.clear();
@@ -9831,7 +10064,7 @@ mod tests {
         r.app.start_job(Request::Copy { sources: vec![r.work().join("a.txt")], dest: r.work().join("dest") });
         r.pump_until("the question", |a| matches!(a.dialog, Some(Dialog::Conflict { .. })));
         std::thread::sleep(JOB_SHOW_AFTER);
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         let job = s.news.jobs.first().expect("the job").clone();
         assert_eq!(job.label, "Copying “a.txt” to dest");
         let bar = s.get(JOB0 + job.id).unwrap();
@@ -9841,7 +10074,7 @@ mod tests {
         // Skip.
         r.app.press_dialog_button(1);
         r.pump_until("copied", |a| a.jobs.is_empty());
-        let t = a11y_snapshot(&r.app);
+        let t = a11y_snapshot(&mut r.app);
         assert_eq!(t.news_since(&s), [("Finished: Copying “a.txt” to dest".to_string(), false)]);
         // Had it ended with errors, which post notices of their own, it wouldn't be finished.
         let mut failed = t.clone();
@@ -9852,7 +10085,7 @@ mod tests {
         r.app.start_job(Request::Copy { sources: vec![r.work().join("a.txt")], dest: r.work().join("dest") });
         r.pump_until("the question again", |a| matches!(a.dialog, Some(Dialog::Conflict { .. })));
         std::thread::sleep(JOB_SHOW_AFTER);
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         let id = s.news.jobs.first().expect("the job").id;
         // Nothing behind the question can be used, so it's set aside for the button.
         r.app.on_msg(Msg::A11y(Act::Press(STOP0 + id)));
@@ -9860,12 +10093,103 @@ mod tests {
         let question = r.app.dialog.take();
         r.app.on_msg(Msg::A11y(Act::Press(STOP0 + id)));
         r.app.dialog = question;
-        let s = a11y_snapshot(&r.app);
+        let s = a11y_snapshot(&mut r.app);
         assert!(s.news.jobs.first().is_some_and(|j| j.stopping && j.progress == "stopping"));
         assert!(!s.get(STOP0 + id).unwrap().enabled, "stopping already");
         // Skip.
         r.app.press_dialog_button(1);
         r.pump_until("stopped", |a| a.jobs.is_empty());
-        assert_eq!(a11y_snapshot(&r.app).news_since(&s), [("Stopped: Copying “a.txt” to dest".to_string(), true)]);
+        assert_eq!(a11y_snapshot(&mut r.app).news_since(&s), [("Stopped: Copying “a.txt” to dest".to_string(), true)]);
+    }
+
+    #[test]
+    fn a_screen_reader_hears_the_preview_and_walks_it() {
+        use crate::a11y::{Act, BACK, PREVIEW_CLOSE, PREVIEW_NEXT, PREVIEW_PREVIOUS};
+        let mut r = viewer_rig("a11y-viewer", "a");
+        let t = r.app.a11y_preview();
+        assert_eq!((t.name.as_str(), t.can_step), ("a", (false, true)), "the first of three");
+        r.app.on_msg(Msg::A11y(Act::Press(PREVIEW_NEXT)));
+        assert_eq!(showing(&r).as_deref(), Some("b"));
+        assert_eq!(r.app.a11y_preview().can_step, (true, true));
+        r.app.on_msg(Msg::A11y(Act::Press(PREVIEW_PREVIOUS)));
+        assert_eq!(showing(&r).as_deref(), Some("a"));
+        // The preview has no Back button: a request meant for a list's does nothing here.
+        r.app.cmds.clear();
+        r.app.on_msg(Msg::A11y(Act::Press(BACK)));
+        assert_eq!(showing(&r).as_deref(), Some("a"));
+        r.app.on_msg(Msg::A11y(Act::Press(PREVIEW_CLOSE)));
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::Quit)), "closed");
+    }
+
+    #[test]
+    fn a_screen_reader_can_use_the_save_dialogs_bar() {
+        use crate::a11y::{Act, CHOOSER_CANCEL, CHOOSER_SAVE_NAME, CHOOSER_TYPE0, CHOOSER_TYPES, Role};
+        let mut r = Rig::new("a11y-chooser");
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        fs::write(r.work().join("b.png"), "b").unwrap();
+        let glob = |g: &str| vec![crate::chooser::Pattern::Glob(g.into())];
+        let filters = vec![crate::chooser::Filter { label: "Text".into(), patterns: glob("*.txt") }, crate::chooser::Filter { label: "All files".into(), patterns: glob("*") }];
+        let spec = crate::chooser::Spec { mode: crate::chooser::Mode::Save, name: Some("new.txt".into()), filters, ..crate::chooser::Spec::default() };
+        r.app.chooser = Some(crate::chooser::Chooser::new(spec, &[], None));
+        r.open(r.work());
+        // The bar is placed as it was last drawn.
+        let mut px = vec![0u32; (r.app.w * r.app.h) as usize];
+        r.app.paint(&mut crate::canvas::Canvas::new(&mut px, r.app.w, r.app.h));
+        let parts = r.app.a11y_chooser_parts();
+        let name = parts.iter().find(|n| n.id == CHOOSER_SAVE_NAME).expect("the name field");
+        assert_eq!((name.role, name.field.as_ref().map(|f| f.text.as_str())), (Role::Entry, Some("new.txt")));
+        assert!(!name.rect.is_empty() && r.app.a11y_name_has_keyboard());
+        let types = parts.iter().find(|n| n.id == CHOOSER_TYPES).expect("the file types");
+        assert_eq!(types.children, [CHOOSER_TYPE0, CHOOSER_TYPE0 + 1]);
+        assert!(parts.iter().any(|n| n.id == CHOOSER_TYPE0 && n.selected));
+        assert!(parts.iter().filter(|n| n.parent == CHOOSER_TYPES).all(|n| n.showing && n.rect == types.rect), "the types count as showing, or a screen reader leaves them out");
+        // Picking a file type shows its files.
+        r.app.on_msg(Msg::A11y(Act::Focus(CHOOSER_TYPE0 + 1)));
+        r.pump_until("every file", |a| a.rows.len() == 2);
+        assert_eq!(r.app.chooser.as_ref().unwrap().filter, Some(1));
+        // Moving to a row takes the keyboard from the name, and moving to the name gives it back.
+        let dir = Arc::new(r.work());
+        r.app.on_msg(Msg::A11y(Act::FocusRow(dir, b"b.png".to_vec())));
+        assert!(!r.app.a11y_name_has_keyboard() && r.app.cursor_shown);
+        r.app.on_msg(Msg::A11y(Act::Focus(CHOOSER_SAVE_NAME)));
+        assert!(r.app.a11y_name_has_keyboard());
+        // A late request about a folder the dialog has left doesn't take the keyboard from the name.
+        r.app.on_msg(Msg::A11y(Act::FocusRow(Arc::new(r.work().join("gone")), b"b.png".to_vec())));
+        assert!(r.app.a11y_name_has_keyboard(), "a request about another folder took the keyboard");
+        r.app.on_msg(Msg::A11y(Act::Press(CHOOSER_CANCEL)));
+        assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::Quit)) && r.app.chooser.as_ref().unwrap().picked.is_none(), "cancelled");
+    }
+
+    #[test]
+    fn a_screen_reader_types_the_name_to_save_as() {
+        use crate::a11y::{Act, CHOOSER_SAVE_NAME, Focus, Link, TextEdit};
+        let mut r = Rig::new("a11y-save-name");
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        let spec = crate::chooser::Spec { mode: crate::chooser::Mode::Save, name: Some("new.txt".into()), ..crate::chooser::Spec::default() };
+        r.app.chooser = Some(crate::chooser::Chooser::new(spec, &[], None));
+        r.open(r.work());
+        let mut px = vec![0u32; (r.app.w * r.app.h) as usize];
+        r.app.paint(&mut crate::canvas::Canvas::new(&mut px, r.app.w, r.app.h));
+        let name = |r: &Rig| r.app.chooser.as_ref().unwrap().name.text.clone();
+        // The snapshot has where its characters are, and the number its requests carry.
+        let s = Link::new().build(&mut r.app);
+        assert_eq!(s.focus, Focus::Node(CHOOSER_SAVE_NAME));
+        assert_eq!(s.geometry(CHOOSER_SAVE_NAME).map(|g| g.edges.len()), Some("new.txt".len() + 1));
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, s.edit_gen, TextEdit::Replace(0, 3, "report".into()))));
+        assert_eq!(name(&r), "report.txt");
+        // With the keyboard in the list, typing in the name gives it the keyboard first, as a
+        // click on it does.
+        r.app.on_msg(Msg::A11y(Act::FocusRow(Arc::new(r.work()), b"a.txt".to_vec())));
+        assert!(!r.app.a11y_name_has_keyboard());
+        let edit_gen = r.app.edit_gen;
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, edit_gen, TextEdit::Replace(0, usize::MAX, "b.txt".into()))));
+        assert!(r.app.a11y_name_has_keyboard());
+        assert_eq!(name(&r), "b.txt");
+        // A request from before the filter box opened is dropped.
+        r.key(k::KEY_Tab, "");
+        r.key(0, "/");
+        assert!(matches!(r.app.edit, Edit::Filter(_)));
+        r.app.on_msg(Msg::A11y(Act::EditText(CHOOSER_SAVE_NAME, edit_gen, TextEdit::Replace(0, 0, "x".into()))));
+        assert_eq!(name(&r), "b.txt");
     }
 }

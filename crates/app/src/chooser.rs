@@ -18,6 +18,7 @@ use gannet_core::mime::{MimeDb, glob_match};
 use gannet_core::ops;
 use xkbcommon::xkb::keysyms as k;
 
+use crate::a11y;
 use crate::app::{Action, App, Dialog, Hit, Menu, MenuItem};
 use crate::canvas::{Canvas, Rect};
 use crate::field::Field;
@@ -317,6 +318,8 @@ pub struct Chooser {
     out: Option<OwnedFd>,
     /// The buttons and file-type list as last drawn, for the end-to-end checks to click.
     pub drawn: (Rect, Rect, Option<Rect>),
+    /// The name field as last drawn, for screen readers.
+    pub drawn_name: Option<Rect>,
 }
 
 impl Chooser {
@@ -332,7 +335,7 @@ impl Chooser {
         let labels = spec.filters.iter().map(|f| &*Box::leak(f.label.clone().into_boxed_str())).collect();
         let folders_only = matches!(spec.mode, Mode::Folder | Mode::SaveFiles);
         let rows = Arc::new(RowFilter::new(folders_only, filter.and_then(|i| spec.filters.get(i)), db.clone()));
-        Self { spec, filter, name, name_focused, match_path: None, rows, db, picked: None, labels, out, drawn: Default::default() }
+        Self { spec, filter, name, name_focused, match_path: None, rows, db, picked: None, labels, out, drawn: Default::default(), drawn_name: None }
     }
 
     fn set_filter(&mut self, i: usize) {
@@ -590,6 +593,70 @@ impl App {
         }
     }
 
+    /// Whether typing goes to the Save dialog's name field, which then has the keyboard. The
+    /// path or filter box, while open, has it first.
+    pub(crate) fn a11y_name_has_keyboard(&self) -> bool {
+        self.chooser.as_ref().is_some_and(|c| c.name_focused && c.spec.mode == Mode::Save) && matches!(self.edit, crate::app::Edit::None)
+    }
+
+    /// The bar's parts, for screen readers: the name to save as, or the line saying what's
+    /// picked; the file types; and the buttons. Placed as they were last drawn.
+    pub(crate) fn a11y_chooser_parts(&self) -> Vec<a11y::Node> {
+        use a11y::{FRAME, Node, Role};
+        let Some(c) = self.chooser.as_ref() else { return Vec::new() };
+        let (accept, cancel, types) = c.drawn;
+        let mut out = Vec::new();
+        match c.drawn_name.filter(|_| c.spec.mode == Mode::Save) {
+            Some(r) => {
+                // Its text is the field itself, read and typed in through a screen reader as
+                // the other text fields are.
+                let mut name = Node::new(a11y::CHOOSER_SAVE_NAME, Role::Entry, "Name", r, FRAME).doing(a11y::Action::new("activate", "Save with this name", "Return"));
+                name.field = Some(c.name.clone());
+                out.push(name);
+            }
+            None => out.push(Node::new(a11y::CHOOSER_INFO, Role::Label, self.chooser_info(), self.layout().status, FRAME)),
+        }
+        if !c.labels.is_empty() {
+            // The list is drawn as one button showing the type picked, so each type is placed
+            // there, and counts as showing: a screen reader leaves out what isn't.
+            let r = types.unwrap_or_default();
+            let items: Vec<Node> = c.labels.iter().enumerate().map(|(i, &label)| Node::new(a11y::CHOOSER_TYPE0 + i as u64, Role::ListItem, label, r, a11y::CHOOSER_TYPES).selected(c.filter == Some(i))).collect();
+            out.push(Node::new(a11y::CHOOSER_TYPES, Role::List, "File type", r, FRAME).with_children(items.iter().map(|n| n.id).collect()));
+            out.extend(items);
+        }
+        out.push(Node::new(a11y::CHOOSER_CANCEL, Role::PushButton, "Cancel", cancel, FRAME).doing(a11y::click("Close without choosing", "Escape")));
+        out.push(Node::new(a11y::CHOOSER_ACCEPT, Role::PushButton, c.spec.accept_label(), accept, FRAME).enabled(self.chooser_can_accept()).doing(a11y::click("Choose what's picked", "Return")));
+        out
+    }
+
+    /// Something a screen reader asked of the bar. Returns whether it was about the bar.
+    pub(crate) fn a11y_chooser_act(&mut self, act: &a11y::Act) -> bool {
+        if self.chooser.is_none() {
+            return false;
+        }
+        match *act {
+            a11y::Act::Press(a11y::CHOOSER_ACCEPT) | a11y::Act::Press(a11y::CHOOSER_SAVE_NAME) => self.chooser_accept(),
+            a11y::Act::Press(a11y::CHOOSER_CANCEL) => self.chooser_cancel(),
+            a11y::Act::Focus(a11y::CHOOSER_SAVE_NAME) => {
+                if let Some(c) = self.chooser.as_mut().filter(|c| c.spec.mode == Mode::Save) {
+                    c.name_focused = true;
+                    self.invalidate_all();
+                }
+            }
+            a11y::Act::Focus(id) if id >= a11y::CHOOSER_TYPE0 && id < a11y::CHOOSER_TYPE0 + self.chooser.as_ref().map_or(0, |c| c.labels.len() as u64) => self.choose_filter((id - a11y::CHOOSER_TYPE0) as usize),
+            // A row moved to takes the keyboard back to the list, as a click on it does; not a
+            // late request about the folder just left, which is dropped.
+            a11y::Act::FocusRow(ref dir, _) | a11y::Act::SelectRow(ref dir, ..) => {
+                if **dir == self.dir {
+                    self.chooser_clicked_list(None);
+                }
+                return false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// A key the chooser handles before the list does. Returns whether it did.
     pub(crate) fn chooser_key(&mut self, sym: u32, utf8: &str, m: Mods) -> bool {
         let Some(c) = self.chooser.as_mut() else { return false };
@@ -735,6 +802,7 @@ impl App {
         let b = self.chooser_bar();
         if let Some(ch) = self.chooser.as_mut() {
             ch.drawn = (b.accept, b.cancel, b.filter);
+            ch.drawn_name = b.name.map(|(r, _)| r);
         }
         let Some(ch) = self.chooser.as_ref() else { return };
         // The path or filter box, while open, has the keyboard before the name does.
@@ -783,7 +851,7 @@ impl App {
     }
 
     /// The line on the left when opening: what's picked, or what to do.
-    fn chooser_info(&mut self) -> String {
+    fn chooser_info(&self) -> String {
         let Some(c) = self.chooser.as_ref() else { return String::new() };
         let (mode, multiple) = (c.spec.mode, c.spec.multiple);
         let Some(l) = self.listing.clone() else { return String::new() };

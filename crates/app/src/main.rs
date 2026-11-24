@@ -288,7 +288,7 @@ fn main() {
         app.open_selecting(start_dir, names);
     }
     let mut first_frame = true;
-    // What screen readers see, while one is running. Only a file manager window has it yet.
+    // What screen readers see, while one is running.
     let mut a11y = a11y::Link::new();
     #[cfg(feature = "bench")]
     let mut bench = bench::Bench::new(app.viewer);
@@ -388,14 +388,15 @@ fn main() {
                     app.system_bus = Some(address.clone());
                     drives::watch(hub.clone(), address);
                 }
-                // Only a file manager window offers "Set as background", and is served to screen
-                // readers so far.
-                if !app.viewer && app.chooser.is_none() {
-                    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-                    if let Some(address) = gannet_core::bus::session_address(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(), runtime.as_deref()) {
+                // Every window is served to screen readers, and only a file manager window offers
+                // "Set as background".
+                let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+                if let Some(address) = gannet_core::bus::session_address(std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(), runtime.as_deref()) {
+                    let manager = !app.viewer && app.chooser.is_none();
+                    if manager {
                         app.session_bus = Some(address.clone());
-                        session::watch(hub.clone(), address, a11y.shared.clone(), std::env::var("AT_SPI_BUS_ADDRESS").ok());
                     }
+                    session::watch(hub.clone(), address, manager, a11y.shared.clone(), std::env::var("AT_SPI_BUS_ADDRESS").ok());
                 }
             }
             let mut missing = app.text.take_missing();
@@ -405,7 +406,7 @@ fn main() {
             }
         }
         // After painting, so what a screen reader is told is placed as it's drawn.
-        a11y.update(&app);
+        a11y.update(&mut app);
         #[cfg(feature = "bench")]
         bench.idle(&app);
         #[cfg(feature = "bench")]
@@ -984,12 +985,15 @@ mod bench {
         };
         let doc = match (&p.content, &p.doc_layout) {
             (Content::Doc { doc, .. }, layout) => format!(
-                "{{\"blocks\":{},\"cut\":{},\"lines\":{},\"scroll\":{:.0},\"height\":{},\"text\":{}}}",
+                "{{\"blocks\":{},\"cut\":{},\"lines\":{},\"scroll\":{:.0},\"height\":{},\"width\":{},\"table_lines\":{},\"table_right\":{},\"text\":{}}}",
                 doc.blocks.len(),
                 doc.cut,
                 layout.as_ref().map_or(0, |l| l.lines.len()),
                 p.scroll,
                 layout.as_ref().map_or(0, |l| l.height),
+                layout.as_ref().map_or(0, |l| l.width),
+                layout.as_ref().map_or(0, |l| l.lines.iter().filter(|l| matches!(l.mark, crate::docview::Mark::Table { .. })).count()),
+                layout.as_ref().and_then(|l| l.lines.iter().find_map(|l| match l.mark { crate::docview::Mark::Table { right, .. } => Some(right), _ => None })).unwrap_or(0),
                 esc(&doc.blocks.iter().take(3).flat_map(|b| b.spans.iter().map(|s| s.text.as_str())).collect::<String>().chars().take(200).collect::<String>()),
             ),
             _ => "null".to_string(),

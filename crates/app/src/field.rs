@@ -123,6 +123,30 @@ impl Field {
             self.anchor = self.caret;
         }
     }
+
+    /// How many characters there are before a byte offset. Screen readers count in characters.
+    pub fn chars_before(&self, at: usize) -> usize {
+        self.text.get(..at.min(self.text.len())).map_or(0, |t| t.chars().count())
+    }
+
+    /// The byte offset of a character's place, or the end past the last one.
+    pub fn byte_of(&self, chars: usize) -> usize {
+        self.text.char_indices().nth(chars).map_or(self.text.len(), |(i, _)| i)
+    }
+
+    /// Selects from `anchor` to `caret`, both in characters.
+    pub fn select_chars(&mut self, anchor: usize, caret: usize) {
+        self.anchor = self.byte_of(anchor);
+        self.caret = self.byte_of(caret);
+    }
+
+    /// Puts `with` in place of the characters from `from` to `to`, as typing over a selection
+    /// of them would, and leaves the caret after it.
+    pub fn replace_chars(&mut self, from: usize, to: usize, with: &str) {
+        self.select_chars(from.min(to), from.max(to));
+        self.delete_selection();
+        self.insert(with);
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +212,23 @@ mod tests {
         assert_eq!((f.caret, f.anchor), (4, 4));
         f.left(false, true);
         assert_eq!(f.selection(), (3, 4));
+    }
+
+    #[test]
+    fn screen_readers_count_characters_not_bytes() {
+        let mut f = Field::new("aé日b");
+        assert_eq!((f.chars_before(f.text.len()), f.byte_of(2), f.byte_of(9)), (4, 3, 7));
+        f.replace_chars(1, 3, "xy");
+        assert_eq!((f.text.as_str(), f.caret, f.anchor), ("axyb", 3, 3));
+        f.replace_chars(4, 0, "");
+        assert_eq!(f.text, "");
+        let mut f = Field::new("aé日b");
+        f.select_chars(3, 1);
+        assert_eq!((f.caret, f.anchor, f.selection()), (1, 6, (1, 6)));
+        f.replace_chars(1, 1, "z\n");
+        assert_eq!(f.text, "azé日b", "inserting at a point leaves the rest, and control characters out");
+        f.replace_chars(0, usize::MAX, "all");
+        assert_eq!((f.text.as_str(), f.caret), ("all", 3), "past the end means to the end");
     }
 
     #[test]

@@ -21,11 +21,22 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   crumb N              does the action of link N in the path bar
   notices              the panel of jobs and notices: each part's role, name, description,
                        and a job's value
+  fields               the window's text fields: name, description, text, caret, selection,
+                       states, and each character's box
+  focus_field NAME     moves the keyboard to a field through its Component interface
+  set_text NAME TEXT   replaces a field's text through its EditableText interface
+  insert NAME AT TEXT  inserts text at a character's place
+  delete NAME A B      deletes the characters from A to B
+  caret NAME AT        moves the caret through the Text interface
+  select_text NAME A B selects from A to B
+  word NAME AT         the word at a character's place, as Orca reads one: [text, start, end]
+  at X Y               the name of the window's part at a point, as pointing at it finds
   events               the events heard since last asked, an announcement with what it said
+A field is found by its name, or the start of its name.
 
 For the other windows (the preview, Open and Save dialogs, Open With), a window is the one of
 Gannet's whose name has the first of a JSON list's strings in it, and a part is found in it by
-its name, the rest of the list being the names on the way down:
+its name, the rest of the list being the names on the way down. "NAME@ROLE" also says its role:
 
   dump ["WINDOW"]               the window's parts: role, name, description, states, children
   do ["WINDOW", "NAME"...]      does that part's action
@@ -55,14 +66,16 @@ def on_event(e):
         src = e.source.get_name()
     except GLib.Error as ex:
         src = f"? {ex.message}"
-    heard = {"type": e.type, "detail1": e.detail1, "source": src}
+    heard = {"type": e.type, "detail1": e.detail1, "detail2": e.detail2, "source": src}
+    if e.type.startswith("object:text-changed"):
+        heard["text"] = e.any_data
     if e.type == "object:announcement":
         heard["said"] = e.any_data
     events.append(heard)
 
 
 listener = Atspi.EventListener.new(on_event)
-for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:state-changed:checked", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:property-change:accessible-description", "object:active-descendant-changed", "window:activate", "object:announcement", "object:property-change:accessible-value"]:
+for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:state-changed:checked", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:property-change:accessible-description", "object:active-descendant-changed", "window:activate", "object:text-changed", "object:text-caret-moved", "object:text-selection-changed", "object:announcement", "object:property-change:accessible-value"]:
     listener.register(t)
 
 
@@ -117,6 +130,41 @@ def tree():
     }
 
 
+def entries():
+    frame = gannet().get_child_at_index(0)
+    return [k for k in children(frame) if k.get_role() == Atspi.Role.ENTRY]
+
+
+def field(name):
+    found = [k for k in entries() if k.get_name() == name] or [k for k in entries() if k.get_name().startswith(name)]
+    if not found:
+        raise LookupError(f"no field {name!r} among {[k.get_name() for k in entries()]}")
+    return found[0]
+
+
+def describe(f):
+    n = Atspi.Text.get_character_count(f)
+    states = f.get_state_set()
+    boxes = [Atspi.Text.get_character_extents(f, i, Atspi.CoordType.WINDOW) for i in range(n)]
+    selections = [Atspi.Text.get_selection(f, i) for i in range(Atspi.Text.get_n_selections(f))]
+    ext = f.get_extents(Atspi.CoordType.WINDOW)
+    return {
+        "name": f.get_name(),
+        "description": f.get_description(),
+        "role": f.get_role_name(),
+        "text": Atspi.Text.get_text(f, 0, -1),
+        "count": n,
+        "caret": Atspi.Text.get_caret_offset(f),
+        "selections": [[r.start_offset, r.end_offset] for r in selections],
+        "editable": states.contains(Atspi.StateType.EDITABLE),
+        "single_line": states.contains(Atspi.StateType.SINGLE_LINE),
+        "focused": states.contains(Atspi.StateType.FOCUSED),
+        "rect": [ext.x, ext.y, ext.width, ext.height],
+        "boxes": [[b.x, b.y, b.width, b.height] for b in boxes],
+        "interfaces": f.get_interfaces(),
+    }
+
+
 STATES = {"focused": Atspi.StateType.FOCUSED, "selected": Atspi.StateType.SELECTED, "enabled": Atspi.StateType.SENSITIVE, "showing": Atspi.StateType.SHOWING, "checked": Atspi.StateType.CHECKED, "editable": Atspi.StateType.EDITABLE, "active": Atspi.StateType.ACTIVE}
 
 
@@ -134,7 +182,9 @@ def window(sub):
 def part(names):
     o = window(names[0])
     for name in names[1:]:
-        found = [c for c in children(o) if c.get_name() == name]
+        # "NAME@ROLE" picks among parts of one name, like the Name heading and the Name field.
+        name, _, role = name.partition("@")
+        found = [c for c in children(o) if c.get_name() == name and role in ("", c.get_role_name())]
         if not found:
             raise LookupError(f"no {name!r} in {o.get_name()!r}")
         o = found[0]
@@ -144,7 +194,7 @@ def part(names):
 def dump(o, depth=0):
     states = o.get_state_set()
     out = {"role": o.get_role_name(), "name": o.get_name(), "description": o.get_description(), "states": [k for k, v in STATES.items() if states.contains(v)]}
-    if o.get_role_name() not in ("list item", "label", "heading", "button", "check box", "entry"):
+    if o.get_role_name() not in ("list item", "label", "heading", "button", "check box", "entry", "table cell"):
         out["children"] = [dump(c, depth + 1) for c in children(o)]
     try:
         out["action"] = o.get_action_name(0) if o.get_n_actions() > 0 else None
@@ -157,8 +207,8 @@ def place_items():
     return [p for p in children(parts()[2]) if p.get_role_name() == "list item"]
 
 
-def by_name(o, name):
-    found = [c for c in children(o) if c.get_name() == name]
+def by_name(o, name, role=None):
+    found = [c for c in children(o) if c.get_name() == name and role in (None, c.get_role_name())]
     if not found:
         raise LookupError(f"no {name!r} in {o.get_name()!r}")
     return found[0]
@@ -185,10 +235,10 @@ def run(cmd, arg):
     if cmd == "heading":
         return Atspi.Table.get_column_header(parts()[3], int(arg)).do_action(0)
     if cmd == "path":
-        links = children(by_name(parts()[0], "Path"))
+        links = children(by_name(parts()[0], "Path", "list"))
         return [{"role": c.get_role_name(), "name": c.get_name(), "showing": c.get_state_set().contains(Atspi.StateType.SHOWING), "current": c.get_attributes().get("current")} for c in links]
     if cmd == "crumb":
-        return children(by_name(parts()[0], "Path"))[int(arg)].do_action(0)
+        return children(by_name(parts()[0], "Path", "list"))[int(arg)].do_action(0)
     if cmd == "notices":
         out = []
         for c in children(by_name(parts()[0], "Notices")):
@@ -233,6 +283,33 @@ def run(cmd, arg):
         return parts()[2].select_child(place_items()[int(arg)].get_index_in_parent())
     if cmd == "press_back":
         return parts()[1].do_action(0)
+    if cmd == "at":
+        x, y = arg.split(" ")
+        o = gannet().get_child_at_index(0).get_accessible_at_point(int(x), int(y), Atspi.CoordType.WINDOW)
+        return o.get_name() if o else None
+    if cmd == "fields":
+        return [describe(f) for f in entries()]
+    if cmd == "focus_field":
+        return field(arg).grab_focus()
+    if cmd == "set_text":
+        name, _, text = arg.partition(" ")
+        return Atspi.EditableText.set_text_contents(field(name), text)
+    if cmd == "insert":
+        name, at, text = arg.split(" ", 2)
+        return Atspi.EditableText.insert_text(field(name), int(at), text, len(text.encode()))
+    if cmd == "delete":
+        name, a, b = arg.split(" ")
+        return Atspi.EditableText.delete_text(field(name), int(a), int(b))
+    if cmd == "caret":
+        name, at = arg.split(" ")
+        return Atspi.Text.set_caret_offset(field(name), int(at))
+    if cmd == "select_text":
+        name, a, b = arg.split(" ")
+        return Atspi.Text.set_selection(field(name), 0, int(a), int(b))
+    if cmd == "word":
+        name, at = arg.split(" ")
+        r = Atspi.Text.get_string_at_offset(field(name), int(at), Atspi.TextGranularity.WORD)
+        return [r.content, r.start_offset, r.end_offset]
     if cmd == "events":
         out = list(events)
         events.clear()

@@ -1201,7 +1201,7 @@ impl App {
 
     /// Goes to the next or previous file. The selection follows, as with plain arrows, unless
     /// that would lose a selection of several things.
-    fn preview_move(&mut self, delta: isize) {
+    pub(crate) fn preview_move(&mut self, delta: isize) {
         let keep_selection = self.sel_count > 1;
         self.step(delta, Mods { ctrl: keep_selection, ..Mods::default() });
         if let Some(path) = self.path_at_cursor()
@@ -1747,26 +1747,7 @@ impl App {
             if matches!(p.content, Content::Pdf(_)) {
                 self.paint_pdf(c, area, &mut p);
             }
-            let foot = match (&p.content, &view) {
-                (Content::Image { image, thumbnail: false }, Some(view)) => {
-                    let size = p.size.map_or_else(String::new, |s| format!("  ·  {}", format::size(s)));
-                    let by = p.made_by.as_ref().map_or_else(String::new, |by| format!("  ·  a picture by {by}"));
-                    format!("{} × {}{size}  ·  {:.0}%{by}", image.w, image.h, view.scale * 100.0)
-                }
-                (Content::Pdf(pdf), _) => {
-                    let (shown, of) = pdf_shown.unwrap_or((1, pdf.pages.len()));
-                    [Some(pdf.info.description.clone()), pdf.info.size.map(format::size), Some(format!("page {shown} of {of}"))].into_iter().flatten().collect::<Vec<_>>().join("  ·  ")
-                }
-                (Content::Image { thumbnail: true, .. }, _) => "Loading the full image…".to_string(),
-                (Content::Info(info), _) => info.mime.clone(),
-                (Content::Doc { doc, info }, _) => {
-                    let lines = doc.lines();
-                    let lines = (lines > 0).then(|| format::count(lines, "line", "lines"));
-                    let cut = doc.cut.then(|| format!("showing the first {}", format::size(doc::TEXT_LIMIT as u64)));
-                    [Some(info.description.clone()), info.size.map(format::size), lines, cut].into_iter().flatten().collect::<Vec<_>>().join("  ·  ")
-                }
-                _ => String::new(),
-            };
+            let foot = foot_parts(&p, view.as_ref(), pdf_shown).join("  ·  ");
             let foot_y = self.baseline(area.bottom(), self.px(FOOT_H));
             // The window has no other place for something going wrong, like a file that
             // wouldn't open.
@@ -1937,6 +1918,74 @@ impl App {
             _ => return false,
         }
         true
+    }
+}
+
+/// What the footer says about what's shown, a part at a time.
+fn foot_parts(p: &Preview, view: Option<&View>, pdf_shown: Option<(usize, usize)>) -> Vec<String> {
+    match (&p.content, view) {
+        (Content::Image { image, thumbnail: false }, Some(view)) => {
+            let size = p.size.map(format::size);
+            let by = p.made_by.as_ref().map(|by| format!("a picture by {by}"));
+            [Some(format!("{} × {}", image.w, image.h)), size, Some(format!("{:.0}%", view.scale * 100.0)), by].into_iter().flatten().collect()
+        }
+        (Content::Pdf(pdf), _) => {
+            let (shown, of) = pdf_shown.unwrap_or((1, pdf.pages.len()));
+            [Some(pdf.info.description.clone()), pdf.info.size.map(format::size), Some(format!("page {shown} of {of}"))].into_iter().flatten().collect()
+        }
+        (Content::Image { thumbnail: true, .. }, _) => vec!["Loading the full image…".to_string()],
+        (Content::Info(info), _) => vec![info.mime.clone()],
+        (Content::Doc { doc, info }, _) => {
+            let lines = doc.lines();
+            let lines = (lines > 0).then(|| format::count(lines, "line", "lines"));
+            let cut = doc.cut.then(|| format!("showing the first {}", format::size(doc::TEXT_LIMIT as u64)));
+            [Some(info.description.clone()), info.size.map(format::size), lines, cut].into_iter().flatten().collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+impl App {
+    /// What a screen reader is told about the file the preview window shows: what the window
+    /// draws as words, and for a picture or a video, what it is.
+    pub(crate) fn a11y_preview(&self) -> crate::a11y::PreviewText {
+        let g = self.preview_geometry();
+        let (title, foot) = (Rect::new(0, 0, g.rect.w, g.area.y), Rect::new(0, g.area.bottom(), g.rect.w, (g.rect.bottom() - g.area.bottom()).max(0)));
+        let can_step = (self.cursor > 0 && !self.rows.is_empty(), self.cursor + 1 < self.rows.len());
+        let Some(p) = self.preview.as_ref() else { return crate::a11y::PreviewText { name: String::new(), kind: String::new(), shows: String::new(), title, area: g.area, foot, can_step } };
+        let (kind, mut shows) = match &p.content {
+            Content::Waiting => (String::new(), if p.loading_shown { vec!["Loading…".to_string()] } else { Vec::new() }),
+            // What's said here is said again whenever it changes, so it leaves out what changes
+            // while nothing new is shown: how far it's zoomed, the page scrolled to, and a count
+            // still going.
+            Content::Image { image, thumbnail: false } => ("Picture".to_string(), [Some(format!("{} × {}", image.w, image.h)), p.size.map(format::size)].into_iter().flatten().collect()),
+            Content::Image { thumbnail: true, .. } => ("Picture".to_string(), vec!["Loading the full image…".to_string()]),
+            Content::Info(info) => {
+                let contents = (info.mime == mime::FOLDER).then(|| match info.folder {
+                    Some(t) if t.done => folder_contents(Some(t)).replace("  ·  ", ", "),
+                    _ => "Counting…".to_string(),
+                });
+                let now = gannet_core::time::now();
+                (info.description.clone(), [contents, info.size.map(format::size), info.modified.map(|m| format!("Modified {}", format::date(m, now)))].into_iter().flatten().collect())
+            }
+            Content::Video(v) => {
+                let what = if v.sound.is_some() { "Sound" } else { "Video" };
+                let kind = v.sound.as_ref().map_or_else(|| what.to_string(), |i| i.description.clone());
+                // Not where it's got to, which would be news every second while it plays.
+                let s = v.state;
+                let state = if s.paused { "paused" } else { "playing" };
+                // Its length once the player knows it.
+                (kind, vec![if s.duration > 0.0 { format!("{state}, {} long", clock(s.duration)) } else { state.to_string() }])
+            }
+            Content::Doc { info, .. } => (info.description.clone(), foot_parts(p, None, None).into_iter().skip(1).collect()),
+            Content::Pdf(pdf) => (pdf.info.description.clone(), [pdf.info.size.map(format::size), Some(format::count(pdf.pages.len(), "page", "pages"))].into_iter().flatten().collect()),
+            Content::Message(m) => (String::new(), vec![m.clone()]),
+        };
+        // Something going wrong is said where the footer would be.
+        if let Some(n) = self.notices.last() {
+            shows.push(n.clone());
+        }
+        crate::a11y::PreviewText { name: display_name(&p.path), kind, shows: shows.join(", "), title, area: g.area, foot, can_step }
     }
 }
 
