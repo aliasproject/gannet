@@ -4,6 +4,7 @@
 
 pub mod archive;
 pub mod bus;
+pub mod cli;
 pub mod clipboard;
 pub mod disks;
 pub mod folder_sorts;
