@@ -229,6 +229,7 @@ impl App {
         }
         // A drag that can't go to the Trash shows it dimmed, like a button that can't be pressed.
         let trash_off = self.trash_unavailable();
+        let carried = self.carried_pin().map(std::path::Path::to_path_buf);
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {
             let y = tops[i];
@@ -252,8 +253,10 @@ impl App {
                 PlaceKind::Music => Icon::Audio,
                 PlaceKind::Pictures => Icon::Image,
                 PlaceKind::Videos => Icon::Video,
+                PlaceKind::Pinned => Icon::Folder,
             };
-            let off = trash_off && p.kind == PlaceKind::Trash;
+            // A pin being carried elsewhere is dimmed where it was, like the Trash a drag can't use.
+            let off = (trash_off && p.kind == PlaceKind::Trash) || (p.kind == PlaceKind::Pinned && carried.as_ref() == Some(&p.path));
             self.icons.draw(c, ic, r.x + self.px(8.0), y + (row - icon) / 2, icon, if here { co.on_selection } else if off { co.border } else { co.muted });
             let tx = (r.x + self.px(32.0)) as f32;
             // A drive that's busy, or not mounted yet, is quieter than the rest.
@@ -273,6 +276,11 @@ impl App {
             }
         }
         self.places = places;
+        // Where a pin or a dragged folder would land among the pins.
+        if let Some(y) = self.pin_bar() {
+            let h = self.px(2.0).max(2);
+            c.rrect(Rect::new(l.sidebar.x + self.px(8.0), y - h / 2, l.sidebar.w - self.px(17.0), h), h / 2, co.accent);
+        }
     }
 
     fn paint_header(&mut self, c: &mut Canvas) {

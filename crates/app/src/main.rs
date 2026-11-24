@@ -210,6 +210,12 @@ fn main() {
     app.cache_home = Some(d.cache.clone());
     app.kinds = Arc::new(preview::Kinds::new(d.mime.clone(), language()).with_thumbnailers(d.thumbnailers.clone()));
     let mut theme_watch = ThemeWatch::new(theme_paths.clone()).ok();
+    // Pins, shared with GTK through its bookmarks file. The preview window has no sidebar.
+    let mut bookmarks_watch = None;
+    if viewing.is_none() {
+        app.set_bookmarks(d.config.join(gannet_core::bookmarks::FILE));
+        bookmarks_watch = gannet_core::bookmarks::BookmarksWatch::new(d.config.clone()).ok();
+    }
     let mut theme_due: Option<Instant> = None;
     #[cfg(feature = "bench")]
     {
@@ -290,7 +296,7 @@ fn main() {
                 }
                 Cmd::CancelDrag => wl.cancel_drag(),
                 Cmd::AcceptDrop(accept) => wl.accept_drop(accept),
-                Cmd::ReadDrop { dest, trash, decided } => read_drop(&wl, &hub, dest, trash, decided),
+                Cmd::ReadDrop { dest, trash, decided, pin } => read_drop(&wl, &hub, dest, trash, decided, pin),
                 Cmd::FinishDrop => wl.finish_drop(),
                 Cmd::AbandonDrop => wl.abandon_drop(),
                 Cmd::OpenPreview { generation, path, hidden, sort } => {
@@ -394,6 +400,10 @@ fn main() {
             fds.push(PollFd::from_borrowed_fd(w.watch.as_fd(), PollFlags::IN));
             fds.len() - 1
         });
+        let bookmarks_at = bookmarks_watch.as_ref().map(|w| {
+            fds.push(PollFd::from_borrowed_fd(w.watch.as_fd(), PollFlags::IN));
+            fds.len() - 1
+        });
         let _ = poll(&mut fds, timeout.as_ref());
         let ready = |i: usize| fds[i].revents().intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP);
         let (wl_ready, wake_ready) = (ready(0), ready(1));
@@ -401,6 +411,7 @@ fn main() {
         let repeat_ready = repeat_at.is_some_and(ready);
         let dir_ready = dir_at.is_some_and(ready);
         let theme_ready = theme_at.is_some_and(ready);
+        let bookmarks_ready = bookmarks_at.is_some_and(ready);
         drop(fds);
         let read_error = if wl_ready { guard.read().err().filter(read_is_fatal) } else { None };
         if read_error.is_some() || wl_hup {
@@ -425,6 +436,9 @@ fn main() {
         }
         if dir_ready && dir_watch.as_ref().is_some_and(|w| w.drain()) {
             app.folder_changed();
+        }
+        if bookmarks_ready && bookmarks_watch.as_mut().is_some_and(gannet_core::bookmarks::BookmarksWatch::changed) {
+            app.bookmarks_changed();
         }
         if theme_ready && theme_watch.as_mut().is_some_and(ThemeWatch::changed) {
             // A swap deletes then moves; a short wait lets it finish.
@@ -476,13 +490,13 @@ fn read_clipboard(wl: &wl::Wl, hub: &Hub, purpose: app::Paste) {
 }
 
 /// Reads a dropped file list off the main thread, since the other program can stall.
-fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option<app::DropAction>) {
+fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option<app::DropAction>, pin: Option<gannet_core::bookmarks::Spot>) {
     const MAX: u64 = 64 * 1024 * 1024;
     /// The largest picture taken from a browser.
     const MAX_IMAGE: u64 = 256 * 1024 * 1024;
-    let nothing = |dest| app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false, saved: None, link: false };
+    let nothing = |dest, pin| app::Dropped { paths: Vec::new(), dest, trash, can_copy: false, can_move: false, decided, all_local: false, saved: None, link: false, pin, not_folders: 0 };
     let Some(read) = wl.read_drop() else {
-        hub.send(Msg::Dropped(nothing(dest)));
+        hub.send(Msg::Dropped(nothing(dest, pin)));
         return;
     };
     let (can_copy, can_move) = (read.can_copy, read.can_move);
@@ -518,15 +532,22 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
         });
     }
     let waiter = hub.clone();
-    let (wait_dest, wait_trash) = (dest.clone(), trash);
+    let (wait_dest, wait_trash, pin_back) = (dest.clone(), trash, pin.clone());
     let waiting = std::thread::Builder::new().name("gannet-drop-wait".into()).spawn(move || {
         let until = std::time::Instant::now() + PATIENCE;
         let data = list.recv_timeout(until.saturating_duration_since(std::time::Instant::now())).ok().flatten().unwrap_or_default();
-        let (paths, _) = clipboard::parse(clipboard::URI_LIST, &data);
+        let (mut paths, _) = clipboard::parse(clipboard::URI_LIST, &data);
         let all_local = clipboard::uri_list_is_all_local(&data, &paths);
+        // Only folders are pinned. Asking a disk can hang, which is why this is done here.
+        let mut not_folders = 0;
+        if pin.is_some() {
+            let before = paths.len();
+            paths.retain(|p| p.is_dir());
+            not_folders = before - paths.len();
+        }
         let address = gannet_core::webdrop::web_address(&data);
         // Files win: a picture is only kept when nothing else came.
-        let saved = image_mime.filter(|_| paths.is_empty()).map(|mime| {
+        let saved = image_mime.filter(|_| paths.is_empty() && pin.is_none()).map(|mime| {
             if wait_trash {
                 return Err("a picture from a browser can't go to the Trash".to_string());
             }
@@ -535,10 +556,10 @@ fn read_drop(wl: &wl::Wl, hub: &Hub, dest: PathBuf, trash: bool, decided: Option
             gannet_core::webdrop::save_new(&wait_dest, &name, &bytes).map_err(|e| gannet_core::listing::describe(&e).to_lowercase())
         });
         let link = paths.is_empty() && saved.is_none() && address.is_some();
-        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local, saved, link }));
+        waiter.send(Msg::Dropped(app::Dropped { paths, dest: wait_dest, trash: wait_trash, can_copy, can_move, decided, all_local, saved, link, pin, not_folders }));
     });
     if waiting.is_err() {
-        hub.send(Msg::Dropped(nothing(dest)));
+        hub.send(Msg::Dropped(nothing(dest, pin_back)));
     }
 }
 
@@ -803,6 +824,13 @@ mod bench {
     }
 
     fn drag(a: &App) -> String {
+        if let Some(d) = &a.pin_drag {
+            return match (d.active, d.gap) {
+                (false, _) => "pressed".to_string(),
+                (true, Some(g)) => format!("pin to {g}"),
+                (true, None) => "pin".to_string(),
+            };
+        }
         match &a.file_drag {
             Some(crate::app::FileDrag::Active(d)) if d.is_out() => "out".to_string(),
             Some(crate::app::FileDrag::Active(d)) => a.drag_label(d),
