@@ -482,6 +482,72 @@ def opening_an_archive_extracts_it_in_gannet(h):
 
 
 @check
+def open_in_terminal_asks_xdg_terminal_exec_for_the_folder(h):
+    fs = fresh_fs()
+    tree(fs, {"my project/readme": "r", "broken/x": "", "notes.txt": "n"})
+    # A stand-in for the launcher: it logs where it started and what it was asked, and never
+    # starts a real terminal. In "broken" it fails, as when no terminal is set up.
+    bin_dir = SCRATCH / "terminal-bin"
+    shutil.rmtree(bin_dir, ignore_errors=True)
+    bin_dir.mkdir()
+    log = SCRATCH / "terminal.log"
+    log.unlink(missing_ok=True)
+    launcher = bin_dir / "xdg-terminal-exec"
+    launcher.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$PWD" "$*" >> {log}\ncase "$PWD" in */broken) exit 1;; esac\nexit 0\n')
+    launcher.chmod(0o755)
+
+    def logged(n):
+        end = time.monotonic() + 5
+        while time.monotonic() < end and (not log.exists() or len(log.read_text().splitlines()) < n):
+            time.sleep(0.02)
+        return log.read_text().splitlines() if log.exists() else []
+
+    def menu_at(row_or_y):
+        a.click(ROW_X, row_or_y, 0x111)
+        return a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+
+    a = App(h, fs, path_prefix=str(bin_dir))
+    a.wait(lambda s: s["names"] == ["broken", "my project", "notes.txt"], "listed")
+    # The empty space: the folder on screen.
+    items = menu_at(row_y(6))
+    assert items[-1] == "Open in terminal", items
+    a.shot("terminal-menu-empty")
+    a.key("Up", "Return")
+    assert logged(1) == [f"{fs}|--dir={fs}"], logged(1)
+    # A folder: that folder.
+    items = menu_at(row_y(1))
+    assert items[-1] == "Open in terminal", items
+    a.shot("terminal-menu-folder")
+    a.key("Up", "Return")
+    assert logged(2)[1] == f"{fs / 'my project'}|--dir={fs / 'my project'}", logged(2)
+    assert a.state()["notices"] == [], a.state()["notices"]
+    # Not for a file.
+    assert "Open in terminal" not in menu_at(row_y(2)), "not for a file"
+    a.key("Escape")
+    # A terminal that can't start says so.
+    assert menu_at(row_y(0))[-1] == "Open in terminal"
+    a.key("Up", "Return")
+    s = a.wait(lambda s: s["notices"], "the failure shown")
+    assert s["notices"] == ["Couldn't open a terminal in “broken”: it exited with code 1"], s["notices"]
+    a.shot("terminal-failed")
+    a.close()
+    # Without xdg-terminal-exec it isn't offered.
+    shutil.rmtree(bin_dir)
+    bin_dir.mkdir()
+    for tool in ("fc-match", "xdg-open"):
+        if shutil.which(tool):
+            os.symlink(shutil.which(tool), bin_dir / tool)
+    a = App(h, fs, bwrap_extra=("--setenv", "PATH", str(bin_dir)))
+    a.wait(lambda s: s["count"] == 3, "listed")
+    assert "Open in terminal" not in menu_at(row_y(6)), "not without the launcher"
+    assert "Open in terminal" not in menu_at(row_y(1))
+    a.key("Escape")
+    a.close()
+    shutil.rmtree(bin_dir, ignore_errors=True)
+    assert len(logged(3)) == 3, "nothing more was started"
+
+
+@check
 def live_refresh_keeps_selection(h):
     fs = fresh_fs()
     tree(fs, {"a": "", "b": "", "c": ""})
