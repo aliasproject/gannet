@@ -169,6 +169,8 @@ pub enum Cmd {
     PreviewShow(PathBuf, SortSpec),
     /// In the preview window: tells the list which file is showing now.
     PreviewStepped(PathBuf),
+    /// Asks which app to open these files with, in a window over this one.
+    OpenWith(Vec<PathBuf>),
     Quit,
 }
 
@@ -433,6 +435,8 @@ pub enum DropAction {
 #[derive(Clone, Debug, PartialEq, Eq, Copy)]
 pub enum Action {
     Open,
+    /// Opens the files selected with an app picked from a list.
+    OpenWith,
     Preview,
     ToggleHidden,
     SortBy(SortKey),
@@ -1695,6 +1699,11 @@ impl App {
             Action::Extract => {
                 if let Some(archives) = self.selected_archives() {
                     self.extract(archives);
+                }
+            }
+            Action::OpenWith => {
+                if let Some(files) = self.open_with_files() {
+                    self.cmds.push(Cmd::OpenWith(files));
                 }
             }
             Action::EmptyTrash => self.ask_empty_trash(),
@@ -3086,10 +3095,14 @@ impl App {
         Some(Rect::new(l.sidebar.right() - self.px(7.0) - self.side_bar_room() - w, self.place_top(i), w, self.px(30.0)))
     }
 
-    /// The list's menu, with "Extract" and "Set as background" after Preview when they apply,
-    /// and "Open in terminal" last.
+    /// The list's menu, with "Open with…" after Open, "Extract" and "Set as background" after
+    /// Preview when they apply, and "Open in terminal" last.
     fn context_items(&self) -> Vec<MenuItem> {
         let mut items = self.view_menu_items();
+        if self.open_with_files().is_some() {
+            let at = items.iter().position(|m| m.action == Action::Open).map_or(0, |p| p + 1);
+            items.insert(at, MenuItem { label: "Open with…", keys: "", action: Action::OpenWith, enabled: true });
+        }
         if self.selected_archives().is_some() {
             let at = items.iter().position(|m| m.action == Action::Preview).map_or(items.len(), |p| p + 1);
             items.insert(at, MenuItem { label: "Extract", keys: "", action: Action::Extract, enabled: true });
@@ -3137,6 +3150,18 @@ impl App {
         let id = *self.selected_ids().first()?;
         let picture = matches!(l.kind(id), Kind::File | Kind::Link) && crate::icons::icon_for_name(l.name(id)) == crate::icons::Icon::Image && !is_raw_or_icon(l.name(id));
         picture.then(|| l.path(id))
+    }
+
+    /// The files "Open with…" opens: the selection, when it's only files, and not too many.
+    /// Archives count, so another app can open one rather than Gannet extracting it. Never in
+    /// a chooser, which only picks, or the Trash, whose files have to be restored first.
+    pub(crate) fn open_with_files(&self) -> Option<Vec<PathBuf>> {
+        if self.chooser.is_some() || self.sel_count == 0 || self.sel_count > crate::openwith::MANY || self.in_trash() {
+            return None;
+        }
+        let l = self.listing.as_ref().filter(|l| !l.is_trash())?;
+        let ids = self.selected_ids();
+        ids.iter().all(|&i| matches!(l.kind(i), Kind::File | Kind::Link)).then(|| ids.iter().map(|&i| l.path(i)).collect())
     }
 
     /// The archives selected, when that's all that's selected. Never in a chooser, where
@@ -8570,6 +8595,41 @@ mod tests {
         }
         r.app.select_all();
         assert!(!menu_has_extract(&r), "not with other things selected");
+    }
+
+    #[test]
+    fn open_with_is_offered_for_files_archives_too_and_asks_for_them() {
+        let mut r = Rig::new("open-with");
+        fs::create_dir_all(r.work().join("sub")).unwrap();
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        fs::write(r.work().join("b.zip"), "PK").unwrap();
+        let w = r.work();
+        r.open(w.clone());
+        let labels = |r: &Rig| r.app.context_items().iter().map(|m| m.label).collect::<Vec<_>>();
+        r.select("a.txt");
+        assert_eq!(labels(&r)[..2], ["Open", "Open with…"], "right after Open");
+        // An archive opens in Gannet, so this is the way to another app.
+        r.select("b.zip");
+        assert!(labels(&r).contains(&"Open with…"));
+        r.app.action(Action::OpenWith);
+        assert!(matches!(r.app.cmds.last(), Some(Cmd::OpenWith(p)) if *p == [w.join("b.zip")]), "asks for the archive");
+        assert!(r.app.jobs.is_empty(), "nothing extracted");
+        r.app.select_all();
+        assert!(!labels(&r).contains(&"Open with…"), "not with a folder selected");
+        r.select("sub");
+        assert!(!labels(&r).contains(&"Open with…"));
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        r.select("a.txt");
+        assert!(!labels(&r).contains(&"Open with…") && !r.app.chooser_allows(Action::OpenWith), "not in an Open dialog");
+    }
+
+    #[test]
+    fn open_with_isnt_offered_in_the_trash() {
+        let mut r = Rig::new("open-with-trash");
+        trash_names(&mut r, &["a.txt"]);
+        open_trash(&mut r);
+        r.select("a.txt");
+        assert!(r.app.open_with_files().is_none());
     }
 
     #[test]

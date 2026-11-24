@@ -151,6 +151,28 @@ impl MimeDb {
         false
     }
 
+    /// The type, then the types it's a kind of, nearest first, as apps for a type are looked
+    /// up: a C source file is also plain text, as every `text/` type is.
+    pub fn ancestors(&self, mime: &str) -> Vec<String> {
+        let mut seen: Vec<&str> = vec![self.unalias(mime)];
+        let mut at = 0;
+        while at < seen.len() && seen.len() < 64 {
+            let m = seen[at];
+            at += 1;
+            for p in self.parents.get(m).into_iter().flatten() {
+                let p = self.unalias(p);
+                if !seen.contains(&p) {
+                    seen.push(p);
+                }
+            }
+        }
+        let mut out: Vec<String> = seen.into_iter().map(str::to_string).collect();
+        if out[0].starts_with("text/") && !out.iter().any(|m| m == PLAIN_TEXT) {
+            out.push(PLAIN_TEXT.to_string());
+        }
+        out
+    }
+
     /// One folder's `globs2`. Call [`Self::index_globs`] once they're all in.
     fn add_globs(&mut self, text: &[u8], rank: usize) {
         let mut cleared: Vec<&str> = Vec::new();
@@ -573,6 +595,11 @@ mod tests {
         assert!(d.is_a("application/pdf", OCTET_STREAM) && !d.is_a(FOLDER, OCTET_STREAM));
         assert!(!d.is_a("a/loop", "c/none"), "a loop ends");
         assert!(!d.is_a("application/pdf", "text/plain"));
+        assert_eq!(d.ancestors("image/svg+xml"), ["image/svg+xml", "application/xml", "text/plain"], "nearest first");
+        assert_eq!(d.ancestors("application/x-shellscript"), ["application/x-shellscript", "application/x-executable", "text/plain"]);
+        assert_eq!(d.ancestors("text/x-c"), ["text/x-c", "text/plain"]);
+        assert_eq!(d.ancestors("application/acrobat"), ["application/pdf"], "by its real name");
+        assert_eq!(d.ancestors("a/loop"), ["a/loop", "b/loop"]);
     }
 
     #[test]

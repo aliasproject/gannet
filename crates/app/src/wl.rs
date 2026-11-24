@@ -19,7 +19,7 @@ use wayland_protocols::wp::fractional_scale::v1::client::{wp_fractional_scale_ma
 use wayland_protocols::wp::viewporter::client::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::client::{zxdg_decoration_manager_v1 as deco_mgr, zxdg_toplevel_decoration_v1 as deco};
 use wayland_protocols::xdg::dialog::v1::client::{xdg_dialog_v1, xdg_wm_dialog_v1};
-use wayland_protocols::xdg::foreign::zv2::client::{zxdg_imported_v2, zxdg_importer_v2};
+use wayland_protocols::xdg::foreign::zv2::client::{zxdg_exported_v2, zxdg_exporter_v2, zxdg_imported_v2, zxdg_importer_v2};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use xkbcommon::xkb;
 
@@ -137,6 +137,10 @@ pub struct State {
     importer: Option<zxdg_importer_v2::ZxdgImporterV2>,
     dialog_manager: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     imported: Option<zxdg_imported_v2::ZxdgImportedV2>,
+    /// This window, exported with xdg-foreign, so a dialog of ours can sit over it, and the
+    /// handle the compositor gave it.
+    exporter: Option<zxdg_exporter_v2::ZxdgExporterV2>,
+    exported: Option<(zxdg_exported_v2::ZxdgExportedV2, Option<String>)>,
     dialog: Option<xdg_dialog_v1::XdgDialogV1>,
 
     surface: Option<wl_surface::WlSurface>,
@@ -239,6 +243,8 @@ impl Wl {
             importer: None,
             dialog_manager: None,
             imported: None,
+            exporter: None,
+            exported: None,
             dialog: None,
             surface: None,
             xdg_surface: None,
@@ -331,6 +337,20 @@ impl Wl {
         if let Some(t) = &self.state.toplevel {
             t.set_title(title.to_string());
         }
+    }
+
+    /// Exports the window with xdg-foreign, so a dialog this window opens can be its child.
+    /// The handle comes with the compositor's next events. Nothing happens on a compositor
+    /// without the protocol.
+    pub fn export(&mut self) {
+        if let (Some(e), Some(surface), None) = (&self.state.exporter, &self.state.surface, &self.state.exported) {
+            self.state.exported = Some((e.export_toplevel(surface, &self.qh, ()), None));
+        }
+    }
+
+    /// The window's xdg-foreign handle, once the compositor has given one.
+    pub fn exported(&self) -> Option<String> {
+        self.state.exported.as_ref().and_then(|(_, h)| h.clone())
     }
 
     pub fn fd(&self) -> BorrowedFd<'_> {
@@ -767,6 +787,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             }
             "zxdg_decoration_manager_v1" => s.deco_manager = Some(r.bind(name, 1, qh, ())),
             "zxdg_importer_v2" => s.importer = Some(r.bind(name, 1, qh, ())),
+            "zxdg_exporter_v2" => s.exporter = Some(r.bind(name, 1, qh, ())),
             "xdg_wm_dialog_v1" => s.dialog_manager = Some(r.bind(name, 1, qh, ())),
             _ => {}
         }
@@ -797,6 +818,7 @@ ignore_events!(
     deco::ZxdgToplevelDecorationV1,
     wl_data_device_manager::WlDataDeviceManager,
     zxdg_importer_v2::ZxdgImporterV2,
+    zxdg_exporter_v2::ZxdgExporterV2,
     xdg_wm_dialog_v1::XdgWmDialogV1,
     xdg_dialog_v1::XdgDialogV1,
 );
@@ -807,6 +829,14 @@ impl Dispatch<zxdg_imported_v2::ZxdgImportedV2, ()> for State {
         if let zxdg_imported_v2::Event::Destroyed = e {
             i.destroy();
             s.imported = None;
+        }
+    }
+}
+
+impl Dispatch<zxdg_exported_v2::ZxdgExportedV2, ()> for State {
+    fn event(s: &mut State, _: &zxdg_exported_v2::ZxdgExportedV2, e: zxdg_exported_v2::Event, _: &(), _: &Connection, _: &QueueHandle<State>) {
+        if let (zxdg_exported_v2::Event::Handle { handle }, Some((_, h))) = (e, s.exported.as_mut()) {
+            *h = Some(handle);
         }
     }
 }
