@@ -866,12 +866,13 @@ impl App {
     /// Shows the folder now if it's cached and there's no search, and reads or searches it
     /// either way.
     fn show_folder(&mut self) {
-        // A full path in a Save dialog's name, as picking a search's match puts there, would
-        // still save over that file once the folder showing is another: only the name stays.
+        // The full path picking a search's match put in a Save dialog's name would still save
+        // over that file once the folder showing is another: only the name stays. A path the
+        // user typed is left alone.
         if let Some(c) = self.chooser.as_mut()
-            && c.spec.mode == crate::chooser::Mode::Save
-            && c.name.text.starts_with('/')
-            && let Some(name) = Path::new(&c.name.text).file_name().map(|n| n.to_string_lossy().into_owned())
+            && let Some(path) = c.match_path.take()
+            && c.name.text == path
+            && let Some(name) = Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned())
         {
             c.name = Field::new(&name);
         }
@@ -4798,7 +4799,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_f_searches_every_folder_below_and_escape_comes_back() {
+    fn ctrl_f_searches_every_folder_below_and_escape_comes_back() {
         let mut r = search_rig("search-basic");
         r.search("notes");
         assert!(matches!(r.app.edit, Edit::Filter(_)) && r.app.search_below);
@@ -4953,6 +4954,12 @@ mod tests {
         r.app.dialog = None;
         r.key(k::KEY_Escape, "");
         assert_eq!(r.app.chooser.as_ref().unwrap().name.text, "notes-deep.md");
+        // A full path typed in stays as it is when the folder changes.
+        let typed = r.work().join("a/b/typed.md").to_string_lossy().into_owned();
+        r.app.chooser.as_mut().unwrap().name = Field::new(&typed);
+        r.app.go_up();
+        r.pump_until("the folder above", |a| !a.loading);
+        assert_eq!(r.app.chooser.as_ref().unwrap().name.text, typed);
     }
 
     #[test]
