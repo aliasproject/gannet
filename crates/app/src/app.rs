@@ -1327,8 +1327,13 @@ impl App {
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
         use crate::a11y::{Act, BACK};
-        // Nothing behind a dialog can be used, by the pointer or by a screen reader.
-        if self.dialog.is_some() {
+        // As with the pointer: nothing behind a dialog can be used, and anything outside a menu
+        // only closes it, so the menu never acts on a selection changed under it.
+        if self.dialog.is_some() || matches!(act, Act::Wake) {
+            return;
+        }
+        if self.menu.is_some() {
+            self.close_menu();
             return;
         }
         let row = |app: &Self, dir: &Path, key: &[u8]| {

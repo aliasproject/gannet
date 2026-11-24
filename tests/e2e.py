@@ -1471,6 +1471,13 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         assert s["dir"] == str(fs / "docs") and s["dialog"].startswith("rename-many") and len(s["selected"]) == 5, s
         a.key("Escape")
         a.wait(lambda s: s["dialog"] == "", "the dialog closed")
+        # Outside a menu, a request only closes it, as a click does: the menu never acts on a
+        # selection changed under it.
+        a.click(ROW_X, row_y(1), 0x111)
+        a.wait(lambda s: s["menu"], "the menu")
+        assert sr.ask("deselect_row 0") is True, "deselect_row"
+        a.wait(lambda s: not s["menu"], "the menu closed")
+        assert len(a.state()["selected"]) == 5, a.state()
 
         # A place opens when it's selected.
         assert sr.ask(f"select_place {places.index('Home')}") is True
