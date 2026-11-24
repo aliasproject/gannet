@@ -22,6 +22,10 @@ pub const ARG: &str = "--preview-helper";
 /// After `ARG`: read the file as text, or as Markdown, rather than as an image.
 pub const TEXT_ARG: &str = "text";
 pub const MARKDOWN_ARG: &str = "markdown";
+/// The argument for a decoder of thumbnails for the list's rows. It's the same decoder, locked
+/// down the same way, under another name so it isn't taken for the preview's.
+pub const THUMBNAIL_ARG: &str = "--thumbnail-helper";
+const THUMBNAIL_MODE: &str = "thumbnail";
 
 pub const EXIT_UNSUPPORTED: i32 = 3;
 pub const EXIT_DAMAGED: i32 = 4;
@@ -54,6 +58,11 @@ pub enum Failure {
     TooLarge,
 }
 
+/// A decoder of thumbnails, started with `THUMBNAIL_ARG`.
+pub fn thumbnail_main() -> ! {
+    helper_main(Some(THUMBNAIL_MODE))
+}
+
 pub fn helper_main(mode: Option<&str>) -> ! {
     if !lock_down() {
         std::process::exit(EXIT_NO_SANDBOX);
@@ -63,6 +72,7 @@ pub fn helper_main(mode: Option<&str>) -> ! {
     let done = match mode {
         Some(TEXT_ARG) => document(input, output, false),
         Some(MARKDOWN_ARG) => document(input, output, true),
+        Some(THUMBNAIL_MODE) => thumbnail(input, output),
         _ => decode(input, output),
     };
     std::process::exit(match done {
@@ -457,6 +467,24 @@ pub fn decode<R: Read + Seek>(input: R, mut output: impl Write) -> Result<(), Fa
     if let Some(frames) = animation(format, &mut input)? {
         return write_animation(frames, &mut output);
     }
+    write_still(still(input, format)?, &mut output)
+}
+
+/// A picture of the image for a list row: its first frame, upright, shrunk to fit a "normal"
+/// freedesktop thumbnail if it's bigger.
+pub fn thumbnail<R: Read + Seek>(input: R, mut output: impl Write) -> Result<(), Failure> {
+    let reader = ImageReader::new(BufReader::new(input)).with_guessed_format().map_err(|_| Failure::Damaged)?;
+    let Some(format) = reader.format() else { return Err(Failure::Unsupported) };
+    let mut image = still(reader.into_inner(), format)?;
+    let most = gannet_core::thumbcache::NORMAL_PIXELS;
+    if image.width() > most || image.height() > most {
+        image = image.thumbnail(most, most);
+    }
+    write_still(image, &mut output)
+}
+
+/// The image `input` holds, or its first frame, upright.
+fn still<R: Read + Seek>(mut input: BufReader<R>, format: ImageFormat) -> Result<DynamicImage, Failure> {
     input.rewind().map_err(|_| Failure::Damaged)?;
     let mut reader = ImageReader::with_format(input, format);
     reader.limits(limits());
@@ -469,6 +497,10 @@ pub fn decode<R: Read + Seek>(input: R, mut output: impl Write) -> Result<(), Fa
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     let mut image = DynamicImage::from_decoder(decoder).map_err(classify)?;
     image.apply_orientation(orientation);
+    Ok(image)
+}
+
+fn write_still(image: DynamicImage, output: &mut impl Write) -> Result<(), Failure> {
     let rgba = image.into_rgba8();
     let mut header = MAGIC.to_vec();
     header.extend_from_slice(&rgba.width().to_ne_bytes());
@@ -678,6 +710,34 @@ mod tests {
     fn something_that_isnt_an_image_is_unsupported() {
         assert_eq!(run(b"just some words, nothing to see here").unwrap_err(), Failure::Unsupported);
         assert_eq!(run(b"").unwrap_err(), Failure::Unsupported);
+    }
+
+    fn thumb(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), Failure> {
+        let mut out = Vec::new();
+        thumbnail(Cursor::new(bytes), &mut out)?;
+        assert_eq!(&out[..4], MAGIC, "always a still picture");
+        let w = u32::from_ne_bytes(out[4..8].try_into().unwrap());
+        let h = u32::from_ne_bytes(out[8..12].try_into().unwrap());
+        assert_eq!(out.len(), HEADER + w as usize * h as usize * 4);
+        Ok((w, h, out[HEADER..].to_vec()))
+    }
+
+    #[test]
+    fn thumbnails_fit_the_normal_size_upright_and_still() {
+        let wide = RgbaImage::from_pixel(600, 300, image::Rgba([10, 200, 10, 255]));
+        let (w, h, px) = thumb(&encoded(&wide, image::ImageFormat::Png)).unwrap();
+        assert_eq!((w, h), (128, 64), "shrunk to fit, keeping its shape");
+        assert_eq!(&px[..4], [10, 200, 10, 255]);
+        let tall = RgbaImage::from_pixel(100, 1000, image::Rgba([0, 0, 0, 255]));
+        assert_eq!(thumb(&encoded(&tall, image::ImageFormat::Png)).unwrap().1, 128);
+        assert_eq!(thumb(&encoded(&two_by_one(), image::ImageFormat::Png)).unwrap().0, 2, "small ones aren't made bigger");
+        let (w, h, _) = thumb(&sideways_jpeg()).unwrap();
+        assert_eq!((w, h), (2, 4), "turned the way the photo says");
+        let (w, h, px) = thumb(&gif(&[(255, 100), (128, 250)])).unwrap();
+        assert_eq!((w, h, px[0]), (3, 2, 255), "a moving one is its first frame");
+        assert_eq!(thumb(b"just words").unwrap_err(), Failure::Unsupported);
+        let png = encoded(&wide, image::ImageFormat::Png);
+        assert_eq!(thumb(&png[..png.len() / 2]).unwrap_err(), Failure::Damaged);
     }
 
     #[test]

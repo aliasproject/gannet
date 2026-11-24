@@ -19,6 +19,7 @@ mod preview;
 mod preview_window;
 mod service;
 mod text;
+mod thumbs;
 mod tools;
 mod wallpaper;
 mod wl;
@@ -109,6 +110,9 @@ fn main() {
     if let Some(a) = arg.as_deref().and_then(|a| a.to_str()) {
         if a == decode::ARG {
             decode::helper_main(std::env::args().nth(2).as_deref());
+        }
+        if a == decode::THUMBNAIL_ARG {
+            decode::thumbnail_main();
         }
         if a == media::ARG {
             media::helper_main(&std::env::args().skip(2).collect::<Vec<_>>());
@@ -242,6 +246,7 @@ fn main() {
     // Pins, shared with GTK through its bookmarks file. The preview window has no sidebar.
     let mut bookmarks_watch = None;
     if viewing.is_none() {
+        app.thumbs = Some(thumbs::Thumbs::new(hub.clone(), d.cache.clone(), app.kinds.clone()));
         app.set_bookmarks(d.config.join(gannet_core::bookmarks::FILE));
         bookmarks_watch = gannet_core::bookmarks::BookmarksWatch::new(d.config.clone()).ok();
     }
@@ -700,6 +705,7 @@ mod bench {
         rows_stamped: Option<std::path::PathBuf>,
         /// The search results last reported: what for, how many, and whether they were all.
         search_stamped: Option<(String, usize, bool)>,
+        thumbs_stamped: (usize, usize),
     }
 
     pub fn mono_ms() -> f64 {
@@ -717,6 +723,7 @@ mod bench {
                 last_state: String::new(),
                 rows_stamped: None,
                 search_stamped: None,
+                thumbs_stamped: (0, 0),
             }
         }
 
@@ -755,6 +762,15 @@ mod bench {
 
         /// Writes the visible state when it changes, for checks to wait on.
         pub fn idle(&mut self, app: &App) {
+            // How many rows have a thumbnail, and how many are still being looked for or made. A
+            // row just off screen can get one without a paint, so this isn't stamped there.
+            if self.log.is_some() {
+                let thumbs = (thumbnailed(app).len(), app.thumbs.as_ref().map_or(0, |t| t.waiting()));
+                if thumbs != self.thumbs_stamped {
+                    self.thumbs_stamped = thumbs;
+                    self.stamp(format!("thumbs {} {} {:.1}", thumbs.0, thumbs.1, mono_ms()));
+                }
+            }
             let Some(path) = self.state_path.clone() else { return };
             let state = dump(app);
             if state != self.last_state {
@@ -796,7 +812,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"side_scroll\":{},\"side_max\":{},\"chooser\":{},\"searching\":{},\"found\":{},\"locations\":{},\"status\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"side_scroll\":{},\"side_max\":{},\"chooser\":{},\"searching\":{},\"found\":{},\"locations\":{},\"status\":{},\"thumbs\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -847,7 +863,20 @@ mod bench {
             found(a),
             list(a.rows.iter().take(300).map(|&i| a.listing.as_ref().filter(|l| l.search().is_some()).and_then(|l| l.location(i).map(|f| a.search_location(f))).unwrap_or_default())),
             esc(&a.status_text()),
+            thumbs(a),
         )
+    }
+
+    /// The names of the rows, of the first 300, that are drawn with a thumbnail, and each one's
+    /// picture size.
+    fn thumbnailed(a: &App) -> Vec<(String, u32, u32)> {
+        let Some(l) = a.listing.as_ref() else { return Vec::new() };
+        a.rows.iter().take(300).filter_map(|&id| a.thumbnail(l, id).map(|p| (String::from_utf8_lossy(l.name(id)).into_owned(), p.w, p.h))).collect()
+    }
+
+    fn thumbs(a: &App) -> String {
+        let shown: Vec<String> = thumbnailed(a).into_iter().map(|(name, w, h)| format!("[{},{w},{h}]", esc(&name))).collect();
+        format!("{{\"shown\":[{}],\"waiting\":{}}}", shown.join(","), a.thumbs.as_ref().map_or(0, |t| t.waiting()))
     }
 
     /// What a search shows: what it was for, and whether it has finished or stopped at the limit.
