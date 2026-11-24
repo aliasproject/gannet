@@ -415,7 +415,11 @@ pub fn name_contains(name: &[u8], needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    if name.is_ascii() && needle.is_ascii() {
+    // Lowercase text with something other than ASCII in it can't be in a name that's all ASCII.
+    if name.is_ascii() && !needle.is_ascii() {
+        return false;
+    }
+    if name.is_ascii() {
         let n = needle.as_bytes();
         // Only where the first letter matches, either way, is the rest compared.
         let (lower, upper) = (n[0], n[0].to_ascii_uppercase());
@@ -447,6 +451,9 @@ pub struct LoadRequest {
     pub recent: bool,
     /// Search `dir` and below for names containing this, instead of listing it.
     pub search: Option<String>,
+    /// The home Trash (`$XDG_DATA_HOME/Trash`) and the user's id, so that a search leaves out
+    /// every Trash folder, whose items have to stay paired with their info files.
+    pub search_skips_trash: Option<(PathBuf, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -841,7 +848,11 @@ fn load_search(req: LoadRequest, watch: Option<&Arc<Watch>>, cancel: &Arc<Atomic
     let limit = crate::search::LIMIT;
     let started = Instant::now();
     let (mut found, mut shown, mut next_show) = (Vec::new(), 0, SEARCH_FIRST_SHOW);
-    let result = crate::search::walk(&req.dir, &query, req.show_hidden, limit, &mut |step| {
+    let skip = |p: &Path| match &req.search_skips_trash {
+        Some((home, uid)) => p == home || p.file_name().is_some_and(|n| n == ".Trash" || n.as_bytes() == format!(".Trash-{uid}").as_bytes()),
+        None => false,
+    };
+    let result = crate::search::walk_skipping(&req.dir, &query, req.show_hidden, limit, &skip, &mut |step| {
         match step {
             crate::search::Step::Found(f) => {
                 found.push(f);
@@ -1068,7 +1079,7 @@ mod tests {
     use std::path::Path;
 
     fn request(dir: &Path) -> LoadRequest {
-        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None, trash: None, recent: false, search: None }
+        LoadRequest { dir: dir.into(), generation: 1, sort: SortSpec::default(), show_hidden: false, filter: String::new(), first_row: 0, row_count: 64, slow_read: None, slow_stat: None, trash: None, recent: false, search: None, search_skips_trash: None }
     }
 
     /// Runs a load to completion, returning every event in order.
@@ -1613,6 +1624,18 @@ mod tests {
         assert_eq!(l.listing.location(deep), Some(s.path().join("sub/deeper").as_path()));
         assert_eq!(&*l.listing.key(deep), s.path().join("sub/deeper/Match.txt").as_os_str().as_bytes(), "two matches can share a name");
         assert!(matches!(l.listing.stat(deep), Stat::Known { size: 3, .. }), "sizes are there from the start");
+    }
+
+    #[test]
+    fn a_search_leaves_out_every_trash_folder() {
+        let s = Scratch::new();
+        for p in ["data/Trash/files/hit", "data/Trash/info/hit.trashinfo", "disk/.Trash-1000/files/hit", "disk/.Trash/1000/files/hit", "keep/hit", "keep/.Trash-other/hit"] {
+            s.file(p, b"");
+        }
+        let req = LoadRequest { show_hidden: true, search_skips_trash: Some((s.path().join("data/Trash"), 1000)), ..search_request(s.path(), "hit") };
+        let l = last(run(req));
+        let paths: Vec<PathBuf> = l.rows.iter().map(|&i| l.listing.path(i)).collect();
+        assert_eq!(paths, [s.path().join("keep/.Trash-other/hit"), s.path().join("keep/hit")]);
     }
 
     #[test]

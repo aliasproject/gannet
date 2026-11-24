@@ -911,6 +911,7 @@ impl App {
             trash: self.is_trash_view().then(|| TrashSpec { home_trash: self.home_trash(), uid: rustix::process::geteuid().as_raw(), mounts: self.trash_mounts.clone(), disks_give_up: DISKS_GIVE_UP }),
             recent: self.is_recent_view(),
             search: self.req_search.clone(),
+            search_skips_trash: Some((self.home_trash(), rustix::process::geteuid().as_raw())),
         };
         let hub = self.hub.clone();
         self.load = Some(spawn_load_watching(req, self.watch.clone(), move |e| hub.send(Msg::Load(e))));
@@ -1023,10 +1024,13 @@ impl App {
             }
         }
         // The entry being renamed is gone, so there's nothing left to rename.
-        if let Edit::Rename { name, .. } = &self.edit
-            && l.settled
-            && l.listing.find(name).is_none()
-        {
+        // In a search it's known by its path, as another match can have its name.
+        let renaming_gone = match &self.edit {
+            Edit::Rename { path, .. } if l.listing.search().is_some() => !(0..l.listing.len() as u32).any(|i| l.listing.path(i) == *path),
+            Edit::Rename { name, .. } => l.listing.find(name).is_none(),
+            _ => false,
+        };
+        if l.settled && renaming_gone {
             self.edit = Edit::None;
         }
         // Settings changed while this was loading: it was built for the old ones.
@@ -1473,7 +1477,9 @@ impl App {
                 }
                 // An open preview window on a file here walks the folder in the list's order.
                 // One left on a file in another folder keeps that folder's order.
-                if let Some(p) = self.previewer.clone().filter(|p| !self.viewer && p.parent() == Some(self.dir.as_path())) {
+                // In a search, that's any file below.
+                let here = |p: &Path| p.parent() == Some(self.dir.as_path()) || (self.search_query().is_some() && p.starts_with(&self.dir));
+                if let Some(p) = self.previewer.clone().filter(|p| !self.viewer && here(p)) {
                     self.cmds.push(Cmd::PreviewShow(p, self.view_sort()));
                 }
                 self.rederive(true);
@@ -4717,6 +4723,20 @@ mod tests {
         r.pump_until("searched again", |a| !a.loading && a.listing.as_ref().is_some_and(|l| (0..l.len() as u32).any(|i| l.name(i) == b"notes-renamed.md")));
         assert!(r.work().join("a/b/notes-renamed.md").exists());
         assert_eq!(r.selected_names(), ["notes-renamed.md"], "the renamed match stays selected");
+    }
+
+    #[test]
+    fn saving_over_a_match_in_a_save_dialog_saves_where_the_match_is() {
+        let mut r = search_rig("search-save");
+        let spec = crate::chooser::Spec { mode: crate::chooser::Mode::Save, ..crate::chooser::Spec::default() };
+        r.app.chooser = Some(crate::chooser::Chooser::new(spec, &[], None));
+        r.search("notes");
+        let l = r.app.listing.clone().unwrap();
+        let deep = (0..l.len() as u32).find(|&i| l.name(i) == b"notes-deep.md").unwrap();
+        r.app.chooser_open(vec![deep]);
+        let deep_path = r.work().join("a/b/notes-deep.md");
+        assert!(matches!(&r.app.dialog, Some(Dialog::ConfirmReplace { existing, .. }) if *existing == [deep_path.clone()]), "asks about the match itself");
+        assert!(!r.work().join("notes-deep.md").exists());
     }
 
     #[test]

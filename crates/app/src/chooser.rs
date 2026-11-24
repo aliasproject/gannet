@@ -468,7 +468,7 @@ impl App {
         match mode {
             Mode::Open if !files.is_empty() => self.chooser_accept(),
             Mode::Save if !files.is_empty() => {
-                let name = String::from_utf8_lossy(l.name(files[0])).into_owned();
+                let name = save_name(&l, files[0]);
                 if let Some(c) = self.chooser.as_mut() {
                     c.name = Field::new(&name);
                 }
@@ -678,7 +678,7 @@ impl App {
             && c.spec.mode == Mode::Save
             && !l.kind(id).is_dirlike()
         {
-            c.name = Field::new(&String::from_utf8_lossy(l.name(id)));
+            c.name = Field::new(&save_name(&l, id));
             self.invalidate(self.layout().status);
         }
     }
@@ -833,6 +833,15 @@ fn allows(a: Action) -> bool {
     }
 }
 
+
+/// What goes in a Save dialog's name field for saving over a file in the list. A search's match
+/// can be in any folder below, so it's named in full, and the save goes where it is.
+fn save_name(l: &gannet_core::listing::Listing, id: u32) -> String {
+    match l.search() {
+        Some(_) => l.path(id).to_string_lossy().into_owned(),
+        None => String::from_utf8_lossy(l.name(id)).into_owned(),
+    }
+}
 
 #[cfg(test)]
 mod tests {

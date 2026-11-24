@@ -45,7 +45,7 @@ pub enum Step {
 pub struct Walked {
     /// It stopped at the limit, so there may be more.
     pub truncated: bool,
-    /// Folders below the top one that couldn't be read, as when permission is denied.
+    /// Folders that couldn't be read, or read to the end, as when permission is denied.
     pub unreadable: usize,
 }
 
@@ -54,6 +54,11 @@ pub struct Walked {
 /// stops the walk; `None` means it was stopped.
 /// Fails only if `root` itself can't be read.
 pub fn walk(root: &Path, query: &str, show_hidden: bool, limit: usize, step: &mut dyn FnMut(Step) -> bool) -> std::io::Result<Option<Walked>> {
+    walk_skipping(root, query, show_hidden, limit, &|_| false, step)
+}
+
+/// As `walk`, leaving out every folder `skip` says to: it isn't a match, and isn't read.
+pub fn walk_skipping(root: &Path, query: &str, show_hidden: bool, limit: usize, skip: &dyn Fn(&Path) -> bool, step: &mut dyn FnMut(Step) -> bool) -> std::io::Result<Option<Walked>> {
     let needle = query.to_lowercase();
     // The top folder can be reached through a symlink, as the folder showing can be.
     let top = open_dir(root, true)?;
@@ -99,6 +104,9 @@ pub fn walk(root: &Path, query: &str, show_hidden: bool, limit: usize, step: &mu
                 continue;
             }
             let mut ty = e.file_type();
+            if ty == FileType::Directory && skip(&dir.join(std::ffi::OsStr::from_bytes(b))) {
+                continue;
+            }
             if name_contains(b, &needle) {
                 let at = dir.join(std::ffi::OsStr::from_bytes(b));
                 let st = statx(fd.as_fd(), name, AtFlags::SYMLINK_NOFOLLOW | AtFlags::NO_AUTOMOUNT, StatxFlags::TYPE | StatxFlags::SIZE | StatxFlags::MTIME).ok();
