@@ -343,7 +343,7 @@ pub(crate) struct Band {
 
 const BAND_SCROLL_EVERY: Duration = Duration::from_millis(16);
 /// How near the sidebar's top or bottom a drag has to be to scroll it, in logical pixels.
-const SIDE_SCROLL_EDGE: f64 = 28.0;
+const SIDE_SCROLL_EDGE: f64 = 20.0;
 
 pub(crate) struct ActiveDrag {
     pub paths: Vec<PathBuf>,
@@ -2877,7 +2877,8 @@ impl App {
         let (x, y) = self.pointer;
         if self.pin_drag.as_ref().is_some_and(|d| d.active) {
             self.pin_drag_moved(x, y);
-        } else if x >= 0 && self.menu.is_none() && self.dialog.is_none() {
+        } else if x >= 0 && self.menu.is_none() && self.dialog.is_none() && self.drag_scroll.is_none() {
+            // A thumb being dragged keeps its hover, wherever the pointer drifts.
             let h = self.hit(x, y);
             self.set_hover(h);
         }
@@ -8802,6 +8803,10 @@ mod tests {
         let (top, h) = r.app.scrollbar_thumb(Pane::Sidebar);
         r.app.input(Input::Move { x: edge as f64, y: (side.y + top + h / 2) as f64 });
         r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        // Drifting onto the places while it scrolls doesn't light them up.
+        r.app.input(Input::Move { x, y: (side.y + top + h / 2 - 100) as f64 });
+        assert!(r.app.side_scroll < r.app.max_scroll_in(Pane::Sidebar), "the thumb moved");
+        assert_eq!(r.app.hover, Hit::Scrollbar(Pane::Sidebar), "and keeps its hover");
         r.app.input(Input::Move { x: edge as f64, y: side.y as f64 - 200.0 });
         r.release();
         assert_eq!(r.app.side_scroll, 0.0);
