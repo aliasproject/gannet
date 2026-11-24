@@ -40,6 +40,11 @@ BUDGETS = [
     ("Space to 128 kB of text in the preview", 100, "ms"),
     ("Space to 128 kB of Markdown in the preview", 150, "ms"),
     ("Space to the first page of a PDF in the preview", 200, "ms"),
+    ("launch to sorted rows, 3,000 photos", 150, "ms"),
+    ("thumbnails on screen, 3,000 photos, made", 300, "ms"),
+    ("thumbnails on screen, 3,000 photos, cached", 200, "ms"),
+    ("paint scrolling 3,000 photos p99, 1280x800", 4, "ms"),
+    ("longest UI stall, scrolling 3,000 photos", 16, "ms"),
 ]
 
 
@@ -369,6 +374,71 @@ def measure_preview_pdf(h, results, runs):
     results["Space to the first page of a PDF in the preview"] = median(times)
 
 
+def wait_thumbs(log, timeout=60):
+    """When the rows on screen all had their thumbnails: the first `thumbs` stamp with some shown
+    and none still waiting."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        for l in read_log(log):
+            f = l.split()
+            if f[0] == "thumbs" and int(f[1]) > 0 and f[2] == "0":
+                return float(f[3])
+        time.sleep(0.005)
+    raise AssertionError(f"thumbnails never finished in {log}")
+
+
+def measure_photos(h, results, runs):
+    """A folder of 3,000 photos: rows on screen, their thumbnails made and then read back from
+    the cache, and scrolling through while they're being made."""
+    folder = DATA / "fixture-photos"
+    marker = folder / ".gannet-bench-fixture"
+    if not marker.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        photo = png(640, 480)
+        for i in range(3000):
+            (folder / f"photo-{i:04}.png").write_bytes(photo)
+        marker.touch()
+    for _ in os.scandir(folder):
+        pass
+    rows, made, cached = [], [], []
+    for fresh in [True] * runs + [False] * runs:
+        log, env = log_env(h, "photos")
+        cache = Path(env["XDG_CACHE_HOME"]) / "thumbnails"
+        assert str(cache).startswith("/tmp/gnbench-client/"), cache
+        if fresh:
+            shutil.rmtree(cache, ignore_errors=True)
+        t0 = time.monotonic() * 1000
+        p = subprocess.Popen([str(BENCH), str(folder)], env=env, stderr=subprocess.DEVNULL)
+        h.wait_window(30)
+        f = wait_log(log, "rows")
+        assert f[1] == "3000", f
+        if fresh:
+            rows.append(float(f[2]) - t0)
+        (made if fresh else cached).append(wait_thumbs(log) - float(f[2]))
+        stop(p)
+        time.sleep(0.3)
+    results["launch to sorted rows, 3,000 photos"] = median(rows)
+    results["thumbnails on screen, 3,000 photos, made"] = median(made)
+    results["thumbnails on screen, 3,000 photos, cached"] = median(cached)
+    log, env = log_env(h, "photos-scroll")
+    shutil.rmtree(Path(env["XDG_CACHE_HOME"]) / "thumbnails", ignore_errors=True)
+    p = subprocess.Popen([str(BENCH), str(folder)], env=env, stderr=subprocess.DEVNULL)
+    h.wait_window(30)
+    wait_log(log, "rows")
+    time.sleep(0.3)
+    start = len(read_log(log))
+    for _ in range(6):
+        key(env, *(["Next"] * 20))
+    time.sleep(1)
+    lines = read_log(log)[start:]
+    paints = [int(l.split()[1]) / 1000 for l in lines if l.startswith("paint")]
+    busy = [int(l.split()[1]) / 1000 for l in lines if l.startswith("busy")]
+    assert len(paints) > 30, f"only {len(paints)} paints"
+    results["paint scrolling 3,000 photos p99, 1280x800"] = p99(paints)
+    results["longest UI stall, scrolling 3,000 photos"] = max(busy, default=0)
+    stop(p)
+
+
 def measure_copy(results):
     src = DATA / "copy-1g.bin"
     if not src.exists() or src.stat().st_size != 1 << 30:
@@ -473,6 +543,7 @@ def main():
         measure_preview(h, results, a.runs)
         measure_preview_documents(h, results, a.runs)
         measure_preview_pdf(h, results, a.runs)
+        measure_photos(h, results, a.runs)
     finally:
         h.stop()
     h = Headless("/tmp/gnbench-h", "3840x2160")

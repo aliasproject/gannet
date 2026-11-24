@@ -2128,6 +2128,82 @@ def thumbnailers_show_what_nothing_else_can(h):
     a.close()
 
 
+def png_info(path):
+    """A PNG's width, height and text entries."""
+    data = path.read_bytes()
+    w, h = struct.unpack(">II", data[16:24])
+    text, at = {}, 8
+    while at + 8 <= len(data):
+        size, kind = struct.unpack(">I4s", data[at:at + 8])
+        if kind == b"tEXt":
+            key, _, value = data[at + 8:at + 8 + size].partition(b"\0")
+            text[key.decode()] = value.decode()
+        at += 12 + size
+    return w, h, text
+
+
+def thumbs_of(s):
+    return {name: (w, h) for name, w, h in s["thumbs"]["shown"]}
+
+
+@check
+def pictures_and_videos_show_thumbnails_in_their_rows(h):
+    fs = fresh_fs()
+    cache = SCRATCH / "client/cache"
+    normal, fail = cache / "thumbnails/normal", cache / "thumbnails/fail/gannet"
+    # Red over blue, so the row's picture has something in it to see.
+    (fs / "a-photo.png").write_bytes(png_bytes(400, 300, lambda y: (220, 50, 50) if y < 150 else (50, 50, 220)))
+    (fs / "b-broken.png").write_bytes(png_bytes(400, 300)[:300])
+    make_video(fs / "c-clip.mp4", seconds=3, size="320x240", audio=False)
+    (fs / "d-notes.txt").write_text("words")
+    (fs / "e-drawing.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg" width="300" height="200"><rect width="300" height="200" fill="#c33"/><circle cx="150" cy="100" r="70" fill="#fff"/></svg>')
+    # Another program's thumbnail, already made: it's used rather than made again.
+    (fs / "f-cached.png").write_bytes(png_bytes(800, 600, (200, 200, 200)))
+    cache_thumbnail(cache, fs / "f-cached.png", 256, 192, int((fs / "f-cached.png").stat().st_mtime))
+    (fs / "folder.png").mkdir()
+    a = App(h, fs)
+    want = {"a-photo.png", "c-clip.mp4", "e-drawing.svg", "f-cached.png"}
+    s = a.wait(lambda s: s["count"] == 7 and set(thumbs_of(s)) >= want and s["thumbs"]["waiting"] == 0, "thumbnails in the rows", timeout=30)
+    shown = thumbs_of(s)
+    assert set(shown) == want, f"no picture for a broken file, text or a folder: {shown}"
+    assert all(size == (20, 20) for size in shown.values()), shown
+    a.shot("list-thumbnails")
+    # Each is in the shared cache at the normal size, saying what it's of. The broken one is noted,
+    # so it isn't tried again, and the one another program made isn't made again.
+    def uri(name):
+        return "file://" + quote(str(fs / name), safe="!$&'()*+,-./:=@_~")
+
+    def cached(folder, name):
+        return folder / (hashlib.md5(uri(name).encode()).hexdigest() + ".png")
+
+    made = {}
+    for name in ("a-photo.png", "c-clip.mp4", "e-drawing.svg"):
+        thumb = cached(normal, name)
+        w, h_, text = png_info(thumb)
+        assert max(w, h_) == 128 and text["Thumb::URI"] == uri(name) and text["Thumb::MTime"] == str(int((fs / name).stat().st_mtime)), (name, w, h_, text)
+        assert stat.S_IMODE(thumb.stat().st_mode) == 0o600
+        made[thumb] = thumb.stat().st_mtime_ns
+    assert png_info(cached(normal, "a-photo.png"))[:2] == (128, 96), "keeps its shape"
+    assert len(list(normal.iterdir())) == 3, sorted(p.name for p in normal.iterdir())
+    assert [p.name for p in fail.iterdir()] == [cached(fail, "b-broken.png").name]
+    a.close()
+    # Next time they all come from the cache, and nothing's made again.
+    a = App(h, fs)
+    a.wait(lambda s: set(thumbs_of(s)) == want and s["thumbs"]["waiting"] == 0, "from the cache", timeout=10)
+    assert {p: p.stat().st_mtime_ns for p in made} == made, "nothing made again"
+    # A picture that changes gets a new thumbnail.
+    photo = fs / "a-photo.png"
+    photo.write_bytes(png_bytes(300, 300, (40, 200, 40)))
+    later = int(time.time()) + 5
+    os.utime(photo, (later, later))
+    thumb = cached(normal, "a-photo.png")
+    end = time.monotonic() + 10
+    while time.monotonic() < end and png_info(thumb)[2].get("Thumb::MTime") != str(later):
+        time.sleep(0.05)
+    assert png_info(thumb)[:2] == (128, 128), "made again from the new picture"
+    a.close()
+
+
 @check
 def a_crash_in_the_preview_closes_only_the_preview_and_closing_the_list_closes_both(h):
     fs = fresh_fs()
@@ -2658,6 +2734,8 @@ def a_cached_thumbnail_shows_first_unless_its_out_of_date(h):
     shutil.rmtree(cache / "thumbnails", ignore_errors=True)
     cache_thumbnail(cache, photo, 128, 96, int(photo.stat().st_mtime))
     cache_thumbnail(cache, stale, 128, 96, int(stale.stat().st_mtime) - 100)
+    # The list would make an up-to-date one for its row, which the preview would rightly show.
+    (cache / "thumbnails/normal").mkdir(mode=0o500)
     a = App(h, fs, extra_env={"GANNET_SLOW_PREVIEW_MS": "500"})
     a.wait(lambda s: s["count"] == 2, "listing")
     a.key("space")
@@ -3713,6 +3791,8 @@ def main():
             shutil.rmtree(SCRATCH / "client/state/gannet", ignore_errors=True)
             # Nor any pins: they're in GTK's bookmarks file, which every window shares.
             shutil.rmtree(SCRATCH / "client/config/gtk-3.0", ignore_errors=True)
+            # Nor thumbnails, which the list makes of any picture or video it shows.
+            shutil.rmtree(SCRATCH / "client/cache/thumbnails", ignore_errors=True)
             try:
                 t(h)
                 print(f"ok    {t.__name__}", flush=True)
