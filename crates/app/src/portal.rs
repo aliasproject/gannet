@@ -1,19 +1,21 @@
-//! Open and Save dialogs for other programs, through xdg-desktop-portal.
+//! Open and Save dialogs, and Open With, for other programs, through xdg-desktop-portal.
 //!
 //! `gannet --file-chooser-service` runs without a window. It owns
-//! `org.freedesktop.impl.portal.desktop.gannet` and serves the portal's FileChooser backend.
-//! Each request starts a chooser window, `gannet --choose ...`, waits for it without holding
-//! up other calls, and answers with what it picked. The window belongs to the request:
+//! `org.freedesktop.impl.portal.desktop.gannet` and serves the portal's FileChooser and
+//! AppChooser backends. Each request starts a window, `gannet --choose ...` or
+//! `gannet --open-with ...`, waits for it without holding up other calls, and answers with
+//! what it picked. The window belongs to the request:
 //! closing the request ends it, and so does the service ending, even by a crash. With
 //! nothing asked of it for a while the service exits, and D-Bus starts it again on the next
 //! request, from the service file in `packaging/`.
 
 use std::collections::HashMap;
 use std::future::poll_fn;
-use std::io::Read;
+use std::ffi::OsString;
+use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -257,58 +259,50 @@ impl Request {
     }
 }
 
-struct FileChooser {
+/// Shows a window for each request: what the file chooser and the app chooser share.
+struct Dialogs {
     exe: PathBuf,
     busy: Arc<Busy>,
+    /// What each app chooser window reads, by its request's handle, for changing its list.
+    inputs: Mutex<HashMap<String, ChildStdin>>,
 }
 
-impl FileChooser {
-    async fn choose(&self, conn: &zbus::Connection, handle: OwnedObjectPath, method: Method, parent_window: &str, title: &str, options: Options) -> (u32, Results) {
+impl Dialogs {
+    /// Starts a window, `exe` with `args`, for the request at `handle`, and waits for what it
+    /// says and whether it ended well. `None` if it didn't start, or the request was closed.
+    /// With `input`, its standard input is kept for `tell`.
+    async fn show(&self, conn: &zbus::Connection, handle: &OwnedObjectPath, args: Vec<OsString>, input: bool) -> Option<(String, bool)> {
         let _open = Open::new(&self.busy);
-        self.run(conn, handle, method, parent_window, title, &options).await
-    }
-
-    async fn run(&self, conn: &zbus::Connection, handle: OwnedObjectPath, method: Method, parent_window: &str, title: &str, options: &Options) -> (u32, Results) {
-        let spec = spec_from(method, parent_window, title, options);
         let (window, closed) = (Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)));
-        let served = conn.object_server().at(&handle, Request { window: window.clone(), closed: closed.clone() }).await;
-        let outcome = self.window(&spec, &window, &closed).await;
+        let served = conn.object_server().at(handle, Request { window: window.clone(), closed: closed.clone() }).await;
+        let outcome = self.window(args, input.then(|| handle.to_string()), &window, &closed).await;
         if served.is_ok() {
-            let _ = conn.object_server().remove::<Request, _>(&handle).await;
+            let _ = conn.object_server().remove::<Request, _>(handle).await;
         }
         window.lock().unwrap().take();
-        let Some((text, ended_well)) = outcome.filter(|_| !closed.load(Ordering::SeqCst)) else { return (ENDED, Results::new()) };
-        match crate::chooser::read_outcome(&text) {
-            Some((uris, filter)) => (PICKED, results(&spec, uris, filter, options)),
-            None if ended_well => (CANCELLED, Results::new()),
-            None => (ENDED, Results::new()),
-        }
+        self.inputs.lock().unwrap().remove(handle.as_str());
+        outcome.filter(|_| !closed.load(Ordering::SeqCst))
+    }
+
+    /// Sends a line to the window for the request at `handle`, if it's still open. False if
+    /// there's no such window.
+    fn tell(&self, handle: &str, line: &str) -> bool {
+        let mut inputs = self.inputs.lock().unwrap();
+        let Some(input) = inputs.get_mut(handle) else { return false };
+        writeln!(input, "{line}").and_then(|_| input.flush()).is_ok()
     }
 
     /// Starts the window and waits for what it says, and whether it ended well.
-    async fn window(&self, spec: &Spec, window: &Mutex<Option<OwnedFd>>, closed: &AtomicBool) -> Option<(String, bool)> {
+    async fn window(&self, args: Vec<OsString>, input: Option<String>, window: &Mutex<Option<OwnedFd>>, closed: &AtomicBool) -> Option<(String, bool)> {
         let mut command = Command::new(&self.exe);
-        command.args(spec.args()).stdin(Stdio::null()).stdout(Stdio::piped());
+        command.args(args).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped());
         // The window goes when the service does, even if it crashes, rather than staying on
-        // with nowhere to send its answer. The signal comes when the thread that started the
-        // window ends: that's zbus's runtime thread or the main one, which both last as long
-        // as the service.
-        let service = rustix::process::getpid();
-        // SAFETY: only async-signal-safe calls, on plain integers.
-        unsafe {
-            command.pre_exec(move || {
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
-                // Already gone before that took hold.
-                if libc::getppid() != service.as_raw_nonzero().get() {
-                    libc::_exit(1);
-                }
-                Ok(())
-            });
-        }
+        // with nowhere to send its answer.
+        die_with_this_thread(&mut command);
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("gannet: couldn't open a file chooser: {e}");
+                eprintln!("gannet: couldn't open a dialog: {e}");
                 return None;
             }
         };
@@ -318,6 +312,9 @@ impl FileChooser {
         // Closed before the window existed to be told.
         if closed.load(Ordering::SeqCst) {
             let _ = child.kill();
+        }
+        if let (Some(handle), Some(stdin)) = (input, child.stdin.take()) {
+            self.inputs.lock().unwrap().insert(handle, stdin);
         }
         let (tx, rx) = hand_over();
         let mut out = child.stdout.take()?;
@@ -329,10 +326,115 @@ impl FileChooser {
             tx.send((text, ok));
         });
         if let Err(e) = waiting {
-            eprintln!("gannet: couldn't wait for the file chooser: {e}");
+            eprintln!("gannet: couldn't wait for the dialog: {e}");
             return None;
         }
         wait_for(rx).await
+    }
+}
+
+/// Has the kernel stop the program `command` starts when the thread starting it ends. Here
+/// that's zbus's runtime thread or the main one, which both last as long as the service. For
+/// Open With from the file list, it's the thread waiting on the window.
+pub(crate) fn die_with_this_thread(command: &mut Command) {
+    let parent = rustix::process::getpid();
+    // SAFETY: only async-signal-safe calls, on plain integers.
+    unsafe {
+        command.pre_exec(move || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong, 0, 0, 0);
+            // Already gone before that took hold.
+            if libc::getppid() != parent.as_raw_nonzero().get() {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+struct FileChooser {
+    dialogs: Arc<Dialogs>,
+}
+
+impl FileChooser {
+    async fn choose(&self, conn: &zbus::Connection, handle: OwnedObjectPath, method: Method, parent_window: &str, title: &str, options: Options) -> (u32, Results) {
+        let spec = spec_from(method, parent_window, title, &options);
+        let Some((text, ended_well)) = self.dialogs.show(conn, &handle, spec.args(), false).await else { return (ENDED, Results::new()) };
+        match crate::chooser::read_outcome(&text) {
+            Some((uris, filter)) => (PICKED, results(&spec, uris, filter, &options)),
+            None if ended_well => (CANCELLED, Results::new()),
+            None => (ENDED, Results::new()),
+        }
+    }
+}
+
+/// The app chooser: "Open with…" for a sandboxed program's file or link with no default app.
+/// The portal gives the apps to choose from, and opens the one chosen itself.
+struct AppChooser {
+    dialogs: Arc<Dialogs>,
+    /// Every app offered for each open request, by its handle: an answer can only be one.
+    offered: Mutex<HashMap<String, Vec<String>>>,
+}
+
+#[zbus::interface(name = "org.freedesktop.impl.portal.AppChooser")]
+impl AppChooser {
+    #[zbus(out_args("response", "results"))]
+    async fn choose_application(&self, #[zbus(connection)] conn: &zbus::Connection, handle: OwnedObjectPath, _app_id: String, parent_window: String, choices: Vec<String>, options: Options) -> (u32, Results) {
+        let spec = app_spec_from(&parent_window, choices, &options);
+        self.offered.lock().unwrap().insert(handle.to_string(), spec.choices.clone().unwrap_or_default());
+        let shown = self.dialogs.show(conn, &handle, spec.args(), true).await;
+        let offered = self.offered.lock().unwrap().remove(handle.as_str()).unwrap_or_default();
+        let Some((text, ended_well)) = shown else { return (ENDED, Results::new()) };
+        match crate::openwith::read_outcome(&text) {
+            Some((id, _)) if offered.contains(&id) => {
+                let mut r = Results::new();
+                if let Ok(v) = OwnedValue::try_from(Value::from(id)) {
+                    r.insert("choice".to_string(), v);
+                }
+                (PICKED, r)
+            }
+            _ if ended_well => (CANCELLED, Results::new()),
+            _ => (ENDED, Results::new()),
+        }
+    }
+
+    /// The program found more apps while the window is open.
+    fn update_choices(&self, handle: OwnedObjectPath, choices: Vec<String>) -> zbus::fdo::Result<()> {
+        let choices = clean_choices(choices);
+        let mut offered = self.offered.lock().unwrap();
+        let Some(all) = offered.get_mut(handle.as_str()) else { return Err(zbus::fdo::Error::Failed("no dialog is open for that request".into())) };
+        for c in &choices {
+            if !all.contains(c) && all.len() < MAX_NAMES {
+                all.push(c.clone());
+            }
+        }
+        drop(offered);
+        if self.dialogs.tell(handle.as_str(), &crate::openwith::choices_line(&choices)) { Ok(()) } else { Err(zbus::fdo::Error::Failed("no dialog is open for that request".into())) }
+    }
+}
+
+/// App IDs from another program: plain names only, and not too many.
+fn clean_choices(choices: Vec<String>) -> Vec<String> {
+    choices.into_iter().filter(|c| !c.is_empty() && c.len() <= MAX_TEXT && !c.chars().any(|ch| ch.is_whitespace() || ch.is_control() || ch == '/')).take(MAX_NAMES).collect()
+}
+
+/// What an app chooser request asks for, as an Open With window understands it.
+pub fn app_spec_from(parent_window: &str, choices: Vec<String>, o: &Options) -> crate::openwith::Spec {
+    // The file's name, or the last part of the link, for the title.
+    let named = opt::<String>(o, "filename").filter(|f| !f.is_empty()).or_else(|| {
+        let uri = opt::<String>(o, "uri")?;
+        let path = uri.split(['?', '#']).next().unwrap_or("");
+        let last = path.trim_end_matches('/').rsplit('/').next().filter(|l| !l.is_empty() && !l.contains(':'))?;
+        Some(gannet_core::uri::from_file_uri(&format!("file:///{last}")).map_or_else(|| last.to_string(), |p| p.to_string_lossy().trim_start_matches('/').to_string()))
+    });
+    let mime = opt::<String>(o, "content_type").filter(|m| m.len() <= MAX_TEXT && m.contains('/') && !m.chars().any(|c| c.is_whitespace() || c.is_control()));
+    crate::openwith::Spec {
+        what: named.map(|n| format!("“{}”", short(&n))),
+        types: mime.into_iter().collect(),
+        choices: Some(clean_choices(choices)),
+        last: opt::<String>(o, "last_choice").map(|l| short(&l)).filter(|l| !l.is_empty()),
+        offer_always: false,
+        parent: Some(short(parent_window)).filter(|p| p.starts_with("wayland:")),
+        modal: opt::<bool>(o, "modal").unwrap_or(true),
     }
 }
 
@@ -358,7 +460,9 @@ impl FileChooser {
 fn start(bus: &Bus, exe: &Path) -> zbus::Result<Option<(Arc<Busy>, Receiver<()>)>> {
     let (tx, rx) = channel();
     let busy = Arc::new(Busy { open: AtomicUsize::new(0), nudge: Mutex::new(Some(tx)) });
-    bus.serve(PATH, FileChooser { exe: exe.to_path_buf(), busy: busy.clone() })?;
+    let dialogs = Arc::new(Dialogs { exe: exe.to_path_buf(), busy: busy.clone(), inputs: Mutex::new(HashMap::new()) });
+    bus.serve(PATH, FileChooser { dialogs: dialogs.clone() })?;
+    bus.serve(PATH, AppChooser { dialogs, offered: Mutex::new(HashMap::new()) })?;
     Ok(bus.own_name(NAME)?.then_some((busy, rx)))
 }
 
@@ -633,5 +737,88 @@ mod tests {
             run(&busy, &rx, Duration::from_millis(50));
         });
         assert!(t0.elapsed() >= Duration::from_millis(150));
+    }
+
+    #[test]
+    fn an_app_request_becomes_an_open_with_spec() {
+        let o = options(vec![("filename", Value::from("notes.txt")), ("content_type", Value::from("text/plain")), ("last_choice", Value::from("org.x.Edit")), ("modal", Value::from(false))]);
+        let s = app_spec_from("wayland:p1", vec!["org.x.Edit".into(), "bad id".into(), "../x".into(), "".into(), "org.x.View".into()], &o);
+        assert_eq!(s.what.as_deref(), Some("“notes.txt”"));
+        assert_eq!(s.types, ["text/plain"]);
+        assert_eq!(s.choices.as_deref(), Some(&["org.x.Edit".to_string(), "org.x.View".to_string()][..]), "plain IDs only");
+        assert_eq!(s.last.as_deref(), Some("org.x.Edit"));
+        assert_eq!((s.parent.as_deref(), s.modal, s.offer_always), (Some("wayland:p1"), false, false));
+        // A link names what's opened by its last part.
+        let o = options(vec![("uri", Value::from("https://example.com/docs/My%20Report.pdf?x=1")), ("content_type", Value::from("not a type"))]);
+        let s = app_spec_from("x11:3", vec![], &o);
+        assert_eq!(s.what.as_deref(), Some("“My Report.pdf”"));
+        assert!(s.types.is_empty() && s.parent.is_none() && s.modal);
+        assert_eq!(s.choices.as_deref(), Some(&[][..]), "an empty list is still the program's list");
+        assert_eq!(app_spec_from("", vec![], &options(vec![("uri", Value::from("mailto:me@example.com"))])).what, None);
+    }
+
+    const APPS: &str = "org.freedesktop.impl.portal.AppChooser";
+
+    /// A stand-in Open With window: writes its arguments, then a line it reads if `reads`,
+    /// then says `text`.
+    fn app_window(bus: &PrivateBus, text: &str, reads: bool) -> PathBuf {
+        let p = bus.dir.join("openwith.sh");
+        let (args, got) = (bus.dir.join("args"), bus.dir.join("got"));
+        std::fs::write(&p, format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}.tmp'\nmv '{}.tmp' '{}'\n{}printf '{text}'\n", args.display(), args.display(), args.display(), if reads { format!("read line\nprintf '%s\\n' \"$line\" > '{}'\n", got.display()) } else { String::new() })).unwrap();
+        Command::new("chmod").arg("755").arg(&p).status().unwrap();
+        p
+    }
+
+    #[test]
+    fn an_app_is_chosen_and_new_choices_reach_the_window() {
+        let bus = PrivateBus::start("apps");
+        let exe = app_window(&bus, "open org.x.View\\n", true);
+        let gannet = Bus::connect(&bus.address).unwrap();
+        start(&gannet, &exe).unwrap().expect("the name was free");
+        let address = bus.address.clone();
+        let handle = "/org/freedesktop/portal/desktop/request/1_1/a";
+        let asking = std::thread::spawn(move || busctl(&address, &["--json=short", "call", NAME, PATH, APPS, "ChooseApplication", "ossasa{sv}", handle, "org.x.Caller", "wayland:h2", "1", "org.x.Edit", "2", "content_type", "s", "text/plain", "filename", "s", "a.txt"]));
+        let t0 = std::time::Instant::now();
+        while !bus.dir.join("args").exists() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "the window never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let args = std::fs::read_to_string(bus.dir.join("args")).unwrap();
+        assert!(args.starts_with("--open-with\n") && args.contains("--what\n“a.txt”") && args.contains("--type\ntext/plain") && args.contains("--choices\n--choice\norg.x.Edit") && args.contains("--parent\nwayland:h2"), "{args}");
+        // The window can start a moment before the service has its input to hand.
+        let t0 = std::time::Instant::now();
+        loop {
+            let updated = busctl(&bus.address, &["call", NAME, PATH, APPS, "UpdateChoices", "oas", handle, "2", "org.x.Edit", "org.x.View"]);
+            if updated.status.success() {
+                break;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "{}", String::from_utf8_lossy(&updated.stderr));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = asking.join().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains(r#""data":[0,{"choice":{"type":"s","data":"org.x.View"}}]"#), "{text}");
+        assert_eq!(std::fs::read_to_string(bus.dir.join("got")).unwrap(), "choices\torg.x.Edit\torg.x.View\n");
+        // Updating a request that's done is an error, not a hang.
+        let late = busctl(&bus.address, &["call", NAME, PATH, APPS, "UpdateChoices", "oas", handle, "0"]);
+        assert!(!late.status.success());
+    }
+
+    #[test]
+    fn an_app_that_wasnt_offered_or_a_cancel_is_answered_as_a_cancel() {
+        let bus = PrivateBus::start("apps-cancel");
+        let gannet = Bus::connect(&bus.address).unwrap();
+        let exe = app_window(&bus, "open org.x.Sneaky\\n", false);
+        start(&gannet, &exe).unwrap().expect("the name was free");
+        let call = || busctl(&bus.address, &["call", NAME, PATH, APPS, "ChooseApplication", "ossasa{sv}", "/r/3", "", "", "1", "org.x.Edit", "0"]);
+        let out = call();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("ua{sv} 1 0"), "{}", String::from_utf8_lossy(&out.stdout));
+        app_window(&bus, "cancel\\n", false);
+        let out = call();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("ua{sv} 1 0"), "{}", String::from_utf8_lossy(&out.stdout));
+        std::fs::write(&exe, "#!/bin/sh\nkill -9 $$\n").unwrap();
+        let out = call();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("ua{sv} 2 0"), "a window that dies: {}", String::from_utf8_lossy(&out.stdout));
     }
 }

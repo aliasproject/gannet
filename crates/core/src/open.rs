@@ -1,4 +1,4 @@
-//! Opening files with the default app, through `xdg-open`.
+//! Opening files with the default app, through `xdg-open`, and starting other programs.
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -22,6 +22,23 @@ pub fn spawn_detached(cmd: &mut Command, on_fail: impl FnOnce(String) + Send + '
 pub fn spawn_detached_logged(cmd: &mut Command, on_fail: impl FnOnce(String) + Send + 'static) {
     cmd.stderr(Stdio::inherit());
     run_detached(cmd, false, on_fail);
+}
+
+/// Starts an app, on its own, with its output discarded. Only its failing to start is
+/// reported: how it ends, maybe hours later, is its own business.
+pub fn launch(cmd: &mut Command) -> std::io::Result<()> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // SAFETY: setsid is async-signal-safe and touches no memory.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn()?;
+    // Waited for, so it doesn't linger as a zombie once it's done.
+    let _ = std::thread::Builder::new().name("gannet-wait".into()).spawn(move || child.wait());
+    Ok(())
 }
 
 /// `opener` words a failure as `xdg-open` means it; otherwise it just says how it ended.

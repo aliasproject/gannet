@@ -11,6 +11,7 @@ mod field;
 mod format;
 mod icons;
 mod media;
+mod openwith;
 mod paint;
 mod portal;
 mod preview;
@@ -50,6 +51,14 @@ struct Dirs {
     mime: Vec<PathBuf>,
     /// Where thumbnailers are described, first wins.
     thumbnailers: Vec<PathBuf>,
+    /// The installed apps' `applications` folders, and the `mimeapps.list` files that say
+    /// which open what, first wins.
+    apps: Vec<PathBuf>,
+    mimeapps: Vec<PathBuf>,
+    /// The desktop's names, from `XDG_CURRENT_DESKTOP`, like `Hyprland`.
+    desktops: Vec<String>,
+    /// Where programs are found, from `PATH`.
+    programs: Vec<PathBuf>,
 }
 
 /// The one place Gannet reads where things live. Everything else gets paths as arguments.
@@ -60,7 +69,14 @@ fn dirs() -> Dirs {
     let data_dirs = std::env::var_os("XDG_DATA_DIRS").filter(|d| !d.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
     let in_data = |name: &str| std::iter::once(data.join(name)).chain(std::env::split_paths(&data_dirs).filter(|p| p.is_absolute()).map(|p| p.join(name))).collect::<Vec<_>>();
     let (mime, thumbnailers) = (in_data("mime"), in_data("thumbnailers"));
-    Dirs { config: var("XDG_CONFIG_HOME", ".config"), cache: var("XDG_CACHE_HOME", ".cache"), state: var("XDG_STATE_HOME", ".local/state"), data, home, mime, thumbnailers }
+    let config = var("XDG_CONFIG_HOME", ".config");
+    let split = |name: &str, default: &str| std::env::var_os(name).filter(|d| !d.is_empty()).map_or_else(|| std::env::split_paths(default).collect::<Vec<_>>(), |d| std::env::split_paths(&d).filter(|p| p.is_absolute()).collect());
+    let (data_dirs, config_dirs) = (split("XDG_DATA_DIRS", "/usr/local/share:/usr/share"), split("XDG_CONFIG_DIRS", "/etc/xdg"));
+    let desktops: Vec<String> = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().split(':').filter(|d| !d.is_empty()).map(str::to_string).collect();
+    let apps = gannet_core::apps::app_dirs(&data, &data_dirs);
+    let mimeapps = gannet_core::apps::list_files(&config, &config_dirs, &data, &data_dirs, &desktops);
+    let programs = split("PATH", "/usr/local/bin:/usr/bin");
+    Dirs { cache: var("XDG_CACHE_HOME", ".cache"), state: var("XDG_STATE_HOME", ".local/state"), config, data, home, mime, thumbnailers, apps, mimeapps, desktops, programs }
 }
 
 /// The language messages are in, as GLib chooses it for GTK apps: the first of `LANGUAGE`, then
@@ -112,11 +128,14 @@ fn main() {
         if a == portal::ARG {
             portal::main();
         }
+        if a == openwith::ARG {
+            openwith::main();
+        }
         if a == service::CLAIM_ARG || a == service::RELEASE_ARG {
             service::claim_main(a == service::RELEASE_ARG);
         }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}", preview_window::USAGE, chooser::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG);
+            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}", preview_window::USAGE, chooser::USAGE, openwith::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG);
             return;
         }
         if a == "--version" {
@@ -177,6 +196,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // So Open With can sit over the list, as its child.
+    if viewing.is_none() && choosing.is_none() {
+        wl.export();
+    }
 
     let mut text = text::Text::new(text::UI_PX, text::UI_HINTED);
     text.set_contrast(colors.dark);
@@ -315,6 +338,7 @@ fn main() {
                         preview_window::tell_the_list(&path);
                     }
                 }
+                Cmd::OpenWith(paths) => openwith::ask(hub.clone(), paths, wl.exported(), &d),
                 Cmd::Quit => {
                     // A chooser tells the service what was picked as it goes.
                     if let Some(c) = app.chooser.as_mut() {

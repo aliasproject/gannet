@@ -1,6 +1,7 @@
-# Tells xdg-desktop-portal that Gannet can show Open and Save dialogs. Packages install it into
-# /usr/share/xdg-desktop-portal/portals. It isn't used until a portals.conf picks it, with
-# org.freedesktop.impl.portal.FileChooser=gannet, as the README's "Open and Save dialogs" says.
+# Tells xdg-desktop-portal that Gannet can show Open and Save dialogs, and Open With. Packages
+# install it into /usr/share/xdg-desktop-portal/portals. It isn't used until a portals.conf picks
+# it, with org.freedesktop.impl.portal.FileChooser=gannet and
+# org.freedesktop.impl.portal.AppChooser=gannet, as the README's "Open and Save dialogs" says.
 [portal]
 DBusName=org.freedesktop.impl.portal.desktop.gannet
-Interfaces=org.freedesktop.impl.portal.FileChooser;
+Interfaces=org.freedesktop.impl.portal.FileChooser;org.freedesktop.impl.portal.AppChooser;

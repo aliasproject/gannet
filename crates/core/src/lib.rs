@@ -2,6 +2,7 @@
 //! Trash, the system theme, D-Bus. No code here reads the environment; every path comes in
 //! as an argument, so tests can't reach real user data by accident.
 
+pub mod apps;
 pub mod archive;
 pub mod bus;
 pub mod clipboard;
