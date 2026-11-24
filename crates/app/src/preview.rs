@@ -1921,7 +1921,6 @@ impl App {
     }
 }
 
-/// A file's name as it's shown, or its whole path if it has none.
 /// What the footer says about what's shown, a part at a time.
 fn foot_parts(p: &Preview, view: Option<&View>, pdf_shown: Option<(usize, usize)>) -> Vec<String> {
     match (&p.content, view) {
@@ -1956,9 +1955,16 @@ impl App {
         let Some(p) = self.preview.as_ref() else { return crate::a11y::PreviewText { name: String::new(), kind: String::new(), shows: String::new(), title, area: g.area, foot, can_step } };
         let (kind, mut shows) = match &p.content {
             Content::Waiting => (String::new(), if p.loading_shown { vec!["Loading…".to_string()] } else { Vec::new() }),
-            Content::Image { .. } => ("Picture".to_string(), foot_parts(p, self.preview_view().as_ref(), None)),
+            // What's said here is said again whenever it changes, so it leaves out what changes
+            // while nothing new is shown: how far it's zoomed, the page scrolled to, and a count
+            // still going.
+            Content::Image { image, thumbnail: false } => ("Picture".to_string(), [Some(format!("{} × {}", image.w, image.h)), p.size.map(format::size)].into_iter().flatten().collect()),
+            Content::Image { thumbnail: true, .. } => ("Picture".to_string(), vec!["Loading the full image…".to_string()]),
             Content::Info(info) => {
-                let contents = (info.mime == mime::FOLDER).then(|| folder_contents(info.folder));
+                let contents = (info.mime == mime::FOLDER).then(|| match info.folder {
+                    Some(t) if t.done => folder_contents(Some(t)).replace("  ·  ", ", "),
+                    _ => "Counting…".to_string(),
+                });
                 let now = gannet_core::time::now();
                 (info.description.clone(), [contents, info.size.map(format::size), info.modified.map(|m| format!("Modified {}", format::date(m, now)))].into_iter().flatten().collect())
             }
@@ -1970,7 +1976,7 @@ impl App {
                 (kind, vec![format!("{}, {} long", if s.paused { "paused" } else { "playing" }, clock(s.duration))])
             }
             Content::Doc { info, .. } => (info.description.clone(), foot_parts(p, None, None).into_iter().skip(1).collect()),
-            Content::Pdf(pdf) => (pdf.info.description.clone(), foot_parts(p, None, self.pdf_page_shown()).into_iter().skip(1).collect()),
+            Content::Pdf(pdf) => (pdf.info.description.clone(), [pdf.info.size.map(format::size), Some(format::count(pdf.pages.len(), "page", "pages"))].into_iter().flatten().collect()),
             Content::Message(m) => (String::new(), vec![m.clone()]),
         };
         // Something going wrong is said where the footer would be.
@@ -1981,6 +1987,7 @@ impl App {
     }
 }
 
+/// A file's name as it's shown, or its whole path if it has none.
 fn display_name(path: &Path) -> String {
     path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned())
 }

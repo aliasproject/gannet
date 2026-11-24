@@ -617,8 +617,11 @@ impl App {
             None => out.push(Node::new(a11y::CHOOSER_INFO, Role::Label, self.chooser_info(), self.layout().status, FRAME)),
         }
         if !c.labels.is_empty() {
-            let items: Vec<Node> = c.labels.iter().enumerate().map(|(i, &label)| Node::new(a11y::CHOOSER_TYPE0 + i as u64, Role::ListItem, label, Rect::default(), a11y::CHOOSER_TYPES).selected(c.filter == Some(i)).showing(false)).collect();
-            out.push(Node::new(a11y::CHOOSER_TYPES, Role::List, "File type", types.unwrap_or_default(), FRAME).with_children(items.iter().map(|n| n.id).collect()));
+            // The list is drawn as one button showing the type picked, so each type is placed
+            // there, and counts as showing: a screen reader leaves out what isn't.
+            let r = types.unwrap_or_default();
+            let items: Vec<Node> = c.labels.iter().enumerate().map(|(i, &label)| Node::new(a11y::CHOOSER_TYPE0 + i as u64, Role::ListItem, label, r, a11y::CHOOSER_TYPES).selected(c.filter == Some(i))).collect();
+            out.push(Node::new(a11y::CHOOSER_TYPES, Role::List, "File type", r, FRAME).with_children(items.iter().map(|n| n.id).collect()));
             out.extend(items);
         }
         out.push(Node::new(a11y::CHOOSER_CANCEL, Role::PushButton, "Cancel", cancel, FRAME).doing(a11y::click("Close without choosing", "Escape")));
@@ -641,9 +644,12 @@ impl App {
                 }
             }
             a11y::Act::Focus(id) if id >= a11y::CHOOSER_TYPE0 && id < a11y::CHOOSER_TYPE0 + self.chooser.as_ref().map_or(0, |c| c.labels.len() as u64) => self.choose_filter((id - a11y::CHOOSER_TYPE0) as usize),
-            // A row moved to takes the keyboard back to the list, as a click on it does.
-            a11y::Act::FocusRow(..) | a11y::Act::SelectRow(..) => {
-                self.chooser_clicked_list(None);
+            // A row moved to takes the keyboard back to the list, as a click on it does; not a
+            // late request about the folder just left, which is dropped.
+            a11y::Act::FocusRow(ref dir, _) | a11y::Act::SelectRow(ref dir, ..) => {
+                if **dir == self.dir {
+                    self.chooser_clicked_list(None);
+                }
                 return false;
             }
             _ => return false,

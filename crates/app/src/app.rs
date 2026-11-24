@@ -9634,6 +9634,7 @@ mod tests {
         let types = parts.iter().find(|n| n.id == CHOOSER_TYPES).expect("the file types");
         assert_eq!(types.children, [CHOOSER_TYPE0, CHOOSER_TYPE0 + 1]);
         assert!(parts.iter().any(|n| n.id == CHOOSER_TYPE0 && n.selected));
+        assert!(parts.iter().filter(|n| n.parent == CHOOSER_TYPES).all(|n| n.showing && n.rect == types.rect), "the types count as showing, or a screen reader leaves them out");
         // Picking a file type shows its files.
         r.app.on_msg(Msg::A11y(Act::Focus(CHOOSER_TYPE0 + 1)));
         r.pump_until("every file", |a| a.rows.len() == 2);
@@ -9644,6 +9645,9 @@ mod tests {
         assert!(!r.app.a11y_name_has_keyboard() && r.app.cursor_shown);
         r.app.on_msg(Msg::A11y(Act::Focus(CHOOSER_SAVE_NAME)));
         assert!(r.app.a11y_name_has_keyboard());
+        // A late request about a folder the dialog has left doesn't take the keyboard from the name.
+        r.app.on_msg(Msg::A11y(Act::FocusRow(Arc::new(r.work().join("gone")), b"b.png".to_vec())));
+        assert!(r.app.a11y_name_has_keyboard(), "a request about another folder took the keyboard");
         r.app.on_msg(Msg::A11y(Act::Press(CHOOSER_CANCEL)));
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::Quit)) && r.app.chooser.as_ref().unwrap().picked.is_none(), "cancelled");
     }

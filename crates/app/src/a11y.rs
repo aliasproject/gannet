@@ -32,7 +32,7 @@ pub const CHOOSER_CANCEL: u64 = 21;
 pub const CHOOSER_SAVE_NAME: u64 = 22;
 pub const CHOOSER_INFO: u64 = 23;
 pub const CHOOSER_TYPES: u64 = 24;
-pub const CHOOSER_TYPE0: u64 = 40;
+pub const CHOOSER_TYPE0: u64 = 1 << 16;
 // The preview window.
 pub const PREVIEW: u64 = 50;
 pub const PREVIEW_NAME: u64 = 51;
