@@ -227,6 +227,8 @@ mod tests {
         assert_eq!((f.caret, f.anchor, f.selection()), (1, 6, (1, 6)));
         f.replace_chars(1, 1, "z\n");
         assert_eq!(f.text, "azé日b", "inserting at a point leaves the rest, and control characters out");
+        f.replace_chars(0, usize::MAX, "all");
+        assert_eq!((f.text.as_str(), f.caret), ("all", 3), "past the end means to the end");
     }
 
     #[test]

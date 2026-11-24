@@ -845,7 +845,8 @@ impl Ctx {
         match m {
             "SetTextContents" => {
                 let text: String = body.deserialize().unwrap_or_default();
-                self.reply(h, &(self.edit_text(n, snap, TextEdit::Replace(0, len, text)),))
+                // To the end of the text as it is then, whatever's been typed since this snapshot.
+                self.reply(h, &(self.edit_text(n, snap, TextEdit::Replace(0, usize::MAX, text)),))
             }
             "InsertText" => {
                 let (i, mut text, bytes): (i32, String, i32) = body.deserialize().unwrap_or_default();
@@ -929,7 +930,11 @@ impl Ctx {
                 self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-description", 0), Variant::from(n.description.clone()));
             }
             if let (Some(of), Some(nf)) = (&o.field, &n.field) {
-                self.emit_text_changes(&path, of, nf);
+                // Only within one field: a rename finished and another started in between is a
+                // new field under the same id, not an edit of the last.
+                if old.edit_gen == new.edit_gen {
+                    self.emit_text_changes(&path, of, nf);
+                }
             }
             if o.enabled != n.enabled {
                 state(&path, "enabled", n.enabled);
