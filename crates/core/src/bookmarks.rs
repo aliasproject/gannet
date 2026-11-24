@@ -1,7 +1,9 @@
 //! Folders pinned to the sidebar. They live in GTK's bookmarks file, one URI per line with an
 //! optional label after a space, so Nautilus and GTK's Open and Save dialogs share them. The
 //! line order is the pin order. Gannet shows only local folders, and every other line, such as
-//! an `sftp://` bookmark, stays exactly as it was when the file is written again.
+//! an `sftp://` bookmark, stays exactly as it was when the file is written again. The one
+//! exception is a folder named on more than one line: moving or unpinning it takes all of them,
+//! as only the first one counts.
 
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -40,19 +42,22 @@ pub enum Spot {
 
 /// The local folder a line names, if it names one, with any trailing `/` gone.
 fn line_path(line: &[u8]) -> Option<PathBuf> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
     let uri = line.split(|&b| b == b' ').next()?;
     let path = from_file_uri(std::str::from_utf8(uri).ok()?)?;
     path.is_absolute().then(|| path.components().collect())
 }
 
 fn line_label(line: &[u8]) -> Option<String> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
     let at = line.iter().position(|&b| b == b' ')?;
     let label = String::from_utf8_lossy(&line[at + 1..]).trim().to_string();
     (!label.is_empty()).then_some(label)
 }
 
 fn lines(text: &[u8]) -> Vec<&[u8]> {
-    let mut out: Vec<&[u8]> = text.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l)).collect();
+    // A line keeps a `\r` it ends in, so a file written with CRLF stays that way.
+    let mut out: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
     // The newline that ends the file doesn't start another line.
     if out.last().is_some_and(|l| l.is_empty()) {
         out.pop();
@@ -252,6 +257,13 @@ mod tests {
         let out = with_added(b"file:///a\nsmb://host/share", &["/b".into()], &Spot::End).unwrap();
         assert_eq!(out, b"file:///a\nfile:///b\nsmb://host/share\n");
         assert_eq!(with_added(b"", &["/b".into(), "/c".into()], &Spot::End).unwrap(), b"file:///b\nfile:///c\n");
+    }
+
+    #[test]
+    fn crlf_lines_stay_crlf() {
+        let out = with_added(b"file:///a\r\nsftp://h/x Server\r\n", &["/b".into()], &Spot::Before("/a".into())).unwrap();
+        assert_eq!(out, b"file:///b\nfile:///a\r\nsftp://h/x Server\r\n");
+        assert_eq!(parse(&out), [Pin { path: "/b".into(), label: None }, Pin { path: "/a".into(), label: None }]);
     }
 
     #[test]

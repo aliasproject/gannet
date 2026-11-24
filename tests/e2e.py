@@ -3483,6 +3483,8 @@ def folders_pin_to_the_sidebar_by_dragging_and_reorder_there(h):
     shutil.rmtree(SCRATCH / "client/config/gtk-3.0", ignore_errors=True)
     a = App(h, fs / "work")
     a.wait(lambda s: s["count"] == 3)
+    # After a check with two windows, this one has to take the whole screen first.
+    time.sleep(0.3)
     # A remote bookmark another app wrote, which Gannet doesn't show and has to keep.
     conf = bookmarks_file(a)
     conf.parent.mkdir(parents=True, exist_ok=True)

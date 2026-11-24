@@ -2432,6 +2432,12 @@ impl App {
             }
             _ => {}
         }
+        // The row under the pointer can be another place now.
+        let (x, y) = self.pointer;
+        if x >= 0 {
+            let h = self.hit(x, y);
+            self.set_hover(h);
+        }
         self.invalidate_all();
     }
 
@@ -4401,11 +4407,14 @@ impl App {
                 return;
             }
             let hub = self.hub.clone();
-            let _ = std::thread::Builder::new().name("gannet-pin".into()).spawn(move || {
+            let started = std::thread::Builder::new().name("gannet-pin".into()).spawn(move || {
                 let total = d.paths.len();
                 let folders: Vec<PathBuf> = d.paths.into_iter().filter(|p| p.is_dir()).collect();
                 hub.send(Msg::PinDropped { not_folders: total - folders.len(), folders, at });
             });
+            if let Err(e) = started {
+                self.notice(format!("Couldn't pin those folders: {e}"));
+            }
             return;
         }
         match d.saved {
