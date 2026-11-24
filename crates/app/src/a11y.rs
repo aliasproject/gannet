@@ -295,6 +295,9 @@ pub struct Modal {
     pub id: u64,
     /// The button Enter presses.
     pub default: Option<u64>,
+    /// When a paste's clash was asked: the next clash can ask the same, and is still a new
+    /// question.
+    pub asked: Option<std::time::Instant>,
 }
 
 impl Snapshot {
@@ -305,8 +308,13 @@ impl Snapshot {
     /// Whether a part is behind the menu or dialog that's open, so it can't be used. What's in
     /// the menu or dialog isn't, nor is the window around it.
     pub fn behind(&self, id: u64) -> bool {
+        self.behind_in(id, |at| self.get(at))
+    }
+
+    /// The same, finding parts through `get`, which can be quicker than `Snapshot::get`.
+    pub fn behind_in<'a>(&'a self, id: u64, get: impl Fn(u64) -> Option<&'a Node>) -> bool {
         let Some(m) = self.modal else { return false };
-        let up = |from: u64| std::iter::successors(Some(from), |&at| self.get(at).map(|n| n.parent).filter(|&p| p != 0));
+        let up = |from: u64| std::iter::successors(Some(from), |&at| get(at).map(|n| n.parent).filter(|&p| p != 0));
         !(up(id).any(|at| at == m.id) || up(m.id).any(|at| at == id))
     }
 
@@ -324,7 +332,8 @@ pub enum Act {
     /// picks it, as moving to it does with the keyboard.
     Focus(u64),
     /// Press a menu's item or a dialog's button, by its id, if it's still called that: the menu
-    /// or dialog can have closed, and another opened in its place.
+    /// or dialog can have closed, and another opened in its place. One with the same buttons,
+    /// like the next clash, takes no answer for a moment after it's asked, as with a key.
     Choose(u64, String),
     /// Open a place in the sidebar.
     OpenPlace(usize),
@@ -527,7 +536,7 @@ fn menu(app: &App) -> Option<(Vec<Node>, Modal, u64)> {
     let picked = m.items.get(m.at).filter(|i| i.enabled).map_or(MENU, |_| MENU_ITEM0 + m.at as u64);
     let mut parts = vec![Node::new(MENU, Role::Menu, "", r, FRAME).with_children(items.iter().map(|n| n.id).collect())];
     parts.extend(items);
-    Some((parts, Modal { id: MENU, default: None }, picked))
+    Some((parts, Modal { id: MENU, default: None, asked: None }, picked))
 }
 
 /// The dialog open, if one is: its parts, the dialog first, and the part with the keyboard.
@@ -541,11 +550,13 @@ fn dialog(app: &mut App) -> Option<(Vec<Node>, Modal, u64)> {
     let (title, message) = app.dialog_text(&d);
     let rects = app.dialog_button_rects(&d);
     let default = DIALOG_BUTTON0 + App::dialog_default(&d) as u64;
+    // A clash just asked takes no answer for a moment, as with the keyboard and the pointer.
+    let guarded = app.dialog_guarded();
     let mut parts = Vec::new();
     let mut has = default;
     match &d {
         Dialog::Conflict { apply_to_all, .. } => {
-            let mut check = Node::new(DIALOG_CHECK, Role::CheckBox, "Do the same for the rest", app.dialog_check_rect(), DIALOG).doing(Action::new("toggle", "Answer the rest the same way", "a"));
+            let mut check = Node::new(DIALOG_CHECK, Role::CheckBox, "Do the same for the rest", app.dialog_check_rect(), DIALOG).enabled(!guarded).doing(Action::new("toggle", "Answer the rest the same way", "a"));
             check.checked = Some(*apply_to_all);
             parts.push(check);
         }
@@ -586,15 +597,16 @@ fn dialog(app: &mut App) -> Option<(Vec<Node>, Modal, u64)> {
     }
     for (i, (b, rect)) in App::dialog_buttons(&d).iter().zip(rects).enumerate() {
         // The rename dialog's Rename waits until something changes and nothing clashes.
-        let can = !matches!(&d, Dialog::RenameMany(rm) if i == 0 && !rm.can_rename());
+        let can = !guarded && !matches!(&d, Dialog::RenameMany(rm) if i == 0 && !rm.can_rename());
         let keys = if b.key == "Esc" { "Escape" } else { b.key };
         parts.push(Node::new(DIALOG_BUTTON0 + i as u64, Role::PushButton, b.label, rect, DIALOG).enabled(can).doing(click("Press it", keys)));
     }
     let role = if matches!(d, Dialog::Unlock { .. } | Dialog::RenameMany(_)) { Role::Dialog } else { Role::Alert };
     let kids = parts.iter().filter(|n| n.parent == DIALOG).map(|n| n.id).collect();
     parts.insert(0, Node::new(DIALOG, role, title, r, FRAME).described(message).with_children(kids));
+    let asked = matches!(d, Dialog::Conflict { .. }).then(|| app.dialog_asked()).flatten();
     app.dialog = Some(d);
-    Some((parts, Modal { id: DIALOG, default: Some(default) }, has))
+    Some((parts, Modal { id: DIALOG, default: Some(default), asked }, has))
 }
 
 #[cfg(test)]
@@ -623,7 +635,7 @@ mod tests {
         let fixed = vec![n(FRAME, 0).with_children(vec![BACK, DIALOG]), n(BACK, FRAME), n(DIALOG, FRAME).with_children(vec![DIALOG_BUTTON0]), n(DIALOG_BUTTON0, DIALOG)];
         let mut s = Snapshot { fixed, rows: rows(3, 0.0), focus: Focus::Node(BACK), window_focused: true, dir: Arc::default(), modal: None };
         assert!(!s.behind(BACK) && !s.rows_behind(), "nothing's open");
-        s.modal = Some(Modal { id: DIALOG, default: Some(DIALOG_BUTTON0) });
+        s.modal = Some(Modal { id: DIALOG, default: Some(DIALOG_BUTTON0), asked: None });
         assert!(s.behind(BACK) && s.rows_behind());
         assert!(!s.behind(DIALOG) && !s.behind(DIALOG_BUTTON0), "the dialog and what's in it");
         assert!(!s.behind(FRAME), "nor the window around it");

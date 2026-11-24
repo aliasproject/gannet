@@ -1056,7 +1056,9 @@ impl App {
         // A running job that hasn't shown yet needs one wake-up, when it's due to.
         let job = self.jobs.iter().map(|j| j.started + JOB_SHOW_AFTER).filter(|&t| t > Instant::now()).min();
         let band = if let Some(FileDrag::Band(b)) = &self.file_drag { b.scroll_at } else { None };
-        [self.reload_at, self.hold_paint, job, self.preview_deadline(), band, self.side_scroll_at].into_iter().flatten().min()
+        // A clash's buttons can be used once it has been up a moment, and a screen reader is told.
+        let guard = self.dialog_guard.map(|t| t + DIALOG_GUARD).filter(|&t| t > Instant::now() && self.dialog.is_some());
+        [self.reload_at, self.hold_paint, job, self.preview_deadline(), band, self.side_scroll_at, guard].into_iter().flatten().min()
     }
 
     fn on_loaded(&mut self, l: Loaded) {
@@ -2483,8 +2485,13 @@ impl App {
         self.dialog_guard = Some(Instant::now());
     }
 
-    fn dialog_guarded(&self) -> bool {
+    pub(crate) fn dialog_guarded(&self) -> bool {
         self.dialog_guard.is_some_and(|t| t.elapsed() < DIALOG_GUARD)
+    }
+
+    /// When the last clash was asked.
+    pub(crate) fn dialog_asked(&self) -> Option<Instant> {
+        self.dialog_guard
     }
 
     fn press_dialog_button(&mut self, i: usize) {
@@ -9803,6 +9810,31 @@ mod tests {
         r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0, "Rename".into())));
         r.idle();
         assert!(r.app.dialog.is_none() && r.work().join("a.jpeg").exists());
+    }
+
+    #[test]
+    fn a_clash_just_asked_cant_be_answered_by_a_screen_reader_either() {
+        use crate::a11y::{Act, DIALOG_BUTTON0, DIALOG_CHECK};
+        let mut r = Rig::new("a11y-clash");
+        let (reply, answers) = std::sync::mpsc::sync_channel(2);
+        let clash = |reply| gannet_core::ops::Conflict { job: 1, source: "/a/b.txt".into(), target: "/w/b.txt".into(), both_folders: false, can_replace: true, reply };
+        r.app.show_conflict(clash(reply.clone()));
+        let s = snapshot(&mut r);
+        let asked = s.modal.and_then(|m| m.asked);
+        assert!(asked.is_some(), "a clash says when it was asked");
+        assert!(!s.get(DIALOG_BUTTON0 + 1).unwrap().enabled && !s.get(DIALOG_CHECK).unwrap().enabled, "Skip and the box wait a moment, as with the keyboard");
+        assert!(r.app.next_deadline().is_some(), "and the window wakes when they can be used");
+        r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0 + 1, "Skip".into())));
+        assert!(answers.try_recv().is_err() && r.app.dialog.is_some());
+        r.app.dialog_guard = Some(Instant::now() - DIALOG_GUARD);
+        let s = snapshot(&mut r);
+        assert!(s.get(DIALOG_BUTTON0 + 1).unwrap().enabled && s.get(DIALOG_CHECK).unwrap().enabled);
+        // The next clash about the same name is still a new question.
+        r.app.pending_conflicts.push(clash(reply));
+        r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0 + 1, "Skip".into())));
+        assert!(matches!(answers.try_recv(), Ok(Answer { choice: Choice::Skip, .. })));
+        let s = snapshot(&mut r);
+        assert!(s.modal.and_then(|m| m.asked).is_some_and(|t| Some(t) != asked), "asked again");
     }
 
     #[test]

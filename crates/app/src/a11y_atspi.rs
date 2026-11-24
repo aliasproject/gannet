@@ -421,7 +421,10 @@ impl Ctx {
                 }
                 match n.role {
                     Role::Frame | Role::Dialog if snap.window_focused => on.push(STATE_ACTIVE),
+                    // The rename dialog's names can only be read.
+                    Role::ListItem if n.parent == a11y::RENAME_NAMES => {}
                     Role::ListItem => on.extend([STATE_SELECTABLE, STATE_FOCUSABLE]),
+                    Role::Menu => on.push(STATE_FOCUSABLE),
                     Role::PushButton => on.push(STATE_FOCUSABLE),
                     Role::CheckBox => on.extend([STATE_FOCUSABLE, STATE_CHECKABLE]),
                     Role::Entry => on.extend([STATE_FOCUSABLE, STATE_EDITABLE, STATE_SINGLE_LINE]),
@@ -719,8 +722,11 @@ impl Ctx {
         }
 
         // The fixed parts: names, whether they can be used, and the sidebar's places.
+        // The rename dialog has a part for each name, so parts are looked up by id.
+        let olds: HashMap<u64, &Node> = old.fixed.iter().map(|n| (n.id, n)).collect();
+        let news: HashMap<u64, &Node> = new.fixed.iter().map(|n| (n.id, n)).collect();
         for n in &new.fixed {
-            let Some(o) = old.get(n.id) else { continue };
+            let Some(o) = olds.get(&n.id).copied() else { continue };
             let path = fixed_path(n.id);
             if o.name != n.name {
                 self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-name", 0), Variant::from(n.name.clone()));
@@ -732,7 +738,7 @@ impl Ctx {
                 state(&path, "checked", n.checked == Some(true));
             }
             // Whether it can be used: a menu or dialog opening over it, or closing, changes that.
-            let (was, is) = (o.enabled && !old.behind(n.id), n.enabled && !new.behind(n.id));
+            let (was, is) = (o.enabled && !old.behind_in(n.id, |id| olds.get(&id).copied()), n.enabled && !new.behind_in(n.id, |id| news.get(&id).copied()));
             if was != is {
                 state(&path, "enabled", is);
                 state(&path, "sensitive", is);
@@ -751,7 +757,7 @@ impl Ctx {
         // Parts coming and going: places, and the Open With window's apps as a search narrows
         // them.
         for n in &new.fixed {
-            let Some(o) = old.get(n.id).filter(|o| o.children != n.children) else { continue };
+            let Some(o) = olds.get(&n.id).copied().filter(|o| o.children != n.children) else { continue };
             let path = fixed_path(n.id);
             for (i, id) in o.children.iter().enumerate().rev().filter(|(_, id)| !n.children.contains(id)) {
                 self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
@@ -837,8 +843,10 @@ impl Ctx {
     fn emit_dialog(&self, old: &Snapshot, new: &Snapshot) {
         let Some(d) = new.get(a11y::DIALOG) else { return };
         let frame = fixed_path(a11y::FRAME);
+        // The next clash can ask the same as the last, with the keyboard on the same button.
+        let asked = |s: &Snapshot| s.modal.and_then(|m| m.asked);
         match old.get(a11y::DIALOG) {
-            Some(o) if o.name == d.name => {
+            Some(o) if o.name == d.name && asked(old) == asked(new) => {
                 if o.description != d.description && new.get(a11y::PASSPHRASE).is_some() {
                     self.event(&frame, OBJECT_EVENT, "Announcement", ("", ASSERTIVE), Variant::from(d.description.clone()));
                 }
@@ -851,6 +859,12 @@ impl Ctx {
                 };
                 // Polite, so it follows what's said of the part with the keyboard.
                 self.event(&frame, OBJECT_EVENT, "Announcement", ("", POLITE), Variant::from(said));
+                if old.focus == new.focus
+                    && let a11y::Focus::Node(id) = new.focus
+                    && new.window_focused
+                {
+                    self.event(&fixed_path(id), OBJECT_EVENT, "StateChanged", ("focused", 1), Variant::from(0i32));
+                }
             }
         }
     }
