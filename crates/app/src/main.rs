@@ -984,12 +984,15 @@ mod bench {
         };
         let doc = match (&p.content, &p.doc_layout) {
             (Content::Doc { doc, .. }, layout) => format!(
-                "{{\"blocks\":{},\"cut\":{},\"lines\":{},\"scroll\":{:.0},\"height\":{},\"text\":{}}}",
+                "{{\"blocks\":{},\"cut\":{},\"lines\":{},\"scroll\":{:.0},\"height\":{},\"width\":{},\"table_lines\":{},\"table_right\":{},\"text\":{}}}",
                 doc.blocks.len(),
                 doc.cut,
                 layout.as_ref().map_or(0, |l| l.lines.len()),
                 p.scroll,
                 layout.as_ref().map_or(0, |l| l.height),
+                layout.as_ref().map_or(0, |l| l.width),
+                layout.as_ref().map_or(0, |l| l.lines.iter().filter(|l| matches!(l.mark, crate::docview::Mark::Table { .. })).count()),
+                layout.as_ref().and_then(|l| l.lines.iter().find_map(|l| match l.mark { crate::docview::Mark::Table { right, .. } => Some(right), _ => None })).unwrap_or(0),
                 esc(&doc.blocks.iter().take(3).flat_map(|b| b.spans.iter().map(|s| s.text.as_str())).collect::<String>().chars().take(200).collect::<String>()),
             ),
             _ => "null".to_string(),
