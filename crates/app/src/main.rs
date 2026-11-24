@@ -14,6 +14,7 @@ mod media;
 mod openwith;
 mod paint;
 mod portal;
+mod rename_many;
 mod preview;
 mod preview_window;
 mod service;
@@ -101,6 +102,10 @@ fn start_location(arg: Option<OsString>, home: &Path) -> PathBuf {
 fn main() {
     // Folder names aren't always valid UTF-8, so neither are arguments.
     let arg = std::env::args_os().nth(1);
+    // `gannet list`, `info`, `trash` and `restore`: no window, no display and no D-Bus.
+    if let Some(verb) = arg.as_deref().filter(|a| gannet_core::cli::is_verb(a)).and_then(|a| a.to_str()) {
+        std::process::exit(run_command(verb));
+    }
     if let Some(a) = arg.as_deref().and_then(|a| a.to_str()) {
         if a == decode::ARG {
             decode::helper_main(std::env::args().nth(2).as_deref());
@@ -135,7 +140,7 @@ fn main() {
             service::claim_main(a == service::RELEASE_ARG);
         }
         if a == "--help" || a == "-h" {
-            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}", preview_window::USAGE, chooser::USAGE, openwith::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG);
+            println!("usage: gannet [FOLDER or FILE]\n       gannet --select PATH...\n       {}\n       {}\n       {}\n       gannet {} | {}\n       gannet {}\n       gannet {}\n       {}\n\nA folder named like a command opens as ./NAME. `gannet COMMAND --help` says more.", preview_window::USAGE, chooser::USAGE, openwith::USAGE, service::CLAIM_ARG, service::RELEASE_ARG, service::ARG, portal::ARG, gannet_core::cli::USAGE);
             return;
         }
         if a == "--version" {
@@ -231,6 +236,7 @@ fn main() {
     let dir_watch = Watch::new().ok().map(Arc::new);
     app.watch = dir_watch.clone();
     app.cache_home = Some(d.cache.clone());
+    app.terminal = gannet_core::terminal::Terminal::find(std::env::var_os("PATH").as_deref(), std::env::var_os("XDG_RUNTIME_DIR").as_deref().map(Path::new));
     app.kinds = Arc::new(preview::Kinds::new(d.mime.clone(), language()).with_thumbnailers(d.thumbnailers.clone()));
     let mut theme_watch = ThemeWatch::new(theme_paths.clone()).ok();
     let mut theme_due: Option<Instant> = None;
@@ -455,6 +461,28 @@ fn main() {
             theme_due = Some(Instant::now() + std::time::Duration::from_millis(15));
         }
     }
+}
+
+/// Runs one of the commands for scripts. Returns the exit code.
+fn run_command(verb: &str) -> i32 {
+    // Guessing would aim relative paths somewhere else, and `trash` would move the wrong thing.
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("gannet {verb}: can't tell what the current folder is: {}", gannet_core::listing::describe(&e));
+            return 1;
+        }
+    };
+    let d = dirs();
+    let mut env = gannet_core::cli::Env {
+        cwd,
+        trash: TrashConfig::new(&d.data, rustix::process::geteuid().as_raw()),
+        mounts: read_mounts(),
+        sorts: gannet_core::folder_sorts::FolderSorts::new(d.state.join("gannet/sorts"), gannet_core::places::newest_first_dirs(&d.home, &d.config)),
+        disks_give_up: gannet_core::listing::DISKS_GIVE_UP,
+    };
+    let args: Vec<OsString> = std::env::args_os().skip(2).collect();
+    gannet_core::cli::run(&mut env, verb, &args, &mut std::io::stdout().lock(), &mut std::io::stderr().lock())
 }
 
 /// A read reports `WouldBlock` when it had nothing to dispatch, which is ordinary: all that arrived
@@ -776,6 +804,8 @@ mod bench {
                 Some(crate::app::Dialog::Unlock { waiting: true, .. }) => "unlock-waiting",
                 Some(crate::app::Dialog::Unlock { error: Some(_), .. }) => "unlock-again",
                 Some(crate::app::Dialog::Unlock { .. }) => "unlock",
+                Some(crate::app::Dialog::RenameMany(d)) if !d.can_rename() => "rename-many-blocked",
+                Some(crate::app::Dialog::RenameMany(_)) => "rename-many",
             }),
             a.undo.len(),
             a.redo.len(),

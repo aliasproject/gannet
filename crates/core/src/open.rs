@@ -17,6 +17,12 @@ pub fn spawn_detached(cmd: &mut Command, on_fail: impl FnOnce(String) + Send + '
     run_detached(cmd, true, on_fail);
 }
 
+/// As `spawn_detached`, with a failure said as how the program ended, not as `xdg-open`'s.
+pub fn spawn_program(cmd: &mut Command, on_fail: impl FnOnce(String) + Send + 'static) {
+    cmd.stderr(Stdio::null());
+    run_detached(cmd, false, on_fail);
+}
+
 /// As `spawn_detached`, but the program's errors go where ours do, such as a service's
 /// journal, so a failure there can be found.
 pub fn spawn_detached_logged(cmd: &mut Command, on_fail: impl FnOnce(String) + Send + 'static) {

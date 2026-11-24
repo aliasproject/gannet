@@ -28,6 +28,7 @@ use crate::canvas::Rect;
 use crate::field::Field;
 use crate::icons::Icons;
 use crate::preview::{self, Preview};
+use crate::rename_many::{Focus, RenameMany};
 use crate::text::Text;
 use crate::wl::{Cursor, Input, Mods};
 
@@ -205,6 +206,18 @@ pub enum Dialog {
     /// The passphrase for an encrypted drive. `error` says why the last one didn't work, and
     /// `waiting` is set while udisks2 tries it.
     Unlock { volume: Volume, field: Field, at: usize, error: Option<String>, waiting: bool },
+    /// Renaming the items selected, each old name beside its new one.
+    RenameMany(Box<RenameMany>),
+}
+
+/// Where the rename dialog's parts are. See [`App::rename_layout`].
+pub struct RenameLayout {
+    pub find: Rect,
+    pub replace: Rect,
+    pub headings: Rect,
+    pub list: Rect,
+    pub summary: Rect,
+    pub row_h: i32,
 }
 
 /// One dialog button: its label and the key that presses it.
@@ -237,6 +250,8 @@ pub enum Hit {
     JobCancel(usize),
     DialogButton(usize),
     DialogCheck,
+    /// One of the rename dialog's fields: Find or Replace.
+    DialogField(Focus),
     PreviewBody,
     /// A chooser's bar: its name field, file-type list and buttons.
     ChooserName,
@@ -407,6 +422,8 @@ pub enum Action {
     SetBackground,
     /// Unpacks the archives selected, each into a folder beside it.
     Extract,
+    /// Opens the person's terminal in the folder selected, or the one on screen.
+    OpenTerminal,
     /// For the drive whose menu it is.
     OpenDrive,
     Unmount,
@@ -506,6 +523,8 @@ pub struct App {
     pub session_bus: Option<String>,
     /// Whether the desktop portal can set the background, which "Set as background" needs.
     pub can_set_background: bool,
+    /// How to open a terminal, where `xdg-terminal-exec` is installed.
+    pub terminal: Option<gannet_core::terminal::Terminal>,
     /// The drives udisks2 reported last.
     pub volumes: Vec<Volume>,
     /// The drive a sidebar menu is open for.
@@ -662,6 +681,7 @@ impl App {
             system_bus: None,
             session_bus: None,
             can_set_background: false,
+            terminal: None,
             volumes: Vec::new(),
             drive_menu: None,
             eject_pressed: None,
@@ -1240,6 +1260,9 @@ impl App {
                 if let Some(f) = self.field_mut() {
                     f.insert(&line);
                     self.apply_filter_field();
+                    if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
+                        d.update();
+                    }
                     self.invalidate_all();
                 }
             }
@@ -1255,6 +1278,11 @@ impl App {
     fn field_mut(&mut self) -> Option<&mut Field> {
         match &mut self.edit {
             Edit::Path(f) | Edit::Filter(f) | Edit::NewFolder(f) | Edit::Rename { field: f, .. } => Some(f),
+            // The rename dialog's field with the keyboard.
+            Edit::None if matches!(self.dialog, Some(Dialog::RenameMany(_))) => match &mut self.dialog {
+                Some(Dialog::RenameMany(d)) => d.field_mut(),
+                _ => None,
+            },
             // A chooser's name field, when it has the keyboard.
             Edit::None => self.chooser.as_mut().filter(|c| c.name_focused).map(|c| &mut c.name),
         }
@@ -1510,6 +1538,7 @@ impl App {
             Action::ChooseFilter(i) => self.choose_filter(i),
             Action::ShowInFolder => self.show_in_folder(),
             Action::SetBackground => self.set_background(),
+            Action::OpenTerminal => self.open_terminal(),
             Action::Extract => {
                 if let Some(archives) = self.selected_archives() {
                     self.extract(archives);
@@ -1827,8 +1856,17 @@ impl App {
         let Some(l) = self.listing.clone() else { return };
         let ids = self.selected_ids();
         let [id] = ids.as_slice() else {
-            if ids.len() > 1 {
+            // An Open or Save dialog renames one item at a time, as its menu says.
+            if ids.len() > 1 && self.chooser.is_some() {
                 self.notice("Select one item to rename it".into());
+            } else if ids.len() > 1 {
+                // In the order they're listed, which is the order a running number counts in.
+                let items = ids.iter().map(|&i| (l.path(i), l.name(i).to_vec(), l.kind(i).is_dirlike())).collect();
+                let taken = (0..l.len() as u32).map(|i| l.name(i).to_vec()).collect();
+                self.set_edit(Edit::None);
+                self.edit_gen += 1;
+                self.dialog = Some(Dialog::RenameMany(Box::new(RenameMany::new(items, taken))));
+                self.invalidate_all();
             }
             return;
         };
@@ -1963,6 +2001,7 @@ impl App {
             // No letter: replacing loses what's there, so it takes a deliberate choice.
             Dialog::ConfirmReplace { .. } => vec![b("Replace", "", true), b("Cancel", "Esc", false)],
             Dialog::Unlock { .. } => vec![b("Unlock", "", false), b("Cancel", "Esc", false)],
+            Dialog::RenameMany(_) => vec![b("Rename", "", false), b("Cancel", "Esc", false)],
         }
     }
 
@@ -2026,6 +2065,17 @@ impl App {
                     self.chooser_done(paths);
                 }
             }
+            Dialog::RenameMany(d) => {
+                if label == "Rename" {
+                    // The line under the names says what's stopping it.
+                    if !d.can_rename() {
+                        self.dialog = Some(Dialog::RenameMany(d));
+                        self.invalidate_all();
+                        return;
+                    }
+                    self.start_job(Request::RenameMany { renames: d.renames() });
+                }
+            }
             Dialog::ConfirmQuit { .. } => {
                 if label != "Keep working" {
                     self.jobs.iter().for_each(|j| j.job.cancel());
@@ -2044,9 +2094,55 @@ impl App {
         self.invalidate_all();
     }
 
-    fn dialog_key(&mut self, sym: u32, utf8: &str) {
+    /// Keys in the rename dialog. Typing goes to Find or Replace, whichever has the keyboard, and
+    /// Enter renames from either. Tab goes round the fields and buttons, and Up, Down, Page Up and
+    /// Page Down scroll the names.
+    fn rename_dialog_key(&mut self, sym: u32, utf8: &str, m: Mods) {
+        let shown = self.rename_rows_shown();
+        let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() else { return };
+        let page = shown.saturating_sub(1).max(1);
+        match sym {
+            k::KEY_Escape => return self.press_dialog_button(1),
+            k::KEY_Return | k::KEY_KP_Enter => {
+                let i = if let Focus::Button(i) = d.focus { i } else { 0 };
+                return self.press_dialog_button(i);
+            }
+            k::KEY_Tab | k::KEY_ISO_Left_Tab => d.tab(m.shift || sym == k::KEY_ISO_Left_Tab, 2),
+            k::KEY_Up => d.scroll = d.scroll.saturating_sub(1),
+            k::KEY_Down => d.scroll += 1,
+            k::KEY_Page_Up => d.scroll = d.scroll.saturating_sub(page),
+            k::KEY_Page_Down => d.scroll += page,
+            k::KEY_Left | k::KEY_Right if matches!(d.focus, Focus::Button(_)) => d.focus = Focus::Button(usize::from(sym == k::KEY_Right)),
+            k::KEY_v if m.ctrl && d.field_mut().is_some() => {
+                self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: self.edit_gen }));
+                return;
+            }
+            _ => {
+                let Some(f) = d.field_mut() else { return };
+                match sym {
+                    k::KEY_Left => f.left(m.ctrl, m.shift),
+                    k::KEY_Right => f.right(m.ctrl, m.shift),
+                    k::KEY_Home => f.move_to(0, m.shift),
+                    k::KEY_End => f.move_to(f.text.len(), m.shift),
+                    k::KEY_BackSpace => f.backspace(m.ctrl),
+                    k::KEY_Delete => f.delete(m.ctrl),
+                    k::KEY_a if m.ctrl => f.select_all(),
+                    _ if !m.ctrl && !m.alt && !m.logo && !utf8.is_empty() && !utf8.chars().any(char::is_control) => f.insert(utf8),
+                    _ => return,
+                }
+                d.update();
+            }
+        }
+        d.clamp_scroll(shown);
+        self.invalidate_all();
+    }
+
+    fn dialog_key(&mut self, sym: u32, utf8: &str, m: Mods) {
         if self.dialog_guarded() {
             return;
+        }
+        if matches!(self.dialog, Some(Dialog::RenameMany(_))) {
+            return self.rename_dialog_key(sym, utf8, m);
         }
         let Some(d) = self.dialog.as_mut() else { return };
         let buttons = Self::dialog_buttons(d);
@@ -2091,6 +2187,8 @@ impl App {
         }
         let at = match d {
             Dialog::Conflict { at, .. } | Dialog::ConfirmDelete { at, .. } | Dialog::ConfirmQuit { at } | Dialog::Unlock { at, .. } | Dialog::ConfirmReplace { at, .. } => at,
+            // Has its own keys, above.
+            Dialog::RenameMany(_) => return,
         };
         match sym {
             k::KEY_Left => *at = (*at + n - 1) % n,
@@ -2118,9 +2216,59 @@ impl App {
         Rect::new((self.w - w) / 2, (self.h - h) / 2, w, h)
     }
 
+    /// Where a dialog goes. The rename dialog is bigger, to list the names.
+    pub fn dialog_rect_for(&self, d: &Dialog) -> Rect {
+        match d {
+            Dialog::RenameMany(rm) => self.rename_rect(rm.names.len()),
+            _ => self.dialog_rect(),
+        }
+    }
+
+    /// The rename dialog's size: tall enough for `rows` names, from four up to as many as fit.
+    pub(crate) fn rename_rect(&self, rows: usize) -> Rect {
+        // Everything but the names: title, fields, headings, the line under the names, buttons.
+        let fixed = self.px(228.0);
+        let list = self.px(24.0) * rows.clamp(4, 40) as i32;
+        let (w, h) = (self.px(680.0).min(self.w - self.px(24.0)).max(1), (fixed + list).min(self.px(560.0)).min(self.h - self.px(24.0)).max(1));
+        Rect::new((self.w - w) / 2, (self.h - h) / 2, w, h)
+    }
+
+    /// How many names the open rename dialog has, or none.
+    fn rename_count(&self) -> usize {
+        match &self.dialog {
+            Some(Dialog::RenameMany(d)) => d.names.len(),
+            _ => 0,
+        }
+    }
+
+    /// The rename dialog's parts, for `rows` names: the Find and Replace fields, the names'
+    /// column headings, the list of names and the line under it. The fields leave room on the
+    /// left for their labels.
+    pub fn rename_layout(&self, rows: usize) -> RenameLayout {
+        let r = self.rename_rect(rows);
+        let pad = self.px(16.0);
+        let label = self.px(104.0);
+        let field_h = self.px(30.0);
+        let top = r.y + self.px(12.0) + self.px(26.0) + self.px(8.0);
+        let find = Rect::new(r.x + pad + label, top, r.w - 2 * pad - label, field_h);
+        let replace = Rect::new(find.x, find.bottom() + self.px(8.0), find.w, field_h);
+        let headings = Rect::new(r.x + pad, replace.bottom() + self.px(12.0), r.w - 2 * pad, self.px(22.0));
+        let summary_h = self.px(26.0);
+        let buttons_top = r.bottom() - self.px(12.0) - self.px(30.0);
+        let summary = Rect::new(r.x + pad, buttons_top - self.px(8.0) - summary_h, r.w - 2 * pad, summary_h);
+        let list = Rect::new(r.x + pad, headings.bottom(), r.w - 2 * pad, (summary.y - self.px(4.0) - headings.bottom()).max(0));
+        RenameLayout { find, replace, headings, list, summary, row_h: self.px(24.0).max(1) }
+    }
+
+    /// How many names the open rename dialog's list has room for.
+    pub fn rename_rows_shown(&self) -> usize {
+        let l = self.rename_layout(self.rename_count());
+        (l.list.h / l.row_h).max(1) as usize
+    }
+
     /// The button rectangles, right-aligned along the dialog's bottom.
     pub fn dialog_button_rects(&mut self, d: &Dialog) -> Vec<Rect> {
-        let r = self.dialog_rect();
+        let r = self.dialog_rect_for(d);
         let buttons = Self::dialog_buttons(d);
         let h = self.px(30.0);
         let y = r.bottom() - h - self.px(12.0);
@@ -2386,8 +2534,8 @@ impl App {
         Some(Rect::new(l.sidebar.right() - self.px(7.0) - w, self.place_top(i), w, self.px(30.0)))
     }
 
-    /// The list's menu, with "Open with…" after Open, and "Set as background" after Preview,
-    /// when they apply.
+    /// The list's menu, with "Open with…" after Open, "Extract" and "Set as background" after
+    /// Preview when they apply, and "Open in terminal" last.
     fn context_items(&self) -> Vec<MenuItem> {
         let mut items = self.view_menu_items();
         if self.open_with_files().is_some() {
@@ -2402,7 +2550,32 @@ impl App {
             let at = items.iter().position(|m| m.action == Action::Preview).map_or(items.len(), |p| p + 1);
             items.insert(at, MenuItem { label: "Set as background", keys: "", action: Action::SetBackground, enabled: true });
         }
+        if self.terminal_folder().is_some() {
+            items.push(MenuItem { label: "Open in terminal", keys: "", action: Action::OpenTerminal, enabled: true });
+        }
         items
+    }
+
+    /// The folder "Open in terminal" would open in: the one folder selected, or with nothing
+    /// selected, the folder on screen. Only where `xdg-terminal-exec` is installed, and never
+    /// in a chooser, the Trash or Recent, which aren't folders to work in.
+    fn terminal_folder(&self) -> Option<PathBuf> {
+        if self.terminal.is_none() || self.chooser.is_some() || self.viewer || self.is_recent_view() || self.in_trash() {
+            return None;
+        }
+        let l = self.listing.as_ref()?;
+        match self.selected_ids().as_slice() {
+            [] => Some(self.dir.clone()),
+            [one] if l.kind(*one).is_dirlike() => Some(l.path(*one)),
+            _ => None,
+        }
+    }
+
+    fn open_terminal(&mut self) {
+        let (Some(dir), Some(terminal)) = (self.terminal_folder(), self.terminal.as_ref()) else { return };
+        let name = dir.file_name().map_or_else(|| dir.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        let hub = self.hub.clone();
+        terminal.open(&dir, move |why| hub.send(Msg::Notice(format!("Couldn't open a terminal in “{name}”: {why}"))));
     }
 
     /// The picture "Set as background" would use: the one file selected, if it's a picture, in
@@ -2461,7 +2634,6 @@ impl App {
             return self.chooser_menu_items();
         }
         let any = self.sel_count > 0;
-        let one = self.sel_count == 1;
         if self.is_recent_view() {
             return vec![
                 MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
@@ -2495,7 +2667,7 @@ impl App {
             MenuItem { label: "Cut", keys: "Ctrl+X", action: Action::Cut, enabled: any },
             MenuItem { label: "Copy", keys: "Ctrl+C", action: Action::Copy, enabled: any },
             MenuItem { label: "Paste", keys: "Ctrl+V", action: Action::Paste, enabled: true },
-            MenuItem { label: "Rename", keys: "F2", action: Action::Rename, enabled: one },
+            MenuItem { label: "Rename", keys: "F2", action: Action::Rename, enabled: any },
             MenuItem { label: "Move to Trash", keys: "Delete", action: Action::Trash, enabled: any },
             MenuItem { label: "Delete for good", keys: "Shift+Delete", action: Action::DeleteForGood, enabled: any },
             MenuItem { label: "New folder", keys: "Ctrl+Shift+N", action: Action::NewFolder, enabled: true },
@@ -2574,7 +2746,16 @@ impl App {
             }
             Input::Button { button, pressed } => self.button(button, pressed),
             Input::Scroll { lines, pixels } => {
-                if self.preview.is_some() {
+                if let Some(Dialog::RenameMany(_)) = &self.dialog {
+                    let shown = self.rename_rows_shown();
+                    let row = self.rename_layout(self.rename_count()).row_h as f64;
+                    let by = (lines * 3.0 + pixels * self.scale / row).round() as isize;
+                    if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
+                        d.scroll = d.scroll.saturating_add_signed(by);
+                        d.clamp_scroll(shown);
+                    }
+                    self.invalidate_all();
+                } else if self.preview.is_some() {
                     self.preview_scroll(lines, pixels);
                 } else if self.menu.is_none() {
                     let row = self.layout().row_h as f64;
@@ -2668,7 +2849,7 @@ impl App {
             return;
         }
         if self.dialog.is_some() {
-            self.dialog_key(sym, utf8);
+            self.dialog_key(sym, utf8, m);
         } else if self.menu.is_some() {
             self.menu_key(sym);
         } else if self.preview.is_some() {
@@ -2906,9 +3087,19 @@ impl App {
         if let Some(d) = self.dialog.take() {
             let rects = self.dialog_button_rects(&d);
             let check = matches!(d, Dialog::Conflict { .. }) && self.dialog_check_rect().contains(x, y);
+            let renaming = matches!(d, Dialog::RenameMany(_));
             self.dialog = Some(d);
             if check {
                 return Hit::DialogCheck;
+            }
+            if renaming {
+                let l = self.rename_layout(self.rename_count());
+                if l.find.contains(x, y) {
+                    return Hit::DialogField(Focus::Find);
+                }
+                if l.replace.contains(x, y) {
+                    return Hit::DialogField(Focus::Replace);
+                }
             }
             return rects.iter().position(|r| r.contains(x, y)).map_or(Hit::Outside, Hit::DialogButton);
         }
@@ -3227,6 +3418,12 @@ impl App {
                             self.invalidate_all();
                         }
                     }
+                    Hit::DialogField(f) => {
+                        if let Some(Dialog::RenameMany(d)) = self.dialog.as_mut() {
+                            d.focus = f;
+                            self.invalidate_all();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -3339,7 +3536,7 @@ impl App {
                     j.job.cancel();
                 }
             }
-            Hit::DialogButton(_) | Hit::DialogCheck | Hit::PreviewBody => {}
+            Hit::DialogButton(_) | Hit::DialogCheck | Hit::DialogField(_) | Hit::PreviewBody => {}
             Hit::ChooserName | Hit::ChooserFilter | Hit::ChooserAccept | Hit::ChooserCancel => self.chooser_click(hit, x),
             Hit::Row(row) => {
                 self.chooser_clicked_list(Some(row));
@@ -4234,7 +4431,7 @@ fn verb_is_move(can_copy: bool, can_move: bool) -> bool {
 fn cursor_for(h: Hit) -> Cursor {
     match h {
         Hit::Header(_) | Hit::Crumb(_) | Hit::Back | Hit::Forward | Hit::Up | Hit::EmptyTrash | Hit::Place(_) | Hit::Eject(_) | Hit::MenuItem(_) | Hit::NoticeClose(_) | Hit::JobCancel(_) | Hit::DialogButton(_) | Hit::DialogCheck | Hit::ChooserFilter | Hit::ChooserAccept | Hit::ChooserCancel => Cursor::Pointer,
-        Hit::PathBar | Hit::FilterBox | Hit::ChooserName => Cursor::Text,
+        Hit::PathBar | Hit::FilterBox | Hit::ChooserName | Hit::DialogField(_) => Cursor::Text,
         _ => Cursor::Default,
     }
 }
@@ -4536,6 +4733,102 @@ mod tests {
         r.app.on_msg(Msg::Clipboard(Some(b"junk".to_vec()), clipboard::TEXT.to_string(), asked));
         let Edit::Rename { field, .. } = &r.app.edit else { panic!() };
         assert_eq!(field.text, "a");
+    }
+
+    fn type_in(r: &mut Rig, text: &str) {
+        for c in text.chars() {
+            r.key(0, &c.to_string());
+        }
+    }
+
+    fn rename_dialog(r: &Rig) -> &RenameMany {
+        match &r.app.dialog {
+            Some(Dialog::RenameMany(d)) => d,
+            _ => panic!("the rename dialog isn't open"),
+        }
+    }
+
+    #[test]
+    fn f2_on_several_items_renames_them_all_and_one_undo_puts_them_back() {
+        let mut r = Rig::new("rename-many");
+        for (n, body) in [("a.jpg", "1"), ("b.jpg", "2"), ("keep.txt", "3")] {
+            fs::write(r.work().join(n), body).unwrap();
+        }
+        r.open(r.work());
+        r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
+        assert!(r.app.context_items().iter().any(|m| m.label == "Rename" && m.enabled), "offered for several items");
+        r.key(k::KEY_F2, "");
+        assert!(rename_dialog(&r).find.text.is_empty() && !rename_dialog(&r).can_rename(), "opens with nothing to do yet");
+        type_in(&mut r, ".jpg");
+        r.key(k::KEY_Tab, "");
+        type_in(&mut r, ".jpeg");
+        let d = rename_dialog(&r);
+        assert_eq!(d.new, [b"a.jpeg".to_vec(), b"b.jpeg".to_vec(), b"keep.txt".to_vec()], "previewed beside the old names");
+        assert!(d.summary().0.contains("2 items will be renamed, 1 unchanged"), "{:?}", d.summary());
+        r.key(k::KEY_Return, "");
+        assert!(r.app.dialog.is_none());
+        r.idle();
+        assert_eq!(fs::read_to_string(r.work().join("a.jpeg")).unwrap(), "1");
+        assert_eq!(fs::read_to_string(r.work().join("b.jpeg")).unwrap(), "2");
+        assert_eq!(r.selected_names(), ["a.jpeg", "b.jpeg"], "the renamed items are selected");
+        assert_eq!(r.app.undo.len(), 1, "one undo for the lot");
+        r.ctrl(k::KEY_z);
+        r.idle();
+        assert!(r.work().join("a.jpg").exists() && r.work().join("b.jpg").exists() && !r.work().join("a.jpeg").exists());
+    }
+
+    #[test]
+    fn the_rename_dialog_wont_rename_onto_a_clash_and_says_which() {
+        let mut r = Rig::new("rename-many-clash");
+        for n in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(r.work().join(n), n).unwrap();
+        }
+        r.open(r.work());
+        r.select("a.txt");
+        r.app.move_cursor(1, Mods { shift: true, ..Mods::default() });
+        r.key(k::KEY_F2, "");
+        r.key(k::KEY_Tab, "");
+        // Both would be "same.txt".
+        type_in(&mut r, "same");
+        let (line, problem) = rename_dialog(&r).summary();
+        assert!(problem && line.contains("“a.txt” and “b.txt” would both be named “same.txt”"), "{line}");
+        r.key(k::KEY_Return, "");
+        assert!(r.app.dialog.is_some(), "Enter doesn't rename while names clash");
+        // b.txt would take c.txt's name, which isn't being renamed.
+        r.key(k::KEY_Tab, "");
+        r.key(k::KEY_Tab, "");
+        r.key(k::KEY_Tab, "");
+        type_in(&mut r, "b");
+        r.key(k::KEY_Tab, "");
+        r.ctrl(k::KEY_a);
+        type_in(&mut r, "c");
+        let (line, problem) = rename_dialog(&r).summary();
+        assert!(problem && line.contains("“c.txt” is already in this folder"), "{line}");
+        // Swapping a and b is fine.
+        r.key(k::KEY_Escape, "");
+        assert!(r.app.dialog.is_none());
+        r.app.start_job(Request::RenameMany { renames: vec![(r.work().join("a.txt"), "b.txt".into()), (r.work().join("b.txt"), "a.txt".into())] });
+        r.idle();
+        assert_eq!(fs::read_to_string(r.work().join("a.txt")).unwrap(), "b.txt");
+        assert_eq!(fs::read_to_string(r.work().join("b.txt")).unwrap(), "a.txt");
+        assert_eq!(fs::read_to_string(r.work().join("c.txt")).unwrap(), "c.txt");
+    }
+
+    #[test]
+    fn pasting_into_the_rename_dialog_updates_the_names() {
+        let mut r = Rig::new("rename-many-paste");
+        for n in ["x1", "x2"] {
+            fs::write(r.work().join(n), "").unwrap();
+        }
+        r.open(r.work());
+        r.app.input(Input::Key { keysym: k::KEY_a, utf8: "a".into(), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false });
+        r.key(k::KEY_F2, "");
+        r.key(k::KEY_Tab, "");
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        r.app.on_msg(Msg::Clipboard(Some(b"Trip {n}\nsecond line".to_vec()), clipboard::TEXT.to_string(), asked));
+        assert_eq!(rename_dialog(&r).replace.text, "Trip {n}");
+        assert_eq!(rename_dialog(&r).new, [b"Trip 1".to_vec(), b"Trip 2".to_vec()]);
     }
 
     /// Starts a copy that will clash, and waits for its dialog.
@@ -7117,6 +7410,119 @@ mod tests {
         r.app.on_msg(Msg::CanSetBackground(true));
         r.select("sunset.png");
         assert!(!menu_has_set_as_background(&mut r));
+    }
+
+    /// A stand-in `xdg-terminal-exec` in the rig, which writes the folder it started in and its
+    /// arguments to `terminal.log`, or fails with `exit`.
+    fn stand_in_terminal(r: &mut Rig, exit: i32) -> PathBuf {
+        let bin = r.root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = r.root.join("terminal.log");
+        let draft = r.root.join("terminal.draft");
+        fs::write(&draft, format!("#!/bin/sh\nprintf '%s|%s\\n' \"$PWD\" \"$*\" >> '{}'\nexit {exit}\n", log.display())).unwrap();
+        // Written by `install`, so no descriptor open for writing it can leak into another
+        // test's child and make running it fail with "Text file busy".
+        assert!(std::process::Command::new("install").arg("-m755").arg(&draft).arg(bin.join("xdg-terminal-exec")).status().unwrap().success());
+        r.app.terminal = gannet_core::terminal::Terminal::find(Some(bin.as_os_str()), None);
+        assert!(r.app.terminal.is_some());
+        log
+    }
+
+    fn menu_has_open_in_terminal(r: &mut Rig) -> bool {
+        r.app.context_items().iter().any(|m| m.action == Action::OpenTerminal)
+    }
+
+    #[test]
+    fn open_in_terminal_is_offered_for_a_folder_and_the_empty_space() {
+        let mut r = Rig::new("terminal-menu");
+        fs::create_dir(r.work().join("src")).unwrap();
+        fs::create_dir(r.work().join("docs")).unwrap();
+        fs::write(r.work().join("notes.txt"), "x").unwrap();
+        std::os::unix::fs::symlink("src", r.work().join("linked")).unwrap();
+        let w = r.work();
+        r.open(w);
+        assert!(!menu_has_open_in_terminal(&mut r), "not without xdg-terminal-exec");
+        stand_in_terminal(&mut r, 0);
+        let labels: Vec<_> = r.app.context_items().iter().map(|m| m.label).collect();
+        assert_eq!(labels.last(), Some(&"Open in terminal"), "last, on the empty space");
+        for folder in ["src", "linked"] {
+            r.select(folder);
+            assert!(menu_has_open_in_terminal(&mut r), "{folder}");
+        }
+        r.select("notes.txt");
+        assert!(!menu_has_open_in_terminal(&mut r), "not for a file");
+        r.app.select_all();
+        assert!(!menu_has_open_in_terminal(&mut r), "not for several items");
+        r.app.clear_selection();
+        r.app.chooser = Some(crate::chooser::Chooser::new(crate::chooser::Spec::default(), &[], None));
+        assert!(!menu_has_open_in_terminal(&mut r), "never in an Open or Save dialog");
+        assert!(!r.app.chooser_allows(Action::OpenTerminal));
+    }
+
+    #[test]
+    fn open_in_terminal_is_not_offered_in_the_trash_or_recent() {
+        let mut r = Rig::new("terminal-trash");
+        stand_in_terminal(&mut r, 0);
+        fs::create_dir(r.work().join("old")).unwrap();
+        r.open(r.work());
+        r.select("old");
+        r.key(k::KEY_Delete, "");
+        r.idle();
+        open_trash(&mut r);
+        assert!(!menu_has_open_in_terminal(&mut r), "the Trash's empty space");
+        r.select("old");
+        assert!(!menu_has_open_in_terminal(&mut r), "a folder in the Trash");
+        let recent = r.app.recent_file.clone();
+        fs::create_dir_all(recent.parent().unwrap()).unwrap();
+        fs::write(&recent, "<?xml version=\"1.0\"?><xbel version=\"1.0\"></xbel>").unwrap();
+        r.open(recent);
+        assert!(r.app.is_recent_view());
+        assert!(!menu_has_open_in_terminal(&mut r), "Recent");
+        r.app.action(Action::OpenTerminal);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!r.root.join("terminal.log").exists(), "nothing started from Recent");
+    }
+
+    #[test]
+    fn open_in_terminal_opens_the_folder_selected_or_the_one_on_screen() {
+        let mut r = Rig::new("terminal-open");
+        fs::create_dir(r.work().join("my project")).unwrap();
+        let w = r.work();
+        r.open(w.clone());
+        let log = stand_in_terminal(&mut r, 0);
+        r.select("my project");
+        r.app.action(Action::OpenTerminal);
+        let wait = |n: usize| {
+            let end = Instant::now() + Duration::from_secs(10);
+            while fs::read_to_string(&log).map_or(0, |s| s.lines().count()) < n {
+                assert!(Instant::now() < end, "the terminal wasn't asked for");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait(1);
+        r.app.clear_selection();
+        r.app.action(Action::OpenTerminal);
+        wait(2);
+        let p = w.join("my project");
+        assert_eq!(fs::read_to_string(&log).unwrap(), format!("{}|--dir={}\n{}|--dir={}\n", p.display(), p.display(), w.display(), w.display()));
+        std::thread::sleep(Duration::from_millis(200));
+        while let Ok(m) = r.rx.try_recv() {
+            r.app.on_msg(m);
+        }
+        assert!(r.app.notices.is_empty(), "{:?}", r.app.notices);
+    }
+
+    #[test]
+    fn a_terminal_that_cant_start_says_so() {
+        let mut r = Rig::new("terminal-fails");
+        fs::create_dir(r.work().join("src")).unwrap();
+        let w = r.work();
+        r.open(w);
+        stand_in_terminal(&mut r, 1);
+        r.select("src");
+        r.app.action(Action::OpenTerminal);
+        r.pump_until("the notice", |a| !a.notices.is_empty());
+        assert_eq!(r.app.notices, ["Couldn't open a terminal in “src”: it exited with code 1"]);
     }
 
     #[test]

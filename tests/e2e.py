@@ -489,6 +489,72 @@ def opening_an_archive_extracts_it_in_gannet(h):
 
 
 @check
+def open_in_terminal_asks_xdg_terminal_exec_for_the_folder(h):
+    fs = fresh_fs()
+    tree(fs, {"my project/readme": "r", "broken/x": "", "notes.txt": "n"})
+    # A stand-in for the launcher: it logs where it started and what it was asked, and never
+    # starts a real terminal. In "broken" it fails, as when no terminal is set up.
+    bin_dir = SCRATCH / "terminal-bin"
+    shutil.rmtree(bin_dir, ignore_errors=True)
+    bin_dir.mkdir()
+    log = SCRATCH / "terminal.log"
+    log.unlink(missing_ok=True)
+    launcher = bin_dir / "xdg-terminal-exec"
+    launcher.write_text(f'#!/bin/sh\nprintf "%s|%s\\n" "$PWD" "$*" >> {log}\ncase "$PWD" in */broken) exit 1;; esac\nexit 0\n')
+    launcher.chmod(0o755)
+
+    def logged(n):
+        end = time.monotonic() + 5
+        while time.monotonic() < end and (not log.exists() or len(log.read_text().splitlines()) < n):
+            time.sleep(0.02)
+        return log.read_text().splitlines() if log.exists() else []
+
+    def menu_at(row_or_y):
+        a.click(ROW_X, row_or_y, 0x111)
+        return a.wait(lambda s: s["menu"], "the menu")["menu_items"]
+
+    a = App(h, fs, path_prefix=str(bin_dir))
+    a.wait(lambda s: s["names"] == ["broken", "my project", "notes.txt"], "listed")
+    # The empty space: the folder on screen.
+    items = menu_at(row_y(6))
+    assert items[-1] == "Open in terminal", items
+    a.shot("terminal-menu-empty")
+    a.key("Up", "Return")
+    assert logged(1) == [f"{fs}|--dir={fs}"], logged(1)
+    # A folder: that folder.
+    items = menu_at(row_y(1))
+    assert items[-1] == "Open in terminal", items
+    a.shot("terminal-menu-folder")
+    a.key("Up", "Return")
+    assert logged(2)[1] == f"{fs / 'my project'}|--dir={fs / 'my project'}", logged(2)
+    assert a.state()["notices"] == [], a.state()["notices"]
+    # Not for a file.
+    assert "Open in terminal" not in menu_at(row_y(2)), "not for a file"
+    a.key("Escape")
+    # A terminal that can't start says so.
+    assert menu_at(row_y(0))[-1] == "Open in terminal"
+    a.key("Up", "Return")
+    s = a.wait(lambda s: s["notices"], "the failure shown")
+    assert s["notices"] == ["Couldn't open a terminal in “broken”: it exited with code 1"], s["notices"]
+    a.shot("terminal-failed")
+    a.close()
+    # Without xdg-terminal-exec it isn't offered.
+    shutil.rmtree(bin_dir)
+    bin_dir.mkdir()
+    for tool in ("fc-match", "xdg-open"):
+        if shutil.which(tool):
+            os.symlink(shutil.which(tool), bin_dir / tool)
+    a = App(h, fs, bwrap_extra=("--setenv", "PATH", str(bin_dir)))
+    a.wait(lambda s: s["count"] == 3, "listed")
+    assert "Open in terminal" not in menu_at(row_y(6)), "not without the launcher"
+    assert "Open in terminal" not in menu_at(row_y(1))
+    a.key("Escape")
+    a.close()
+    shutil.rmtree(bin_dir, ignore_errors=True)
+    assert len(logged(3)) == 3, "nothing more was started"
+
+
+@check
 def live_refresh_keeps_selection(h):
     fs = fresh_fs()
     tree(fs, {"a": "", "b": "", "c": ""})
@@ -801,6 +867,66 @@ def rename_new_folder_and_bad_names(h):
     a.key("Return")
     a.wait(lambda s: s["selected"] == ["Made Here"] and s["jobs"] == 0, "folder made and selected")
     assert (fs / "Made Here").is_dir()
+    a.close()
+
+
+@check
+def renaming_several_files_at_once(h):
+    fs = fresh_fs()
+    tree(fs, {"IMG_1.jpg": "1", "IMG_2.jpg": "2", "IMG_3.jpg": "3", "notes.txt": "n"})
+    a = App(h, fs)
+    a.wait(lambda s: s["count"] == 4)
+    a.key("a", mods=["ctrl"])
+    a.wait(lambda s: len(s["selected"]) == 4)
+    a.key("F2")
+    a.wait(lambda s: s["dialog"] == "rename-many-blocked", "F2 on several opens the dialog, with nothing to do yet")
+    a.type("IMG_")
+    a.key("Tab")
+    a.type("Trip ")
+    a.wait(lambda s: s["dialog"] == "rename-many")
+    a.shot("rename-many")
+    a.key("Return")
+    a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0 and s["selected"] == ["Trip 1.jpg", "Trip 2.jpg", "Trip 3.jpg"], "renamed and selected")
+    assert sorted(p.name for p in fs.iterdir()) == ["Trip 1.jpg", "Trip 2.jpg", "Trip 3.jpg", "notes.txt"]
+    a.key("z", mods=["ctrl"])
+    a.wait(lambda s: s["jobs"] == 0 and s["undo"] == 0, "one undo")
+    assert sorted(p.name for p in fs.iterdir()) == ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg", "notes.txt"]
+    # Every name the same: refused, and the dialog says which clash.
+    a.key("a", mods=["ctrl"])
+    a.key("F2")
+    a.wait(lambda s: s["dialog"].startswith("rename-many"))
+    a.key("Tab")
+    a.type("same")
+    a.wait(lambda s: s["dialog"] == "rename-many-blocked")
+    a.shot("rename-many-clash")
+    a.key("Return")
+    a.key("Escape")
+    a.wait(lambda s: s["dialog"] == "")
+    assert sorted(p.name for p in fs.iterdir()) == ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg", "notes.txt"]
+    # {n} counts in the list's order. Sorted by name backwards, IMG_3 becomes IMG_1 and IMG_1
+    # becomes IMG_3: they swap names.
+    a.key("1", mods=["ctrl"])
+    a.wait(lambda s: s["desc"] and s["names"][0] == "notes.txt")
+    a.key("Escape")
+    a.key("Home")
+    a.key("Down")
+    a.wait(lambda s: s["selected"] == ["IMG_3.jpg"])
+    a.key("Down", mods=["shift"])
+    a.key("Down", mods=["shift"])
+    a.wait(lambda s: s["selected"] == ["IMG_3.jpg", "IMG_2.jpg", "IMG_1.jpg"])
+    a.key("F2")
+    a.wait(lambda s: s["dialog"].startswith("rename-many"))
+    a.key("Tab")
+    a.type("IMG_{n}")
+    a.wait(lambda s: s["dialog"] == "rename-many")
+    a.shot("rename-many-swap")
+    a.key("Return")
+    a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0 and s["undo"] == 1, "swapped")
+    assert [(fs / f"IMG_{i}.jpg").read_text() for i in (1, 2, 3)] == ["3", "2", "1"]
+    assert not [p.name for p in fs.iterdir() if p.name.startswith(".gannet")]
+    a.key("z", mods=["ctrl"])
+    a.wait(lambda s: s["jobs"] == 0 and s["undo"] == 0, "swap undone")
+    assert [(fs / f"IMG_{i}.jpg").read_text() for i in (1, 2, 3)] == ["1", "2", "3"]
     a.close()
 
 
