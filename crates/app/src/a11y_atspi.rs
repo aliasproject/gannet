@@ -862,7 +862,8 @@ impl Ctx {
         };
         match m {
             "SetTextContents" => {
-                let text: String = body.deserialize().unwrap_or_default();
+                // Not read as empty, which would clear the field.
+                let Ok(text) = body.deserialize::<String>() else { return self.error(h, "org.freedesktop.DBus.Error.InvalidArgs", m) };
                 // To the end of the text as it is then, whatever's been typed since this snapshot.
                 self.reply(h, &(self.edit_text(n, snap, TextEdit::Replace(0, usize::MAX, text)),))
             }
@@ -894,7 +895,7 @@ impl Ctx {
                 self.reply(h, &(self.edit_text(n, snap, TextEdit::Replace(a, b, String::new())),))
             }
             "PasteText" => {
-                let i: i32 = body.deserialize().unwrap_or(0);
+                let Ok(i) = body.deserialize::<i32>() else { return self.error(h, "org.freedesktop.DBus.Error.InvalidArgs", m) };
                 self.reply(h, &(self.edit_text(n, snap, TextEdit::Paste(at(i))),))
             }
             _ => self.error(h, UNKNOWN_METHOD, m),

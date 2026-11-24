@@ -157,9 +157,10 @@ pub const fn click(description: &'static str, keys: &'static str) -> Action {
 /// Where a field's characters are drawn, for a screen reader that shows or magnifies them.
 #[derive(Clone, PartialEq, Debug)]
 pub struct TextGeometry {
-    /// The text, and how far from its start each character's left edge is, and the last one's
-    /// right edge. Measured once for each text: the field scrolling with its caret only moves it.
-    measured: Arc<(String, Vec<f32>)>,
+    /// The text, its width, and how far from its start each character's left edge is, and the
+    /// last one's right edge. Measured once for each text and size: the field scrolling with
+    /// its caret only moves it.
+    measured: Arc<(String, f32, Vec<f32>)>,
     /// The left edge of each character, and the right edge of the last.
     pub edges: Vec<i32>,
     /// The line the text is on.
@@ -168,12 +169,14 @@ pub struct TextGeometry {
 
 impl TextGeometry {
     /// Where a field's characters are, its text starting at `x0` on `line`. The measuring is
-    /// kept from `prev` while the text is the same, so a field scrolling with its caret only
-    /// moves them. Measuring up to each character, as the caret is placed, takes time in
-    /// proportion to the square of the length, so a longer text, such as a deep path, is
-    /// measured a character at a time. That can be a pixel or two off where letters kern.
+    /// kept from `prev` while the text and its width are the same, so a field scrolling with its
+    /// caret only moves them, and a new scale or font measures them again. Measuring up to each
+    /// character, as the caret is placed, takes time in proportion to the square of the length,
+    /// so a longer text, such as a deep path, is measured a character at a time. That can be a
+    /// pixel or two off where letters kern.
     pub fn measure(text: &mut crate::text::Text, f: &Field, x0: f32, line: Rect, prev: Option<&TextGeometry>) -> Self {
-        let measured = match prev.map(|g| &g.measured).filter(|m| m.0 == f.text) {
+        let width = text.measure(&f.text);
+        let measured = match prev.map(|g| &g.measured).filter(|m| m.0 == f.text && m.1 == width) {
             Some(m) => m.clone(),
             None => {
                 let s = &f.text;
@@ -187,10 +190,10 @@ impl TextGeometry {
                         offsets.push(x);
                     }
                 }
-                Arc::new((s.clone(), offsets))
+                Arc::new((s.clone(), width, offsets))
             }
         };
-        let edges = measured.1.iter().map(|o| (x0 + o).round() as i32).collect();
+        let edges = measured.2.iter().map(|o| (x0 + o).round() as i32).collect();
         TextGeometry { measured, edges, line }
     }
 
