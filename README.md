@@ -105,7 +105,7 @@ To add it to your app launcher:
 | Sort by name, size, modified (again to reverse) | Ctrl+1, Ctrl+2, Ctrl+3 |
 | Copy, cut, paste | Ctrl+C, Ctrl+X, Ctrl+V |
 | Copy path as text | Ctrl+Shift+C |
-| Rename, new folder | F2, Ctrl+Shift+N |
+| Rename (several at once too), new folder | F2, Ctrl+Shift+N |
 | Move to Trash, delete for good | Delete, Shift+Delete |
 | Undo, redo | Ctrl+Z, Ctrl+Shift+Z |
 | Stop the newest operation | Ctrl+. |
@@ -278,6 +278,20 @@ after a few seconds, and the status bar says so.
 When a paste or a drop meets a name that's taken, Replace moves the item already there to
 the Trash rather than overwriting it. If it can't go to the Trash, both are left as they
 were.
+
+## Renaming several files
+
+Select several items and press F2, or choose Rename from the right-click menu, to rename them
+all at once. Type text in Find and what to put in its place in Replace with: every place it
+appears in each name changes. Leave Find empty and Replace with becomes the whole new name, and
+files keep their extensions. `{n}` in Replace with counts 1, 2, 3 in the order the list shows,
+with zeros in front so they sort in order (01 to 12 for twelve items).
+
+Each old name shows beside its new one before anything changes. Rename stays off while two
+items would get the same name, or one would take the name of something else in the folder, and
+the line under the names says which. Items can take each other's names, so a↔b swaps work.
+It's all or nothing: if one rename fails partway, the ones already done are put back. One undo
+puts every name back.
 
 ## Undo and redo
 

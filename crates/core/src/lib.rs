@@ -18,6 +18,7 @@ pub mod open;
 pub mod ops;
 pub mod places;
 pub mod recent;
+pub mod rename_many;
 pub mod sort;
 pub mod terminal;
 pub mod theme;

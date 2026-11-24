@@ -864,6 +864,66 @@ def rename_new_folder_and_bad_names(h):
 
 
 @check
+def renaming_several_files_at_once(h):
+    fs = fresh_fs()
+    tree(fs, {"IMG_1.jpg": "1", "IMG_2.jpg": "2", "IMG_3.jpg": "3", "notes.txt": "n"})
+    a = App(h, fs)
+    a.wait(lambda s: s["count"] == 4)
+    a.key("a", mods=["ctrl"])
+    a.wait(lambda s: len(s["selected"]) == 4)
+    a.key("F2")
+    a.wait(lambda s: s["dialog"] == "rename-many-blocked", "F2 on several opens the dialog, with nothing to do yet")
+    a.type("IMG_")
+    a.key("Tab")
+    a.type("Trip ")
+    a.wait(lambda s: s["dialog"] == "rename-many")
+    a.shot("rename-many")
+    a.key("Return")
+    a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0 and s["selected"] == ["Trip 1.jpg", "Trip 2.jpg", "Trip 3.jpg"], "renamed and selected")
+    assert sorted(p.name for p in fs.iterdir()) == ["Trip 1.jpg", "Trip 2.jpg", "Trip 3.jpg", "notes.txt"]
+    a.key("z", mods=["ctrl"])
+    a.wait(lambda s: s["jobs"] == 0 and s["undo"] == 0, "one undo")
+    assert sorted(p.name for p in fs.iterdir()) == ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg", "notes.txt"]
+    # Every name the same: refused, and the dialog says which clash.
+    a.key("a", mods=["ctrl"])
+    a.key("F2")
+    a.wait(lambda s: s["dialog"].startswith("rename-many"))
+    a.key("Tab")
+    a.type("same")
+    a.wait(lambda s: s["dialog"] == "rename-many-blocked")
+    a.shot("rename-many-clash")
+    a.key("Return")
+    a.key("Escape")
+    a.wait(lambda s: s["dialog"] == "")
+    assert sorted(p.name for p in fs.iterdir()) == ["IMG_1.jpg", "IMG_2.jpg", "IMG_3.jpg", "notes.txt"]
+    # {n} counts in the list's order. Sorted by name backwards, IMG_3 becomes IMG_1 and IMG_1
+    # becomes IMG_3: they swap names.
+    a.key("1", mods=["ctrl"])
+    a.wait(lambda s: s["desc"] and s["names"][0] == "notes.txt")
+    a.key("Escape")
+    a.key("Home")
+    a.key("Down")
+    a.wait(lambda s: s["selected"] == ["IMG_3.jpg"])
+    a.key("Down", mods=["shift"])
+    a.key("Down", mods=["shift"])
+    a.wait(lambda s: s["selected"] == ["IMG_3.jpg", "IMG_2.jpg", "IMG_1.jpg"])
+    a.key("F2")
+    a.wait(lambda s: s["dialog"].startswith("rename-many"))
+    a.key("Tab")
+    a.type("IMG_{n}")
+    a.wait(lambda s: s["dialog"] == "rename-many")
+    a.shot("rename-many-swap")
+    a.key("Return")
+    a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0 and s["undo"] == 1, "swapped")
+    assert [(fs / f"IMG_{i}.jpg").read_text() for i in (1, 2, 3)] == ["3", "2", "1"]
+    assert not [p.name for p in fs.iterdir() if p.name.startswith(".gannet")]
+    a.key("z", mods=["ctrl"])
+    a.wait(lambda s: s["jobs"] == 0 and s["undo"] == 0, "swap undone")
+    assert [(fs / f"IMG_{i}.jpg").read_text() for i in (1, 2, 3)] == ["1", "2", "3"]
+    a.close()
+
+
+@check
 def trash_undo_and_delete_for_good(h):
     fs = fresh_fs()
     tree(fs, {"doomed.txt": "bye", "gone-for-good.txt": "x", "stay.txt": "s"})
