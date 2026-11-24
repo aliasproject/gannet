@@ -1872,6 +1872,8 @@ def a_screen_reader_can_pick_an_app_in_open_with(h):
         assert said(a) == "open writer.desktop\nalways\n"
     finally:
         sr.stop()
+
+
 def find(o, role, name=None):
     """The first part in a dump of that role, and name if given."""
     if o["role"] == role and (name is None or o["name"] == name):
