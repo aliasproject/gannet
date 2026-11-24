@@ -240,7 +240,7 @@ fn main() {
     } else if let Some(name) = saving_over {
         app.open_selecting(start_dir, vec![name]);
     } else if names.is_empty() {
-        app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None });
+        app.go(gannet_core::history::Stop { dir: start_dir, cursor_name: None, search: None });
     } else {
         app.open_selecting(start_dir, names);
     }
@@ -632,6 +632,8 @@ mod bench {
         /// The folder whose rows have been reported. A fast load can finish between two
         /// paints, so a paint that isn't ready can't be relied on to mark a new one.
         rows_stamped: Option<std::path::PathBuf>,
+        /// The search results last reported: what for, how many, and whether they were all.
+        search_stamped: Option<(String, usize, bool)>,
     }
 
     pub fn mono_ms() -> f64 {
@@ -648,6 +650,7 @@ mod bench {
                 state_path: std::env::var("GANNET_STATE").ok().map(|p| format!("{p}{suffix}")),
                 last_state: String::new(),
                 rows_stamped: None,
+                search_stamped: None,
             }
         }
 
@@ -666,6 +669,14 @@ mod bench {
             }
             if !ready {
                 self.rows_stamped = None;
+            }
+            // Search results as they're painted, timed from when the search started.
+            if let Some((l, s)) = app.listing.as_ref().and_then(|l| Some((l, l.search()?))) {
+                let now = (s.query.clone(), app.rows.len(), l.complete);
+                if self.search_stamped.as_ref() != Some(&now) {
+                    self.stamp(format!("search {} {} {:.1} {}", now.2, now.1, app.load_elapsed().as_secs_f64() * 1000.0, now.0));
+                    self.search_stamped = Some(now);
+                }
             }
         }
 
@@ -719,7 +730,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"chooser\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"chooser\":{},\"searching\":{},\"found\":{},\"locations\":{},\"status\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -762,7 +773,18 @@ mod bench {
             places(a),
             format!("[{}]", a.sidebar_headings().iter().map(|(i, _)| i.to_string()).collect::<Vec<_>>().join(",")),
             chooser(a),
+            a.search_below,
+            found(a),
+            list(a.rows.iter().take(300).map(|&i| a.listing.as_ref().filter(|l| l.search().is_some()).and_then(|l| l.location(i).map(|f| a.search_location(f))).unwrap_or_default())),
+            esc(&a.status_text()),
         )
+    }
+
+    /// What a search shows: what it was for, and whether it has finished or stopped at the limit.
+    fn found(a: &App) -> String {
+        let Some(l) = &a.listing else { return "null".to_string() };
+        let Some(s) = l.search() else { return "null".to_string() };
+        format!("{{\"query\":{},\"complete\":{},\"truncated\":{},\"unreadable\":{}}}", esc(&s.query), l.complete, s.truncated, s.unreadable)
     }
 
     /// A chooser's name field, whether it has the keyboard, its filter and whether it can finish.

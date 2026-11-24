@@ -468,6 +468,8 @@ pub struct App {
     pub folder_sorts: FolderSorts,
     pub show_hidden: bool,
     pub filter: String,
+    /// The filter reaches into the folders below as well, as a search.
+    pub search_below: bool,
     pub loading: bool,
     pub load_error: Option<String>,
     load: Option<LoadHandle>,
@@ -476,6 +478,8 @@ pub struct App {
     derive_cancel: Arc<AtomicBool>,
     req_hidden: bool,
     req_filter: String,
+    /// What the load under way searches for, if it's a search.
+    req_search: Option<String>,
     stater: Option<Stater>,
     stats_range: (usize, usize),
     pending_cursor: Option<Vec<u8>>,
@@ -630,6 +634,7 @@ impl App {
             folder_sorts: FolderSorts::in_memory(),
             show_hidden: false,
             filter: String::new(),
+            search_below: false,
             loading: false,
             load_error: None,
             load: None,
@@ -638,6 +643,7 @@ impl App {
             derive_cancel: Arc::new(AtomicBool::new(false)),
             req_hidden: false,
             req_filter: String::new(),
+            req_search: None,
             stater: None,
             stats_range: (0, 0),
             pending_cursor: None,
@@ -794,13 +800,13 @@ impl App {
     pub fn navigate(&mut self, dir: PathBuf, cursor_name: Option<Vec<u8>>) {
         let from = self.current_stop();
         self.history.visit(from);
-        self.go(Stop { dir, cursor_name });
+        self.go(Stop { dir, cursor_name, search: None });
     }
 
     fn current_stop(&self) -> Stop {
         // With no cursor showing there's nothing to come back to.
         let cursor_name = if self.cursor_shown { self.listing.as_ref().and_then(|l| self.rows.get(self.cursor).map(|&i| l.key(i).into_owned())) } else { None };
-        Stop { dir: self.dir.clone(), cursor_name }
+        Stop { dir: self.dir.clone(), cursor_name, search: self.search_query() }
     }
 
     /// Shows a folder now if it's cached, and reads it either way.
@@ -812,7 +818,9 @@ impl App {
             self.sort = self.folder_sorts.for_dir(&self.dir);
         }
         self.pending_cursor = stop.cursor_name;
-        self.filter.clear();
+        // Back to a search searches again.
+        self.search_below = stop.search.is_some();
+        self.filter = stop.search.unwrap_or_default();
         self.edit = Edit::None;
         self.edit_gen += 1;
         self.pending_select.clear();
@@ -832,15 +840,24 @@ impl App {
         if self.chooser.is_none() {
             self.cmds.push(Cmd::Title(self.crumb_label(&self.dir)));
         }
-        if let Some(i) = self.cache.iter().position(|c| c.listing.dir == self.dir) {
-            let c = self.cache.remove(i);
-            self.show_cached(c);
-        } else {
-            self.listing = None;
-            self.sorted = Arc::new(Vec::new());
-            self.rows.clear();
-            self.stater = None;
-            self.hold_paint = Some(Instant::now() + HOLD_FOR_LOAD);
+        self.show_folder();
+    }
+
+    /// Shows the folder now if it's cached and there's no search, and reads or searches it
+    /// either way.
+    fn show_folder(&mut self) {
+        match self.cache.iter().position(|c| c.listing.dir == self.dir).filter(|_| self.search_query().is_none()) {
+            Some(i) => {
+                let c = self.cache.remove(i);
+                self.show_cached(c);
+            }
+            None => {
+                self.listing = None;
+                self.sorted = Arc::new(Vec::new());
+                self.rows.clear();
+                self.stater = None;
+                self.hold_paint = Some(Instant::now() + HOLD_FOR_LOAD);
+            }
         }
         self.start_load();
         self.invalidate_all();
@@ -879,6 +896,7 @@ impl App {
         self.load_started = Instant::now();
         self.req_hidden = self.show_hidden;
         self.req_filter = self.filter.clone();
+        self.req_search = self.search_query();
         let row_h = self.layout().row_h.max(1);
         let req = LoadRequest {
             dir: self.dir.clone(),
@@ -892,6 +910,7 @@ impl App {
             slow_stat: None,
             trash: self.is_trash_view().then(|| TrashSpec { home_trash: self.home_trash(), uid: rustix::process::geteuid().as_raw(), mounts: self.trash_mounts.clone(), disks_give_up: DISKS_GIVE_UP }),
             recent: self.is_recent_view(),
+            search: self.req_search.clone(),
         };
         let hub = self.hub.clone();
         self.load = Some(spawn_load_watching(req, self.watch.clone(), move |e| hub.send(Msg::Load(e))));
@@ -939,7 +958,8 @@ impl App {
         }
         self.hold_paint = None;
         self.first_load = false;
-        let same_dir = self.listing.as_ref().is_some_and(|o| o.dir == l.listing.dir);
+        // A search of a folder is another view of it, and so is a search for something else.
+        let same_dir = self.listing.as_ref().is_some_and(|o| o.dir == l.listing.dir && o.search_query() == l.listing.search_query());
         let old = self.listing.clone();
         // A partial reload of a folder we can already show would make rows and the
         // selection vanish for a moment. The complete listing stays up until the new one is.
@@ -1025,7 +1045,8 @@ impl App {
     }
 
     fn remember(&mut self, listing: Arc<Listing>, sort: SortSpec) {
-        if !listing.complete {
+        // What a search found isn't what's in the folder.
+        if !listing.complete || listing.search().is_some() {
             return;
         }
         self.cache.retain(|c| c.listing.dir != listing.dir);
@@ -1163,7 +1184,7 @@ impl App {
                     if std::mem::take(&mut self.first_load) && error == "Not a directory" {
                         use std::os::unix::ffi::OsStrExt;
                         if let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) {
-                            return self.go(Stop { dir: parent.to_path_buf(), cursor_name: Some(name.as_bytes().to_vec()) });
+                            return self.go(Stop { dir: parent.to_path_buf(), cursor_name: Some(name.as_bytes().to_vec()), search: None });
                         }
                     }
                     self.reload_after_load = false;
@@ -1436,6 +1457,10 @@ impl App {
             Action::ToggleHidden => {
                 self.show_hidden = !self.show_hidden;
                 self.rederive(false);
+                // Hidden folders are only searched when they show.
+                if self.search_query().is_some() {
+                    self.start_load();
+                }
                 self.invalidate_all();
             }
             // Recent is always newest first.
@@ -1463,6 +1488,9 @@ impl App {
             }
             // Recent only lists files from elsewhere: changing them is done in their folders.
             Action::Cut | Action::Paste | Action::Rename | Action::NewFolder | Action::Trash | Action::DeleteForGood if self.is_recent_view() => self.recent_is_read_only(),
+            // Search results come from many folders, so there's no one folder to add to.
+            Action::Paste if self.search_query().is_some() => self.notice("Clear the search to paste into this folder".into()),
+            Action::NewFolder if self.search_query().is_some() => self.notice("Clear the search to make a folder here".into()),
             Action::Cut if self.in_trash() => self.trash_is_read_only(),
             Action::Cut => self.put_on_clipboard(true),
             Action::Copy => self.put_on_clipboard(false),
@@ -1522,7 +1550,7 @@ impl App {
         if names.iter().any(|n| n.first() == Some(&b'.')) {
             self.show_hidden = true;
         }
-        self.go(Stop { dir, cursor_name: names.first().cloned() });
+        self.go(Stop { dir, cursor_name: names.first().cloned(), search: None });
         self.pending_select = names;
     }
 
@@ -1644,7 +1672,7 @@ impl App {
         let parent = self.dir.parent()?;
         if self.trash_files_root(parent).is_some_and(|f| f == parent) {
             // The Trash view finds rows by their real path, which is where we are.
-            return Some(Stop { dir: self.trash_dir.clone(), cursor_name: Some(self.dir.clone().into_os_string().into_vec()) });
+            return Some(Stop { dir: self.trash_dir.clone(), cursor_name: Some(self.dir.clone().into_os_string().into_vec()), search: None });
         }
         parent_stop(&self.dir)
     }
@@ -1689,11 +1717,67 @@ impl App {
             let text = f.text.clone();
             if text != self.filter {
                 self.filter = text;
-                self.rederive(false);
+                self.query_changed();
             }
         }
         self.invalidate(self.layout().toolbar);
         self.invalidate(self.layout().status);
+    }
+
+    /// Opens the filter as a search of this folder and every folder below it.
+    fn start_search(&mut self) {
+        self.start_filter("");
+        self.set_search_below(true);
+    }
+
+    /// Makes the filter reach into the folders below, or only this one.
+    fn set_search_below(&mut self, below: bool) {
+        let below = below && self.can_search();
+        if below != self.search_below {
+            self.search_below = below;
+            self.query_changed();
+        }
+    }
+
+    /// The Trash and Recent views list what's in other folders, so they have nothing below.
+    pub fn can_search(&self) -> bool {
+        !self.is_trash_view() && !self.is_recent_view()
+    }
+
+    /// What the list is searching this folder and below for, if it's a search.
+    pub fn search_query(&self) -> Option<String> {
+        (self.search_below && !self.filter.is_empty() && self.can_search()).then(|| self.filter.clone())
+    }
+
+    /// The filter's text or reach has changed. What's showing narrows at once, and a search
+    /// starts again from the top, stopping the one under way.
+    fn query_changed(&mut self) {
+        let was_search = self.req_search.is_some() || self.listing.as_ref().is_some_and(|l| l.search().is_some());
+        if self.search_query().is_some() {
+            self.rederive(false);
+            self.start_load();
+        } else if was_search {
+            // Back to the folder's own rows, from the cache if they're there.
+            self.rows_changing();
+            self.clear_selection();
+            self.cursor = 0;
+            self.anchor = 0;
+            self.cursor_shown = false;
+            self.scroll = 0.0;
+            self.show_folder();
+        } else {
+            self.rederive(false);
+        }
+        self.invalidate_all();
+    }
+
+    /// Empties the filter, ending a search.
+    fn clear_filter(&mut self) {
+        self.search_below = false;
+        if !self.filter.is_empty() {
+            self.filter.clear();
+            self.query_changed();
+        }
     }
 
     fn commit_path(&mut self, text: &str) {
@@ -1778,9 +1862,15 @@ impl App {
     }
 
     /// Whether what's dragged from here can only leave as copies: the Trash's items, whose two
-    /// folders have to stay paired, and Recent's, which only lists files from elsewhere.
+    /// folders have to stay paired, and Recent's or a search's, which list files from elsewhere.
     fn copies_only(&self) -> bool {
-        self.in_trash() || self.is_recent_view()
+        self.in_trash() || self.is_recent_view() || self.search_query().is_some()
+    }
+
+    /// Recent and search results list files from many folders, so there's nowhere in the list
+    /// to drop onto.
+    fn list_takes_no_drops(&self) -> bool {
+        self.in_trash() || self.is_recent_view() || self.search_query().is_some()
     }
 
     pub(crate) fn in_trash(&self) -> bool {
@@ -1918,7 +2008,9 @@ impl App {
                 }
                 // Another disk's Trash may not be watched, and the Trash view shows it too.
                 let trash_touched = self.is_trash_view() && o.touched.iter().any(|t| self.trash_files_root(t).is_some());
-                if o.touched.contains(&self.dir) || trash_touched {
+                // A search shows what's in every folder below, which only this folder is watched for.
+                let search_touched = self.search_query().is_some() && o.touched.iter().any(|t| t.starts_with(&self.dir));
+                if o.touched.contains(&self.dir) || trash_touched || search_touched {
                     use std::os::unix::ffi::OsStrExt;
                     // A selection made since the job began is the user's, and stays.
                     self.pending_select = o.created.iter().filter(|_| selection_untouched).filter(|p| p.parent() == Some(self.dir.as_path())).filter_map(|p| p.file_name()).map(|n| n.as_bytes().to_vec()).collect();
@@ -2440,10 +2532,30 @@ impl App {
             return vec![
                 MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
                 MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
-                MenuItem { label: "Show in folder", keys: "", action: Action::ShowInFolder, enabled: any },
+                MenuItem { label: "Show in folder", keys: "Alt+Enter", action: Action::ShowInFolder, enabled: any },
                 MenuItem { label: "Copy", keys: "Ctrl+C", action: Action::Copy, enabled: any },
                 MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
                 MenuItem { label: "Reload", keys: "F5", action: Action::Reload, enabled: true },
+                MenuItem { label: "New window", keys: "Ctrl+N", action: Action::NewWindow, enabled: true },
+            ];
+        }
+        if self.search_query().is_some() {
+            return vec![
+                MenuItem { label: "Open", keys: "Enter", action: Action::Open, enabled: any },
+                MenuItem { label: "Preview", keys: "Space", action: Action::Preview, enabled: any },
+                MenuItem { label: "Show in folder", keys: "Alt+Enter", action: Action::ShowInFolder, enabled: any },
+                MenuItem { label: "Cut", keys: "Ctrl+X", action: Action::Cut, enabled: any },
+                MenuItem { label: "Copy", keys: "Ctrl+C", action: Action::Copy, enabled: any },
+                MenuItem { label: "Rename", keys: "F2", action: Action::Rename, enabled: one },
+                MenuItem { label: "Move to Trash", keys: "Delete", action: Action::Trash, enabled: any },
+                MenuItem { label: "Delete for good", keys: "Shift+Delete", action: Action::DeleteForGood, enabled: any },
+                MenuItem { label: "Undo", keys: "Ctrl+Z", action: Action::Undo, enabled: !self.undo.is_empty() },
+                MenuItem { label: "Redo", keys: "Ctrl+Shift+Z", action: Action::Redo, enabled: !self.redo.is_empty() },
+                MenuItem { label: if self.show_hidden { "Hide hidden files" } else { "Show hidden files" }, keys: "Ctrl+H", action: Action::ToggleHidden, enabled: true },
+                MenuItem { label: "Sort by name", keys: "Ctrl+1", action: Action::SortBy(SortKey::Name), enabled: true },
+                MenuItem { label: "Sort by size", keys: "Ctrl+2", action: Action::SortBy(SortKey::Size), enabled: true },
+                MenuItem { label: "Sort by modified", keys: "Ctrl+3", action: Action::SortBy(SortKey::Modified), enabled: true },
+                MenuItem { label: "Search again", keys: "F5", action: Action::Reload, enabled: true },
                 MenuItem { label: "New window", keys: "Ctrl+N", action: Action::NewWindow, enabled: true },
             ];
         }
@@ -2697,6 +2809,11 @@ impl App {
             self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: self.edit_gen }));
             return;
         }
+        // In the filter, Ctrl+Shift+F reaches into the folders below, and Ctrl+F comes back.
+        if is_filter && m.ctrl && matches!(sym, k::KEY_f | k::KEY_F) {
+            self.set_search_below(m.shift);
+            return;
+        }
         let Some(f) = self.field_mut() else { return };
         match sym {
             k::KEY_Left => f.left(m.ctrl, m.shift),
@@ -2730,9 +2847,8 @@ impl App {
     fn field_cancel(&mut self) {
         let was_filter = matches!(self.edit, Edit::Filter(_));
         self.set_edit(Edit::None);
-        if was_filter && !self.filter.is_empty() {
-            self.filter.clear();
-            self.rederive(false);
+        if was_filter {
+            self.clear_filter();
         }
         self.invalidate_all();
     }
@@ -2789,6 +2905,8 @@ impl App {
             (k::KEY_Home, _, _) => self.move_cursor(0, m),
             (k::KEY_End, _, _) => self.move_cursor(usize::MAX, m),
             (k::KEY_BackSpace, _, _) => self.go_up(),
+            // Alt+Enter goes to where a search's match or a recent file is.
+            (k::KEY_Return | k::KEY_KP_Enter, _, true) if self.search_query().is_some() || self.is_recent_view() => self.action(Action::ShowInFolder),
             (k::KEY_Return | k::KEY_KP_Enter, _, _) => self.action(Action::Open),
             // Holding either of these would flicker, and neither means anything repeated.
             (k::KEY_space, _, false) if self.key_is_repeat => {}
@@ -2808,8 +2926,7 @@ impl App {
                 if self.previewer.is_some() {
                     self.close_preview();
                 } else if !self.filter.is_empty() {
-                    self.filter.clear();
-                    self.rederive(false);
+                    self.clear_filter();
                     self.invalidate(self.layout().toolbar);
                 } else if self.sel_count > 0 {
                     self.selection_epoch += 1;
@@ -2840,6 +2957,7 @@ impl App {
             (k::KEY_F10, _, _) | (k::KEY_Menu, _, _) => self.keyboard_menu(),
             (k::KEY_h, true, _) => self.action(Action::ToggleHidden),
             (k::KEY_l, true, _) => self.start_path_edit(),
+            (k::KEY_f | k::KEY_F, true, _) if m.shift => self.start_search(),
             (k::KEY_f, true, _) => self.start_filter(""),
             (k::KEY_a, true, _) => self.select_all(),
             (k::KEY_n, true, _) if !m.shift => self.action(Action::NewWindow),
@@ -3051,6 +3169,17 @@ impl App {
             return "Recent".into();
         }
         title_for(path)
+    }
+
+    /// Where a search's match is, starting from the folder searched: "Documents/photos" for one
+    /// in ~/Documents/photos when ~/Documents was searched, and "Documents" for one in it.
+    pub fn search_location(&self, folder: &Path) -> String {
+        let top = self.crumb_label(&self.dir);
+        match folder.strip_prefix(&self.dir) {
+            Ok(rest) if rest.as_os_str().is_empty() => top,
+            Ok(rest) => format!("{}/{}", top.trim_end_matches('/'), rest.display()),
+            Err(_) => folder.display().to_string(),
+        }
     }
 
     fn crumb_at(&mut self, x: i32) -> Option<usize> {
@@ -3604,7 +3733,7 @@ impl App {
             Hit::Row(row) => {
                 let l = self.listing.as_ref()?;
                 let id = *self.rows.get(row)?;
-                if self.in_trash() || self.is_recent_view() || !l.kind(id).is_dirlike() || self.is_selected(id) {
+                if self.list_takes_no_drops() || !l.kind(id).is_dirlike() || self.is_selected(id) {
                     return None;
                 }
                 Some(DropTarget { hit, dest: l.path(id), trash: false })
@@ -3916,7 +4045,7 @@ impl App {
             return None;
         }
         if !i.moved {
-            let refused = self.in_trash() || self.is_recent_view() || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some();
+            let refused = self.list_takes_no_drops() || self.dialog.is_some() || self.menu.is_some() || self.preview.is_some();
             return (!refused).then(|| DropTarget { hit: Hit::None, dest: self.dir.clone(), trash: false });
         }
         let (x, y) = self.pointer;
@@ -3928,7 +4057,7 @@ impl App {
     fn incoming_target_at(&mut self, can_trash: bool, x: i32, y: i32) -> Option<DropTarget> {
         let hit = self.hit(x, y);
         match hit {
-            Hit::Row(_) | Hit::ListEmpty if self.in_trash() || self.is_recent_view() => None,
+            Hit::Row(_) | Hit::ListEmpty if self.list_takes_no_drops() => None,
             Hit::Row(row) => {
                 let l = self.listing.as_ref()?;
                 let id = *self.rows.get(row)?;
@@ -4351,7 +4480,7 @@ mod tests {
 
         /// Opens `dir` and waits until it's fully read.
         fn open(&mut self, dir: PathBuf) {
-            self.app.go(Stop { dir, cursor_name: None });
+            self.app.go(Stop { dir, cursor_name: None, search: None });
             self.pump_until("folder loaded", |a| !a.loading);
         }
 
@@ -4387,6 +4516,236 @@ mod tests {
 
     fn uri(p: &Path) -> Vec<u8> {
         format!("copy\nfile://{}", p.display()).into_bytes()
+    }
+
+    // ---- Searching below ----
+
+    const CTRL_SHIFT: Mods = Mods { ctrl: true, shift: true, alt: false, logo: false };
+
+    impl Rig {
+        /// Types into whatever field has the keyboard.
+        fn type_text(&mut self, text: &str) {
+            for c in text.chars() {
+                self.app.key(0, &c.to_string(), Mods::default());
+            }
+        }
+
+        /// Starts a search for `q` and waits for all of it.
+        fn search(&mut self, q: &str) {
+            self.app.key(k::KEY_F, "", CTRL_SHIFT);
+            self.type_text(q);
+            self.settle_search(q);
+        }
+
+        fn settle_search(&mut self, q: &str) {
+            self.pump_until("search done", |a| !a.loading && a.listing.as_ref().is_some_and(|l| l.complete && l.search_query() == Some(q)));
+        }
+
+        /// Each row's name and where it is, as the Location column says.
+        fn found(&self) -> Vec<(String, String)> {
+            let l = self.app.listing.clone().unwrap();
+            self.app.rows.iter().map(|&i| (String::from_utf8_lossy(l.name(i)).into_owned(), l.location(i).map(|f| self.app.search_location(f)).unwrap_or_default())).collect()
+        }
+
+        fn row_names(&self) -> Vec<String> {
+            let l = self.app.listing.clone().unwrap();
+            self.app.rows.iter().map(|&i| String::from_utf8_lossy(l.name(i)).into_owned()).collect()
+        }
+    }
+
+    fn found(v: &[(&str, &str)]) -> Vec<(String, String)> {
+        v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    fn search_rig(tag: &str) -> Rig {
+        let mut r = Rig::new(tag);
+        for p in ["notes.txt", "other.txt", "a/b/notes-deep.md", "a/c/plain", ".hid/notes-hidden", "a/notes-dir/inside"] {
+            let p = r.work().join(p);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "x").unwrap();
+        }
+        let w = r.work();
+        r.open(w);
+        r
+    }
+
+    #[test]
+    fn ctrl_shift_f_searches_every_folder_below_and_escape_comes_back() {
+        let mut r = search_rig("search-basic");
+        r.search("notes");
+        assert!(matches!(r.app.edit, Edit::Filter(_)) && r.app.search_below);
+        assert_eq!(r.found(), found(&[("notes-dir", "work/a"), ("notes-deep.md", "work/a/b"), ("notes.txt", "work")]), "folders first, each with where it is");
+        assert!(r.app.status_text().starts_with("3 items found in work"), "{}", r.app.status_text());
+        // Escape ends the search, and the folder is back as it was.
+        r.key(k::KEY_Escape, "");
+        assert!(!r.app.search_below && r.app.filter.is_empty());
+        r.pump_until("the folder again", |a| !a.loading);
+        assert_eq!(r.row_names(), ["a", "notes.txt", "other.txt"]);
+        assert!(r.app.listing.as_ref().unwrap().search().is_none());
+    }
+
+    #[test]
+    fn a_search_is_never_kept_as_what_the_folder_holds() {
+        let mut r = search_rig("search-cache");
+        r.search("notes");
+        r.key(k::KEY_Escape, "");
+        // The folder shows at once from what was read before the search.
+        assert_eq!(r.row_names(), ["a", "notes.txt", "other.txt"]);
+        assert!(r.app.cache.iter().all(|c| c.listing.search().is_none()));
+    }
+
+    #[test]
+    fn typing_more_narrows_what_shows_at_once_and_searches_again() {
+        let mut r = search_rig("search-narrow");
+        r.search("notes");
+        r.type_text("-d");
+        // Before the new search answers, what's showing already fits it.
+        assert_eq!(r.row_names(), ["notes-dir", "notes-deep.md"]);
+        r.settle_search("notes-d");
+        assert_eq!(r.row_names(), ["notes-dir", "notes-deep.md"]);
+        // Fewer letters find more again.
+        r.app.key(k::KEY_BackSpace, "", Mods::default());
+        r.app.key(k::KEY_BackSpace, "", Mods::default());
+        r.settle_search("notes");
+        assert_eq!(r.row_names().len(), 3);
+    }
+
+    #[test]
+    fn ctrl_f_in_a_search_filters_only_this_folder_and_ctrl_shift_f_searches_again() {
+        let mut r = search_rig("search-toggle");
+        r.search("notes");
+        r.ctrl(k::KEY_f);
+        assert!(!r.app.search_below && r.app.filter == "notes");
+        r.pump_until("the folder, filtered", |a| !a.loading && a.listing.as_ref().is_some_and(|l| l.search().is_none()));
+        assert_eq!(r.row_names(), ["notes.txt"]);
+        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        r.settle_search("notes");
+        assert_eq!(r.row_names().len(), 3);
+        // The filter with nothing found says the search is there.
+        r.ctrl(k::KEY_f);
+        r.type_text("-deep");
+        r.pump_until("filtered", |a| !a.loading && a.rows.is_empty());
+        assert!(!r.app.search_below);
+    }
+
+    #[test]
+    fn opening_a_folder_found_and_going_back_returns_to_the_search_on_it() {
+        let mut r = search_rig("search-back");
+        r.search("notes");
+        r.key(k::KEY_Down, "");
+        r.select("notes-dir");
+        r.key(k::KEY_Return, "");
+        r.pump_until("in the folder found", |a| !a.loading && a.dir.ends_with("a/notes-dir"));
+        assert!(!r.app.search_below && r.app.filter.is_empty());
+        assert_eq!(r.row_names(), ["inside"]);
+        r.app.go_back();
+        r.settle_search("notes");
+        assert!(r.app.search_below && r.app.filter == "notes");
+        assert_eq!(r.selected_names(), ["notes-dir"], "on the folder it left from");
+        // And forward again.
+        r.app.go_forward();
+        r.pump_until("in it again", |a| !a.loading && a.dir.ends_with("a/notes-dir"));
+    }
+
+    #[test]
+    fn alt_enter_shows_a_match_in_its_folder() {
+        let mut r = search_rig("search-reveal");
+        r.search("notes");
+        r.key(k::KEY_Down, "");
+        r.select("notes-deep.md");
+        r.app.key(k::KEY_Return, "", Mods { alt: true, ..Mods::default() });
+        r.pump_until("its folder", |a| !a.loading && a.dir.ends_with("a/b"));
+        assert_eq!(r.selected_names(), ["notes-deep.md"]);
+        r.app.go_back();
+        r.settle_search("notes");
+        assert_eq!(r.selected_names(), ["notes-deep.md"], "back on it in the search");
+    }
+
+    #[test]
+    fn hidden_folders_are_searched_only_while_hidden_files_show() {
+        let mut r = search_rig("search-hidden");
+        r.search("notes");
+        r.key(k::KEY_Down, "");
+        assert!(!r.row_names().contains(&"notes-hidden".to_string()));
+        r.ctrl(k::KEY_h);
+        r.pump_until("searched again", |a| !a.loading && a.rows.len() == 4);
+        assert!(r.found().contains(&("notes-hidden".to_string(), "work/.hid".to_string())));
+        r.ctrl(k::KEY_h);
+        r.pump_until("and again", |a| !a.loading && a.rows.len() == 3);
+    }
+
+    #[test]
+    fn a_match_moved_to_the_trash_leaves_the_results() {
+        let mut r = search_rig("search-trash");
+        r.search("notes");
+        r.key(k::KEY_Down, "");
+        r.select("notes-deep.md");
+        r.key(k::KEY_Delete, "");
+        r.idle();
+        r.pump_until("searched again", |a| !a.loading && a.rows.len() == 2);
+        assert!(!r.work().join("a/b/notes-deep.md").exists());
+        assert!(r.app.search_below && r.app.filter == "notes", "still searching");
+        // Undo puts it back, and it's found again.
+        r.ctrl(k::KEY_z);
+        r.idle();
+        r.pump_until("found again", |a| !a.loading && a.rows.len() == 3);
+    }
+
+    #[test]
+    fn renaming_a_match_works_where_it_is() {
+        let mut r = search_rig("search-rename");
+        r.search("notes");
+        r.key(k::KEY_Down, "");
+        r.select("notes-deep.md");
+        r.key(k::KEY_F2, "");
+        assert!(matches!(&r.app.edit, Edit::Rename { path, .. } if path.ends_with("a/b/notes-deep.md")));
+        r.ctrl(k::KEY_a);
+        r.type_text("notes-renamed.md");
+        r.key(k::KEY_Return, "");
+        r.idle();
+        r.pump_until("searched again", |a| !a.loading && a.listing.as_ref().is_some_and(|l| (0..l.len() as u32).any(|i| l.name(i) == b"notes-renamed.md")));
+        assert!(r.work().join("a/b/notes-renamed.md").exists());
+    }
+
+    #[test]
+    fn a_search_isnt_a_folder_to_paste_or_make_a_folder_in_or_drop_on() {
+        let mut r = search_rig("search-readonly");
+        r.search("notes");
+        r.app.action(Action::NewFolder);
+        r.app.action(Action::Paste);
+        assert_eq!(r.app.notices, ["Clear the search to make a folder here", "Clear the search to paste into this folder"]);
+        assert!(r.app.copies_only() && r.app.list_takes_no_drops());
+        let labels: Vec<&str> = r.app.view_menu_items().iter().map(|m| m.label).collect();
+        assert!(labels.contains(&"Show in folder") && !labels.contains(&"Paste") && !labels.contains(&"New folder"), "{labels:?}");
+    }
+
+    #[test]
+    fn nothing_found_and_a_search_cut_short_say_so() {
+        let mut r = search_rig("search-none");
+        r.search("zzz");
+        assert!(r.app.rows.is_empty());
+        assert!(r.app.status_text().starts_with("0 items found"), "{}", r.app.status_text());
+        r.key(k::KEY_Escape, "");
+        r.pump_until("back", |a| !a.loading);
+        for i in 0..gannet_core::search::LIMIT + 5 {
+            fs::write(r.work().join(format!("many-{i}")), "").unwrap();
+        }
+        r.app.reload();
+        r.pump_until("read", |a| !a.loading);
+        r.search("many");
+        assert_eq!(r.app.rows.len(), gannet_core::search::LIMIT);
+        assert_eq!(r.app.status_text(), "The first 1,000 found. Type more to narrow it");
+    }
+
+    #[test]
+    fn the_trash_and_recent_only_filter() {
+        let mut r = Rig::new("search-trash-view");
+        let t = r.app.trash_dir.clone();
+        fs::create_dir_all(&t).unwrap();
+        r.open(t);
+        r.app.key(k::KEY_F, "", CTRL_SHIFT);
+        assert!(matches!(r.app.edit, Edit::Filter(_)));
+        assert!(!r.app.search_below, "the Trash has no folders below to search");
     }
 
     #[test]
@@ -4449,7 +4808,7 @@ mod tests {
         fs::write(r.root.join("data/recently-used.xbel"), format!("<xbel><bookmark href=\"{}\" visited=\"2026-01-01T00:00:00Z\"/></xbel>", gannet_core::uri::to_file_uri(&r.work().join("a")))).unwrap();
         r.open(r.work());
         // The menu is Recent's from the moment it's shown, before its list arrives.
-        r.app.go(Stop { dir: r.app.recent_file.clone(), cursor_name: None });
+        r.app.go(Stop { dir: r.app.recent_file.clone(), cursor_name: None, search: None });
         assert!(!r.app.listing.as_ref().is_some_and(|l| l.is_recent()), "Recent's list isn't here yet");
         assert!(r.app.context_items().iter().all(|i| i.action != Action::Paste && i.action != Action::Trash));
         r.pump_until("Recent", |a| !a.loading);
@@ -6455,7 +6814,7 @@ mod tests {
         for name in ["a", "b"] {
             fs::write(r.work().join(name), "x").unwrap();
         }
-        r.app.go(Stop { dir: r.work(), cursor_name: None });
+        r.app.go(Stop { dir: r.work(), cursor_name: None, search: None });
         r.pump_until("loaded", |a| !a.loading);
         r.app.previewer = Some(r.work().join("a"));
         r.app.cmds.clear();
@@ -6468,7 +6827,7 @@ mod tests {
         let mut r = Rig::new("list-sort-elsewhere");
         fs::create_dir(r.work().join("other")).unwrap();
         fs::write(r.work().join("other/a"), "x").unwrap();
-        r.app.go(Stop { dir: r.work(), cursor_name: None });
+        r.app.go(Stop { dir: r.work(), cursor_name: None, search: None });
         r.pump_until("loaded", |a| !a.loading);
         r.app.previewer = Some(r.work().join("other/a"));
         r.app.cmds.clear();

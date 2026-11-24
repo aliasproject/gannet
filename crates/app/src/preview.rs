@@ -2037,7 +2037,7 @@ impl App {
             self.show_hidden = true;
         }
         self.previewer = Some(path.clone());
-        self.go(Stop { dir, cursor_name: name });
+        self.go(Stop { dir, cursor_name: name, search: None });
         self.preview_begin(path, false);
     }
 
@@ -2060,7 +2060,7 @@ impl App {
         match row {
             Some(row) if !resort => self.move_cursor(row, Mods::default()),
             // Read again in the new order, for the arrows to walk.
-            _ => self.go(Stop { dir, cursor_name: name }),
+            _ => self.go(Stop { dir, cursor_name: name, search: None }),
         }
         if self.preview.as_ref().is_some_and(|p| p.path == path) {
             return;

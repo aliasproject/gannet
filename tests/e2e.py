@@ -339,6 +339,74 @@ def typed_path_filter_and_type_ahead(h):
 
 
 @check
+def searching_below_finds_opens_and_comes_back(h):
+    fs = fresh_fs()
+    tree(fs, {"notes.txt": "x", "other.txt": "", "a/b/notes-deep.md": "xyz", "a/notes-dir/inside": "", "a/c/plain": "", ".hid/notes-hidden": ""})
+    # Enough files below that the walk has something to do.
+    for i in range(40):
+        tree(fs, {f"many/d{i}/f{j}.txt": "" for j in range(50)})
+    a = App(h, fs)
+    a.wait(lambda s: not s["loading"] and s["count"] == 4, "first listing")
+    # The filter only looks here, and says the search is there.
+    a.key("f", mods=["ctrl"])
+    a.type("deep")
+    s = a.wait(lambda s: s["filter"] == "deep" and s["count"] == 0 and not s["searching"], "nothing here")
+    a.shot("search-filter-finds-nothing")
+    # Ctrl+Shift+F, in the box, takes it into every folder below.
+    a.key("f", mods=["ctrl", "shift"])
+    s = a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["names"] == ["notes-deep.md"], "found below")
+    assert s["locations"] == ["fs/a/b"], s["locations"]
+    a.key("Escape")
+    a.wait(lambda s: not s["searching"] and s["filter"] == "" and s["count"] == 4 and s["found"] is None, "back to the folder")
+    # Straight from the list, an empty box says how far it reaches.
+    a.key("f", mods=["ctrl", "shift"])
+    a.wait(lambda s: s["edit"] == "filter:" and s["searching"], "search box")
+    a.shot("search-empty")
+    a.type("notes")
+    s = a.wait(lambda s: s["found"] and s["found"]["complete"] and s["found"]["query"] == "notes" and s["count"] == 3, "found")
+    assert s["names"] == ["notes-dir", "notes-deep.md", "notes.txt"], s["names"]
+    assert s["locations"] == ["fs/a", "fs/a/b", "fs"], s["locations"]
+    assert s["status"] == "3 items found in fs and the folders in it", s["status"]
+    a.shot("search-results")
+    # Into a folder found, and back to the search on it.
+    a.key("Down")
+    a.wait(lambda s: s["edit"] == "none" and s["selected"] == ["notes-dir"], "on the first")
+    a.key("Return")
+    a.wait(lambda s: s["dir"] == str(fs / "a/notes-dir") and s["names"] == ["inside"] and not s["searching"], "opened")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs) and s["searching"] and s["found"] and s["found"]["complete"] and s["selected"] == ["notes-dir"], "back to the search")
+    # Alt+Enter goes to where a match is, with it selected.
+    a.key("Down")
+    a.wait(lambda s: s["selected"] == ["notes-deep.md"])
+    a.key("Return", mods=["alt"])
+    a.wait(lambda s: s["dir"] == str(fs / "a/b") and s["selected"] == ["notes-deep.md"], "shown in its folder")
+    a.key("Left", mods=["alt"])
+    a.wait(lambda s: s["searching"] and s["found"] and s["found"]["complete"] and s["selected"] == ["notes-deep.md"], "back again")
+    # Hidden folders are searched while hidden files show.
+    a.key("h", mods=["ctrl"])
+    a.wait(lambda s: "notes-hidden" in s["names"], "hidden one found")
+    a.key("h", mods=["ctrl"])
+    a.wait(lambda s: "notes-hidden" not in s["names"] and s["found"]["complete"], "and gone again")
+    # The context menu has what fits a search.
+    a.key("Menu")
+    s = a.wait(lambda s: s["menu"], "menu")
+    assert "Show in folder" in s["menu_items"] and "Paste" not in s["menu_items"], s["menu_items"]
+    a.shot("search-menu")
+    a.key("Escape")
+    # A broad search stops at the limit, and says so.
+    a.key("f", mods=["ctrl", "shift"])
+    a.key("a", mods=["ctrl"])
+    a.type("f")
+    s = a.wait(lambda s: s["found"] and s["found"]["query"] == "f" and s["found"]["complete"], "broad search")
+    assert s["found"]["truncated"] and s["count"] == 1000, (s["found"], s["count"])
+    assert s["status"] == "The first 1,000 found. Type more to narrow it", s["status"]
+    a.shot("search-limit")
+    a.key("Escape")
+    a.wait(lambda s: not s["searching"] and s["count"] == 4 and s["found"] is None, "the folder at the end")
+    a.close()
+
+
+@check
 def mouse_selection_and_columns(h):
     fs = fresh_fs()
     tree(fs, {f"f{i}.txt": "" for i in range(6)} | {"dir1/x": ""})

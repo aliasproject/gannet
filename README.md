@@ -100,6 +100,8 @@ To add it to your app launcher:
 | Places in the sidebar | Alt+1 to Alt+9 |
 | Jump to a name | Just type it |
 | Filter, type a path | Ctrl+F or `/`, Ctrl+L |
+| Search the folders inside too | Ctrl+Shift+F |
+| Show a search's match in its folder | Alt+Enter |
 | Hidden files | Ctrl+H |
 | Sort by name, size, modified (again to reverse) | Ctrl+1, Ctrl+2, Ctrl+3 |
 | Copy, cut, paste | Ctrl+C, Ctrl+X, Ctrl+V |
@@ -110,6 +112,20 @@ To add it to your app launcher:
 | Stop the newest operation | Ctrl+. |
 | Context menu | Menu key or F10 |
 | Reload, new window, close | F5 or Ctrl+R, Ctrl+N, Ctrl+Q or Ctrl+W |
+
+## Searching
+
+Ctrl+F filters the folder showing. Ctrl+Shift+F, or Ctrl+Shift+F in the filter, searches it
+and every folder inside it for names that contain what's typed, ignoring case. Matches appear
+as they're found, nearest folders first, with where each one is beside it, and each letter
+typed starts the search again. Enter opens a match, Alt+Enter shows it in its folder, and
+going back from there comes back to the search. Escape ends it.
+
+There's no index: each search reads the folders as they are now, and nothing runs while
+you're not searching. Reading 200,000 files takes a few tens of milliseconds once they've been
+read before. A search stays on the folder's own disk, so other disks, network shares and
+`/proc` mounted inside aren't read, and it doesn't follow symlinks to folders. Hidden folders
+are only searched while hidden files show. It stops after 1,000 matches, and says so.
 
 ## Sorting
 
