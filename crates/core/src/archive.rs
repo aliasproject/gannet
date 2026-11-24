@@ -5,16 +5,18 @@
 //! `bsdtar` refuses, by default, any entry whose path has a `..` in it, and any entry that
 //! would be written through a symlink, so nothing lands outside the folder it's given. It takes
 //! a leading `/` off an absolute path, which keeps that inside the folder too. It does make
-//! symlinks that point outside, so once it's done every symlink is checked, and one that points
-//! anywhere but inside the folder is refused too. Any refusal makes the whole archive fail, and
+//! symlinks that point outside, so once it's done every symlink in the folder that will be put in
+//! place is checked, and one that points anywhere but inside it is refused too. Any refusal makes the whole archive fail, and
 //! the caller removes what was unpacked.
 
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek};
 use std::path::{Component, Path, PathBuf};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -140,8 +142,15 @@ pub fn unpack(tool: &OsStr, archive: &File, into: &Path, mut on_entry: impl FnMu
         while let Ok(line) = rx.try_recv() {
             sort(line, &mut problems);
         }
-        if let Some(status) = child.try_wait().map_err(Failed::Io)? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(Failed::Io(e));
+            }
         }
         let at = reading.stream_position().unwrap_or(0);
         if !keep_going(at) {
@@ -156,23 +165,63 @@ pub fn unpack(tool: &OsStr, archive: &File, into: &Path, mut on_entry: impl FnMu
     while let Ok(line) = rx.try_recv() {
         sort(line, &mut problems);
     }
-    if !status.success() {
-        return Err(Failed::from_messages(&problems));
-    }
-    let root = into.canonicalize().map_err(Failed::Io)?;
-    if links_stay_inside(&root, &root).map_err(Failed::Io)? { Ok(()) } else { Err(Failed::Unsafe) }
+    if status.success() { Ok(()) } else { Err(Failed::from_messages(&problems)) }
 }
 
-/// Whether every symlink under `dir` points somewhere inside `root`. Folders are walked without
-/// following links, so `dir` is always a real folder inside `root`.
-fn links_stay_inside(root: &Path, dir: &Path) -> io::Result<bool> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
+/// The folders `check_links` had to open up to read, each with the mode it had, from the top
+/// down. `restore_modes` puts them back, once the folder is where it's staying.
+pub type Opened = Vec<(PathBuf, u32)>;
+
+/// Checks that every symlink under `root`, the folder that will be put in place, points
+/// somewhere inside it. Folders are walked without following links. One the archive made
+/// unreadable is opened up to be read, as a link inside it counts too, and listed so its mode
+/// can be put back. Stops if `cancel` is set.
+pub fn check_links(root: &Path, cancel: &AtomicBool) -> Result<Opened, Failed> {
+    let mut opened = Vec::new();
+    let found = root.canonicalize().map_err(Failed::Io).and_then(|r| walk(&r, &r, cancel, &mut opened).map(|ok| (r, ok)));
+    match found {
+        Ok((_, true)) => Ok(opened),
+        Ok((r, false)) => {
+            restore_modes(&r, &opened);
+            Err(Failed::Unsafe)
+        }
+        Err(e) => {
+            if let Ok(r) = root.canonicalize() {
+                restore_modes(&r, &opened);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Puts back the modes `check_links` changed, now under `root`, deepest first so each folder
+/// can still be reached while it's done.
+pub fn restore_modes(root: &Path, opened: &Opened) {
+    for (rel, mode) in opened.iter().rev() {
+        let _ = std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(*mode));
+    }
+}
+
+fn walk(root: &Path, dir: &Path, cancel: &AtomicBool, opened: &mut Opened) -> Result<bool, Failed> {
+    let mode = std::fs::symlink_metadata(dir).map_err(Failed::Io)?.permissions().mode() & 0o7777;
+    if mode & 0o500 != 0o500 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o500)).map_err(Failed::Io)?;
+        opened.push((dir.strip_prefix(root).unwrap_or(Path::new("")).to_path_buf(), mode));
+    }
+    for entry in std::fs::read_dir(dir).map_err(Failed::Io)? {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Failed::Cancelled);
+        }
+        let entry = entry.map_err(Failed::Io)?;
+        let kind = entry.file_type().map_err(Failed::Io)?;
         let inside = if kind.is_symlink() {
-            resolve(root, dir.to_path_buf(), &std::fs::read_link(entry.path())?, 40).is_some()
+            let target = std::fs::read_link(entry.path()).map_err(Failed::Io)?;
+            // One budget for the whole lookup, as the kernel keeps, so links that each lead to
+            // two more can't make it take forever.
+            let mut hops = 40;
+            resolve(root, dir.to_path_buf(), &target, &mut hops).is_some()
         } else if kind.is_dir() {
-            links_stay_inside(root, &entry.path())?
+            walk(root, &entry.path(), cancel, opened)?
         } else {
             true
         };
@@ -184,10 +233,10 @@ fn links_stay_inside(root: &Path, dir: &Path) -> io::Result<bool> {
 }
 
 /// Where `target`, read as a link in the folder `at`, leads, or None if it leaves `root` at any
-/// step. Links on the way are followed, as the kernel would, up to `hops` of them, so a link to
+/// step. Links on the way are followed, as the kernel would, until `hops` runs out, so a link to
 /// `.` can't make a later `..` look shallower than it is. A part that doesn't exist yet is taken
 /// as written. An absolute target is refused outright, even one that names a place inside.
-fn resolve(root: &Path, mut at: PathBuf, target: &Path, hops: u32) -> Option<PathBuf> {
+fn resolve(root: &Path, mut at: PathBuf, target: &Path, hops: &mut u32) -> Option<PathBuf> {
     for part in target.components() {
         match part {
             Component::CurDir => {}
@@ -201,8 +250,9 @@ fn resolve(root: &Path, mut at: PathBuf, target: &Path, hops: u32) -> Option<Pat
                 let next = at.join(name);
                 match std::fs::symlink_metadata(&next) {
                     Ok(m) if m.file_type().is_symlink() => {
+                        *hops = hops.checked_sub(1)?;
                         let further = std::fs::read_link(&next).ok()?;
-                        at = resolve(root, at, &further, hops.checked_sub(1)?)?;
+                        at = resolve(root, at, &further, hops)?;
                     }
                     _ => at = next,
                 }
@@ -233,6 +283,24 @@ mod tests {
         assert_eq!(folder_name(b"src-1.2.tar.gz"), b"src-1.2");
         assert_eq!(folder_name(b"Backup.TGZ"), b"Backup");
         assert_eq!(folder_name(b"...zip"), b"Archive");
+    }
+
+    #[test]
+    fn one_budget_of_hops_covers_a_whole_lookup() {
+        let s = crate::testutil::Scratch::new();
+        let root = s.path().canonicalize().unwrap();
+        // l0 -> l1/l1, l1 -> l2/l2 … l30 -> . takes twice the hops at each level: over 40 in all
+        // from l25 down, as it would for the kernel, so l0 is refused, and quickly.
+        for i in 0..30 {
+            std::os::unix::fs::symlink(format!("l{0}/l{0}", i + 1), root.join(format!("l{i}"))).unwrap();
+        }
+        std::os::unix::fs::symlink(".", root.join("l30")).unwrap();
+        let started = std::time::Instant::now();
+        let at = |name: &str| resolve(&root, root.clone(), Path::new(name), &mut 40);
+        assert_eq!(at("l26"), Some(root.clone()));
+        assert_eq!(at("l25"), None);
+        assert_eq!(at("l0"), None);
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
     }
 
     #[test]

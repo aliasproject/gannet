@@ -625,10 +625,22 @@ impl Run {
             }
             return;
         }
+        // What goes into place is decided once, and that same folder is what the links are
+        // checked against: a link can stay inside the hidden folder yet leave the one put in place.
         let only = only_folder(&tmp);
         let (from, name) = match &only {
             Some(n) => (tmp.join(n), n.as_bytes().to_vec()),
             None => (tmp.clone(), crate::archive::folder_name(archive.file_name().map_or(&b""[..], |n| n.as_bytes()))),
+        };
+        let opened = match crate::archive::check_links(&from, &self.job.cancel) {
+            Ok(o) => o,
+            Err(why) => {
+                remove_partial(&tmp);
+                if !matches!(why, crate::archive::Failed::Cancelled) {
+                    self.report(archive, why.message());
+                }
+                return;
+            }
         };
         // Something could take the name between choosing it and the rename, so it tries again.
         let mut placed = Err(io::Error::from(io::ErrorKind::AlreadyExists));
@@ -647,6 +659,9 @@ impl Run {
         if only.is_some() {
             let _ = fs::remove_dir(&tmp);
         }
+        // Folders opened up to be checked get their own modes back, now they're in place. A
+        // folder that can't be written can't be moved to another, so it waits until now.
+        crate::archive::restore_modes(&target, &opened);
         if let Some(stamp) = Stamp::of(&target) {
             self.steps.push(Step::Made(stamp));
         }
@@ -2868,17 +2883,23 @@ mod tests {
 
     /// A tar file written by hand, for entries no archiver would make: `(name, data, symlink to)`.
     fn crafted_tar(path: &Path, entries: &[(&str, &[u8], Option<&str>)]) {
+        let with: Vec<_> = entries.iter().map(|&(n, d, l)| (n, d, l, 0o644)).collect();
+        crafted_tar_with_modes(path, &with);
+    }
+
+    /// As `crafted_tar`, with each entry's mode. A name ending in `/` is a folder.
+    fn crafted_tar_with_modes(path: &Path, entries: &[(&str, &[u8], Option<&str>, u32)]) {
         let mut out = Vec::new();
-        for (name, data, link) in entries {
+        for &(name, data, link, mode) in entries {
             let mut h = [0u8; 512];
             h[..name.len()].copy_from_slice(name.as_bytes());
-            h[100..107].copy_from_slice(b"0000644");
+            h[100..107].copy_from_slice(format!("{mode:07o}").as_bytes());
             h[108..115].copy_from_slice(b"0001750");
             h[116..123].copy_from_slice(b"0001750");
             let size = if link.is_some() { 0 } else { data.len() };
             h[124..135].copy_from_slice(format!("{size:011o}").as_bytes());
             h[136..147].copy_from_slice(b"00000000000");
-            h[156] = if link.is_some() { b'2' } else { b'0' };
+            h[156] = if link.is_some() { b'2' } else if name.ends_with('/') { b'5' } else { b'0' };
             if let Some(l) = link {
                 h[157..157 + l.len()].copy_from_slice(l.as_bytes());
             }
@@ -3002,6 +3023,67 @@ mod tests {
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         assert_eq!(fs::read(work.join("fine/a/ln")).unwrap(), b"bee");
         assert_eq!(fs::read_link(work.join("fine/a/here")).unwrap(), Path::new("."));
+    }
+
+    #[test]
+    fn extract_checks_links_against_the_folder_that_is_put_in_place() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        // Each holds one folder, which is put in place on its own, so `..` from inside it is
+        // the folder the archive is in.
+        let up = work.join("up.tar");
+        crafted_tar(&up, &[("proj/a.txt", b"a", None), ("proj/docs", b"", Some(".."))]);
+        let sib = work.join("sib.tar");
+        crafted_tar(&sib, &[("proj/a.txt", b"a", None), ("proj/sib", b"", Some("../sib"))]);
+        e.start(Request::Extract { archives: vec![up, sib] });
+        let done = finish(&rx, vec![]);
+        assert_eq!(done.errors.len(), 2, "{:?}", done.errors);
+        assert!(done.errors.iter().all(|(_, m)| m.contains("outside its folder")), "{:?}", done.errors);
+        assert_eq!(names_in(&work), ["sib.tar", "up.tar"]);
+
+        let fine = work.join("fine.tar");
+        crafted_tar(&fine, &[("proj/b", b"bee", None), ("proj/a", b"", Some("b"))]);
+        e.start(Request::Extract { archives: vec![fine] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(fs::read(work.join("proj/a")).unwrap(), b"bee");
+    }
+
+    #[test]
+    fn extract_of_links_that_each_lead_to_two_more_ends_quickly() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        // l0 -> l1/l1, l1 -> l2/l2 … l30 -> . doubles the hops at each level. The kernel gives up
+        // after 40 in all and can't open l0 either, so it's refused, and it must not take long.
+        let names: Vec<String> = (0..=30).map(|i| format!("l{i}")).collect();
+        let targets: Vec<String> = (0..30).map(|i| format!("l{0}/l{0}", i + 1)).chain([".".to_string()]).collect();
+        let entries: Vec<_> = names.iter().zip(&targets).map(|(n, t)| (n.as_str(), &b""[..], Some(t.as_str()))).collect();
+        let chain = work.join("chain.tar");
+        crafted_tar(&chain, &entries);
+        let started = Instant::now();
+        e.start(Request::Extract { archives: vec![chain] });
+        let done = finish(&rx, vec![]);
+        assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+        assert_eq!(done.errors.len(), 1, "{:?}", done.errors);
+        assert_eq!(names_in(&work), ["chain.tar"]);
+    }
+
+    #[test]
+    fn extract_reads_folders_the_archive_made_unreadable_and_keeps_their_modes() {
+        let s = Scratch::new();
+        let (e, rx) = engine(&s);
+        let work = s.dir("work");
+        let tar = work.join("backup.tar");
+        crafted_tar_with_modes(&tar, &[("notes.txt", b"n", None, 0o644), ("private/", b"", None, 0o300), ("private/key.txt", b"k", None, 0o600)]);
+        e.start(Request::Extract { archives: vec![tar] });
+        let done = finish(&rx, vec![]);
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        let private = work.join("backup/private");
+        assert_eq!(fs::symlink_metadata(&private).unwrap().permissions().mode() & 0o7777, 0o300);
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::read(private.join("key.txt")).unwrap(), b"k");
     }
 
     #[test]
