@@ -16,6 +16,7 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   press_back           does the Back button's action
   table                the file list through its Table interface: its columns' headings, with
                        how each sorts, and each row's cells
+  focus_cell R C       moves the keyboard to row R's cell C through its Component interface
   heading N            does the action of column N's heading, which sorts by it
   path                 the path bar's links: name, whether showing, and the current one
   crumb N              does the action of link N in the path bar
@@ -232,6 +233,9 @@ def table():
 def run(cmd, arg):
     if cmd == "table":
         return table()
+    if cmd == "focus_cell":
+        r, c = (int(x) for x in arg.split())
+        return Atspi.Table.get_accessible_at(parts()[3], r, c).grab_focus()
     if cmd == "heading":
         return Atspi.Table.get_column_header(parts()[3], int(arg)).do_action(0)
     if cmd == "path":

@@ -548,8 +548,12 @@ impl Ctx {
                 }
                 bits(&on)
             }
-            Target::Cell(_, at, col) => {
+            Target::Cell(e, at, col) => {
                 let mut on = vec![STATE_VISIBLE, STATE_ENABLED, STATE_SENSITIVE];
+                // Selected with its row, as `Table.IsSelected` says.
+                if snap.rows.is_selected(*e) {
+                    on.push(STATE_SELECTED);
+                }
                 if snap.rows.showing(*at) && snap.rows.columns.get(*col).is_some_and(|c| c.w > 0) {
                     on.push(STATE_SHOWING);
                 }
@@ -703,7 +707,8 @@ impl Ctx {
             }
             "GrabFocus" => {
                 let ok = match target {
-                    Target::Row(e, _) => self.tell_row(snap, *e, Act::FocusRow),
+                    // A cell moved to puts the cursor on its row, as clicking it does.
+                    Target::Row(e, _) | Target::Cell(e, ..) => self.tell_row(snap, *e, Act::FocusRow),
                     // The keyboard doesn't go to the sidebar, but a place a screen reader moves
                     // to is shown.
                     Target::Fixed(n) if Self::is_place(n) => self.show_place(n, snap),
@@ -718,7 +723,7 @@ impl Ctx {
             }
             "ScrollTo" | "ScrollToPoint" => {
                 let ok = match target {
-                    Target::Row(e, _) => self.tell_row(snap, *e, Act::ShowRow),
+                    Target::Row(e, _) | Target::Cell(e, ..) => self.tell_row(snap, *e, Act::ShowRow),
                     Target::Fixed(n) if Self::is_place(n) => self.show_place(n, snap),
                     _ => false,
                 };

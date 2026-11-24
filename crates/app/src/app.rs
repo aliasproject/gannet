@@ -10041,6 +10041,11 @@ mod tests {
         r.open(r.work());
         let s = a11y_snapshot(&mut r.app);
         assert_eq!(s.get(LIST).unwrap().description, "This folder is empty");
+        // Not while a folder is being named in it.
+        r.app.action(Action::NewFolder);
+        assert!(matches!(r.app.edit, Edit::NewFolder(_)));
+        assert_eq!(a11y_snapshot(&mut r.app).get(LIST).unwrap().description, "");
+        r.key(k::KEY_Escape, "");
         // The same notice twice is two notices.
         r.app.notice("Something broke".into());
         r.app.notice("Something broke".into());

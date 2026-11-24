@@ -1698,6 +1698,9 @@ def a_screen_reader_reads_columns_the_path_and_drives_and_hears_the_news(h):
         assert t["cell"] == {"role": "table cell", "position": [0, 2], "headings": ["Modified"], "parent": "dest"}, t["cell"]
         # A row says its other cells after its name.
         assert sr.ask("tree")["descriptions"][2] == f"4 B, {t['rows'][2][2]}"
+        # Moving to a cell puts the cursor on its row.
+        assert sr.ask("focus_cell 3 1") is True
+        a.wait(lambda s: s["cursor"] == 3 and s["cursor_shown"], "the cursor on bb.txt")
 
         # A heading's action sorts by it, and the new order is announced.
         sr.ask("events")

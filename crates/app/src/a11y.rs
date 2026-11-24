@@ -764,7 +764,8 @@ impl Link {
             Node::new(BACK, Role::PushButton, "Back", Rect::new(app.px(6.0), 0, b, l.toolbar.h), FRAME).enabled(app.history.can_go_back()).doing(click("Go back", "<Alt>Left")),
             Node::new(SIDEBAR, Role::List, "Places", l.sidebar, FRAME).with_children(side),
             // What the list says when it has no rows: that the folder's empty, or why it can't be shown.
-            Node::new(LIST, Role::Table, "Files", l.list, FRAME).described(app.list_message().map(|m| m.0).unwrap_or_default()),
+            // Not while a new folder is being named in it, which takes that message's place.
+            Node::new(LIST, Role::Table, "Files", l.list, FRAME).described(app.list_message().filter(|_| !matches!(app.edit, Edit::NewFolder(_))).map(|m| m.0).unwrap_or_default()),
             path,
             panel,
         ];
