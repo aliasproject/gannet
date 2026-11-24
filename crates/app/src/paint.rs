@@ -363,36 +363,10 @@ impl App {
             self.paint_field(c, r, &f, true);
             return;
         }
-        let Some(listing) = self.listing.clone() else {
-            if let Some(e) = self.load_error.clone() {
-                self.paint_center(c, area, &format!("Can't open this folder: {e}"), co.danger);
-            } else if self.loading && self.hold_paint.is_none() && self.search_query().is_some() {
-                self.paint_center(c, area, "Searching…", co.muted);
-            }
-            return;
-        };
-        if self.rows.is_empty() {
-            let searching = self.search_query().is_some();
-            if searching && self.loading {
-                self.paint_center(c, area, "Searching…", co.muted);
-            } else if !self.loading {
-                let msg = if searching {
-                    format!("Nothing found in {} or the folders in it", self.crumb_label(&self.dir))
-                } else if !self.filter.is_empty() && self.can_search() {
-                    "Nothing here matches. Ctrl+F searches the folders inside too".to_string()
-                } else if !self.filter.is_empty() {
-                    "Nothing matches the filter".to_string()
-                } else if listing.is_trash() {
-                    "The Trash is empty".to_string()
-                } else if listing.is_recent() {
-                    "No recent files".to_string()
-                } else {
-                    "This folder is empty".to_string()
-                };
-                self.paint_center(c, area, &msg, co.muted);
-            }
-            return;
+        if let Some((msg, error)) = self.list_message() {
+            self.paint_center(c, area, &msg, if error { co.danger } else { co.muted });
         }
+        let Some(listing) = self.listing.clone().filter(|_| !self.rows.is_empty()) else { return };
         let row_h = l.row_h;
         let first = (self.scroll / row_h as f64) as usize;
         let offset = (self.scroll - first as f64 * row_h as f64) as i32;

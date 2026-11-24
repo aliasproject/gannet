@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use gannet_core::listing::Listing;
+use gannet_core::listing::{Kind, Listing, SortKey, Stat};
 
-use crate::app::App;
+use crate::app::{App, Layout};
 use crate::canvas::Rect;
 
 /// Ids of the window's fixed parts. Places are by their place in the sidebar.
@@ -26,6 +26,24 @@ pub const SIDEBAR: u64 = 2;
 pub const LIST: u64 = 3;
 pub const BACK: u64 = 4;
 pub const PLACE0: u64 = 100;
+// The list's column headings, the path bar, the sidebar's headings, and the panel of jobs and
+// notices. A part of the path is by its place in the path, an eject button by its drive's place
+// in the sidebar, a notice by its place among the notices, and a job by its number.
+pub const COLUMN_NAME: u64 = 80;
+pub const COLUMN_LOCATION: u64 = 81;
+pub const COLUMN_SIZE: u64 = 82;
+pub const COLUMN_MODIFIED: u64 = 83;
+pub const PATH: u64 = 84;
+pub const HEADING_PLACES: u64 = 85;
+pub const HEADING_PINNED: u64 = 86;
+pub const HEADING_DEVICES: u64 = 87;
+pub const NOTICES: u64 = 88;
+pub const CRUMB0: u64 = 1 << 12;
+pub const EJECT0: u64 = 1 << 13;
+pub const NOTICE0: u64 = 1 << 14;
+pub const DISMISS0: u64 = 1 << 15;
+pub const JOB0: u64 = 1 << 32;
+pub const STOP0: u64 = 1 << 33;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -33,6 +51,31 @@ pub enum Role {
     List,
     ListItem,
     PushButton,
+    Label,
+    Heading,
+    /// The file list, whose rows are table rows of cells.
+    Table,
+    ColumnHeader,
+    /// A part of the path.
+    Link,
+    /// A job under way. Its value is in `News::jobs`.
+    ProgressBar,
+    Panel,
+}
+
+/// The one thing a part does when a screen reader asks: its name and description, as AT-SPI
+/// has them, and the key that does it too.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Action {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub keys: &'static str,
+}
+
+impl Action {
+    pub const fn new(name: &'static str, description: &'static str, keys: &'static str) -> Self {
+        Self { name, description, keys }
+    }
 }
 
 /// One of the window's fixed parts: everything but the file list's rows.
@@ -41,6 +84,8 @@ pub struct Node {
     pub id: u64,
     pub role: Role,
     pub name: String,
+    /// Said after the name: an app being the default, or what the preview shows.
+    pub description: String,
     /// In the window's own pixels. Wayland never says where a window is on screen.
     pub rect: Rect,
     pub children: Vec<u64>,
@@ -50,6 +95,53 @@ pub struct Node {
     pub enabled: bool,
     /// Whether any of it is in view: a place can be scrolled out of the sidebar.
     pub showing: bool,
+    pub action: Option<Action>,
+    /// A check box's state.
+    pub checked: Option<bool>,
+    /// An entry's text, caret and selection.
+    pub field: Option<crate::field::Field>,
+}
+
+impl Node {
+    /// A part with nothing selected, checked or typed in, enabled and showing.
+    pub fn new(id: u64, role: Role, name: impl Into<String>, rect: Rect, parent: u64) -> Self {
+        Node { id, role, name: name.into(), description: String::new(), rect, children: Vec::new(), parent, selected: false, enabled: true, showing: true, action: None, checked: None, field: None }
+    }
+
+    pub fn described(mut self, d: impl Into<String>) -> Self {
+        self.description = d.into();
+        self
+    }
+
+    pub fn with_children(mut self, c: Vec<u64>) -> Self {
+        self.children = c;
+        self
+    }
+
+    pub fn doing(mut self, a: Action) -> Self {
+        self.action = Some(a);
+        self
+    }
+
+    pub fn enabled(mut self, on: bool) -> Self {
+        self.enabled = on;
+        self
+    }
+
+    pub fn selected(mut self, on: bool) -> Self {
+        self.selected = on;
+        self
+    }
+
+    pub fn showing(mut self, on: bool) -> Self {
+        self.showing = on;
+        self
+    }
+}
+
+/// A push button's action.
+pub const fn click(description: &'static str, keys: &'static str) -> Action {
+    Action::new("click", description, keys)
 }
 
 /// The folder shown, and what's needed to say where a row of Recent, the Trash or a search is.
@@ -84,6 +176,43 @@ pub struct Rows {
     pub scroll: f64,
     /// Changes only with `era`.
     pub here: Arc<Here>,
+    /// The columns, in the order shown, and where each is across a row.
+    pub columns: Vec<Col>,
+    /// The column the list is sorted by, and whether it's in descending order.
+    pub sort: (Column, bool),
+}
+
+/// One of the file list's columns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Column {
+    #[default]
+    Name,
+    /// Where a row of Recent, the Trash or a search is.
+    Location,
+    Size,
+    Modified,
+}
+
+impl Column {
+    /// Its heading's id.
+    pub fn heading(self) -> u64 {
+        match self {
+            Column::Name => COLUMN_NAME,
+            Column::Location => COLUMN_LOCATION,
+            Column::Size => COLUMN_SIZE,
+            Column::Modified => COLUMN_MODIFIED,
+        }
+    }
+}
+
+/// A column as it's shown: what it is, what its heading says, and where it is across the list.
+/// A column too narrow to be drawn has no width.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Col {
+    pub column: Column,
+    pub name: &'static str,
+    pub x: i32,
+    pub w: i32,
 }
 
 impl std::fmt::Debug for Rows {
@@ -99,7 +228,7 @@ impl PartialEq for Rows {
             (None, None) => true,
             _ => false,
         };
-        self.era == o.era && same_listing && Arc::ptr_eq(&self.order, &o.order) && Arc::ptr_eq(&self.selected, &o.selected) && self.area == o.area && self.row_h == o.row_h && self.scroll == o.scroll
+        self.era == o.era && same_listing && Arc::ptr_eq(&self.order, &o.order) && Arc::ptr_eq(&self.selected, &o.selected) && self.area == o.area && self.row_h == o.row_h && self.scroll == o.scroll && self.columns == o.columns && self.sort == o.sort
     }
 }
 
@@ -128,6 +257,33 @@ impl Rows {
         let l = self.listing.as_deref().filter(|l| (entry as usize) < l.len())?;
         let folder = l.location(entry)?;
         Some(if l.search().is_some() { crate::app::search_location(folder, &self.here.dir, &self.here.title) } else { crate::app::home_location(folder, self.here.home.as_deref()) })
+    }
+
+    /// What a row's cell in a column says, as the list shows it. A folder has no size, and a
+    /// file not looked at yet has none of either.
+    pub fn cell(&self, entry: u32, column: Column, now: i64) -> String {
+        let Some(l) = self.listing.as_deref().filter(|l| (entry as usize) < l.len()) else { return String::new() };
+        match (column, l.stat(entry)) {
+            (Column::Name, _) => self.name(entry),
+            (Column::Location, _) => self.location(entry).unwrap_or_default(),
+            (Column::Size, Stat::Known { size, .. }) if !matches!(l.kind(entry), Kind::Dir | Kind::LinkDir) => crate::format::size(size),
+            (Column::Modified, Stat::Known { mtime, .. }) => crate::format::date(mtime, now),
+            (Column::Modified, Stat::Failed) => "unknown".into(),
+            _ => String::new(),
+        }
+    }
+
+    /// What a row says besides its name: its other cells, in the order shown, so the row read
+    /// out as the cursor moves to it sounds as it looks.
+    pub fn summary(&self, entry: u32, now: i64) -> String {
+        let cells: Vec<String> = self.columns.iter().filter(|c| c.column != Column::Name).map(|c| self.cell(entry, c.column, now)).filter(|t| !t.is_empty()).collect();
+        cells.join(", ")
+    }
+
+    /// Where a cell is: its column across the row's area.
+    pub fn cell_rect(&self, at: usize, col: usize) -> Rect {
+        let r = self.rect(at);
+        self.columns.get(col).map_or(Rect::new(r.x, r.y, 0, r.h), |c| Rect::new(c.x, r.y, c.w, r.h))
     }
 
     /// What tells a listing entry's row apart from the others: `Listing::key`.
@@ -195,22 +351,71 @@ pub struct Snapshot {
     pub window_focused: bool,
     /// The folder shown.
     pub dir: Arc<PathBuf>,
+    pub news: News,
+}
+
+/// What the window has to tell, besides its parts: its notices and the jobs under way. A
+/// screen reader hears what's new in it as it comes.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct News {
+    /// How many notices have been posted since the window opened, so a new one can be told
+    /// from an old one that says the same.
+    pub posted: u64,
+    pub notices: Vec<String>,
+    pub jobs: Vec<JobNews>,
+}
+
+/// A job as the panel shows it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct JobNews {
+    pub id: u64,
+    pub label: String,
+    /// How far along it is, while that's known.
+    pub percent: Option<u8>,
+    /// What the panel says of its progress: "4.1 MB of 10 MB", or that it's measuring or stopping.
+    pub progress: String,
+    pub stopping: bool,
 }
 
 impl Snapshot {
     pub fn get(&self, id: u64) -> Option<&Node> {
         self.fixed.iter().find(|n| n.id == id)
     }
+
+    /// What to announce on going from `old` to this, each with whether it's urgent: notices
+    /// posted, which are, and jobs that finished and the list sorted another way, which aren't.
+    /// A job stopped, or one that failed, posts a notice of its own.
+    pub fn news_since(&self, old: &Snapshot) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        if old.rows.era == self.rows.era && old.rows.sort != self.rows.sort {
+            let (column, descending) = self.rows.sort;
+            if let Some(c) = self.rows.columns.iter().find(|c| c.column == column) {
+                out.push((format!("Sorted by {}, {}", c.name.to_lowercase(), if descending { "descending" } else { "ascending" }), false));
+            }
+        }
+        let (was, is) = (&old.news, &self.news);
+        for j in was.jobs.iter().filter(|j| !j.stopping && !is.jobs.iter().any(|n| n.id == j.id)) {
+            out.push((format!("Finished: {}", j.label), false));
+        }
+        // Notices are added at the end, so the new ones are the last.
+        let fresh = is.posted.saturating_sub(was.posted).min(is.notices.len() as u64) as usize;
+        out.extend(is.notices[is.notices.len() - fresh..].iter().map(|t| (t.clone(), true)));
+        out
+    }
 }
 
 /// Something a screen reader asked for.
 pub enum Act {
-    /// Press a button.
+    /// Do a part's action: press a button, sort by a column, or stop a job.
     Press(u64),
     /// Open a place in the sidebar.
     OpenPlace(usize),
     /// Scroll the sidebar to show a place.
     ShowPlace(usize),
+    /// Go to a part of the path, by its place in it, if the window is still in that folder.
+    OpenCrumb(Arc<PathBuf>, usize),
+    /// Eject the drive at that place in the sidebar, if it's still the one of that name.
+    Eject(usize, String),
     /// Put the cursor on a row without changing the selection: the row of that key
     /// (`Listing::key`) in that folder. A request about a folder the window has left is dropped,
     /// here and for each request about a row.
@@ -226,7 +431,7 @@ pub enum Act {
 /// What the server is told.
 pub enum ToServer {
     /// The window as it is now.
-    Snapshot(Snapshot),
+    Snapshot(Box<Snapshot>),
     /// The registry restarted: introduce the app again.
     Embed,
     /// Stop serving: the screen reader has gone.
@@ -307,23 +512,38 @@ impl Link {
         Self { shared: Arc::default(), last: None, epoch: 0, dir: Arc::default(), era: 0, here: Arc::default() }
     }
 
-    /// Hands the server a snapshot if anything changed. Costs nothing while no one listens.
+    /// Hands the server a snapshot of the app's window if anything changed. Costs nothing
+    /// while no one listens.
     pub fn update(&mut self, app: &App) {
+        if self.listening() {
+            let snap = self.build(app);
+            self.offer(snap);
+        }
+    }
+
+    /// Whether a screen reader is listening, so a snapshot is wanted. Forgets the last one
+    /// when not, and when a new server started, which is sent the next one whole.
+    pub fn listening(&mut self) -> bool {
         if !self.shared.is_live() {
             self.last = None;
-            return;
+            return false;
         }
         let epoch = self.shared.current_epoch();
         if epoch != self.epoch {
             self.epoch = epoch;
             self.last = None;
         }
-        let snap = self.build(app);
+        true
+    }
+
+    /// Hands the server a snapshot built elsewhere, as the Open With window's is, if it isn't
+    /// the same as the last. Ask `listening` first.
+    pub fn offer(&mut self, snap: Snapshot) {
         if self.last.as_ref() == Some(&snap) {
             return;
         }
         if let Some((_, tx)) = self.shared.to_server.lock().unwrap().as_ref() {
-            let _ = tx.send(ToServer::Snapshot(snap.clone()));
+            let _ = tx.send(ToServer::Snapshot(Box::new(snap.clone())));
         }
         self.last = Some(snap);
     }
@@ -356,32 +576,185 @@ impl Link {
             _ => Arc::new(app.selected_bits().to_vec()),
         };
         let l = app.layout();
-        let rows = Rows { era: self.era, listing: app.listing.clone(), order, index, selected, area: l.list, row_h: l.row_h.max(1), scroll: app.scroll, here: self.here.clone() };
+        let sort = app.view_sort();
+        let column = match sort.key {
+            SortKey::Name => Column::Name,
+            SortKey::Size => Column::Size,
+            SortKey::Modified => Column::Modified,
+        };
+        let rows = Rows { era: self.era, listing: app.listing.clone(), order, index, selected, area: l.list, row_h: l.row_h.max(1), scroll: app.scroll, here: self.here.clone(), columns: columns(app, &l), sort: (column, sort.descending) };
 
         let place_h = app.px(30.0);
         let places: Vec<Node> = app.places.iter().enumerate().map(|(i, p)| {
                 // Placed as drawn, with the sidebar scrolled.
                 let rect = Rect::new(l.sidebar.x, app.place_top(i), l.sidebar.w, place_h);
                 let showing = rect.y + rect.h > l.sidebar.y && rect.y < l.sidebar.y + l.sidebar.h;
-                Node { id: PLACE0 + i as u64, role: Role::ListItem, name: p.label.clone(), rect, children: Vec::new(), parent: SIDEBAR, selected: p.path == app.dir, enabled: true, showing }
+                Node::new(PLACE0 + i as u64, Role::ListItem, p.label.clone(), rect, SIDEBAR).selected(p.path == app.dir).showing(showing).doing(Action::new("activate", "Open", ""))
             })
             .collect();
         let b = app.px(36.0);
         // As the window's title says it, so Recent and the Trash are called that.
         let title = app.crumb_label(&app.dir);
+        let (side, sidebar) = sidebar(app, &l, places);
+        let headings: Vec<Node> = rows.columns.iter().map(|c| heading(app, &l, c)).collect();
+        let (path, crumbs) = path_bar(app, &l);
+        let (panel, panel_parts, news) = panel(app, &l);
+        let mut top = vec![BACK, PATH, SIDEBAR];
+        top.extend(headings.iter().map(|n| n.id));
+        top.extend([LIST, NOTICES]);
         let mut fixed = vec![
-            Node { id: FRAME, role: Role::Frame, name: format!("{title} - Gannet"), rect: Rect::new(0, 0, app.w, app.h), children: vec![BACK, SIDEBAR, LIST], parent: 0, selected: false, enabled: true, showing: true },
-            Node { id: BACK, role: Role::PushButton, name: "Back".into(), rect: Rect::new(app.px(6.0), 0, b, l.toolbar.h), children: Vec::new(), parent: FRAME, selected: false, enabled: app.history.can_go_back(), showing: true },
-            Node { id: SIDEBAR, role: Role::List, name: "Places".into(), rect: l.sidebar, children: places.iter().map(|n| n.id).collect(), parent: FRAME, selected: false, enabled: true, showing: true },
-            Node { id: LIST, role: Role::List, name: "Files".into(), rect: l.list, children: Vec::new(), parent: FRAME, selected: false, enabled: true, showing: true },
+            Node::new(FRAME, Role::Frame, format!("{title} - Gannet"), Rect::new(0, 0, app.w, app.h), 0).with_children(top),
+            Node::new(BACK, Role::PushButton, "Back", Rect::new(app.px(6.0), 0, b, l.toolbar.h), FRAME).enabled(app.history.can_go_back()).doing(click("Go back", "<Alt>Left")),
+            Node::new(SIDEBAR, Role::List, "Places", l.sidebar, FRAME).with_children(side),
+            // What the list says when it has no rows: that the folder's empty, or why it can't be shown.
+            Node::new(LIST, Role::Table, "Files", l.list, FRAME).described(app.list_message().map(|m| m.0).unwrap_or_default()),
+            path,
+            panel,
         ];
-        fixed.extend(places);
+        fixed.extend(sidebar);
+        fixed.extend(headings);
+        fixed.extend(crumbs);
+        fixed.extend(panel_parts);
         let focus = match rows.entry(app.cursor) {
             Some(e) if app.cursor_shown => Focus::Row(e),
             _ => Focus::Node(LIST),
         };
-        Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone() }
+        Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone(), news }
     }
+}
+
+/// The list's columns, placed as `paint_header` draws them. Recent, the Trash and search
+/// results say where each row is, in a column that's left out of the drawing when the window is
+/// too narrow for it, but not out of what a screen reader hears.
+fn columns(app: &App, l: &Layout) -> Vec<Col> {
+    let area = l.list;
+    let date_x = area.right() - app.px(14.0) - l.col_date;
+    let size_x = date_x - l.col_size;
+    let name_x = area.x + app.px(38.0);
+    let listing = app.listing.as_deref();
+    let trash = listing.is_some_and(|l| l.is_trash());
+    let recent = listing.is_some_and(|l| l.is_recent());
+    let search = listing.is_some_and(|l| l.search().is_some());
+    let origin = (trash || recent || search).then(|| app.origin_column(area, size_x));
+    let name_end = origin.flatten().map_or(size_x, |(ox, _)| ox) - app.px(10.0);
+    let mut out = vec![Col { column: Column::Name, name: "Name", x: name_x, w: (name_end - name_x).max(0) }];
+    if let Some(o) = origin {
+        let (x, w) = o.unwrap_or((size_x, 0));
+        out.push(Col { column: Column::Location, name: if trash { "Original location" } else { "Location" }, x, w });
+    }
+    let date = if trash {
+        "Deleted"
+    } else if recent {
+        "Used"
+    } else {
+        "Modified"
+    };
+    out.push(Col { column: Column::Size, name: "Size", x: size_x, w: l.col_size });
+    out.push(Col { column: Column::Modified, name: date, x: date_x, w: l.col_date });
+    out
+}
+
+/// A column's heading, which sorts the list by it, as clicking it does. Recent's order is fixed,
+/// and nothing sorts by where a row is.
+fn heading(app: &App, l: &Layout, c: &Col) -> Node {
+    let n = Node::new(c.column.heading(), Role::ColumnHeader, c.name, Rect::new(c.x, l.header.y, c.w, l.header.h), FRAME).showing(c.w > 0);
+    let action = match c.column {
+        Column::Name => click("Sort by name", "<Control>1"),
+        Column::Size => click("Sort by size", "<Control>2"),
+        Column::Modified => click("Sort by date", "<Control>3"),
+        Column::Location => return n,
+    };
+    if app.is_recent_view() { n } else { n.doing(action) }
+}
+
+/// The sidebar's children, its headings among its places, and the parts in it: the places,
+/// the headings, and the eject buttons of drives that can be taken out, each inside its drive.
+fn sidebar(app: &App, l: &Layout, mut places: Vec<Node>) -> (Vec<u64>, Vec<Node>) {
+    let heads = app.sidebar_headings();
+    let heading_h = app.px(crate::app::SIDEBAR_HEADING);
+    let in_view = |r: Rect| r.y + r.h > l.sidebar.y && r.y < l.sidebar.y + l.sidebar.h;
+    let mut side = Vec::new();
+    let mut extra = Vec::new();
+    for (i, n) in places.iter_mut().enumerate() {
+        if let Some(&(_, label)) = heads.iter().find(|(at, _)| *at == i) {
+            let id = match label {
+                "Pinned" => HEADING_PINNED,
+                "Devices" => HEADING_DEVICES,
+                _ => HEADING_PLACES,
+            };
+            let r = Rect::new(l.sidebar.x, app.place_top(i) - heading_h, l.sidebar.w, heading_h);
+            side.push(id);
+            extra.push(Node::new(id, Role::Heading, label, r, SIDEBAR).showing(in_view(r)));
+        }
+        side.push(n.id);
+        let Some(r) = app.eject_rect(i) else { continue };
+        let Some(v) = app.places.get(i).and_then(|p| p.volume.as_ref()) else { continue };
+        let id = EJECT0 + i as u64;
+        n.children = vec![id];
+        extra.push(Node::new(id, Role::PushButton, format!("Eject {}", n.name), r, n.id).showing(n.showing).enabled(!app.drives_busy.contains(&v.block)).doing(click("Eject the drive", "")));
+    }
+    places.extend(extra);
+    (side, places)
+}
+
+/// The path bar: a list of links, one for each folder of the path, and the parts in it. The
+/// parts cut off its left aren't showing, and nor is any while the path is being typed.
+fn path_bar(app: &App, l: &Layout) -> (Node, Vec<Node>) {
+    let typing = matches!(app.edit, crate::app::Edit::Path(_));
+    let laid = app.crumbs_laid();
+    let h = (l.toolbar.h - app.px(16.0)).max(0);
+    let crumbs: Vec<Node> = app.crumb_parts().into_iter().enumerate().map(|(i, (_, path))| {
+            let at = laid.iter().find(|(_, _, p)| *p == path).map(|&(x, w, _)| Rect::new(x, app.px(8.0), w, h));
+            Node::new(CRUMB0 + i as u64, Role::Link, app.crumb_label(&path), at.unwrap_or_default(), PATH).selected(path == app.dir).showing(at.is_some() && !typing).doing(Action::new("jump", "Go to this folder", ""))
+        })
+        .collect();
+    let x = laid.first().map_or(l.toolbar.x, |c| c.0);
+    let right = laid.last().map_or(x, |c| c.0 + c.1);
+    let bar = Node::new(PATH, Role::List, "Path", Rect::new(x, 0, right - x, l.toolbar.h), FRAME).showing(!typing).with_children(crumbs.iter().map(|n| n.id).collect());
+    (bar, crumbs)
+}
+
+/// The panel above the status bar, its parts, and the news a screen reader hears of: each job
+/// under way, with its Stop button, then each notice, with its Dismiss button. Only the first
+/// four of each are drawn.
+fn panel(app: &App, l: &Layout) -> (Node, Vec<Node>, News) {
+    let row = app.px(30.0);
+    let mut parts = Vec::new();
+    let mut jobs = Vec::new();
+    let place = |k: usize| Rect::new(l.notices.x, l.notices.y + k as i32 * row, l.notices.w, row);
+    let close = |k: usize| Rect::new(l.notices.right() - row, l.notices.y + k as i32 * row, row, row);
+    for (k, j) in app.visible_jobs().enumerate() {
+        let p = &j.job.progress;
+        let (total, done) = (p.total_bytes.load(Ordering::Relaxed), p.done_bytes.load(Ordering::Relaxed));
+        let (items, done_items) = (p.total_items.load(Ordering::Relaxed), p.done_items.load(Ordering::Relaxed));
+        let scanning = p.scanning.load(Ordering::Relaxed);
+        let stopping = j.job.is_cancelled();
+        // By bytes, or by items when there are no bytes to count.
+        let percent = if scanning { None } else { (done.min(total) * 100).checked_div(total).or_else(|| (done_items.min(items) * 100).checked_div(items)).map(|p| p as u8) };
+        // As the panel says it.
+        let progress = if stopping {
+            "stopping".to_string()
+        } else if scanning {
+            "measuring".to_string()
+        } else if total > 0 {
+            format!("{} of {}", crate::format::size(done), crate::format::size(total))
+        } else {
+            String::new()
+        };
+        let shown = k < 4;
+        parts.push(Node::new(JOB0 + j.job.id, Role::ProgressBar, j.job.label.clone(), place(k), NOTICES).showing(shown));
+        parts.push(Node::new(STOP0 + j.job.id, Role::PushButton, "Stop", close(k), NOTICES).described(j.job.label.clone()).showing(shown).enabled(!stopping).doing(click("Stop the job", "")));
+        jobs.push(JobNews { id: j.job.id, label: j.job.label.clone(), percent, progress, stopping });
+    }
+    let first = jobs.len().min(4);
+    for (i, text) in app.notices.iter().enumerate() {
+        let shown = i < 4;
+        parts.push(Node::new(NOTICE0 + i as u64, Role::Label, text.clone(), place(first + i), NOTICES).showing(shown));
+        parts.push(Node::new(DISMISS0 + i as u64, Role::PushButton, "Dismiss", close(first + i), NOTICES).described(text.clone()).showing(shown).doing(click("Dismiss the notice", "")));
+    }
+    let panel = Node::new(NOTICES, Role::Panel, "Notices", l.notices, FRAME).showing(l.notices.h > 0).with_children(parts.iter().map(|n| n.id).collect());
+    let news = News { posted: app.notices_posted, notices: app.notices.clone(), jobs };
+    (panel, parts, news)
 }
 
 #[cfg(test)]
@@ -390,7 +763,7 @@ mod tests {
 
     fn rows(n: usize, scroll: f64) -> Rows {
         let order: Vec<u32> = (0..n as u32).rev().collect();
-        Rows { era: 1, listing: None, order: Arc::new(order), index: Arc::default(), selected: Arc::new(vec![0b100]), area: Rect::new(10, 100, 300, 200), row_h: 20, scroll, here: Arc::default() }
+        Rows { era: 1, listing: None, order: Arc::new(order), index: Arc::default(), selected: Arc::new(vec![0b100]), area: Rect::new(10, 100, 300, 200), row_h: 20, scroll, ..Rows::default() }
     }
 
     #[test]

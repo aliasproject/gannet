@@ -603,6 +603,10 @@ pub struct App {
     pub edit: Edit,
     pub menu: Option<Menu>,
     pub notices: Vec<String>,
+    /// How many notices have been posted, so a screen reader can tell which are new.
+    pub notices_posted: u64,
+    /// The path bar's parts as last laid out: (start x, width, folder).
+    crumbs_laid: Vec<(i32, i32, PathBuf)>,
 
     pub engine: Engine,
     pub trash_dir: PathBuf,
@@ -764,6 +768,8 @@ impl App {
             edit: Edit::None,
             menu: None,
             notices: Vec::new(),
+            notices_posted: 0,
+            crumbs_laid: Vec::new(),
             engine,
             recent_file: trash_dir.parent().and_then(Path::parent).map_or_else(PathBuf::new, |d| d.join(gannet_core::recent::FILE)),
             trash_dir,
@@ -1228,7 +1234,7 @@ impl App {
             }
         });
         if spawned.is_err() {
-            self.notices.push("Couldn't start a thread to sort this folder".into());
+            self.notice("Couldn't start a thread to sort this folder".into());
             self.invalidate_all();
         }
     }
@@ -1398,6 +1404,7 @@ impl App {
     }
 
     pub fn notice(&mut self, text: String) {
+        self.notices_posted += 1;
         self.notices.push(text);
         self.clamp_scroll();
         self.invalidate_all();
@@ -1501,7 +1508,7 @@ impl App {
     /// Does what a screen reader asked. A request about a row in a folder the window has
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
-        use crate::a11y::{Act, BACK};
+        use crate::a11y::{Act, BACK, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, DISMISS0, STOP0};
         // As with the pointer: nothing behind a dialog can be used, and anything outside a menu
         // only closes it, so the menu never acts on a selection changed under it.
         if self.dialog.is_some() || matches!(act, Act::Wake) {
@@ -1517,7 +1524,42 @@ impl App {
         };
         match act {
             Act::Press(BACK) => self.go_back(),
+            // A column's heading sorts by it, as clicking it does, except in Recent.
+            Act::Press(id @ (COLUMN_NAME | COLUMN_SIZE | COLUMN_MODIFIED)) if !self.is_recent_view() => {
+                self.action(Action::SortBy(match id {
+                    COLUMN_NAME => SortKey::Name,
+                    COLUMN_SIZE => SortKey::Size,
+                    _ => SortKey::Modified,
+                }));
+            }
+            Act::Press(id) if (DISMISS0..DISMISS0 * 2).contains(&id) => {
+                let i = (id - DISMISS0) as usize;
+                if i < self.notices.len() {
+                    self.notices.remove(i);
+                    self.clamp_scroll();
+                    self.invalidate_all();
+                }
+            }
+            Act::Press(id) if id >= STOP0 => {
+                if let Some(j) = self.jobs.iter().find(|j| j.job.id == id - STOP0) {
+                    j.job.cancel();
+                    self.invalidate(self.layout().notices);
+                }
+            }
             Act::Press(_) | Act::Wake => {}
+            Act::OpenCrumb(dir, i) => {
+                if *dir == self.dir
+                    && let Some((_, path)) = self.crumb_parts().into_iter().nth(i)
+                {
+                    self.open_crumb(path);
+                }
+            }
+            // The drive is checked by name, as the sidebar may have changed since.
+            Act::Eject(i, name) => {
+                if let Some(v) = self.places.get(i).filter(|p| p.label == name && self.eject_rect(i).is_some()).and_then(|p| p.volume.clone()) {
+                    self.drive_act(v, Doing::Eject);
+                }
+            }
             Act::OpenPlace(i) => {
                 self.reveal_place(i);
                 self.open_place(i);
@@ -1869,7 +1911,7 @@ impl App {
         for id in self.selected_ids() {
             match l.trashed(id) {
                 Some(t) => items.push(t),
-                None => self.notices.push(format!("“{}” can't be restored: the Trash has no record of where it came from", String::from_utf8_lossy(l.name(id)))),
+                None => self.notice(format!("“{}” can't be restored: the Trash has no record of where it came from", String::from_utf8_lossy(l.name(id)))),
             }
         }
         if !items.is_empty() {
@@ -1912,7 +1954,7 @@ impl App {
         // Opening a pile of files by accident is hard to undo.
         const MANY: usize = 20;
         if ids.len() > MANY {
-            self.notices.push(format!("Select {MANY} items or fewer to open them at once"));
+            self.notice(format!("Select {MANY} items or fewer to open them at once"));
             self.invalidate_all();
             return;
         }
@@ -2081,7 +2123,7 @@ impl App {
         let expanded = expand_home(text, self.places.first().map(|p| p.path.as_path()));
         self.set_edit(Edit::None);
         if !expanded.is_absolute() {
-            self.notices.push("Enter a full path, starting with / or ~".to_string());
+            self.notice("Enter a full path, starting with / or ~".to_string());
             self.invalidate_all();
             return;
         }
@@ -3947,6 +3989,33 @@ impl App {
         let start = self.px(6.0) + self.px(36.0) * 3 + self.px(8.0);
         let end = self.filter_rect().map_or(self.w - self.px(8.0), |r| r.x - self.px(8.0));
         let end = self.empty_trash_rect().map_or(end, |r| r.x - self.px(8.0));
+        let parts = self.crumb_parts();
+        let gap = self.px(14.0) as f32;
+        let widths: Vec<f32> = parts.iter().map(|(s, _)| self.text.measure(s) + self.px(12.0) as f32).collect();
+        let room = (end - start) as f32;
+        let mut first = 0;
+        let mut total: f32 = widths.iter().sum::<f32>() + gap * parts.len().saturating_sub(1) as f32;
+        while total > room && first + 1 < parts.len() {
+            total -= widths[first] + gap;
+            first += 1;
+        }
+        let mut x = start as f32;
+        let mut out = Vec::new();
+        for (i, (_, path)) in parts.into_iter().enumerate().skip(first) {
+            out.push((x as i32, widths[i] as i32, path));
+            x += widths[i] + gap;
+        }
+        self.crumbs_laid.clone_from(&out);
+        out
+    }
+
+    /// The path bar's parts as they were last laid out, for a screen reader.
+    pub fn crumbs_laid(&self) -> &[(i32, i32, PathBuf)] {
+        &self.crumbs_laid
+    }
+
+    /// Every part of the path, from the top, as its label and folder, whether or not it fits.
+    pub fn crumb_parts(&self) -> Vec<(String, PathBuf)> {
         let mut parts: Vec<(String, PathBuf)> = Vec::new();
         let mut acc = PathBuf::new();
         // Recent has no folders above it.
@@ -3971,22 +4040,7 @@ impl App {
             };
             parts.push((label, acc.clone()));
         }
-        let gap = self.px(14.0) as f32;
-        let widths: Vec<f32> = parts.iter().map(|(s, _)| self.text.measure(s) + self.px(12.0) as f32).collect();
-        let room = (end - start) as f32;
-        let mut first = 0;
-        let mut total: f32 = widths.iter().sum::<f32>() + gap * parts.len().saturating_sub(1) as f32;
-        while total > room && first + 1 < parts.len() {
-            total -= widths[first] + gap;
-            first += 1;
-        }
-        let mut x = start as f32;
-        let mut out = Vec::new();
-        for (i, (_, path)) in parts.into_iter().enumerate().skip(first) {
-            out.push((x as i32, widths[i] as i32, path));
-            x += widths[i] + gap;
-        }
-        out
+        parts
     }
 
     /// What a folder is called in the path bar and the window title.
@@ -4004,6 +4058,55 @@ impl App {
     /// in ~/Documents/photos when ~/Documents was searched, and "Documents" for one in it.
     pub fn search_location(&self, folder: &Path) -> String {
         search_location(folder, &self.dir, &self.crumb_label(&self.dir))
+    }
+
+    /// What the list says in place of rows when it has none: why the folder can't be shown,
+    /// that it's being searched, or that nothing's there. The second is whether it's an error.
+    pub fn list_message(&self) -> Option<(String, bool)> {
+        let searching = self.search_query().is_some();
+        let Some(listing) = self.listing.as_deref() else {
+            if let Some(e) = &self.load_error {
+                return Some((format!("Can't open this folder: {e}"), true));
+            }
+            return (self.loading && self.hold_paint.is_none() && searching).then(|| ("Searching…".to_string(), false));
+        };
+        if !self.rows.is_empty() {
+            return None;
+        }
+        if searching && self.loading {
+            return Some(("Searching…".to_string(), false));
+        }
+        if self.loading {
+            return None;
+        }
+        let msg = if searching {
+            format!("Nothing found in {} or the folders in it", self.crumb_label(&self.dir))
+        } else if !self.filter.is_empty() && self.can_search() {
+            "Nothing here matches. Ctrl+F searches the folders inside too".to_string()
+        } else if !self.filter.is_empty() {
+            "Nothing matches the filter".to_string()
+        } else if listing.is_trash() {
+            "The Trash is empty".to_string()
+        } else if listing.is_recent() {
+            "No recent files".to_string()
+        } else {
+            "This folder is empty".to_string()
+        };
+        Some((msg, false))
+    }
+
+    /// Goes up the path to one of its folders, with the cursor on the folder come from.
+    fn open_crumb(&mut self, path: PathBuf) {
+        if path == self.dir {
+            return;
+        }
+        let name = if path == self.trash_dir && let Some(files) = self.trash_files_root(&self.dir) {
+            // The Trash view finds rows by their real path, not their name.
+            self.dir.strip_prefix(&files).ok().and_then(|r| r.components().next()).map(|c| files.join(c).into_os_string().into_vec())
+        } else {
+            self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec())
+        };
+        self.navigate(path, name);
     }
 
     fn crumb_at(&mut self, x: i32) -> Option<usize> {
@@ -4224,16 +4327,8 @@ impl App {
             Hit::Up => self.go_up(),
             Hit::EmptyTrash => self.action(Action::EmptyTrash),
             Hit::Crumb(i) => {
-                if let Some((_, _, path)) = self.crumbs().into_iter().nth(i)
-                    && path != self.dir
-                {
-                    let name = if path == self.trash_dir && let Some(files) = self.trash_files_root(&self.dir) {
-                        // The Trash view finds rows by their real path, not their name.
-                        self.dir.strip_prefix(&files).ok().and_then(|r| r.components().next()).map(|c| files.join(c).into_os_string().into_vec())
-                    } else {
-                        self.dir.strip_prefix(&path).ok().and_then(|r| r.components().next()).map(|c| std::os::unix::ffi::OsStrExt::as_bytes(c.as_os_str()).to_vec())
-                    };
-                    self.navigate(path, name);
+                if let Some((_, _, path)) = self.crumbs().into_iter().nth(i) {
+                    self.open_crumb(path);
                 }
             }
             Hit::PathBar => {
@@ -9586,5 +9681,176 @@ mod tests {
         r.app.bookmarks_changed();
         assert_eq!(r.app.side_scroll, 0.0);
         assert!(!r.app.scrollbar_visible(Pane::Sidebar));
+    }
+
+    /// What a screen reader would be handed now, as a server that just started gets it.
+    fn a11y_snapshot(app: &App) -> crate::a11y::Snapshot {
+        let mut link = crate::a11y::Link::new();
+        let (tx, rx) = channel();
+        assert!(link.shared.connect(link.shared.next_epoch(), tx));
+        link.update(app);
+        match rx.try_recv() {
+            Ok(crate::a11y::ToServer::Snapshot(s)) => *s,
+            _ => panic!("no snapshot"),
+        }
+    }
+
+    fn paint_once(app: &mut App) {
+        let mut px = vec![0u32; (app.w * app.h) as usize];
+        app.paint(&mut crate::canvas::Canvas::new(&mut px, app.w, app.h));
+    }
+
+    #[test]
+    fn a_screen_reader_reads_the_list_as_a_table_and_sorts_by_its_headings() {
+        use crate::a11y::{Act, Column, Role, COLUMN_LOCATION, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, FRAME, LIST};
+        let mut r = Rig::new("a11y-columns");
+        fs::write(r.work().join("a.txt"), "aaaa").unwrap();
+        fs::create_dir(r.work().join("sub")).unwrap();
+        r.open(r.work());
+        r.pump_until("sizes known", |a| a.listing.as_ref().is_some_and(|l| a.rows.iter().all(|&e| matches!(l.stat(e), Stat::Known { .. }))));
+        let s = a11y_snapshot(&r.app);
+        assert_eq!(s.get(LIST).map(|n| n.role), Some(Role::Table));
+        assert_eq!(s.rows.columns.iter().map(|c| c.name).collect::<Vec<_>>(), ["Name", "Size", "Modified"]);
+        let frame = &s.get(FRAME).unwrap().children;
+        assert!([COLUMN_NAME, COLUMN_SIZE, COLUMN_MODIFIED].iter().all(|h| frame.contains(h)) && !frame.contains(&COLUMN_LOCATION), "{frame:?}");
+        let size = s.get(COLUMN_SIZE).unwrap();
+        assert_eq!((size.role, size.action.map(|a| a.keys)), (Role::ColumnHeader, Some("<Control>2")));
+        assert_eq!(s.rows.sort, (Column::Name, false));
+        // Each row's cells read as the list shows them: a folder has no size.
+        let now = gannet_core::time::now();
+        let (sub, a) = (s.rows.entry(0).unwrap(), s.rows.entry(1).unwrap());
+        assert_eq!((s.rows.name(a), s.rows.cell(a, Column::Size, now)), ("a.txt".to_string(), "4 B".to_string()));
+        assert_eq!(s.rows.cell(sub, Column::Size, now), "");
+        let date = s.rows.cell(a, Column::Modified, now);
+        assert!(!date.is_empty());
+        assert_eq!(s.rows.summary(a, now), format!("4 B, {date}"), "the row says its other cells");
+        assert_eq!(s.rows.summary(sub, now), date);
+        // A heading sorts by its column, as a click does, and the new order is news.
+        r.app.on_msg(Msg::A11y(Act::Press(COLUMN_SIZE)));
+        r.pump_until("sorted by size", |a| a.sort.key == SortKey::Size && !a.rows.is_empty());
+        let t = a11y_snapshot(&r.app);
+        assert_eq!(t.rows.sort, (Column::Size, SortKey::Size.first_order().descending));
+        let said = if t.rows.sort.1 { "Sorted by size, descending" } else { "Sorted by size, ascending" };
+        assert_eq!(t.news_since(&s), [(said.to_string(), false)]);
+        // Where search results are has a column of its own, which nothing sorts by.
+        r.search("a.txt");
+        let s = a11y_snapshot(&r.app);
+        assert_eq!(s.rows.columns.iter().map(|c| c.name).collect::<Vec<_>>(), ["Name", "Location", "Size", "Modified"]);
+        assert!(s.get(COLUMN_LOCATION).is_some_and(|n| n.action.is_none()));
+        let e = s.rows.entry(0).unwrap();
+        assert_eq!(s.rows.cell(e, Column::Location, now), "work");
+    }
+
+    #[test]
+    fn a_screen_reader_goes_up_the_path_bar() {
+        use crate::a11y::{Act, Role, PATH};
+        let mut r = Rig::new("a11y-path");
+        fs::create_dir_all(r.work().join("x/y")).unwrap();
+        r.open(r.work().join("x/y"));
+        paint_once(&mut r.app);
+        let s = a11y_snapshot(&r.app);
+        let links: Vec<_> = s.get(PATH).unwrap().children.iter().map(|&c| s.get(c).unwrap()).collect();
+        assert!(links.iter().all(|n| n.role == Role::Link && n.parent == PATH));
+        let names: Vec<&str> = links.iter().map(|n| n.name.as_str()).collect();
+        assert_eq!(names[names.len() - 3..], ["work", "x", "y"]);
+        assert!(links.last().is_some_and(|n| n.selected && n.showing), "the folder shown is the current part, and in view");
+        assert!(links.iter().filter(|n| n.showing).all(|n| !n.rect.is_empty()), "placed as drawn");
+        let x = links.len() - 2;
+        // A request about a folder the window has left does nothing.
+        r.app.on_msg(Msg::A11y(Act::OpenCrumb(Arc::new(r.work()), x)));
+        assert_eq!(r.app.dir, r.work().join("x/y"));
+        r.app.on_msg(Msg::A11y(Act::OpenCrumb(Arc::new(r.work().join("x/y")), x)));
+        r.pump_until("up to x", |a| !a.loading && a.dir.ends_with("x"));
+        assert_eq!(r.row_names(), ["y"]);
+        assert!(r.app.cursor_shown && r.app.cursor == 0, "the cursor on the folder come from");
+        // While the path is typed, the links aren't showing.
+        r.app.start_path_edit();
+        let s = a11y_snapshot(&r.app);
+        assert!(!s.get(PATH).unwrap().showing);
+    }
+
+    #[test]
+    fn a_screen_reader_hears_the_sidebars_headings_and_ejects_a_drive_by_name() {
+        use crate::a11y::{Act, Role, EJECT0, HEADING_DEVICES, HEADING_PLACES, PLACE0, SIDEBAR};
+        let mut r = drive_rig("a11y-eject");
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        let s = a11y_snapshot(&r.app);
+        let side = &s.get(SIDEBAR).unwrap().children;
+        assert_eq!(side[..4], [HEADING_PLACES, PLACE0, HEADING_DEVICES, PLACE0 + 1], "each heading before its section's first place");
+        let devices = s.get(HEADING_DEVICES).unwrap();
+        assert_eq!((devices.role, devices.name.as_str()), (Role::Heading, "Devices"));
+        assert!(s.get(PLACE0).unwrap().children.is_empty(), "Home has no eject button");
+        assert_eq!(s.get(PLACE0 + 1).unwrap().children, [EJECT0 + 1]);
+        let eject = s.get(EJECT0 + 1).unwrap();
+        assert_eq!((eject.role, eject.name.as_str(), eject.parent, eject.enabled), (Role::PushButton, "Eject PHOTOS", PLACE0 + 1, true));
+        assert_eq!(Some(eject.rect), r.app.eject_rect(1));
+        // A drive that took the place of the one asked about isn't ejected.
+        r.app.on_msg(Msg::A11y(Act::Eject(1, "OTHER".into())));
+        assert!(r.app.notices.is_empty());
+        r.app.on_msg(Msg::A11y(Act::Eject(1, "PHOTOS".into())));
+        assert!(r.app.notices.iter().any(|n| n.starts_with("Couldn't eject “PHOTOS”")), "the drive was asked to eject: {:?}", r.app.notices);
+    }
+
+    #[test]
+    fn notices_and_jobs_are_news_to_a_screen_reader() {
+        use crate::a11y::{Act, Role, DISMISS0, JOB0, LIST, NOTICE0, NOTICES, STOP0};
+        let mut r = Rig::new("a11y-news");
+        r.open(r.work());
+        let s = a11y_snapshot(&r.app);
+        assert_eq!(s.get(LIST).unwrap().description, "This folder is empty");
+        // The same notice twice is two notices.
+        r.app.notice("Something broke".into());
+        r.app.notice("Something broke".into());
+        let t = a11y_snapshot(&r.app);
+        assert_eq!(t.news_since(&s), [("Something broke".to_string(), true), ("Something broke".to_string(), true)]);
+        assert_eq!(t.get(NOTICES).unwrap().children, [NOTICE0, DISMISS0, NOTICE0 + 1, DISMISS0 + 1]);
+        assert_eq!(t.get(DISMISS0 + 1).unwrap().description, "Something broke");
+        r.app.on_msg(Msg::A11y(Act::Press(DISMISS0)));
+        let u = a11y_snapshot(&r.app);
+        assert_eq!(r.app.notices.len(), 1);
+        assert!(u.news_since(&t).is_empty(), "dismissing one isn't news");
+        r.app.notices.clear();
+
+        // A copy waiting on a question has lasted long enough to show, with a Stop button.
+        fs::create_dir(r.work().join("dest")).unwrap();
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        fs::write(r.work().join("dest/a.txt"), "old").unwrap();
+        r.app.start_job(Request::Copy { sources: vec![r.work().join("a.txt")], dest: r.work().join("dest") });
+        r.pump_until("the question", |a| matches!(a.dialog, Some(Dialog::Conflict { .. })));
+        std::thread::sleep(JOB_SHOW_AFTER);
+        let s = a11y_snapshot(&r.app);
+        let job = s.news.jobs.first().expect("the job").clone();
+        assert_eq!(job.label, "Copying “a.txt” to dest");
+        let bar = s.get(JOB0 + job.id).unwrap();
+        assert_eq!((bar.role, bar.name.as_str(), bar.parent), (Role::ProgressBar, "Copying “a.txt” to dest", NOTICES));
+        assert!(s.get(STOP0 + job.id).is_some_and(|b| b.enabled && b.description == job.label));
+        // Answered, it finishes, and that's news.
+        // Skip.
+        r.app.press_dialog_button(1);
+        r.pump_until("copied", |a| a.jobs.is_empty());
+        let t = a11y_snapshot(&r.app);
+        assert_eq!(t.news_since(&s), [("Finished: Copying “a.txt” to dest".to_string(), false)]);
+
+        // A job stopped through its button posts a notice that it stopped, not that it finished.
+        r.app.start_job(Request::Copy { sources: vec![r.work().join("a.txt")], dest: r.work().join("dest") });
+        r.pump_until("the question again", |a| matches!(a.dialog, Some(Dialog::Conflict { .. })));
+        std::thread::sleep(JOB_SHOW_AFTER);
+        let s = a11y_snapshot(&r.app);
+        let id = s.news.jobs.first().expect("the job").id;
+        // Nothing behind the question can be used, so it's set aside for the button.
+        r.app.on_msg(Msg::A11y(Act::Press(STOP0 + id)));
+        assert!(!r.app.jobs[0].job.is_cancelled(), "stopped from behind the question");
+        let question = r.app.dialog.take();
+        r.app.on_msg(Msg::A11y(Act::Press(STOP0 + id)));
+        r.app.dialog = question;
+        let s = a11y_snapshot(&r.app);
+        assert!(s.news.jobs.first().is_some_and(|j| j.stopping && j.progress == "stopping"));
+        assert!(!s.get(STOP0 + id).unwrap().enabled, "stopping already");
+        // Skip.
+        r.app.press_dialog_button(1);
+        r.pump_until("stopped", |a| a.jobs.is_empty());
+        assert_eq!(a11y_snapshot(&r.app).news_since(&s), [("Stopped: Copying “a.txt” to dest".to_string(), true)]);
     }
 }

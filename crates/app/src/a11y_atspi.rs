@@ -13,6 +13,10 @@
 //! stand for another file, so a screen reader can't be handed a name it kept from before. The
 //! list says it manages its descendants, so screen readers don't keep its children either,
 //! and a big change needn't be announced row by row.
+//!
+//! The list is a table: each row has a cell for each column, whose path is the row's with the
+//! column's place in front. Notices, jobs that finish and a new sort order are announced, as
+//! Orca presents an `Announcement` straight away; a job's progress is a progress bar's value.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -36,6 +40,9 @@ const APPLICATION: &str = "org.a11y.atspi.Application";
 const COMPONENT: &str = "org.a11y.atspi.Component";
 const ACTION: &str = "org.a11y.atspi.Action";
 const SELECTION: &str = "org.a11y.atspi.Selection";
+const TABLE: &str = "org.a11y.atspi.Table";
+const TABLE_CELL: &str = "org.a11y.atspi.TableCell";
+const VALUE: &str = "org.a11y.atspi.Value";
 const PROPS: &str = "org.freedesktop.DBus.Properties";
 const OBJECT_EVENT: &str = "org.a11y.atspi.Event.Object";
 const WINDOW_EVENT: &str = "org.a11y.atspi.Event.Window";
@@ -45,9 +52,11 @@ const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 // AtspiRole and AtspiStateType numbers.
 const ROLE_APPLICATION: u32 = 75;
 const STATE_ACTIVE: u32 = 1;
+const STATE_CHECKED: u32 = 4;
 const STATE_ENABLED: u32 = 8;
 const STATE_FOCUSABLE: u32 = 11;
 const STATE_FOCUSED: u32 = 12;
+const STATE_INDETERMINATE: u32 = 32;
 const STATE_MULTISELECTABLE: u32 = 18;
 const STATE_SELECTABLE: u32 = 22;
 const STATE_SELECTED: u32 = 23;
@@ -55,6 +64,10 @@ const STATE_SENSITIVE: u32 = 24;
 const STATE_SHOWING: u32 = 25;
 const STATE_VISIBLE: u32 = 30;
 const STATE_MANAGES_DESCENDANTS: u32 = 31;
+
+// AtspiLive: how urgently an announcement is to be made.
+const POLITE: i32 = 1;
+const ASSERTIVE: i32 = 2;
 
 /// More rows than this changing at once aren't announced one by one. The list manages its
 /// descendants, so screen readers don't rely on hearing each.
@@ -127,7 +140,7 @@ fn run(shared: &Shared, epoch: u64, hub: Hub, address: &str) -> zbus::Result<()>
     hub.send(Msg::A11y(Act::Wake));
     let mut old = loop {
         match rx.recv() {
-            Ok(ToServer::Snapshot(s)) => break Arc::new(s),
+            Ok(ToServer::Snapshot(s)) => break Arc::new(*s),
             // Not introduced yet, so there's nothing to introduce again.
             Ok(ToServer::Embed) => {}
             Ok(ToServer::Stop) | Err(_) => return Ok(()),
@@ -139,7 +152,7 @@ fn run(shared: &Shared, epoch: u64, hub: Hub, address: &str) -> zbus::Result<()>
     for m in rx {
         match m {
             ToServer::Snapshot(s) => {
-                let new = Arc::new(s);
+                let new = Arc::new(*s);
                 *ctx.now.lock().unwrap() = Some(new.clone());
                 ctx.emit_changes(&old, &new);
                 old = new;
@@ -166,6 +179,9 @@ enum Target<'a> {
     Fixed(&'a Node),
     /// A row: its listing entry and its place in the list.
     Row(u32, usize),
+    /// A row's cell: its listing entry, the row's place in the list, and its column's place
+    /// among the columns.
+    Cell(u32, usize, usize),
 }
 
 fn fixed_path(id: u64) -> String {
@@ -179,6 +195,11 @@ fn row_path(era: u64, key: &[u8]) -> String {
         let _ = write!(p, "{b:02x}");
     }
     p
+}
+
+/// A row's cell's path: the row's, with the column's place among the columns.
+fn cell_path(era: u64, col: usize, key: &[u8]) -> String {
+    row_path(era, key).replacen(&format!("{PREFIX}r"), &format!("{PREFIX}c{col}_"), 1)
 }
 
 /// The folder visit and key a row's path names.
@@ -197,6 +218,13 @@ fn role_of(r: Role) -> (u32, &'static str) {
         Role::List => (31, "list"),
         Role::ListItem => (32, "list item"),
         Role::PushButton => (43, "push button"),
+        Role::Label => (29, "label"),
+        Role::Heading => (83, "heading"),
+        Role::Table => (55, "table"),
+        Role::ColumnHeader => (10, "column header"),
+        Role::Link => (88, "link"),
+        Role::ProgressBar => (42, "progress bar"),
+        Role::Panel => (39, "panel"),
     }
 }
 
@@ -238,6 +266,10 @@ impl Ctx {
         self.at(&row_path(rows.era, &rows.key(entry)))
     }
 
+    fn cell_ref(&self, rows: &Rows, entry: u32, col: usize) -> Ref {
+        self.at(&cell_path(rows.era, col, &rows.key(entry)))
+    }
+
     fn reply<B: zbus::export::serde::Serialize + zbus::DynamicType>(&self, h: &Header<'_>, body: &B) {
         let _ = zbus::block_on(self.bus.connection().reply(h, body));
     }
@@ -269,18 +301,17 @@ impl Ctx {
         let target = if path == ROOT {
             Target::Root
         } else if let Some(rest) = path.strip_prefix(PREFIX) {
-            match rest.strip_prefix('r') {
-                Some(row) => {
-                    let found = parse_row(row).filter(|(era, _)| *era == snap.rows.era).and_then(|(_, key)| snap.rows.position_of(&key)).and_then(|at| Some((snap.rows.entry(at)?, at)));
-                    match found {
-                        Some((e, at)) => Target::Row(e, at),
-                        None => return self.error(&h, UNKNOWN_OBJECT, "gone"),
-                    }
-                }
-                None => match rest.parse().ok().and_then(|id| snap.get(id)) {
-                    Some(n) => Target::Fixed(n),
-                    None => return self.error(&h, UNKNOWN_OBJECT, "gone"),
-                },
+            // A row's path, or a cell's, names a row of this folder visit that's still listed.
+            let row = |r: &str| parse_row(r).filter(|(era, _)| *era == snap.rows.era).and_then(|(_, key)| snap.rows.position_of(&key)).and_then(|at| Some((snap.rows.entry(at)?, at)));
+            let cell = rest.strip_prefix('c').and_then(|c| c.split_once('_')).and_then(|(col, r)| Some((col.parse::<usize>().ok().filter(|&c| c < snap.rows.columns.len())?, r)));
+            let found = match (cell, rest.strip_prefix('r')) {
+                (Some((col, r)), _) => row(r).map(|(e, at)| Target::Cell(e, at, col)),
+                (None, Some(r)) => row(r).map(|(e, at)| Target::Row(e, at)),
+                (None, None) => rest.parse().ok().and_then(|id| snap.get(id)).map(Target::Fixed),
+            };
+            match found {
+                Some(t) => t,
+                None => return self.error(&h, UNKNOWN_OBJECT, "gone"),
             }
         } else {
             return self.error(&h, UNKNOWN_OBJECT, "no such object");
@@ -311,6 +342,8 @@ impl Ctx {
             (COMPONENT, m) => self.component(&h, m, &body, &target, &snap),
             (ACTION, m) => self.action(&h, m, &body, &target, &snap),
             (SELECTION, m) => self.selection(&h, m, &body, &target, &snap),
+            (TABLE, m) => self.table(&h, m, &body, &target, &snap),
+            (TABLE_CELL, m) => self.table_cell(&h, m, &target, &snap),
             (APPLICATION, "GetLocale") => self.reply(&h, &("",)),
             (APPLICATION, "GetApplicationBusAddress") => self.reply(&h, &("",)),
             _ => self.error(&h, UNKNOWN_METHOD, member.as_str()),
@@ -322,7 +355,8 @@ impl Ctx {
             Target::Root => 1,
             Target::Fixed(n) if n.id == a11y::LIST => snap.rows.len(),
             Target::Fixed(n) => n.children.len(),
-            Target::Row(..) => 0,
+            Target::Row(..) => snap.rows.columns.len(),
+            Target::Cell(..) => 0,
         }
     }
 
@@ -331,16 +365,18 @@ impl Ctx {
             Target::Root => (i == 0).then(|| self.fixed_ref(a11y::FRAME)),
             Target::Fixed(n) if n.id == a11y::LIST => snap.rows.entry(i).map(|e| self.row_ref(&snap.rows, e)),
             Target::Fixed(n) => n.children.get(i).map(|&c| self.fixed_ref(c)),
-            Target::Row(..) => None,
+            Target::Row(e, _) => (i < snap.rows.columns.len()).then(|| self.cell_ref(&snap.rows, *e, i)),
+            Target::Cell(..) => None,
         }
     }
 
-    fn parent(&self, target: &Target<'_>) -> Ref {
+    fn parent(&self, target: &Target<'_>, snap: &Snapshot) -> Ref {
         match target {
             Target::Root => self.desktop.lock().unwrap().clone(),
             Target::Fixed(n) if n.parent == 0 => self.at(ROOT),
             Target::Fixed(n) => self.fixed_ref(n.parent),
             Target::Row(..) => self.fixed_ref(a11y::LIST),
+            Target::Cell(e, ..) => self.row_ref(&snap.rows, *e),
         }
     }
 
@@ -350,6 +386,7 @@ impl Ctx {
             Target::Fixed(n) if n.parent == 0 => 0,
             Target::Fixed(n) => snap.get(n.parent).and_then(|p| p.children.iter().position(|&c| c == n.id)).map_or(-1, |i| i as i32),
             Target::Row(_, at) => *at as i32,
+            Target::Cell(_, _, col) => *col as i32,
         }
     }
 
@@ -358,14 +395,17 @@ impl Ctx {
             Target::Root => "Gannet".into(),
             Target::Fixed(n) => n.name.clone(),
             Target::Row(e, _) => snap.rows.name(*e),
+            Target::Cell(e, _, col) => snap.rows.columns.get(*col).map(|c| snap.rows.cell(*e, c.column, gannet_core::time::now())).unwrap_or_default(),
         }
     }
 
-    /// Where a row of Recent, the Trash or a search is, so two of one name can be told apart.
+    /// What a row says besides its name, the rest of its cells, or what a part says besides
+    /// its name.
     fn description(&self, target: &Target<'_>, snap: &Snapshot) -> String {
         match target {
-            Target::Row(e, _) => snap.rows.location(*e).unwrap_or_default(),
-            _ => String::new(),
+            Target::Row(e, _) => snap.rows.summary(*e, gannet_core::time::now()),
+            Target::Fixed(n) => n.description.clone(),
+            Target::Root | Target::Cell(..) => String::new(),
         }
     }
 
@@ -373,7 +413,8 @@ impl Ctx {
         match target {
             Target::Root => (ROLE_APPLICATION, "application"),
             Target::Fixed(n) => role_of(n.role),
-            Target::Row(..) => role_of(Role::ListItem),
+            Target::Row(..) => (90, "table row"),
+            Target::Cell(..) => (56, "table cell"),
         }
     }
 
@@ -393,12 +434,17 @@ impl Ctx {
                     Role::Frame if snap.window_focused => on.push(STATE_ACTIVE),
                     Role::ListItem => on.extend([STATE_SELECTABLE, STATE_FOCUSABLE]),
                     Role::PushButton => on.push(STATE_FOCUSABLE),
-                    Role::List if n.id == a11y::LIST => on.extend([STATE_FOCUSABLE, STATE_MULTISELECTABLE, STATE_MANAGES_DESCENDANTS]),
+                    Role::Table => on.extend([STATE_FOCUSABLE, STATE_MULTISELECTABLE, STATE_MANAGES_DESCENDANTS]),
+                    Role::ProgressBar if snap.news.jobs.iter().any(|j| a11y::JOB0 + j.id == n.id && j.percent.is_none()) => on.push(STATE_INDETERMINATE),
                     Role::List => on.push(STATE_FOCUSABLE),
                     _ => {}
                 }
-                if n.selected {
+                // The folder shown is marked as the current part of the path, not as selected.
+                if n.selected && n.role != Role::Link {
                     on.push(STATE_SELECTED);
+                }
+                if n.checked == Some(true) {
+                    on.push(STATE_CHECKED);
                 }
                 if focused(a11y::Focus::Node(n.id)) {
                     on.push(STATE_FOCUSED);
@@ -418,6 +464,13 @@ impl Ctx {
                 }
                 bits(&on)
             }
+            Target::Cell(_, at, col) => {
+                let mut on = vec![STATE_VISIBLE, STATE_ENABLED, STATE_SENSITIVE];
+                if snap.rows.showing(*at) && snap.rows.columns.get(*col).is_some_and(|c| c.w > 0) {
+                    on.push(STATE_SHOWING);
+                }
+                bits(&on)
+            }
         }
     }
 
@@ -426,18 +479,18 @@ impl Ctx {
             Target::Root => None,
             Target::Fixed(n) => Some(n.rect),
             Target::Row(_, at) => Some(snap.rows.rect(*at)),
+            Target::Cell(_, at, col) => Some(snap.rows.cell_rect(*at, *col)),
         }
     }
 
     fn is_place(n: &Node) -> bool {
-        n.parent == a11y::SIDEBAR
+        n.parent == a11y::SIDEBAR && n.role == Role::ListItem
     }
 
-    /// The single action an object has: its name and description.
-    fn action_of(&self, target: &Target<'_>) -> Option<(&'static str, &'static str)> {
+    /// The single action an object has.
+    fn action_of(&self, target: &Target<'_>) -> Option<a11y::Action> {
         match target {
-            Target::Fixed(n) if n.id == a11y::BACK => Some(("click", "Go back")),
-            Target::Fixed(n) if Self::is_place(n) => Some(("activate", "Open")),
+            Target::Fixed(n) => n.action,
             _ => None,
         }
     }
@@ -447,7 +500,7 @@ impl Ctx {
             (ACCESSIBLE, _) => vec![
                 ("Name", Variant::from(self.name(target, snap))),
                 ("Description", Variant::from(self.description(target, snap))),
-                ("Parent", Variant::from(self.parent(target))),
+                ("Parent", Variant::from(self.parent(target, snap))),
                 ("ChildCount", Variant::from(self.child_count(target, snap) as i32)),
                 ("Locale", Variant::from(String::new())),
                 ("AccessibleId", Variant::from(String::new())),
@@ -460,7 +513,31 @@ impl Ctx {
                 ("Id", Variant::from(*self.id.lock().unwrap())),
             ],
             (ACTION, _) if self.action_of(target).is_some() => vec![("NActions", Variant::from(1i32))],
-            (SELECTION, Target::Fixed(n)) if n.role == Role::List => vec![("NSelectedChildren", Variant::from(self.selected_children(n, snap).len() as i32))],
+            (SELECTION, Target::Fixed(n)) if Self::selects(n) => vec![("NSelectedChildren", Variant::from(self.selected_children(n, snap).len() as i32))],
+            (TABLE, Target::Fixed(n)) if n.id == a11y::LIST => vec![
+                ("NRows", Variant::from(snap.rows.len() as i32)),
+                ("NColumns", Variant::from(snap.rows.columns.len() as i32)),
+                ("Caption", Variant::from(null())),
+                ("Summary", Variant::from(null())),
+                ("NSelectedRows", Variant::from(self.selected_children(n, snap).len() as i32)),
+                ("NSelectedColumns", Variant::from(0i32)),
+            ],
+            (TABLE_CELL, Target::Cell(_, at, col)) => vec![
+                ("ColumnSpan", Variant::from(1i32)),
+                ("RowSpan", Variant::from(1i32)),
+                ("Position", Variant::from((*at as i32, *col as i32))),
+                ("Table", Variant::from(self.fixed_ref(a11y::LIST))),
+            ],
+            (VALUE, Target::Fixed(n)) if n.role == Role::ProgressBar => {
+                let job = snap.news.jobs.iter().find(|j| a11y::JOB0 + j.id == n.id);
+                vec![
+                    ("MinimumValue", Variant::from(0.0f64)),
+                    ("MaximumValue", Variant::from(100.0f64)),
+                    ("MinimumIncrement", Variant::from(1.0f64)),
+                    ("CurrentValue", Variant::from(job.and_then(|j| j.percent).map_or(0.0, f64::from))),
+                    ("Text", Variant::from(job.map(|j| j.progress.clone()).unwrap_or_default())),
+                ]
+            }
             _ => Vec::new(),
         }
     }
@@ -480,7 +557,7 @@ impl Ctx {
             "GetRole" => self.reply(h, &(self.role(target).0,)),
             "GetRoleName" | "GetLocalizedRoleName" => self.reply(h, &(self.role(target).1,)),
             "GetState" => self.reply(h, &(self.states(target, snap),)),
-            "GetAttributes" => self.reply(h, &(HashMap::from([("toolkit", "Gannet")]),)),
+            "GetAttributes" => self.reply(h, &(self.attributes(target, snap),)),
             "GetApplication" => self.reply(h, &(self.at(ROOT),)),
             "GetInterfaces" => {
                 let mut v = vec![ACCESSIBLE];
@@ -491,8 +568,15 @@ impl Ctx {
                 if self.action_of(target).is_some() {
                     v.push(ACTION);
                 }
-                if matches!(target, Target::Fixed(n) if n.role == Role::List) {
-                    v.push(SELECTION);
+                match target {
+                    Target::Fixed(n) if Self::selects(n) => v.push(SELECTION),
+                    Target::Cell(..) => v.push(TABLE_CELL),
+                    _ => {}
+                }
+                match target {
+                    Target::Fixed(n) if n.id == a11y::LIST => v.push(TABLE),
+                    Target::Fixed(n) if n.role == Role::ProgressBar => v.push(VALUE),
+                    _ => {}
                 }
                 self.reply(h, &(v,))
             }
@@ -521,6 +605,7 @@ impl Ctx {
                         .then(|| ((y - r.y) as f64 + snap.rows.scroll) / snap.rows.row_h as f64)
                         .and_then(|at| snap.rows.entry(at as usize))
                         .map(|e| self.row_ref(&snap.rows, e)),
+                    Target::Row(e, at) => (0..snap.rows.columns.len()).find(|&c| snap.rows.cell_rect(*at, c).contains(x, y)).map(|c| self.cell_ref(&snap.rows, *e, c)),
                     // A place scrolled out of the sidebar isn't there to point at.
                     Target::Fixed(n) => n.children.iter().filter_map(|&c| snap.get(c)).find(|c| r.contains(x, y) && c.rect.contains(x, y)).map(|c| self.fixed_ref(c.id)),
                     _ => None,
@@ -550,9 +635,10 @@ impl Ctx {
         }
     }
 
-    /// A place's index among the sidebar's places.
+    /// A place's index among the sidebar's places, which leaves out its headings.
     fn place_index(n: &Node, snap: &Snapshot) -> Option<usize> {
-        snap.get(a11y::SIDEBAR).and_then(|s| s.children.iter().position(|&c| c == n.id))
+        let _ = snap.get(a11y::SIDEBAR)?.children.iter().position(|&c| c == n.id)?;
+        usize::try_from(n.id.checked_sub(a11y::PLACE0)?).ok()
     }
 
     fn show_place(&self, n: &Node, snap: &Snapshot) -> bool {
@@ -569,18 +655,27 @@ impl Ctx {
     }
 
     fn action(&self, h: &Header<'_>, m: &str, body: &Body, target: &Target<'_>, snap: &Snapshot) {
-        let Some((name, description)) = self.action_of(target) else { return self.error(h, UNKNOWN_METHOD, m) };
+        let Some(a) = self.action_of(target) else { return self.error(h, UNKNOWN_METHOD, m) };
         let Target::Fixed(n) = target else { return self.error(h, UNKNOWN_METHOD, m) };
         match m {
-            "GetActions" => self.reply(h, &(vec![(name, description, "")],)),
-            "GetName" | "GetLocalizedName" => self.reply(h, &(name,)),
-            "GetDescription" => self.reply(h, &(description,)),
-            "GetKeyBinding" => self.reply(h, &(if n.id == a11y::BACK { "<Alt>Left" } else { "" },)),
+            "GetActions" => self.reply(h, &(vec![(a.name, a.description, a.keys)],)),
+            "GetName" | "GetLocalizedName" => self.reply(h, &(a.name,)),
+            "GetDescription" => self.reply(h, &(a.description,)),
+            "GetKeyBinding" => self.reply(h, &(a.keys,)),
             "DoAction" => {
                 let i: i32 = body.deserialize().unwrap_or(-1);
                 let ok = i == 0 && n.enabled;
                 if ok {
-                    let act = if Self::is_place(n) { Act::OpenPlace(Self::place_index(n, snap).unwrap_or(usize::MAX)) } else { Act::Press(n.id) };
+                    let act = if Self::is_place(n) {
+                        Act::OpenPlace(Self::place_index(n, snap).unwrap_or(usize::MAX))
+                    } else if n.parent == a11y::PATH {
+                        Act::OpenCrumb(snap.dir.clone(), (n.id - a11y::CRUMB0) as usize)
+                    } else if (a11y::EJECT0..a11y::NOTICE0).contains(&n.id) {
+                        // Named for the drive, so it can't eject another that took its place.
+                        Act::Eject((n.id - a11y::EJECT0) as usize, snap.get(n.parent).map(|p| p.name.clone()).unwrap_or_default())
+                    } else {
+                        Act::Press(n.id)
+                    };
                     self.hub.send(Msg::A11y(act));
                 }
                 self.reply(h, &(ok,))
@@ -599,9 +694,87 @@ impl Ctx {
         }
     }
 
+    /// Whether a list picks among its children through Selection. The path bar's links don't.
+    fn selects(n: &Node) -> bool {
+        matches!(n.role, Role::List | Role::Table) && n.id != a11y::PATH
+    }
+
+    /// A column heading's sort order, as Orca reads it, the folder shown as the current part of
+    /// the path, and the sidebar's headings' level.
+    fn attributes(&self, target: &Target<'_>, snap: &Snapshot) -> HashMap<&'static str, &'static str> {
+        let mut a = HashMap::from([("toolkit", "Gannet")]);
+        match target {
+            Target::Fixed(n) if n.role == Role::ColumnHeader => {
+                let (column, descending) = snap.rows.sort;
+                a.insert("sort", if column.heading() != n.id { "none" } else if descending { "descending" } else { "ascending" });
+            }
+            Target::Fixed(n) if n.role == Role::Link && n.selected => {
+                a.insert("current", "location");
+            }
+            Target::Fixed(n) if n.role == Role::Heading => {
+                a.insert("level", "2");
+            }
+            _ => {}
+        }
+        a
+    }
+
+    /// The file list as a table: a row for each file, and a column for each of the list's.
+    /// A cell's index is its row's place times the number of columns, plus its column's.
+    fn table(&self, h: &Header<'_>, m: &str, body: &Body, target: &Target<'_>, snap: &Snapshot) {
+        let Target::Fixed(n) = target else { return self.error(h, UNKNOWN_METHOD, m) };
+        if n.id != a11y::LIST {
+            return self.error(h, UNKNOWN_METHOD, m);
+        }
+        let rows = &snap.rows;
+        let cols = rows.columns.len();
+        let cell = |(r, c): (i32, i32)| -> Option<(u32, usize, usize)> {
+            let (r, c) = (usize::try_from(r).ok()?, usize::try_from(c).ok().filter(|&c| c < cols)?);
+            Some((rows.entry(r)?, r, c))
+        };
+        let at = |i: i32| usize::try_from(i).ok().filter(|_| cols > 0).and_then(|i| cell(((i / cols) as i32, (i % cols) as i32)));
+        let two = || body.deserialize::<(i32, i32)>().unwrap_or((-1, -1));
+        let one = || body.deserialize::<i32>().unwrap_or(-1);
+        match m {
+            "GetAccessibleAt" => self.reply(h, &(cell(two()).map_or_else(null, |(e, _, c)| self.cell_ref(rows, e, c)),)),
+            "GetIndexAt" => self.reply(h, &(cell(two()).map_or(-1, |(_, r, c)| (r * cols + c) as i32),)),
+            "GetRowAtIndex" => self.reply(h, &(at(one()).map_or(-1, |(_, r, _)| r as i32),)),
+            "GetColumnAtIndex" => self.reply(h, &(at(one()).map_or(-1, |(_, _, c)| c as i32),)),
+            "GetRowDescription" => self.reply(h, &("",)),
+            "GetColumnDescription" => self.reply(h, &(usize::try_from(one()).ok().and_then(|c| rows.columns.get(c)).map_or("", |c| c.name),)),
+            "GetRowExtentAt" | "GetColumnExtentAt" => self.reply(h, &(i32::from(cell(two()).is_some()),)),
+            "GetRowHeader" => self.reply(h, &(null(),)),
+            "GetColumnHeader" => self.reply(h, &(usize::try_from(one()).ok().and_then(|c| rows.columns.get(c)).map_or_else(null, |c| self.fixed_ref(c.column.heading())),)),
+            "GetSelectedRows" => self.reply(h, &(self.selected_children(n, snap).into_iter().map(|r| r as i32).collect::<Vec<i32>>(),)),
+            "GetSelectedColumns" => self.reply(h, &(Vec::<i32>::new(),)),
+            "IsRowSelected" => self.reply(h, &(usize::try_from(one()).ok().and_then(|r| rows.entry(r)).is_some_and(|e| rows.is_selected(e)),)),
+            "IsSelected" => self.reply(h, &(cell(two()).is_some_and(|(e, ..)| rows.is_selected(e)),)),
+            "IsColumnSelected" | "AddColumnSelection" | "RemoveColumnSelection" => self.reply(h, &(false,)),
+            // As through Selection: adding a row leaves the rest of the selection as it is.
+            "AddRowSelection" => self.reply(h, &(usize::try_from(one()).ok().and_then(|r| rows.entry(r)).is_some_and(|e| self.tell_row(snap, e, |d, k| Act::SelectRow(d, k, true))),)),
+            "RemoveRowSelection" => self.reply(h, &(usize::try_from(one()).ok().and_then(|r| rows.entry(r)).is_some_and(|e| rows.is_selected(e) && self.tell_row(snap, e, |d, k| Act::SelectRow(d, k, false))),)),
+            "GetRowColumnExtentsAtIndex" => match at(one()) {
+                Some((e, r, c)) => self.reply(h, &(true, r as i32, c as i32, 1i32, 1i32, rows.is_selected(e))),
+                None => self.reply(h, &(false, -1i32, -1i32, 0i32, 0i32, false)),
+            },
+            _ => self.error(h, UNKNOWN_METHOD, m),
+        }
+    }
+
+    /// A row's cell, under its column's heading.
+    fn table_cell(&self, h: &Header<'_>, m: &str, target: &Target<'_>, snap: &Snapshot) {
+        let Target::Cell(_, at, col) = target else { return self.error(h, UNKNOWN_METHOD, m) };
+        match m {
+            "GetRowColumnSpan" => self.reply(h, &(true, *at as i32, *col as i32, 1i32, 1i32)),
+            "GetColumnHeaderCells" => self.reply(h, &(snap.rows.columns.get(*col).map(|c| self.fixed_ref(c.column.heading())).into_iter().collect::<Vec<Ref>>(),)),
+            "GetRowHeaderCells" => self.reply(h, &(Vec::<Ref>::new(),)),
+            _ => self.error(h, UNKNOWN_METHOD, m),
+        }
+    }
+
     fn selection(&self, h: &Header<'_>, m: &str, body: &Body, target: &Target<'_>, snap: &Snapshot) {
         let Target::Fixed(n) = target else { return self.error(h, UNKNOWN_METHOD, m) };
-        if n.role != Role::List {
+        if !Self::selects(n) {
             return self.error(h, UNKNOWN_METHOD, m);
         }
         let i = usize::try_from(body.deserialize::<i32>().unwrap_or(-1)).ok();
@@ -624,10 +797,10 @@ impl Ctx {
                 // does.
                 let ok = match i {
                     Some(at) if n.id == a11y::LIST => snap.rows.entry(at).is_some_and(|e| self.tell_row(snap, e, |d, k| Act::SelectRow(d, k, true))),
-                    Some(at) if at < n.children.len() => {
-                        self.hub.send(Msg::A11y(Act::OpenPlace(at)));
+                    Some(at) if n.id == a11y::SIDEBAR => n.children.get(at).and_then(|&c| snap.get(c)).filter(|c| Self::is_place(c)).and_then(|c| Self::place_index(c, snap)).is_some_and(|i| {
+                        self.hub.send(Msg::A11y(Act::OpenPlace(i)));
                         true
-                    }
+                    }),
                     _ => false,
                 };
                 self.reply(h, &(ok,))
@@ -660,6 +833,12 @@ impl Ctx {
             if o.name != n.name {
                 self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-name", 0), Variant::from(n.name.clone()));
             }
+            if o.description != n.description {
+                self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-description", 0), Variant::from(n.description.clone()));
+            }
+            if o.checked != n.checked {
+                state(&path, "checked", n.checked == Some(true));
+            }
             if o.enabled != n.enabled {
                 state(&path, "enabled", n.enabled);
                 state(&path, "sensitive", n.enabled);
@@ -670,18 +849,25 @@ impl Ctx {
             }
             // A place is "selected" while the window is in it, which only marks it: announcing
             // that would read out the sidebar each time the folder changes, while the keyboard
-            // is in the list. A screen reader asking still hears it.
-            if o.selected != n.selected && n.parent != a11y::SIDEBAR {
+            // is in the list. A screen reader asking still hears it. The folder shown is the
+            // current part of the path, which isn't a selection either.
+            if o.selected != n.selected && n.parent != a11y::SIDEBAR && n.role != Role::Link {
                 state(&path, "selected", n.selected);
+                if n.role == Role::ListItem {
+                    self.event(&fixed_path(n.parent), OBJECT_EVENT, "SelectionChanged", ("", 0), Variant::from(0i32));
+                }
             }
         }
-        if let (Some(o), Some(n)) = (old.get(a11y::SIDEBAR), new.get(a11y::SIDEBAR)) {
-            let sidebar = fixed_path(a11y::SIDEBAR);
+        // Parts coming and going: places, and the Open With window's apps as a search narrows
+        // them.
+        for n in &new.fixed {
+            let Some(o) = old.get(n.id).filter(|o| o.children != n.children) else { continue };
+            let path = fixed_path(n.id);
             for (i, id) in o.children.iter().enumerate().rev().filter(|(_, id)| !n.children.contains(id)) {
-                self.event(&sidebar, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
+                self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
             }
             for (i, id) in n.children.iter().enumerate().filter(|(_, id)| !o.children.contains(id)) {
-                self.event(&sidebar, OBJECT_EVENT, "ChildrenChanged", ("add", i as i32), Variant::from(self.fixed_ref(*id)));
+                self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("add", i as i32), Variant::from(self.fixed_ref(*id)));
             }
         }
 
@@ -741,6 +927,20 @@ impl Ctx {
                 state(p, "focused", true);
             }
         }
+        self.emit_news(old, new);
+    }
+
+    /// Announces what's new, and tells of jobs' progress.
+    fn emit_news(&self, old: &Snapshot, new: &Snapshot) {
+        for j in &new.news.jobs {
+            if old.news.jobs.iter().any(|o| o.id == j.id && o.percent != j.percent) {
+                self.event(&fixed_path(a11y::JOB0 + j.id), OBJECT_EVENT, "PropertyChange", ("accessible-value", 0), Variant::from(j.percent.map_or(0.0, f64::from)));
+            }
+        }
+        let frame = fixed_path(a11y::FRAME);
+        for (text, urgent) in new.news_since(old) {
+            self.event(&frame, OBJECT_EVENT, "Announcement", ("", if urgent { ASSERTIVE } else { POLITE }), Variant::from(text));
+        }
     }
 }
 
@@ -756,6 +956,9 @@ mod tests {
         assert_eq!(parse_row("3_zz"), None);
         assert_eq!(parse_row("x_61"), None);
         assert_eq!(fixed_path(a11y::LIST), "/org/a11y/atspi/accessible/3");
+        // A cell's path is its row's with its column first, and doesn't pass for a row's.
+        assert_eq!(cell_path(3, 2, b"a b\xff"), "/org/a11y/atspi/accessible/c2_3_612062ff");
+        assert_eq!(cell_path(3, 2, b"a").strip_prefix(PREFIX).and_then(|r| r.strip_prefix('r')), None);
         assert_eq!(bits(&[STATE_FOCUSED, STATE_MANAGES_DESCENDANTS, STATE_VISIBLE]), vec![(1 << 12) | (1 << 31) | (1 << 30), 0]);
     }
 }

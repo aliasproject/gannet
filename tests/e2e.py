@@ -1539,7 +1539,7 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         heard = sr.until("events", lambda e: any(x["type"].startswith("object:children-changed:add") for x in e), "the new row is heard")
         assert [x["source"] for x in heard if x["type"].startswith("object:children-changed:add")] == ["Files"], heard
         assert not any(x["type"] == "object:state-changed:focused" for x in heard), f"the row with focus was announced again: {heard}"
-        assert sr.ask("kept") == {"role": "list item", "name": "b.txt"}
+        assert sr.ask("kept") == {"role": "table row", "name": "b.txt"}
 
         # While a dialog is open, a screen reader can't act behind it, as the pointer can't.
         places = sr.ask("tree")["places"]
@@ -1659,7 +1659,8 @@ def a_screen_reader_hears_pins_scrolled_places_and_search_results(h):
         a.type("README")
         a.wait(lambda s: s["found"] and s["found"]["complete"] and s["names"] == ["README.md", "README.md"], "found")
         t = sr.until("tree", lambda t: t["rows"] == ["README.md", "README.md"], "the results")
-        assert t["descriptions"] == ["docs/one", "docs/two"], t["descriptions"]
+        # Each says where it is first, as the Location column comes first.
+        assert [d.split(", ")[0] for d in t["descriptions"]] == ["docs/one", "docs/two"], t["descriptions"]
         assert sr.ask("select_row 1") is True and sr.ask("focus_row 1") is True
         a.wait(lambda s: s["cursor"] == 1 and s["selected"] == ["README.md"], "the second result")
         t = sr.until("tree", lambda t: t["focus_at"] == [1], "focus on the second result")
@@ -1668,6 +1669,112 @@ def a_screen_reader_hears_pins_scrolled_places_and_search_results(h):
     finally:
         sr.stop()
 
+
+@check
+def a_screen_reader_reads_columns_the_path_and_drives_and_hears_the_news(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"docs/a.txt": "aaaa", "docs/bb.txt": "b" * 2000, "docs/sub/x.txt": "x", "docs/dest/a.txt": "old"})
+    media = SCRATCH / "media"
+    shutil.rmtree(media, ignore_errors=True)
+    tree(media, {"PHOTOS/beach.png": png_bytes(10, 10)})
+    disks = StandIn(media)
+    sr = ScreenReader()
+    try:
+        disks.say("drive Stick Kingston-1234", "fs sdb1 Stick PHOTOS")
+        a = App(h, fs / "docs", extra_env={"DBUS_SESSION_BUS_ADDRESS": sr.session.address, "DBUS_SYSTEM_BUS_ADDRESS": disks.bus.address})
+        a.wait(lambda s: s["names"] == ["dest", "sub", "a.txt", "bb.txt"] and place_flags(s, "PHOTOS") == {"eject"}, "listed, with the drive")
+        time.sleep(0.5)
+        assert sr.ask("apps") == [], "registered with no screen reader on"
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered once a screen reader is on")
+
+        # The list is a table: its headings say which sorts it, and each row's cells read as shown.
+        t = sr.until("table", lambda t: len(t["rows"]) == 4 and t["rows"][2][1] == "4 B", "the table, sizes known")
+        assert (t["role"], t["row_role"]) == ("table", "table row"), t
+        assert [(c["name"], c["role"], c["sort"], c["actions"]) for c in t["columns"]] == [("Name", "column header", "ascending", 1), ("Size", "column header", "none", 1), ("Modified", "column header", "none", 1)], t["columns"]
+        assert [r[:2] for r in t["rows"]] == [["dest", ""], ["sub", ""], ["a.txt", "4 B"], ["bb.txt", "2.0 kB"]], t["rows"]
+        assert all(r[2] for r in t["rows"]), "every row has a date"
+        assert t["cell"] == {"role": "table cell", "position": [0, 2], "headings": ["Modified"], "parent": "dest"}, t["cell"]
+        # A row says its other cells after its name.
+        assert sr.ask("tree")["descriptions"][2] == f"4 B, {t['rows'][2][2]}"
+
+        # A heading's action sorts by it, and the new order is announced.
+        sr.ask("events")
+        assert sr.ask("heading 1") is True
+        a.wait(lambda s: s["sort"] == "Size" and s["desc"], "sorted by size, biggest first")
+        t = sr.until("table", lambda t: t["columns"][1]["sort"] == "descending", "the Size heading says so")
+        assert t["columns"][0]["sort"] == "none" and [r[0] for r in t["rows"]][2:] == ["bb.txt", "a.txt"], t
+        heard = sr.until("events", lambda e: any(x["type"] == "object:announcement" for x in e), "the sort announced")
+        assert [x["said"] for x in heard if x["type"] == "object:announcement"] == ["Sorted by size, descending"], heard
+        a.key("1", mods=["ctrl"])
+        a.wait(lambda s: s["sort"] == "Name" and not s["desc"], "back to by name")
+
+        # The path bar is a list of links, the folder shown the current one, and a link goes there.
+        p = sr.until("path", lambda p: p and p[-1]["name"] == "docs", "the path")
+        assert all(x["role"] == "link" for x in p) and [x["current"] for x in p][-2:] == [None, "location"], p
+        assert p[-1]["showing"] and p[-2]["name"] == fs.name, p
+        assert sr.ask(f"crumb {len(p) - 2}") is True
+        a.wait(lambda s: s["dir"] == str(fs) and s["selected"] == ["docs"], "up to the folder above, on the one come from")
+        sr.until("path", lambda p: p[-1]["name"] == fs.name and p[-1]["current"] == "location", "the path says where it is now")
+        a.key("Return")
+        a.wait(lambda s: s["dir"] == str(fs / "docs") and s["count"] == 4, "back in docs")
+
+        # The sidebar's sections have headings, and a drive's eject button is in it, named for it.
+        side = sr.until("tree", lambda t: "PHOTOS" in t["places"], "the drive")["sidebar"]
+        assert side[0] == ["heading", "Places", []] and ["heading", "Devices", []] in side, side
+        assert side.index(["heading", "Devices", []]) < side.index(["list item", "PHOTOS", ["Eject PHOTOS"]]), side
+        assert all(kids == [] for role, name, kids in side if name not in ("PHOTOS",)), "only drives that come out have one"
+        assert sr.ask('do ["docs", "Places", "PHOTOS", "Eject PHOTOS"]') is True
+        a.wait(lambda s: place_flags(s, "PHOTOS") is None, "ejected", timeout=10)
+        sr.until("tree", lambda t: "PHOTOS" not in t["places"], "gone")
+
+        # A notice is announced, and can be dismissed.
+        sr.ask("events")
+        a.key("l", mods=["ctrl"])
+        a.type("nowhere")
+        a.key("Return")
+        a.wait(lambda s: s["notices"] == ["Enter a full path, starting with / or ~"], "the notice")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:announcement" for x in e), "the notice announced")
+        assert [x["said"] for x in heard if x["type"] == "object:announcement"] == ["Enter a full path, starting with / or ~"], heard
+        n = sr.until("notices", lambda n: n, "the notice in the panel")
+        assert n == [{"role": "label", "name": "Enter a full path, starting with / or ~", "description": ""}, {"role": "button", "name": "Dismiss", "description": "Enter a full path, starting with / or ~"}], n
+        a.shot("a11y-notice")
+        assert sr.ask('do ["docs", "Notices", "Dismiss"]') is True
+        a.wait(lambda s: s["notices"] == [], "dismissed")
+
+        # A job that lasts long enough to show is a progress bar with a Stop button, and its end
+        # is announced. This one waits on a question, as a big copy would on its bytes.
+        go_to(a, "a.txt")
+        a.key("c", mods=["ctrl"])
+        time.sleep(0.1)
+        a.key("l", mods=["ctrl"])
+        a.type(str(fs / "docs/dest"))
+        a.key("Return")
+        a.wait(lambda s: s["dir"] == str(fs / "docs/dest"), "in dest")
+        a.key("v", mods=["ctrl"])
+        a.wait(lambda s: s["dialog"] == "conflict" and s["visible_jobs"] == 1, "the question, and the job showing")
+        n = sr.until("notices", lambda n: len(n) == 2, "the job in the panel")
+        assert [(x["role"], x["name"], x["description"]) for x in n] == [("progress bar", "Copying “a.txt” to dest", ""), ("button", "Stop", "Copying “a.txt” to dest")], n
+        assert n[0]["value"][0] == 0.0, n
+        a.shot("a11y-job")
+        sr.ask("events")
+        time.sleep(0.45)  # A new question ignores input for a moment.
+        a.type("s")
+        a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0, "skipped, and done")
+        heard = sr.until("events", lambda e: any(x["type"] == "object:announcement" for x in e), "the end announced")
+        assert [x["said"] for x in heard if x["type"] == "object:announcement"] == ["Finished: Copying “a.txt” to dest"], heard
+        assert sr.ask("notices") == []
+
+        # An empty folder says so.
+        go_to(a, "a.txt")
+        a.key("Delete")
+        a.wait(lambda s: s["count"] == 0 and s["jobs"] == 0, "dest emptied")
+        assert sr.until("tree", lambda t: t["files_description"] == "This folder is empty", "the list says it's empty")
+        a.close()
+    finally:
+        sr.stop()
+        disks.stop()
 
 PORTAL = ["org.freedesktop.impl.portal.desktop.gannet", "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser"]
 
