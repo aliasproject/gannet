@@ -198,9 +198,12 @@ pub fn check_links(root: &Path, cancel: &AtomicBool) -> Result<Opened, Failed> {
 
 /// Puts back the modes `check_links` changed, now under `root`, deepest first so each folder
 /// can still be reached while it's done.
+/// The folder at `root` keeps write for its owner: without it, it couldn't be moved again, so
+/// undo couldn't put it in the Trash.
 pub fn restore_modes(root: &Path, opened: &Opened) {
     for (rel, mode) in opened.iter().rev() {
-        let _ = std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(*mode));
+        let mode = if rel.as_os_str().is_empty() { mode | 0o200 } else { *mode };
+        let _ = std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(mode));
     }
 }
 

@@ -660,7 +660,8 @@ impl Run {
             let _ = fs::remove_dir(&tmp);
         }
         // Folders opened up for the check get their own modes back now they're in place. The one
-        // moved had to be writable to move to another folder, so this waits until now.
+        // moved had to be writable to move to another folder, so this waits until now, and that
+        // one stays writable for its owner so undo can move it to the Trash.
         crate::archive::restore_modes(&target, &opened);
         if let Some(stamp) = Stamp::of(&target) {
             self.steps.push(Step::Made(stamp));
@@ -3087,19 +3088,27 @@ mod tests {
     }
 
     #[test]
-    fn extract_moves_a_single_folder_it_cant_write_and_keeps_its_mode() {
+    fn extract_moves_a_single_folder_it_cant_write_and_undo_can_move_it_again() {
         let s = Scratch::new();
         let (e, rx) = engine(&s);
         let work = s.dir("work");
         let tar = work.join("release.tar");
-        crafted_tar_with_modes(&tar, &[("proj/", b"", None, 0o555), ("proj/readme.txt", b"r", None, 0o644)]);
+        crafted_tar_with_modes(&tar, &[("proj/", b"", None, 0o555), ("proj/sub/", b"", None, 0o555), ("proj/readme.txt", b"r", None, 0o644)]);
         e.start(Request::Extract { archives: vec![tar] });
         let done = finish(&rx, vec![]);
         assert!(done.errors.is_empty(), "{:?}", done.errors);
         let proj = work.join("proj");
-        assert_eq!(fs::symlink_metadata(&proj).unwrap().permissions().mode() & 0o7777, 0o555);
+        let mode = |p: &Path| fs::symlink_metadata(p).unwrap().permissions().mode() & 0o7777;
+        // The top folder keeps write for its owner, or it couldn't be moved to the Trash again.
+        assert_eq!(mode(&proj), 0o755);
+        assert_eq!(mode(&proj.join("sub")), 0o555, "folders inside keep the archive's modes");
         assert_eq!(fs::read(proj.join("readme.txt")).unwrap(), b"r");
-        fs::set_permissions(&proj, fs::Permissions::from_mode(0o755)).unwrap();
+        e.start(Request::Undo(done.outcome.undo.unwrap()));
+        let undone = finish(&rx, vec![]);
+        assert!(undone.errors.is_empty(), "{:?}", undone.errors);
+        assert!(!proj.exists(), "undo moves it to the Trash");
+        let trashed = s.path().join("data/Trash/files/proj");
+        fs::set_permissions(trashed.join("sub"), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
