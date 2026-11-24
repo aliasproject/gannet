@@ -3,7 +3,7 @@
 //!
 //! `xdg-terminal-exec --dir=FOLDER` passes the folder with the terminal's own option where its
 //! desktop entry names one (`X-TerminalArgDir`), and otherwise changes to it before starting the
-//! terminal. The launcher also starts in the folder, for versions that don't take `--dir`.
+//! terminal. The launcher also starts in the folder, for the few names `--dir=` can't carry.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 /// The program that starts the person's terminal.
 pub const LAUNCHER: &str = "xdg-terminal-exec";
 
-/// A terminal that ends this soon after it's asked for didn't start. One that ends later was
-/// closed, whatever its exit status, and that isn't news.
-const STARTING: Duration = Duration::from_secs(10);
+/// A terminal that ends badly this soon after it's asked for didn't start: the launcher and
+/// systemd-run fail within a fraction of a second. One that ends later was closed, whatever its
+/// exit status, and that isn't news.
+const STARTING: Duration = Duration::from_secs(3);
 
 /// How terminals are started here.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,9 +51,10 @@ impl Terminal {
             }
             None => Command::new(&self.launcher),
         };
-        // The launcher reads `--dir=` up to the end of a line, so a folder with a newline in its
-        // name is left to the folder it starts in.
-        if !dir.as_os_str().as_encoded_bytes().contains(&b'\n') {
+        // The launcher reads `--dir=` with the shell's `read`, which stops at a newline and drops
+        // a trailing `=`. A folder whose name it would change is left to the folder it starts in.
+        let bytes = dir.as_os_str().as_encoded_bytes();
+        if !bytes.contains(&b'\n') && !bytes.ends_with(b"=") {
             let mut arg = OsString::from("--dir=");
             arg.push(dir);
             c.arg(arg);
@@ -148,11 +150,13 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_with_a_newline_is_left_to_the_starting_folder() {
-        let dir = Path::new("/tmp/two\nlines");
-        let c = Terminal { launcher: "/usr/bin/xdg-terminal-exec".into(), scope: None }.command(dir);
-        assert_eq!(args(&c), ["/usr/bin/xdg-terminal-exec"]);
-        assert_eq!(c.get_current_dir(), Some(dir));
+    fn a_folder_the_launcher_would_misread_is_left_to_the_starting_folder() {
+        for dir in ["/tmp/two\nlines", "/tmp/a=", "/tmp/a=="] {
+            let dir = Path::new(dir);
+            let c = Terminal { launcher: "/usr/bin/xdg-terminal-exec".into(), scope: None }.command(dir);
+            assert_eq!(args(&c), ["/usr/bin/xdg-terminal-exec"], "{dir:?}");
+            assert_eq!(c.get_current_dir(), Some(dir));
+        }
     }
 
     #[test]
