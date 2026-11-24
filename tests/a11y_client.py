@@ -22,6 +22,7 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   caret NAME AT        moves the caret through the Text interface
   select NAME A B      selects from A to B
   word NAME AT         the word at a character's place, as Orca reads one: [text, start, end]
+  at X Y               the name of the window's part at a point, as pointing at it finds
   events               the events heard since last asked
 A field is found by its name, or the start of its name.
 """
@@ -167,6 +168,10 @@ def run(cmd, arg):
         return parts()[2].select_child(int(arg))
     if cmd == "press_back":
         return parts()[1].do_action(0)
+    if cmd == "at":
+        x, y = arg.split(" ")
+        o = gannet().get_child_at_index(0).get_accessible_at_point(int(x), int(y), Atspi.CoordType.WINDOW)
+        return o.get_name() if o else None
     if cmd == "fields":
         return [describe(f) for f in entries()]
     if cmd == "focus_field":

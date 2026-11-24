@@ -603,8 +603,9 @@ impl Ctx {
                         .then(|| ((y - r.y) as f64 + snap.rows.scroll) / snap.rows.row_h as f64)
                         .and_then(|at| snap.rows.entry(at as usize))
                         .map(|e| self.row_ref(&snap.rows, e)),
-                    // A place scrolled out of the sidebar isn't there to point at.
-                    Target::Fixed(n) => n.children.iter().filter_map(|&c| snap.get(c)).find(|c| r.contains(x, y) && c.rect.contains(x, y)).map(|c| self.fixed_ref(c.id)),
+                    // A place scrolled out of the sidebar isn't there to point at. The last child
+                    // drawn is on top: the rename field over the list.
+                    Target::Fixed(n) => n.children.iter().rev().filter_map(|&c| snap.get(c)).find(|c| c.showing && r.contains(x, y) && c.rect.contains(x, y)).map(|c| self.fixed_ref(c.id)),
                     _ => None,
                 };
                 self.reply(h, &(hit.unwrap_or_else(null),))

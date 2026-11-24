@@ -1511,8 +1511,14 @@ impl App {
             let l = app.listing.as_ref().filter(|_| app.dir == dir)?;
             app.rows.iter().position(|&e| *l.key(e) == *key)
         };
-        // Pressing something, or moving to a row, ends an edit as clicking there would.
-        if matches!(act, Act::Press(_) | Act::OpenPlace(_) | Act::FocusRow(..) | Act::SelectRow(..)) {
+        // Pressing something, or moving to a row, ends an edit as clicking there would. A request
+        // about a row of a folder the window has left is dropped, and leaves the edit alone.
+        let clicks = match &act {
+            Act::Press(_) | Act::OpenPlace(_) => true,
+            Act::FocusRow(dir, key) | Act::SelectRow(dir, key, _) => row(self, dir, key).is_some(),
+            _ => false,
+        };
+        if clicks {
             self.leave_field();
         }
         match act {
@@ -1525,14 +1531,14 @@ impl App {
             // The other fields show only while they have the keyboard.
             Act::Focus(_) => {}
             Act::EditText(id, edit_gen, op) => {
-                let ours = match (&self.edit, id) {
-                    (Edit::Path(_), PATH_FIELD) | (Edit::Filter(_), FILTER) => true,
-                    (Edit::Rename { .. } | Edit::NewFolder(_), NAME_FIELD) => edit_gen == self.edit_gen,
-                    _ => false,
-                };
+                // A request about a field since closed, or opened again, is dropped.
+                if edit_gen != self.edit_gen {
+                    return;
+                }
+                let ours = matches!((&self.edit, id), (Edit::Path(_), PATH_FIELD) | (Edit::Filter(_), FILTER) | (Edit::Rename { .. } | Edit::NewFolder(_), NAME_FIELD));
                 // Changing the filter box's text while it shows but isn't typed in opens it first,
                 // as clicking it does.
-                if !ours && id == FILTER && self.filter_rect().is_some() {
+                if !ours && id == FILTER && matches!(self.edit, Edit::None) && self.filter_rect().is_some() {
                     self.leave_field();
                     self.start_filter("");
                 } else if !ours {
@@ -1602,7 +1608,7 @@ impl App {
         self.field_edited();
     }
 
-    /// Which rename or new folder is under way: each starts a new one.
+    /// Which field is open: each opened or closed, and each rename or new folder, is a new one.
     pub fn edit_gen(&self) -> u64 {
         self.edit_gen
     }
@@ -2045,6 +2051,11 @@ impl App {
     }
 
     fn set_edit(&mut self, e: Edit) {
+        // Each field opened or closed is a new one, so a late paste or a screen reader's request
+        // about the last can't land in it.
+        if e != self.edit {
+            self.edit_gen += 1;
+        }
         self.edit = e;
         self.invalidate(self.layout().toolbar);
     }
@@ -5981,6 +5992,9 @@ mod tests {
         // A request about an earlier rename is dropped.
         r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(NAME_FIELD, r.app.edit_gen - 1, TextEdit::Replace(0, 7, "no".into()))));
         assert_eq!(field_text(&r).0, "tea.txt");
+        // A request about a row of another folder is dropped, and leaves the rename alone.
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::FocusRow(Arc::new(r.root.clone()), b"work".to_vec())));
+        assert_eq!(field_text(&r).0, "tea.txt");
         // Moving to a row ends the rename as clicking there does: it's made.
         let key = r.app.listing.as_ref().unwrap().key(r.app.rows[0]).into_owned();
         r.app.on_msg(Msg::A11y(crate::a11y::Act::FocusRow(Arc::new(r.work()), key)));
@@ -6015,6 +6029,26 @@ mod tests {
         r.key(k::KEY_Tab, "");
         r.app.on_msg(Msg::A11y(crate::a11y::Act::Focus(FILTER)));
         assert!(matches!(r.app.edit, Edit::Filter(_)));
+    }
+
+    #[test]
+    fn a_late_paste_or_request_doesnt_land_in_a_field_opened_since() {
+        use crate::a11y::{FILTER, TextEdit};
+        let mut r = Rig::new("a11y-late");
+        fs::write(r.work().join("a"), "x").unwrap();
+        r.open(r.work());
+        r.key(0, "/");
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        let stale = r.app.edit_gen;
+        // The box closes and opens again before the answers come.
+        r.key(k::KEY_Escape, "");
+        r.key(0, "/");
+        r.app.on_msg(Msg::Clipboard(Some(b"junk".to_vec()), clipboard::TEXT.to_string(), asked));
+        r.app.on_msg(Msg::A11y(crate::a11y::Act::EditText(FILTER, stale, TextEdit::Replace(0, 0, "old".into()))));
+        assert_eq!(field_text(&r).0, "");
+        a11y_edit(&mut r, FILTER, TextEdit::Replace(0, 0, "new".into()));
+        assert_eq!(field_text(&r).0, "new");
     }
 
     #[test]

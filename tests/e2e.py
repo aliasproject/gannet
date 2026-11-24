@@ -1771,6 +1771,9 @@ def a_screen_reader_reads_and_edits_the_text_fields(h):
         (rx, ry, rw, rh) = f["rect"]
         assert row_y(0) - 20 < ry < row_y(0) < ry + rh and rx < ROW_X < rx + rw, (f["rect"], row_y(0))
         assert all(rx < b[0] and b[0] + b[2] < rx + rw and ry <= b[1] and b[1] + b[3] <= ry + rh for b in f["boxes"]), f
+        # Pointing at it finds the field, on top of the list; beside it, the list.
+        assert sr.ask(f"at {ROW_X} {row_y(0)}") == "Rename apple.txt"
+        assert sr.ask(f"at {ROW_X} {row_y(1)}") == "Files"
         a.shot("a11y-rename-field")
 
         # Moving the caret and selecting through AT-SPI is heard, and typing then replaces

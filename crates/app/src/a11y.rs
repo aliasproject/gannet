@@ -68,9 +68,9 @@ pub struct Node {
 /// Where a field's characters are drawn, for a screen reader that shows or magnifies them.
 #[derive(Clone, PartialEq, Debug)]
 pub struct TextGeometry {
-    /// The text it was worked out for, and where that starts: a field scrolls with its caret.
-    text: String,
-    x0: f32,
+    /// The text, and how far from its start each character's left edge is, and the last one's
+    /// right edge. Measured once for each text: the field scrolling with its caret only moves it.
+    measured: Arc<(String, Vec<f32>)>,
     /// The left edge of each character, and the right edge of the last.
     pub edges: Vec<i32>,
     /// The line the text is on.
@@ -456,17 +456,17 @@ impl Link {
             node(LIST, Role::List, "Files", l.list, Vec::new(), true),
         ];
         fixed.extend(places);
-        // A field's characters are measured again only when its text or its place changes.
+        // A field's characters are measured again only when its text changes.
         let mut text_geometry = Vec::new();
         for (n, x0) in &fields {
             let Some(f) = n.field.as_ref() else { continue };
-            let line = app.field_line(n.rect);
-            let kept = self.last.as_ref().and_then(|s| s.text_geometry.iter().find(|(i, _)| *i == n.id)).filter(|(_, g)| g.text == f.text && g.x0 == *x0 && g.line == line);
-            let g = match kept {
-                Some((_, g)) => g.clone(),
-                None => Arc::new(TextGeometry { text: f.text.clone(), x0: *x0, edges: app.char_edges(&f.text, *x0), line }),
+            let kept = self.last.as_ref().and_then(|s| s.text_geometry.iter().find(|(i, _)| *i == n.id)).map(|(_, g)| &g.measured).filter(|m| m.0 == f.text);
+            let measured = match kept {
+                Some(m) => m.clone(),
+                None => Arc::new((f.text.clone(), app.char_offsets(&f.text))),
             };
-            text_geometry.push((n.id, g));
+            let edges = measured.1.iter().map(|o| (x0 + o).round() as i32).collect();
+            text_geometry.push((n.id, Arc::new(TextGeometry { measured, edges, line: app.field_line(n.rect) })));
         }
         // The filter box can show what it filters by without being typed in.
         let typing = fields.iter().map(|(n, _)| n.id).find(|&id| id != FILTER || matches!(app.edit, Edit::Filter(_)));
@@ -482,9 +482,12 @@ impl Link {
     /// The text fields showing, each with where its text starts.
     fn fields(app: &mut App) -> Vec<(Node, f32)> {
         let mut out = Vec::new();
+        let list = app.layout().list;
         let mut add = |app: &mut App, id, name: String, description: &str, rect: Rect, f: Field| {
             let x0 = app.field_text_x(rect, &f);
-            out.push((Node { id, role: Role::Entry, name, rect, children: Vec::new(), parent: FRAME, selected: false, enabled: true, showing: true, description: description.into(), field: Some(f) }, x0));
+            // The row being renamed can be scrolled out of view.
+            let showing = id != NAME_FIELD || rect.intersects(list);
+            out.push((Node { id, role: Role::Entry, name, rect, children: Vec::new(), parent: FRAME, selected: false, enabled: true, showing, description: description.into(), field: Some(f) }, x0));
         };
         if let Edit::Path(f) = &app.edit {
             let f = f.clone();
@@ -536,7 +539,7 @@ mod tests {
 
     #[test]
     fn a_fields_characters_are_found_by_place() {
-        let g = TextGeometry { text: "abc".into(), x0: 10.0, edges: vec![10, 17, 25, 31], line: Rect::new(0, 20, 100, 16) };
+        let g = TextGeometry { measured: Arc::default(), edges: vec![10, 17, 25, 31], line: Rect::new(0, 20, 100, 16) };
         assert_eq!(g.char_rect(1), Rect::new(17, 20, 8, 16));
         assert_eq!(g.char_rect(3), Rect::new(31, 20, 0, 16), "past the end, an empty box");
         assert_eq!(g.char_at(17, 20), Some(1));
