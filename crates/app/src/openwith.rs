@@ -602,7 +602,7 @@ impl Window {
         let x0 = (r.x + self.px(8.0)) as f32 - shift;
         let line = Rect::new(r.x, r.y + (r.h - line_h) / 2, r.w, line_h);
         let geometry = a11y::TextGeometry::measure(&mut self.text, f, x0, line, prev);
-        a11y::Snapshot { fixed, rows, focus, window_focused: self.has_keyboard, dir: Arc::default(), text_geometry: vec![(a11y::OPEN_WITH_SEARCH, Arc::new(geometry))], edit_gen: 0 }
+        a11y::Snapshot { fixed, rows, focus, window_focused: self.has_keyboard, dir: Arc::default(), text_geometry: vec![(a11y::OPEN_WITH_SEARCH, Arc::new(geometry))], edit_gen: 0, news: a11y::News::default() }
     }
 
     /// Does what a screen reader asked, as the pointer would.

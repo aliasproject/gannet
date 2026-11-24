@@ -11,8 +11,17 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   deselect_row N       takes row N out of the selection, the same way
   focus_row N          moves the keyboard to row N through its Component interface
   focus_place N        moves to place N in the sidebar through its Component interface
-  select_place N       selects place N in the sidebar, which opens it
+  select_place N       selects place N in the sidebar, which opens it (N counts places, not
+                       the headings among them)
   press_back           does the Back button's action
+  table                the file list through its Table interface: its columns' headings, with
+                       how each sorts, and each row's cells
+  focus_cell R C       moves the keyboard to row R's cell C through its Component interface
+  heading N            does the action of column N's heading, which sorts by it
+  path                 the path bar's links: name, whether showing, and the current one
+  crumb N              does the action of link N in the path bar
+  notices              the panel of jobs and notices: each part's role, name, description,
+                       and a job's value
   fields               the window's text fields: name, description, text, caret, selection,
                        states, and each character's box
   focus_field NAME     moves the keyboard to a field through its Component interface
@@ -23,12 +32,12 @@ each with a line of JSON, and keeps the events it hears for the "events" command
   select_text NAME A B selects from A to B
   word NAME AT         the word at a character's place, as Orca reads one: [text, start, end]
   at X Y               the name of the window's part at a point, as pointing at it finds
-  events               the events heard since last asked
+  events               the events heard since last asked, an announcement with what it said
 A field is found by its name, or the start of its name.
 
 For the other windows (the preview, Open and Save dialogs, Open With), a window is the one of
 Gannet's whose name has the first of a JSON list's strings in it, and a part is found in it by
-its name, the rest of the list being the names on the way down:
+its name, the rest of the list being the names on the way down. "NAME@ROLE" also says its role:
 
   dump ["WINDOW"]               the window's parts: role, name, description, states, children
   do ["WINDOW", "NAME"...]      does that part's action
@@ -61,11 +70,13 @@ def on_event(e):
     heard = {"type": e.type, "detail1": e.detail1, "detail2": e.detail2, "source": src}
     if e.type.startswith("object:text-changed"):
         heard["text"] = e.any_data
+    if e.type == "object:announcement":
+        heard["said"] = e.any_data
     events.append(heard)
 
 
 listener = Atspi.EventListener.new(on_event)
-for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:state-changed:checked", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:property-change:accessible-description", "object:active-descendant-changed", "window:activate", "object:text-changed", "object:text-caret-moved", "object:text-selection-changed"]:
+for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:state-changed:checked", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:property-change:accessible-description", "object:active-descendant-changed", "window:activate", "object:text-changed", "object:text-caret-moved", "object:text-selection-changed", "object:announcement", "object:property-change:accessible-value"]:
     listener.register(t)
 
 
@@ -106,14 +117,16 @@ def tree():
     return {
         "frame": frame.get_name(),
         "back_enabled": back.get_state_set().contains(Atspi.StateType.SENSITIVE),
-        "places": [p.get_name() for p in children(places)],
-        "places_showing": [p.get_name() for p in children(places) if p.get_state_set().contains(Atspi.StateType.SHOWING)],
+        "places": [p.get_name() for p in children(places) if p.get_role_name() == "list item"],
+        "places_showing": [p.get_name() for p in children(places) if p.get_role_name() == "list item" and p.get_state_set().contains(Atspi.StateType.SHOWING)],
+        "sidebar": [(p.get_role_name(), p.get_name(), [c.get_name() for c in children(p)]) for p in children(places)],
         "rows": [r.get_name() for r in rows],
         "selected": [r.get_name() for r in rows if r.get_state_set().contains(Atspi.StateType.SELECTED)],
         "selected_at": [i for i, r in enumerate(rows) if r.get_state_set().contains(Atspi.StateType.SELECTED)],
         "focus_at": [i for i, r in enumerate(rows) if focused(r)],
         "focus": focus,
         "descriptions": [r.get_description() for r in rows],
+        "files_description": files.get_description(),
         "manages_descendants": files.get_state_set().contains(Atspi.StateType.MANAGES_DESCENDANTS),
     }
 
@@ -170,7 +183,9 @@ def window(sub):
 def part(names):
     o = window(names[0])
     for name in names[1:]:
-        found = [c for c in children(o) if c.get_name() == name]
+        # "NAME@ROLE" picks among parts of one name, like the Name heading and the Name field.
+        name, _, role = name.partition("@")
+        found = [c for c in children(o) if c.get_name() == name and role in ("", c.get_role_name())]
         if not found:
             raise LookupError(f"no {name!r} in {o.get_name()!r}")
         o = found[0]
@@ -180,7 +195,7 @@ def part(names):
 def dump(o, depth=0):
     states = o.get_state_set()
     out = {"role": o.get_role_name(), "name": o.get_name(), "description": o.get_description(), "states": [k for k, v in STATES.items() if states.contains(v)]}
-    if o.get_role_name() not in ("list item", "label", "heading", "button", "check box", "entry"):
+    if o.get_role_name() not in ("list item", "label", "heading", "button", "check box", "entry", "table cell"):
         out["children"] = [dump(c, depth + 1) for c in children(o)]
     try:
         out["action"] = o.get_action_name(0) if o.get_n_actions() > 0 else None
@@ -189,7 +204,53 @@ def dump(o, depth=0):
     return out
 
 
+def place_items():
+    return [p for p in children(parts()[2]) if p.get_role_name() == "list item"]
+
+
+def by_name(o, name, role=None):
+    found = [c for c in children(o) if c.get_name() == name and role in (None, c.get_role_name())]
+    if not found:
+        raise LookupError(f"no {name!r} in {o.get_name()!r}")
+    return found[0]
+
+
+def table():
+    files = parts()[3]
+    rows, cols = Atspi.Table.get_n_rows(files), Atspi.Table.get_n_columns(files)
+    headings = [Atspi.Table.get_column_header(files, c) for c in range(cols)]
+    cell = Atspi.Table.get_accessible_at(files, 0, cols - 1) if rows else None
+    return {
+        "role": files.get_role_name(),
+        "row_role": files.get_child_at_index(0).get_role_name() if rows else None,
+        "columns": [{"name": h.get_name(), "role": h.get_role_name(), "sort": h.get_attributes().get("sort"), "actions": h.get_n_actions()} for h in headings],
+        "rows": [[Atspi.Table.get_accessible_at(files, r, c).get_name() for c in range(cols)] for r in range(rows)],
+        # The last cell of the first row, as a screen reader moving through the table finds it.
+        "cell": None if cell is None else {"role": cell.get_role_name(), "position": list(Atspi.TableCell.get_position(cell))[1:], "headings": [h.get_name() for h in Atspi.TableCell.get_column_header_cells(cell)], "parent": cell.get_parent().get_name()},
+    }
+
+
 def run(cmd, arg):
+    if cmd == "table":
+        return table()
+    if cmd == "focus_cell":
+        r, c = (int(x) for x in arg.split())
+        return Atspi.Table.get_accessible_at(parts()[3], r, c).grab_focus()
+    if cmd == "heading":
+        return Atspi.Table.get_column_header(parts()[3], int(arg)).do_action(0)
+    if cmd == "path":
+        links = children(by_name(parts()[0], "Path", "list"))
+        return [{"role": c.get_role_name(), "name": c.get_name(), "showing": c.get_state_set().contains(Atspi.StateType.SHOWING), "current": c.get_attributes().get("current")} for c in links]
+    if cmd == "crumb":
+        return children(by_name(parts()[0], "Path", "list"))[int(arg)].do_action(0)
+    if cmd == "notices":
+        out = []
+        for c in children(by_name(parts()[0], "Notices")):
+            item = {"role": c.get_role_name(), "name": c.get_name(), "description": c.get_description()}
+            if c.get_role_name() == "progress bar":
+                item["value"] = [Atspi.Value.get_current_value(c), Atspi.Value.get_text(c)]
+            out.append(item)
+        return out
     if cmd == "dump":
         return dump(window(json.loads(arg)[0]))
     if cmd == "do":
@@ -218,11 +279,12 @@ def run(cmd, arg):
     if cmd == "deselect_row":
         return parts()[3].deselect_child(int(arg))
     if cmd == "focus_place":
-        return parts()[2].get_child_at_index(int(arg)).grab_focus()
+        return place_items()[int(arg)].grab_focus()
     if cmd == "focus_row":
         return parts()[3].get_child_at_index(int(arg)).grab_focus()
     if cmd == "select_place":
-        return parts()[2].select_child(int(arg))
+        # The sidebar's headings are among its children, so a place's index there is its own.
+        return parts()[2].select_child(place_items()[int(arg)].get_index_in_parent())
     if cmd == "press_back":
         return parts()[1].do_action(0)
     if cmd == "at":
