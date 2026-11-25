@@ -47,7 +47,7 @@ const TYPE_AHEAD_RESET: Duration = Duration::from_millis(900);
 const HOLD_FOR_LOAD: Duration = Duration::from_millis(16);
 const JOB_SHOW_AFTER: Duration = Duration::from_millis(200);
 const UNDO_DEPTH: usize = 20;
-const DIALOG_GUARD: Duration = Duration::from_millis(400);
+pub(crate) const DIALOG_GUARD: Duration = Duration::from_millis(400);
 const CACHE_ENTRIES: usize = 8;
 const CACHE_TOTAL_ROWS: usize = 300_000;
 /// Below this, filtering on the UI thread takes well under a frame.
@@ -10079,6 +10079,7 @@ mod tests {
         r.pump_until("sizes known", |a| a.listing.as_ref().is_some_and(|l| a.rows.iter().all(|&e| matches!(l.stat(e), Stat::Known { .. }))));
         let s = a11y_snapshot(&mut r.app);
         assert_eq!(s.get(LIST).map(|n| n.role), Some(Role::Table));
+        assert_eq!(s.get(LIST).unwrap().name, s.get(FRAME).unwrap().name.trim_end_matches(" - Gannet"), "the table is named for its folder");
         assert_eq!(s.rows.columns.iter().map(|c| c.name).collect::<Vec<_>>(), ["Name", "Size", "Modified"]);
         let frame = &s.get(FRAME).unwrap().children;
         assert!([COLUMN_NAME, COLUMN_SIZE, COLUMN_MODIFIED].iter().all(|h| frame.contains(h)) && !frame.contains(&COLUMN_LOCATION), "{frame:?}");
@@ -10093,7 +10094,8 @@ mod tests {
         let date = s.rows.cell(a, Column::Modified, now);
         assert!(!date.is_empty());
         assert_eq!(s.rows.summary(a, now), format!("4 B, {date}"), "the row says its other cells");
-        assert_eq!(s.rows.summary(sub, now), date);
+        // A folder says so first, as its icon does: its name alone can't tell it from a file.
+        assert_eq!(s.rows.summary(sub, now), format!("folder, {date}"));
         // A heading sorts by its column, as a click does, and the new order is news.
         r.app.on_msg(Msg::A11y(Act::Press(COLUMN_SIZE)));
         r.pump_until("sorted by size", |a| a.sort.key == SortKey::Size && !a.rows.is_empty());
@@ -10410,10 +10412,13 @@ mod tests {
         let s = snapshot(&mut r);
         let asked = s.modal.and_then(|m| m.asked);
         assert!(asked.is_some(), "a clash says when it was asked");
-        assert!(!s.get(DIALOG_BUTTON0 + 1).unwrap().enabled && !s.get(DIALOG_CHECK).unwrap().enabled, "Skip and the box wait a moment, as with the keyboard");
+        // Skip and the box wait a moment, as with the keyboard, but aren't said to be
+        // unavailable: a screen reader would read "grayed" and never hear that it's over. The
+        // server refuses a press while `asked` is that recent.
+        assert!(s.get(DIALOG_BUTTON0 + 1).unwrap().enabled && s.get(DIALOG_CHECK).unwrap().enabled, "not grayed");
         assert!(r.app.next_deadline().is_some(), "and the window wakes when they can be used");
         r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0 + 1, "Skip".into())));
-        assert!(answers.try_recv().is_err() && r.app.dialog.is_some());
+        assert!(answers.try_recv().is_err() && r.app.dialog.is_some(), "dropped meanwhile");
         r.app.dialog_guard = Some(Instant::now() - DIALOG_GUARD);
         let s = snapshot(&mut r);
         assert!(s.get(DIALOG_BUTTON0 + 1).unwrap().enabled && s.get(DIALOG_CHECK).unwrap().enabled);

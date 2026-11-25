@@ -1509,6 +1509,14 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         t = sr.until("tree", lambda t: t["frame"] == "sub - Gannet", "the new folder's name")
         assert t["rows"] == ["x.txt"] and t["back_enabled"], t
         assert "error" in sr.ask("kept"), "a row from the last folder still answers"
+        # Nor does the table: each folder's is a new one, named for it, so a screen reader
+        # doesn't go on with the last one's count of rows.
+        assert sr.ask('keep_part ["sub - Gannet", "sub@table"]') == "sub"
+        a.key("BackSpace")
+        sr.until("tree", lambda t: t["frame"] == "docs - Gannet", "back up")
+        assert "error" in sr.ask("kept"), "the last folder's table still answers"
+        a.key("Return")
+        sr.until("tree", lambda t: t["frame"] == "sub - Gannet", "the folder again")
 
         # Back, through its action.
         sr.ask("events")
@@ -1537,7 +1545,7 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         (fs / "docs/bb.txt").write_text("new")
         a.wait(lambda s: "bb.txt" in s["names"], "the new file shows")
         heard = sr.until("events", lambda e: any(x["type"].startswith("object:children-changed:add") for x in e), "the new row is heard")
-        assert [x["source"] for x in heard if x["type"].startswith("object:children-changed:add")] == ["Files"], heard
+        assert [x["source"] for x in heard if x["type"].startswith("object:children-changed:add")] == ["docs"], heard
         assert not any(x["type"] == "object:state-changed:focused" for x in heard), f"the row with focus was announced again: {heard}"
         assert sr.ask("kept") == {"role": "table row", "name": "b.txt"}
 
@@ -1712,6 +1720,8 @@ def a_screen_reader_reads_columns_the_path_and_drives_and_hears_the_news(h):
         assert t["columns"][0]["sort"] == "none" and [r[0] for r in t["rows"]][2:] == ["bb.txt", "a.txt"], t
         heard = sr.until("events", lambda e: any(x["type"] == "object:announcement" for x in e), "the sort announced")
         assert [x["said"] for x in heard if x["type"] == "object:announcement"] == ["Sorted by size, descending"], heard
+        # The rows are said to be in another order, so a screen reader asks the table again.
+        assert any(x["type"] == "object:row-reordered" and x["source"] == "docs" for x in heard), heard
         a.key("1", mods=["ctrl"])
         a.wait(lambda s: s["sort"] == "Name" and not s["desc"], "back to by name")
 
@@ -1886,7 +1896,7 @@ def a_screen_reader_reads_and_edits_the_text_fields(h):
         assert all(rx < b[0] and b[0] + b[2] < rx + rw and ry <= b[1] and b[1] + b[3] <= ry + rh for b in f["boxes"]), f
         # Pointing at it finds the field, on top of the list; beside it, the list.
         assert sr.ask(f"at {ROW_X} {row_y(0)}") == "Rename apple.txt"
-        assert sr.ask(f"at {ROW_X} {row_y(1)}") == "Files"
+        assert sr.ask(f"at {ROW_X} {row_y(1)}") == "docs"
         a.shot("a11y-rename-field")
 
         # Moving the caret and selecting through AT-SPI is heard, and typing then replaces
@@ -1963,8 +1973,13 @@ def a11y_window(h, sr, args, extra_env=None, launcher_started=False):
     time.sleep(0.5)
     assert sr.ask("apps") == [], "registered with no screen reader on"
     assert launcher_started or not sr.launcher_running(), "the window started at-spi-bus-launcher"
+    sr.ask("events")
     sr.screen_reader(True)
     sr.until("apps", lambda x: x == ["Gannet"], "registered once a screen reader is on")
+    # A window that opens with the keyboard says it's active, or a screen reader already
+    # running doesn't turn to it, and the window opens in silence.
+    heard = sr.until("events", lambda e: any(x["type"] == "window:activate" for x in e), "the window said to be active")
+    assert any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in heard), heard
     return a
 
 
@@ -2024,7 +2039,7 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         # Save: a dialog named for the request and the folder, with the name to save as where
         # the keyboard is, the file types, the file list as in the main window, and the buttons.
         a = a11y_window(h, sr, ["--choose", "save", "--title", "Save the report", "--folder", str(docs), "--name", "report.txt", "--filter", "Text", "--glob", "*.txt", "--filter", "All files", "--glob", "*"])
-        w = sr.until("dump [\"Save the report\"]", lambda w: [r["name"] for r in a11y_find(w, "Files", "table")["children"]] == ["sub", "a.txt"], "the rows")
+        w = sr.until("dump [\"Save the report\"]", lambda w: [r["name"] for r in a11y_find(w, "docs", "table")["children"]] == ["sub", "a.txt"], "the rows")
         assert w["role"] == "dialog" and w["name"] == "Save the report - docs", w
         name = a11y_find(w, "Name", "entry")
         assert name and "editable" in name["states"] and a11y_focus(w) == ["Name"], (name, a11y_focus(w))
@@ -2038,7 +2053,7 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         sr.until("dump [\"Save the report\"]", lambda w: "selected" in a11y_find(w, "All files")["states"], "the type picked heard")
         # A row moved to takes the keyboard from the name, as a click does.
         sr.ask("events")
-        assert sr.ask("grab [\"Save the report\", \"Files\", \"a.txt\"]") is True
+        assert sr.ask("grab [\"Save the report\", \"docs\", \"a.txt\"]") is True
         a.wait(lambda s: not s["chooser"]["name_focused"] and s["cursor"] == 1, "the keyboard in the list")
         sr.until("dump [\"Save the report\"]", lambda w: a11y_focus(w) == ["a.txt"], "focus on a.txt")
         # The list's Name heading shares its name.
@@ -2057,8 +2072,9 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         alert = a11y_find(w, ask, "alert")
         assert alert["description"] == "It's already in “docs”. Replacing it overwrites what's there." and [c["name"] for c in alert["children"]] == ["Replace", "Cancel"], alert
         assert "enabled" not in a11y_find(w, "File type", "list")["states"], "the bar is behind the alert"
-        heard = sr.until("events", lambda e: announced(e), "the alert announced")
-        assert announced(heard) == [f"{ask} {alert['description']}"], heard
+        # The keyboard moving into it reads it; it isn't announced as well.
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "the keyboard moving in")
+        assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Cancel"] and announced(heard) == [], heard
         assert sr.ask("select [\"Save the report\", \"File type\", 0]") is False, "behind the alert"
         assert sr.ask(f"do {json.dumps(['Save the report', ask, 'Cancel'])}") is True
         a.wait(lambda s: s["dialog"] == "" and s["chooser"], "kept the dialog open")
@@ -2085,7 +2101,7 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         a = a11y_window(h, sr, ["--choose", "open", "--folder", str(docs)], launcher_started=True)
         w = sr.until("dump [\"Open File\"]", lambda w: a11y_find(w, "Choose a file to open", "label"), "what to do")
         assert w["role"] == "dialog" and "enabled" not in a11y_find(w, "Open", "button")["states"], w
-        assert sr.ask("grab [\"Open File\", \"Files\", \"b.png\"]") is True
+        assert sr.ask("grab [\"Open File\", \"docs\", \"b.png\"]") is True
         a.wait(lambda s: s["cursor"] == 2 and s["cursor_shown"], "the cursor on b.png")
         sr.until("dump [\"Open File\"]", lambda w: a11y_find(w, "“b.png”", "label") and "enabled" in a11y_find(w, "Open", "button")["states"], "b.png picked, and Open usable")
         a.shot("a11y-chooser-open")
@@ -2150,10 +2166,14 @@ def a_screen_reader_can_pick_an_app_in_open_with(h):
         wait_open_with(lambda s: s["search"] == "", "the search emptied through AT-SPI")
         assert sr.ask(f"grab {json.dumps([title, 'Apps', 'Writer'])}") is True
         wait_open_with(lambda s: s["picked"] == "writer.desktop", "Writer picked again")
-        # Always use it, then Open, through their actions.
+        # Always use it, then Open, through their actions. The keyboard stays on the app, as
+        # Space ticks it, so the tick is announced.
+        sr.ask("events")
         assert sr.ask(f"do {json.dumps([title, 'Always use for Markdown document files'])}") is True
         wait_open_with(lambda s: s["always"], "ticked")
         sr.until(f"dump {json.dumps([title])}", lambda w: "checked" in a11y_find(w, "Always use for Markdown document files")["states"], "the tick heard")
+        heard = sr.until("events", lambda e: announced(e), "the tick announced")
+        assert announced(heard) == ["Always use for Markdown document files, checked"], heard
         assert sr.ask(f"do {json.dumps([title, 'Open'])}") is True
         assert said(a) == "open writer.desktop\nalways\n"
     finally:
@@ -2205,7 +2225,7 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         assert items["Copy"]["role"] == "menu item" and items["Copy"]["description"] == "Ctrl+C" and items["Copy"]["action"] == "click", items["Copy"]
         assert "enabled" not in items["Undo"]["states"], "nothing to undo"
         assert "focused" in items["Open"]["states"], "the keyboard is on the first item"
-        files = find(d, "table", "Files")
+        files = find(d, "table", "docs")
         assert "enabled" not in files["states"] and all("enabled" not in r["states"] for r in files["children"]), "the list is behind the menu"
         heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "focus moves into the menu")
         assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Open"], heard
@@ -2221,7 +2241,8 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         a.shot("a11y-menu-chosen")
 
         # A confirmation is an alert: what it asks, what it says under that, its buttons and the
-        # one Enter presses, which has the keyboard. It's announced as it opens.
+        # one Enter presses, which has the keyboard. The keyboard moving into it reads it, so it
+        # isn't announced as well, which read it twice.
         sr.ask("events")
         a.key("Delete", mods=("shift",))
         a.wait(lambda s: s["dialog"] == "delete", "asks")
@@ -2232,10 +2253,10 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         buttons = {b["name"]: b for b in alert["children"]}
         assert list(buttons) == ["Delete", "Cancel"], buttons
         assert {"focused", "default", "enabled"} <= set(buttons["Cancel"]["states"]) and "default" not in buttons["Delete"]["states"], buttons
-        heard = sr.until("events", lambda e: announced(e), "the alert announced")
-        assert announced(heard) == [f"{ask} This can't be undone."], announced(heard)
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "the keyboard moving in")
         assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Cancel"], heard
-        assert any(x["type"] == "object:state-changed:sensitive" and x["detail1"] == 0 and x["source"] == "Files" for x in heard), f"the list was said to be unavailable: {heard}"
+        assert announced(heard) == [], announced(heard)
+        assert any(x["type"] == "object:state-changed:sensitive" and x["detail1"] == 0 and x["source"] == "docs" for x in heard), f"the list was said to be unavailable: {heard}"
         a.shot("a11y-delete-alert")
         assert sr.ask("focus_row 1") is False and sr.ask("select_row 1") is False, "behind the alert"
         assert sr.ask(f'do ["{w}", "{ask}", "Cancel"]') is True
@@ -2245,6 +2266,9 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         a.key("Delete", mods=("shift",))
         a.wait(lambda s: s["dialog"] == "delete", "asks again")
         sr.until(f'dump ["{w}"]', lambda d: find(d, "alert") is not None, "the alert")
+        # The next dialog's buttons are new objects, though they take these ones' places: a
+        # screen reader that kept one read the clash under this alert's name.
+        assert sr.ask(f'keep_part ["{w}", "{ask}", "Cancel"]') == "Cancel"
         assert sr.ask(f'do ["{w}", "{ask}", "Delete"]') is True
         a.wait(lambda s: s["dialog"] == "" and s["names"] == ["b.txt"], "deleted")
 
@@ -2269,11 +2293,21 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         assert alert["description"] == "Replace trashes the old one. Keep both renames the new one.", alert
         check_box = find(alert, "check box")
         assert "checked" not in check_box["states"] and check_box["action"] == "toggle", check_box
-        assert announced(sr.until("events", lambda e: announced(e), "the clash announced")) == [f"{ask}. Replace trashes the old one. Keep both renames the new one."]
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "the keyboard moving in")
+        assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Skip"] and announced(heard) == [], heard
+        assert "error" in sr.ask("kept"), "the last alert's Cancel answers for the clash's Skip"
+        # For a moment it takes no answer, but it isn't said to be unavailable: "grayed" would be
+        # read, and its end never heard.
+        assert all("enabled" in c["states"] for c in alert["children"]), alert
         a.shot("a11y-clash")
         time.sleep(0.45)  # A new clash takes no answer for a moment.
+        sr.ask("events")
         assert sr.ask(f'do ["{w}", "{ask}", "Do the same for the rest"]') is True
         sr.until(f'dump ["{w}"]', lambda d: "checked" in find(d, "check box")["states"], "ticked")
+        # The keyboard is on Skip, and a screen reader only reads a tick of the part with the
+        # keyboard, so it's announced.
+        heard = sr.until("events", lambda e: announced(e), "the tick announced")
+        assert announced(heard) == ["Do the same for the rest, checked"], heard
         assert sr.ask(f'do ["{w}", "{ask}", "Replace"]') is True
         a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0, "replaced")
         assert (fs / "docs/b.txt").read_text() == "new"
@@ -2314,6 +2348,9 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         a.wait(lambda s: s["dialog"] == "unlock-again", "told it's wrong", timeout=10)
         heard = sr.until("events", lambda e: "That passphrase isn't right. Try again." in announced(e), "the wrong passphrase announced")
         assert not any("nope" in t for t in announced(heard)), heard
+        # Announced only: as a description change too, it was read twice, and a screen reader
+        # reading the changes in turn could end on an "Unlocking…" that was over.
+        assert not any(x["type"] == "object:property-change:accessible-description" and x["source"] == ask for x in heard), heard
         a.shot("a11y-unlock-wrong")
         a.type("hunter2")
         assert sr.ask(f'do ["{w}", "{ask}", "Unlock"]') is True

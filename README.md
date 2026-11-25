@@ -536,10 +536,27 @@ Gannet matches the terminal and the bar. Pick another and Gannet uses it from it
 The chevrons, drive and lock icons are [Lucide](https://lucide.dev)'s (ISC, see
 `LICENSES/lucide.txt`); the rest are Gannet's own.
 
+## Screen readers
+
+Gannet works with screen readers such as Orca, over AT-SPI. It joins the accessibility bus
+only while a screen reader is on, and does no work for one otherwise.
+
+The file list reads as a table named for the folder: each row's name, then whether it's a
+folder, its size and when it changed, and in Recent, the Trash and search results, where it
+is. The sidebar with its headings, the path bar, the column headings (which sort), the path,
+filter, search and rename fields, menus, questions such as "Delete for good?", the rename
+dialog, notices and the progress of copies are read too, and changes are announced as they
+happen. The drive-unlock prompt reads its passphrase as dots and never gives it out. The
+preview, the Open and Save dialogs and Open With are windows of their own and read the same
+way.
+
+Typing echo and Orca's own key commands depend on the desktop passing keys to Orca, which not
+every Wayland compositor does. A pin's or a drive's menu opens only with a right-click for now.
+
 ## Known gaps
 
 - No tabs yet.
-- No accessibility support, input methods, compose or right-to-left text yet.
+- No input methods, compose or right-to-left text yet.
 - Copies keep mode, times and extended attributes, but not ownership or hard links.
 - Wayland only, so there's no X11 support.
 
@@ -568,6 +585,19 @@ For the end-to-end checks:
 
 The drive checks run a stand-in for udisks2 (`crates/core/examples/udisks-standin.rs`) on a
 private bus, so no check ever reaches the real one or a real drive.
+
+The screen-reader checks run the real `at-spi2-registryd` on private buses with a scripted
+libatspi client (`tests/a11y_client.py`). To hear what Orca makes of Gannet, with the same
+builds and `orca` installed:
+
+    python3 -B tests/orca_tour.py
+
+It walks through the window, the preview, the Save dialog and Open With with Orca listening,
+and writes what Orca said after each step to `.bench/orca-tour.txt`, with Orca's debug log
+beside it. Orca runs in bubblewrap on the private buses, with no sound devices, no
+speech-dispatcher and its settings in memory, so nothing is spoken aloud and your own Orca
+settings aren't touched. It fails if the passphrase typed at the unlock prompt appears
+anywhere in Orca's log.
 
 ## License
 
