@@ -390,8 +390,11 @@ impl Rows {
 
     /// What a row says besides its name: its other cells, in the order shown, so the row read
     /// out as the cursor moves to it sounds as it looks.
+    /// A folder's icon says it's a folder, and so does its description, first.
     pub fn summary(&self, entry: u32, now: i64) -> String {
-        let cells: Vec<String> = self.columns.iter().filter(|c| c.column != Column::Name).map(|c| self.cell(entry, c.column, now)).filter(|t| !t.is_empty()).collect();
+        let folder = self.listing.as_deref().filter(|l| (entry as usize) < l.len()).is_some_and(|l| matches!(l.kind(entry), Kind::Dir | Kind::LinkDir));
+        let cells = self.columns.iter().filter(|c| c.column != Column::Name).map(|c| self.cell(entry, c.column, now)).filter(|t| !t.is_empty());
+        let cells: Vec<String> = folder.then(|| "folder".to_string()).into_iter().chain(cells).collect();
         cells.join(", ")
     }
 
@@ -822,7 +825,7 @@ impl Link {
             Node::new(SIDEBAR, Role::List, "Places", l.sidebar, FRAME).with_children(side),
             // What the list says when it has no rows: that the folder's empty, or why it can't be shown.
             // Not while a new folder is being named in it, which takes that message's place.
-            Node::new(LIST, Role::Table, "Files", l.list, FRAME).described(app.list_message().filter(|_| !matches!(app.edit, Edit::NewFolder(_))).map(|m| m.0).unwrap_or_default()),
+            Node::new(LIST, Role::Table, title.clone(), l.list, FRAME).described(app.list_message().filter(|_| !matches!(app.edit, Edit::NewFolder(_))).map(|m| m.0).unwrap_or_default()),
             path,
             panel,
         ];
@@ -974,13 +977,15 @@ fn dialog(app: &mut App) -> Option<(Vec<Node>, Modal, u64)> {
     let (title, message) = app.dialog_text(&d);
     let rects = app.dialog_button_rects(&d);
     let default = DIALOG_BUTTON0 + App::dialog_default(&d) as u64;
-    // A clash just asked takes no answer for a moment, as with the keyboard and the pointer.
-    let guarded = app.dialog_guarded();
+    // A clash just asked takes no answer for a moment, as with the keyboard and the pointer,
+    // but its buttons aren't drawn as unavailable meanwhile, and aren't said to be: a screen
+    // reader would read "grayed" as the dialog opens, and never hear that it's over. The
+    // server refuses a press meanwhile, as the app would drop it.
     let mut parts = Vec::new();
     let mut has = default;
     match &d {
         Dialog::Conflict { apply_to_all, .. } => {
-            let mut check = Node::new(DIALOG_CHECK, Role::CheckBox, "Do the same for the rest", app.dialog_check_rect(), DIALOG).enabled(!guarded).doing(Action::new("toggle", "Answer the rest the same way", "a"));
+            let mut check = Node::new(DIALOG_CHECK, Role::CheckBox, "Do the same for the rest", app.dialog_check_rect(), DIALOG).doing(Action::new("toggle", "Answer the rest the same way", "a"));
             check.checked = Some(*apply_to_all);
             parts.push(check);
         }
@@ -1021,7 +1026,7 @@ fn dialog(app: &mut App) -> Option<(Vec<Node>, Modal, u64)> {
     }
     for (i, (b, rect)) in App::dialog_buttons(&d).iter().zip(rects).enumerate() {
         // The rename dialog's Rename waits until something changes and nothing clashes.
-        let can = !guarded && !matches!(&d, Dialog::RenameMany(rm) if i == 0 && !rm.can_rename());
+        let can = !matches!(&d, Dialog::RenameMany(rm) if i == 0 && !rm.can_rename());
         let keys = if b.key == "Esc" { "Escape" } else { b.key };
         parts.push(Node::new(DIALOG_BUTTON0 + i as u64, Role::PushButton, b.label, rect, DIALOG).enabled(can).doing(click("Press it", keys)));
     }

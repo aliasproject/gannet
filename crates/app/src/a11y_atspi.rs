@@ -126,7 +126,7 @@ impl Drop for Lost {
 fn run(shared: &Shared, epoch: u64, hub: Hub, address: &str) -> zbus::Result<()> {
     let bus = Bus::connect(address)?;
     let me = bus.connection().unique_name().map(|n| n.to_string()).unwrap_or_default();
-    let ctx = Arc::new(Ctx { bus: bus.clone(), me, now: Mutex::default(), hub: hub.clone(), desktop: Mutex::new(null()), id: Mutex::new(0) });
+    let ctx = Arc::new(Ctx { bus: bus.clone(), me, now: Mutex::default(), hub: hub.clone(), desktop: Mutex::new(null()), id: Mutex::new(0), served: Mutex::default(), incarnations: Mutex::default() });
     let (tx, rx) = channel();
     let calls = MatchRule::builder().msg_type(Type::MethodCall).build()?;
     // The registry starting again forgets every app, so it's introduced again.
@@ -159,12 +159,21 @@ fn run(shared: &Shared, epoch: u64, hub: Hub, address: &str) -> zbus::Result<()>
     };
     *ctx.now.lock().unwrap() = Some(old.clone());
     ctx.embed()?;
+    ctx.remember(&old);
+    // A window that opens with the keyboard says so, as one that gains it later does. A
+    // screen reader that's already running only turns to a new window when it's told, so
+    // without this the preview, the Open and Save dialogs and Open With open in silence.
+    if old.window_focused {
+        let before = Snapshot { window_focused: false, ..(*old).clone() };
+        ctx.emit_changes(&before, &old);
+    }
     for m in rx {
         match m {
             ToServer::Snapshot(s) => {
                 let new = Arc::new(*s);
                 *ctx.now.lock().unwrap() = Some(new.clone());
                 ctx.emit_changes(&old, &new);
+                ctx.remember(&new);
                 old = new;
             }
             ToServer::Embed => {
@@ -325,13 +334,47 @@ struct Ctx {
     desktop: Mutex<Ref>,
     /// The id the registry gave the app.
     id: Mutex<i32>,
+    /// What each part was last served as: its role, name and description. A menu's or
+    /// dialog's parts come back under the same ids as another's.
+    served: Mutex<HashMap<u64, (Role, String, String)>>,
+    /// How many times a part has come back as something else, which is in its path after its
+    /// id, so it's a new object each time.
+    incarnations: Mutex<HashMap<u64, u32>>,
 }
 
 impl Ctx {
+    fn remember(&self, s: &Snapshot) {
+        let mut served = self.served.lock().unwrap();
+        for n in &s.fixed {
+            match served.get_mut(&n.id) {
+                Some(was) if was.0 == n.role && was.1 == n.name && was.2 == n.description => {}
+                Some(was) => *was = (n.role, n.name.clone(), n.description.clone()),
+                None => {
+                    served.insert(n.id, (n.role, n.name.clone(), n.description.clone()));
+                }
+            }
+        }
+    }
+
     fn embed(&self) -> zbus::Result<()> {
         let (desktop,): (Ref,) = self.bus.call(REGISTRY, ROOT, "org.a11y.atspi.Socket", "Embed", &((self.me.clone(), OwnedObjectPath::try_from(ROOT)?),))?;
         *self.desktop.lock().unwrap() = desktop;
         Ok(())
+    }
+
+    /// A part's path: its id, and how many times it's come back as something else, if it has.
+    fn path(&self, id: u64) -> String {
+        match self.incarnations.lock().unwrap().get(&id) {
+            Some(&n) if n > 0 => format!("{}_{n}", fixed_path(id)),
+            _ => fixed_path(id),
+        }
+    }
+
+    /// The part a path names, if it's still that part.
+    fn part<'a>(&self, rest: &str, snap: &'a Snapshot) -> Option<&'a Node> {
+        let (id, n) = rest.split_once('_').map_or(Some((rest, 0)), |(id, n)| Some((id, n.parse::<u32>().ok().filter(|&n| n > 0)?)))?;
+        let id: u64 = id.parse().ok()?;
+        (self.incarnations.lock().unwrap().get(&id).copied().unwrap_or(0) == n).then(|| snap.get(id)).flatten()
     }
 
     fn at(&self, path: &str) -> Ref {
@@ -339,7 +382,7 @@ impl Ctx {
     }
 
     fn fixed_ref(&self, id: u64) -> Ref {
-        self.at(&fixed_path(id))
+        self.at(&self.path(id))
     }
 
     fn row_ref(&self, rows: &Rows, entry: u32) -> Ref {
@@ -392,7 +435,7 @@ impl Ctx {
             let found = match (cell, rest.strip_prefix('r')) {
                 (Some((col, r)), _) => row(r).map(|(e, at)| Target::Cell(e, at, col)),
                 (None, Some(r)) => row(r).map(|(e, at)| Target::Row(e, at)),
-                (None, None) => rest.parse().ok().and_then(|id| snap.get(id)).map(Target::Fixed),
+                (None, None) => self.part(rest, &snap).map(Target::Fixed),
             };
             match found {
                 Some(t) => t,
@@ -816,7 +859,10 @@ impl Ctx {
             "GetKeyBinding" => self.reply(h, &(a.keys,)),
             "DoAction" => {
                 let i: i32 = body.deserialize().unwrap_or(-1);
-                let ok = i == 0 && n.enabled;
+                // A clash just asked takes no answer for a moment (`App::dialog_guarded`). Its
+                // buttons aren't shown as unavailable meanwhile, but a press is refused.
+                let guarded = n.parent == a11y::DIALOG && snap.modal.and_then(|m| m.asked).is_some_and(|t| t.elapsed() < crate::app::DIALOG_GUARD);
+                let ok = i == 0 && n.enabled && !guarded;
                 if ok {
                     let act = if Self::is_place(n) {
                         Act::OpenPlace(Self::place_index(n, snap).unwrap_or(usize::MAX))
@@ -1160,7 +1206,33 @@ impl Ctx {
     /// Tells listeners what changed between two snapshots.
     fn emit_changes(&self, old: &Snapshot, new: &Snapshot) {
         let state = |path: &str, what: &str, on: bool| self.event(path, OBJECT_EVENT, "StateChanged", (what, on as i32), Variant::from(0i32));
-        let frame = fixed_path(a11y::FRAME);
+        // What had the keyboard, by its path before any part becomes a new object below.
+        let path_of = |s: &Snapshot| match s.focus {
+            a11y::Focus::Node(id) => self.path(id),
+            a11y::Focus::Row(e) => row_path(s.rows.era, &s.rows.key(e)),
+        };
+        let had = old.window_focused.then(|| path_of(old));
+        let old_list = self.fixed_ref(a11y::LIST);
+        // A part back under an id that another part had is a new object. A dialog's parts take
+        // the ids the last dialog's had, and a screen reader that kept what those said read a
+        // new alert under the last dialog's name, and its line twice. The list is a new table in
+        // each folder: a screen reader keeps how many rows and columns a table has until it
+        // hears the table change, which it hears only after reading where the keyboard went,
+        // so it read the last folder's count.
+        let new_list = old.rows.era != new.rows.era && old.get(a11y::LIST).is_some() && new.get(a11y::LIST).is_some();
+        {
+            let served = self.served.lock().unwrap();
+            let mut incarnations = self.incarnations.lock().unwrap();
+            for n in new.fixed.iter().filter(|n| old.get(n.id).is_none()) {
+                if served.get(&n.id).is_some_and(|(role, name, description)| (*role, name, description) != (n.role, &n.name, &n.description)) {
+                    *incarnations.entry(n.id).or_default() += 1;
+                }
+            }
+            if new_list {
+                *incarnations.entry(a11y::LIST).or_default() += 1;
+            }
+        }
+        let frame = self.path(a11y::FRAME);
         if old.window_focused != new.window_focused {
             let member = if new.window_focused { "Activate" } else { "Deactivate" };
             self.event(&frame, WINDOW_EVENT, member, ("", 0), Variant::from(""));
@@ -1171,18 +1243,33 @@ impl Ctx {
         // The rename dialog has a part for each name, so parts are looked up by id.
         let olds: HashMap<u64, &Node> = old.fixed.iter().map(|n| (n.id, n)).collect();
         let news: HashMap<u64, &Node> = new.fixed.iter().map(|n| (n.id, n)).collect();
+        let focused = |s: &Snapshot, id: u64| s.window_focused && s.focus == a11y::Focus::Node(id);
         for n in &new.fixed {
             let Some(o) = olds.get(&n.id).copied() else { continue };
-            let path = fixed_path(n.id);
+            let path = self.path(n.id);
+            // A new folder's table is a new object, with nothing of the last one's to change: an
+            // empty folder's "This folder is empty" was read twice.
+            if n.id == a11y::LIST && new_list {
+                continue;
+            }
             if o.name != n.name {
                 self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-name", 0), Variant::from(n.name.clone()));
             }
-            // The filter box turning into a search, and back, among others.
-            if o.description != n.description {
+            // The filter box turning into a search, and back, among others. The unlock prompt's
+            // line is announced instead (`emit_dialog`): as a description change too, it would
+            // be read twice, and a screen reader that reads the changes in turn can end on an
+            // "Unlocking…" that's already over.
+            if o.description != n.description && !(n.id == a11y::DIALOG && new.get(a11y::PASSPHRASE).is_some()) {
                 self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-description", 0), Variant::from(n.description.clone()));
             }
             if o.checked != n.checked {
                 state(&path, "checked", n.checked == Some(true));
+                // A screen reader reads that only of the part with the keyboard, and a box is
+                // often ticked from elsewhere: Space in Open With's list, A in a clash.
+                if !focused(new, n.id) && o.checked.is_some() && n.checked.is_some() {
+                    let said = format!("{}, {}", n.name, if n.checked == Some(true) { "checked" } else { "not checked" });
+                    self.event(&frame, OBJECT_EVENT, "Announcement", ("", POLITE), Variant::from(said));
+                }
             }
             if let (Some(of), Some(nf)) = (&o.field, &n.field) {
                 // Only within one field: a rename finished and another started in between is a
@@ -1208,7 +1295,7 @@ impl Ctx {
             if o.selected != n.selected && n.parent != a11y::SIDEBAR && n.role != Role::Link {
                 state(&path, "selected", n.selected);
                 if n.role == Role::ListItem {
-                    self.event(&fixed_path(n.parent), OBJECT_EVENT, "SelectionChanged", ("", 0), Variant::from(0i32));
+                    self.event(&self.path(n.parent), OBJECT_EVENT, "SelectionChanged", ("", 0), Variant::from(0i32));
                 }
             }
         }
@@ -1216,7 +1303,7 @@ impl Ctx {
         // apps as a search narrows them.
         for n in &new.fixed {
             let Some(o) = olds.get(&n.id).copied().filter(|o| o.children != n.children) else { continue };
-            let path = fixed_path(n.id);
+            let path = self.path(n.id);
             for (i, id) in o.children.iter().enumerate().rev().filter(|(_, id)| !n.children.contains(id)) {
                 self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
             }
@@ -1224,10 +1311,17 @@ impl Ctx {
                 self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("add", i as i32), Variant::from(self.fixed_ref(*id)));
             }
         }
+        // The last folder's table gives way to this one's.
+        if new_list && let Some(list) = new.get(a11y::LIST) {
+            let at = new.get(list.parent).and_then(|p| p.children.iter().position(|&c| c == a11y::LIST)).map_or(-1, |at| at as i32);
+            let parent = self.path(list.parent);
+            self.event(&parent, OBJECT_EVENT, "ChildrenChanged", ("remove", at), Variant::from(old_list));
+            self.event(&parent, OBJECT_EVENT, "ChildrenChanged", ("add", at), Variant::from(self.fixed_ref(a11y::LIST)));
+        }
 
         // The rows on show can't be used while a menu or dialog is open over them. A screen
         // reader asks again about any other.
-        let list = fixed_path(a11y::LIST);
+        let list = self.path(a11y::LIST);
         let same_folder = old.rows.era == new.rows.era;
         if old.rows_behind() != new.rows_behind() {
             let r = &new.rows;
@@ -1239,10 +1333,17 @@ impl Ctx {
         }
 
         // The rows. Within one folder, a few rows coming or going are announced one by one.
+        // Otherwise the table is said to have been reordered: a screen reader keeps how many
+        // rows and columns a table has until it hears the table change, and would go on
+        // reading the last folder's.
+        let columns = |s: &Snapshot| s.rows.columns.iter().map(|c| c.column).collect::<Vec<_>>();
+        let mut reordered = same_folder && columns(old) != columns(new);
         if same_folder && !Arc::ptr_eq(&old.rows.order, &new.rows.order) {
             let gone: Vec<(usize, u32)> = old.rows.order.iter().enumerate().filter(|(_, e)| new.rows.position_of(&old.rows.key(**e)).is_none()).map(|(at, e)| (at, *e)).take(ROW_EVENTS + 1).collect();
             let came: Vec<(usize, u32)> = new.rows.order.iter().enumerate().filter(|(_, e)| old.rows.position_of(&new.rows.key(**e)).is_none()).map(|(at, e)| (at, *e)).take(ROW_EVENTS + 1).collect();
-            if gone.len() + came.len() <= ROW_EVENTS {
+            if gone.is_empty() && came.is_empty() || gone.len() + came.len() > ROW_EVENTS {
+                reordered = true;
+            } else {
                 for &(at, e) in gone.iter().rev() {
                     self.event(&list, OBJECT_EVENT, "ChildrenChanged", ("remove", at as i32), Variant::from(self.row_ref(&old.rows, e)));
                 }
@@ -1250,6 +1351,9 @@ impl Ctx {
                     self.event(&list, OBJECT_EVENT, "ChildrenChanged", ("add", at as i32), Variant::from(self.row_ref(&new.rows, e)));
                 }
             }
+        }
+        if reordered {
+            self.event(&list, OBJECT_EVENT, "RowReordered", ("", 0), Variant::from(0i32));
         }
 
         // Selection, by key. Rows that left the list aren't told they're no longer selected.
@@ -1269,11 +1373,6 @@ impl Ctx {
         }
 
         // Focus last, so a screen reader reads the row as it is now.
-        let path_of = |s: &Snapshot| match s.focus {
-            a11y::Focus::Node(id) => fixed_path(id),
-            a11y::Focus::Row(e) => row_path(s.rows.era, &s.rows.key(e)),
-        };
-        let had = old.window_focused.then(|| path_of(old));
         let has = new.window_focused.then(|| path_of(new));
         if had != has {
             if let Some(p) = &had {
@@ -1300,10 +1399,10 @@ impl Ctx {
     fn emit_news(&self, old: &Snapshot, new: &Snapshot) {
         for j in &new.news.jobs {
             if old.news.jobs.iter().any(|o| o.id == j.id && o.percent != j.percent) {
-                self.event(&fixed_path(a11y::JOB0 + j.id), OBJECT_EVENT, "PropertyChange", ("accessible-value", 0), Variant::from(j.percent.map_or(0.0, f64::from)));
+                self.event(&self.path(a11y::JOB0 + j.id), OBJECT_EVENT, "PropertyChange", ("accessible-value", 0), Variant::from(j.percent.map_or(0.0, f64::from)));
             }
         }
-        let frame = fixed_path(a11y::FRAME);
+        let frame = self.path(a11y::FRAME);
         for (text, urgent) in new.news_since(old) {
             self.event(&frame, OBJECT_EVENT, "Announcement", ("", if urgent { ASSERTIVE } else { POLITE }), Variant::from(text));
         }
@@ -1314,7 +1413,7 @@ impl Ctx {
     /// when it's being tried and when it didn't work.
     fn emit_dialog(&self, old: &Snapshot, new: &Snapshot) {
         let Some(d) = new.get(a11y::DIALOG) else { return };
-        let frame = fixed_path(a11y::FRAME);
+        let frame = self.path(a11y::FRAME);
         // The next clash can ask the same as the last, with the keyboard on the same button.
         let asked = |s: &Snapshot| s.modal.and_then(|m| m.asked);
         match old.get(a11y::DIALOG) {
@@ -1323,20 +1422,24 @@ impl Ctx {
                     self.event(&frame, OBJECT_EVENT, "Announcement", ("", ASSERTIVE), Variant::from(d.description.clone()));
                 }
             }
+            // Moving the keyboard into it reads it: a screen reader says the dialog the part
+            // with the keyboard is in, its question and the line under it. Announcing it too
+            // read everything twice. Only a question asked again with the keyboard where it
+            // was, as the next clash can be, is announced, since nothing moves.
             _ => {
-                let said = match (d.name.as_str(), d.description.as_str()) {
-                    (asks, "") => asks.to_string(),
-                    (asks, says) if asks.ends_with(['?', '.', '!', '…']) => format!("{asks} {says}"),
-                    (asks, says) => format!("{asks}. {says}"),
-                };
-                // Polite, so it follows what's said of the part with the keyboard.
-                self.event(&frame, OBJECT_EVENT, "Announcement", ("", POLITE), Variant::from(said));
                 if old.focus == new.focus
                     && let a11y::Focus::Node(id) = new.focus
                     && old.window_focused
                     && new.window_focused
                 {
-                    self.event(&fixed_path(id), OBJECT_EVENT, "StateChanged", ("focused", 1), Variant::from(0i32));
+                    let said = match (d.name.as_str(), d.description.as_str()) {
+                        (asks, "") => asks.to_string(),
+                        (asks, says) if asks.ends_with(['?', '.', '!', '…']) => format!("{asks} {says}"),
+                        (asks, says) => format!("{asks}. {says}"),
+                    };
+                    // Polite, so it follows what's said of the part with the keyboard.
+                    self.event(&frame, OBJECT_EVENT, "Announcement", ("", POLITE), Variant::from(said));
+                    self.event(&self.path(id), OBJECT_EVENT, "StateChanged", ("focused", 1), Variant::from(0i32));
                 }
             }
         }
