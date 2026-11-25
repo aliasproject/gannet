@@ -1065,7 +1065,8 @@ impl App {
         // A running job that hasn't shown yet needs one wake-up, when it's due to.
         let job = self.jobs.iter().map(|j| j.started + JOB_SHOW_AFTER).filter(|&t| t > Instant::now()).min();
         let band = if let Some(FileDrag::Band(b)) = &self.file_drag { b.scroll_at } else { None };
-        // A clash's buttons can be used once it has been up a moment, and a screen reader is told.
+        // A clash takes answers once it has been up a moment. Its buttons look and read the
+        // same meanwhile, so the wake-up only ends the guard on time.
         let guard = self.dialog_guard.map(|t| t + DIALOG_GUARD).filter(|&t| t > Instant::now() && self.dialog.is_some());
         [self.reload_at, self.hold_paint, job, self.preview_deadline(), band, self.side_scroll_at, guard].into_iter().flatten().min()
     }
