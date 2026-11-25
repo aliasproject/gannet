@@ -114,7 +114,7 @@ To add it to your app launcher:
 | Move to Trash, delete for good | Delete, Shift+Delete |
 | Undo, redo | Ctrl+Z, Ctrl+Shift+Z |
 | Stop the newest operation | Ctrl+. |
-| Context menu, of a file or of a pin or drive in the sidebar | Menu key or F10 |
+| Context menu, of a file or of a pin or drive in the sidebar | Menu key, F10 or Shift+F10 |
 | Reload, new window, close | F5 or Ctrl+R, Ctrl+N, Ctrl+Q or Ctrl+W |
 
 ## Searching
@@ -294,7 +294,8 @@ Drag a folder between places in the sidebar to pin it there, under Pinned: below
 just above or below a pin. A bar shows where it will land. Dropping onto a place still moves
 the folder into it; pinning never moves or changes the folder. Files can't be pinned. Drag a
 pin up or down to put the pins in another order, and Escape puts it back. Right-click a pin
-to unpin it, which leaves the folder alone, or press F6, move to it and press the Menu key. Alt+1 to Alt+9 follow the sidebar, pins included.
+to unpin it, which leaves the folder alone, or press F6, move to it and press the Menu key.
+Alt+1 to Alt+9 follow the sidebar, pins included.
 
 When the places don't fit, the sidebar scrolls with the wheel or its scroll bar. A drag held
 near its top or bottom edge scrolls it too, and Alt+1 to Alt+9 scroll the place they open
@@ -427,8 +428,8 @@ Each of `items` has every one of these fields, `null` where it doesn't apply:
 USB sticks, SD cards and other drives you plug in show in the sidebar, whether they're mounted
 or not. Click one to mount and open it. A drive that can come out has an eject button, which
 unmounts everything on it and powers it off so it's safe to pull out. Right-click a drive for
-Unmount and Eject, or press F6, move to it and press the Menu key. An encrypted drive shows a lock, and asks for its passphrase when you open
-it. Unmounting or ejecting it locks it again.
+Unmount and Eject, or press F6, move to it and press the Menu key. An encrypted drive shows a
+lock, and asks for its passphrase when you open it. Unmounting or ejecting it locks it again.
 
 Unmounting or ejecting a drive closes the preview window, and if the window is showing the
 drive, takes it home first. If another program has files on the drive open, it stays put and
