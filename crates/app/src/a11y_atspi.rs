@@ -61,6 +61,7 @@ const STATE_SELECTABLE_TEXT: u32 = 38;
 const STATE_ENABLED: u32 = 8;
 const STATE_FOCUSABLE: u32 = 11;
 const STATE_FOCUSED: u32 = 12;
+const STATE_MODAL: u32 = 16;
 const STATE_INDETERMINATE: u32 = 32;
 const STATE_MULTISELECTABLE: u32 = 18;
 const STATE_SELECTABLE: u32 = 22;
@@ -70,6 +71,7 @@ const STATE_SHOWING: u32 = 25;
 const STATE_SINGLE_LINE: u32 = 26;
 const STATE_VISIBLE: u32 = 30;
 const STATE_MANAGES_DESCENDANTS: u32 = 31;
+const STATE_IS_DEFAULT: u32 = 39;
 const STATE_CHECKABLE: u32 = 41;
 const STATE_READ_ONLY: u32 = 43;
 
@@ -237,6 +239,10 @@ fn role_of(r: Role) -> (u32, &'static str) {
         Role::Link => (88, "link"),
         Role::ProgressBar => (42, "progress bar"),
         Role::Panel => (39, "panel"),
+        Role::Alert => (2, "alert"),
+        Role::PasswordText => (40, "password text"),
+        Role::Menu => (33, "menu"),
+        Role::MenuItem => (35, "menu item"),
     }
 }
 
@@ -396,6 +402,28 @@ impl Ctx {
             return self.error(&h, UNKNOWN_OBJECT, "no such object");
         };
         let body = m.body();
+        // Nothing behind a menu or dialog can be used, as with the pointer: asking it to do
+        // anything does nothing, and says so.
+        let behind = match &target {
+            Target::Root => false,
+            Target::Fixed(n) => snap.behind(n.id),
+            Target::Row(..) | Target::Cell(..) => snap.rows_behind(),
+        };
+        let request = matches!(
+            (iface, member.as_str()),
+            (ACTION, "DoAction")
+                | (COMPONENT, "GrabFocus" | "ScrollTo" | "ScrollToPoint")
+                | (SELECTION, "SelectChild" | "DeselectChild" | "DeselectSelectedChild" | "SelectAll" | "ClearSelection")
+                | (TABLE, "AddRowSelection" | "RemoveRowSelection")
+                | (TEXT, "SetCaretOffset" | "AddSelection" | "SetSelection" | "RemoveSelection")
+                | (EDITABLE_TEXT, "SetTextContents" | "InsertText" | "CutText" | "DeleteText" | "PasteText")
+        );
+        // A passphrase is typed with the keyboard only: its text here is dots, which mustn't
+        // become the passphrase.
+        let passphrase = matches!(&target, Target::Fixed(n) if n.role == Role::PasswordText);
+        if (behind || passphrase) && request {
+            return self.reply(&h, &(false,));
+        }
         match (iface, member.as_str()) {
             (PROPS, "Get") => {
                 let Ok((i, name)) = body.deserialize::<(String, String)>() else { return self.error(&h, "org.freedesktop.DBus.Error.InvalidArgs", "") };
@@ -508,20 +536,33 @@ impl Ctx {
                 if n.showing {
                     on.push(STATE_SHOWING);
                 }
-                if n.enabled {
+                if n.enabled && !snap.behind(n.id) {
                     on.extend([STATE_ENABLED, STATE_SENSITIVE]);
                 }
                 match n.role {
                     Role::Frame | Role::Dialog if snap.window_focused => on.push(STATE_ACTIVE),
+                    // The rename dialog's names can only be read.
+                    Role::ListItem if n.parent == a11y::RENAME_NAMES => {}
                     Role::ListItem => on.extend([STATE_SELECTABLE, STATE_FOCUSABLE]),
+                    Role::Menu => on.push(STATE_FOCUSABLE),
                     Role::PushButton => on.push(STATE_FOCUSABLE),
                     Role::CheckBox => on.extend([STATE_FOCUSABLE, STATE_CHECKABLE]),
                     Role::Entry => on.extend([STATE_FOCUSABLE, STATE_EDITABLE, STATE_SINGLE_LINE, STATE_SELECTABLE_TEXT]),
+                    Role::PasswordText => on.extend([STATE_FOCUSABLE, STATE_EDITABLE, STATE_SINGLE_LINE]),
+                    Role::MenuItem => on.extend([STATE_SELECTABLE, STATE_FOCUSABLE]),
                     Role::Document => on.extend([STATE_FOCUSABLE, STATE_READ_ONLY]),
                     Role::Table => on.extend([STATE_FOCUSABLE, STATE_MULTISELECTABLE, STATE_MANAGES_DESCENDANTS]),
                     Role::ProgressBar if snap.news.jobs.iter().any(|j| a11y::JOB0 + j.id == n.id && j.percent.is_none()) => on.push(STATE_INDETERMINATE),
                     Role::List => on.push(STATE_FOCUSABLE),
                     _ => {}
+                }
+                // A dialog keeps the keyboard until it's answered.
+                if matches!(n.role, Role::Dialog | Role::Alert) && n.parent != 0 {
+                    on.push(STATE_MODAL);
+                }
+                // Only while it can be pressed: Enter does nothing otherwise.
+                if n.enabled && snap.modal.is_some_and(|m| m.default == Some(n.id)) {
+                    on.push(STATE_IS_DEFAULT);
                 }
                 // The folder shown is marked as the current part of the path, not as selected.
                 if n.selected && n.role != Role::Link {
@@ -536,7 +577,10 @@ impl Ctx {
                 bits(&on)
             }
             Target::Row(e, at) => {
-                let mut on = vec![STATE_VISIBLE, STATE_ENABLED, STATE_SENSITIVE, STATE_SELECTABLE, STATE_FOCUSABLE];
+                let mut on = vec![STATE_VISIBLE, STATE_SELECTABLE, STATE_FOCUSABLE];
+                if !snap.rows_behind() {
+                    on.extend([STATE_ENABLED, STATE_SENSITIVE]);
+                }
                 if snap.rows.showing(*at) {
                     on.push(STATE_SHOWING);
                 }
@@ -549,7 +593,10 @@ impl Ctx {
                 bits(&on)
             }
             Target::Cell(e, at, col) => {
-                let mut on = vec![STATE_VISIBLE, STATE_ENABLED, STATE_SENSITIVE];
+                let mut on = vec![STATE_VISIBLE];
+                if !snap.rows_behind() {
+                    on.extend([STATE_ENABLED, STATE_SENSITIVE]);
+                }
                 // Selected with its row, as `Table.IsSelected` says.
                 if snap.rows.is_selected(*e) {
                     on.push(STATE_SELECTED);
@@ -712,8 +759,14 @@ impl Ctx {
                     // The keyboard doesn't go to the sidebar, but a place a screen reader moves
                     // to is shown.
                     Target::Fixed(n) if Self::is_place(n) => self.show_place(n, snap),
+                    // A part of the menu or dialog that's open, which moving to picks, as the
+                    // keyboard or pointer does.
+                    Target::Fixed(n) if snap.modal.is_some() && n.enabled && matches!(n.role, Role::MenuItem | Role::PushButton | Role::Entry) => {
+                        self.hub.send(Msg::A11y(Act::Focus(n.id)));
+                        true
+                    }
                     // An entry, or an item of another list, which moving to picks.
-                    Target::Fixed(n) if matches!(n.role, Role::Entry | Role::ListItem) && n.enabled => {
+                    Target::Fixed(n) if matches!(n.role, Role::Entry | Role::ListItem) && n.enabled && n.parent != a11y::RENAME_NAMES => {
                         self.hub.send(Msg::A11y(Act::Focus(n.id)));
                         true
                     }
@@ -767,6 +820,9 @@ impl Ctx {
                 if ok {
                     let act = if Self::is_place(n) {
                         Act::OpenPlace(Self::place_index(n, snap).unwrap_or(usize::MAX))
+                    } else if matches!(n.role, Role::MenuItem) || (n.parent == a11y::DIALOG && n.role == Role::PushButton) {
+                        // Named, so it can't press another menu's or dialog's in its place.
+                        Act::Choose(n.id, n.name.clone())
                     } else if n.parent == a11y::PATH {
                         Act::OpenCrumb(snap.dir.clone(), (n.id - a11y::CRUMB0) as usize)
                     } else if (a11y::EJECT0..a11y::NOTICE0).contains(&n.id) {
@@ -795,9 +851,10 @@ impl Ctx {
         }
     }
 
-    /// Whether a list picks among its children through Selection. The path bar's links don't.
+    /// Whether a list picks among its children through Selection. The path bar's links and the
+    /// rename dialog's names don't.
     fn selects(n: &Node) -> bool {
-        matches!(n.role, Role::List | Role::Table) && n.id != a11y::PATH
+        matches!(n.role, Role::List | Role::Table) && n.id != a11y::PATH && n.id != a11y::RENAME_NAMES
     }
 
     /// A column heading's sort order, as Orca reads it, the folder shown as the current part of
@@ -1111,8 +1168,11 @@ impl Ctx {
         }
 
         // The fixed parts: names, whether they can be used, and the sidebar's places.
+        // The rename dialog has a part for each name, so parts are looked up by id.
+        let olds: HashMap<u64, &Node> = old.fixed.iter().map(|n| (n.id, n)).collect();
+        let news: HashMap<u64, &Node> = new.fixed.iter().map(|n| (n.id, n)).collect();
         for n in &new.fixed {
-            let Some(o) = old.get(n.id) else { continue };
+            let Some(o) = olds.get(&n.id).copied() else { continue };
             let path = fixed_path(n.id);
             if o.name != n.name {
                 self.event(&path, OBJECT_EVENT, "PropertyChange", ("accessible-name", 0), Variant::from(n.name.clone()));
@@ -1131,9 +1191,11 @@ impl Ctx {
                     self.emit_text_changes(&path, of, nf);
                 }
             }
-            if o.enabled != n.enabled {
-                state(&path, "enabled", n.enabled);
-                state(&path, "sensitive", n.enabled);
+            // Whether it can be used: a menu or dialog opening over it, or closing, changes that.
+            let (was, is) = (o.enabled && !old.behind_in(n.id, |id| olds.get(&id).copied()), n.enabled && !new.behind_in(n.id, |id| news.get(&id).copied()));
+            if was != is {
+                state(&path, "enabled", is);
+                state(&path, "sensitive", is);
             }
             // A place scrolling into or out of the sidebar.
             if o.showing != n.showing {
@@ -1153,7 +1215,7 @@ impl Ctx {
         // Parts coming and going: places, the fields in the frame, and the Open With window's
         // apps as a search narrows them.
         for n in &new.fixed {
-            let Some(o) = old.get(n.id).filter(|o| o.children != n.children) else { continue };
+            let Some(o) = olds.get(&n.id).copied().filter(|o| o.children != n.children) else { continue };
             let path = fixed_path(n.id);
             for (i, id) in o.children.iter().enumerate().rev().filter(|(_, id)| !n.children.contains(id)) {
                 self.event(&path, OBJECT_EVENT, "ChildrenChanged", ("remove", i as i32), Variant::from(self.fixed_ref(*id)));
@@ -1163,9 +1225,20 @@ impl Ctx {
             }
         }
 
-        // The rows. Within one folder, a few rows coming or going are announced one by one.
+        // The rows on show can't be used while a menu or dialog is open over them. A screen
+        // reader asks again about any other.
         let list = fixed_path(a11y::LIST);
         let same_folder = old.rows.era == new.rows.era;
+        if old.rows_behind() != new.rows_behind() {
+            let r = &new.rows;
+            for e in (0..r.len()).skip_while(|&at| !r.showing(at)).take_while(|&at| r.showing(at)).filter_map(|at| r.entry(at)) {
+                let path = row_path(r.era, &r.key(e));
+                state(&path, "enabled", !new.rows_behind());
+                state(&path, "sensitive", !new.rows_behind());
+            }
+        }
+
+        // The rows. Within one folder, a few rows coming or going are announced one by one.
         if same_folder && !Arc::ptr_eq(&old.rows.order, &new.rows.order) {
             let gone: Vec<(usize, u32)> = old.rows.order.iter().enumerate().filter(|(_, e)| new.rows.position_of(&old.rows.key(**e)).is_none()).map(|(at, e)| (at, *e)).take(ROW_EVENTS + 1).collect();
             let came: Vec<(usize, u32)> = new.rows.order.iter().enumerate().filter(|(_, e)| old.rows.position_of(&new.rows.key(**e)).is_none()).map(|(at, e)| (at, *e)).take(ROW_EVENTS + 1).collect();
@@ -1220,6 +1293,7 @@ impl Ctx {
             }
         }
         self.emit_news(old, new);
+        self.emit_dialog(old, new);
     }
 
     /// Announces what's new, and tells of jobs' progress.
@@ -1232,6 +1306,39 @@ impl Ctx {
         let frame = fixed_path(a11y::FRAME);
         for (text, urgent) in new.news_since(old) {
             self.event(&frame, OBJECT_EVENT, "Announcement", ("", if urgent { ASSERTIVE } else { POLITE }), Variant::from(text));
+        }
+    }
+
+    /// Announces a dialog as it opens, after the part it gives the keyboard, what it asks and
+    /// what it says under that; and the passphrase prompt's line as it changes, which says
+    /// when it's being tried and when it didn't work.
+    fn emit_dialog(&self, old: &Snapshot, new: &Snapshot) {
+        let Some(d) = new.get(a11y::DIALOG) else { return };
+        let frame = fixed_path(a11y::FRAME);
+        // The next clash can ask the same as the last, with the keyboard on the same button.
+        let asked = |s: &Snapshot| s.modal.and_then(|m| m.asked);
+        match old.get(a11y::DIALOG) {
+            Some(o) if o.name == d.name && asked(old) == asked(new) => {
+                if o.description != d.description && new.get(a11y::PASSPHRASE).is_some() {
+                    self.event(&frame, OBJECT_EVENT, "Announcement", ("", ASSERTIVE), Variant::from(d.description.clone()));
+                }
+            }
+            _ => {
+                let said = match (d.name.as_str(), d.description.as_str()) {
+                    (asks, "") => asks.to_string(),
+                    (asks, says) if asks.ends_with(['?', '.', '!', '…']) => format!("{asks} {says}"),
+                    (asks, says) => format!("{asks}. {says}"),
+                };
+                // Polite, so it follows what's said of the part with the keyboard.
+                self.event(&frame, OBJECT_EVENT, "Announcement", ("", POLITE), Variant::from(said));
+                if old.focus == new.focus
+                    && let a11y::Focus::Node(id) = new.focus
+                    && old.window_focused
+                    && new.window_focused
+                {
+                    self.event(&fixed_path(id), OBJECT_EVENT, "StateChanged", ("focused", 1), Variant::from(0i32));
+                }
+            }
         }
     }
 }

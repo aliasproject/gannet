@@ -43,6 +43,8 @@ its name, the rest of the list being the names on the way down. "NAME@ROLE" also
   do ["WINDOW", "NAME"...]      does that part's action
   grab ["WINDOW", "NAME"...]    moves to that part through its Component interface
   select ["WINDOW", "NAME"..., N]  selects child N of that list through its Selection interface
+
+A menu has no name, so its items are found under "".
 """
 import json
 import os
@@ -76,7 +78,7 @@ def on_event(e):
 
 
 listener = Atspi.EventListener.new(on_event)
-for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:state-changed:checked", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:property-change:accessible-description", "object:active-descendant-changed", "window:activate", "object:text-changed", "object:text-caret-moved", "object:text-selection-changed", "object:announcement", "object:property-change:accessible-value"]:
+for t in ["object:state-changed:focused", "object:state-changed:selected", "object:state-changed:showing", "object:state-changed:checked", "object:state-changed:sensitive", "object:selection-changed", "object:children-changed", "object:property-change:accessible-name", "object:property-change:accessible-description", "object:active-descendant-changed", "window:activate", "object:text-changed", "object:text-caret-moved", "object:text-selection-changed", "object:announcement", "object:property-change:accessible-value"]:
     listener.register(t)
 
 
@@ -133,7 +135,10 @@ def tree():
 
 def entries():
     frame = gannet().get_child_at_index(0)
-    return [k for k in children(frame) if k.get_role() == Atspi.Role.ENTRY]
+    kids = children(frame)
+    # A dialog's fields are in it.
+    kids += [k for d in kids if d.get_role() in (Atspi.Role.DIALOG, Atspi.Role.ALERT) for k in children(d)]
+    return [k for k in kids if k.get_role() in (Atspi.Role.ENTRY, Atspi.Role.PASSWORD_TEXT)]
 
 
 def field(name):
@@ -167,6 +172,7 @@ def describe(f):
 
 
 STATES = {"focused": Atspi.StateType.FOCUSED, "selected": Atspi.StateType.SELECTED, "enabled": Atspi.StateType.SENSITIVE, "showing": Atspi.StateType.SHOWING, "checked": Atspi.StateType.CHECKED, "editable": Atspi.StateType.EDITABLE, "active": Atspi.StateType.ACTIVE}
+STATES |= {"default": Atspi.StateType.IS_DEFAULT, "modal": Atspi.StateType.MODAL}
 
 
 def window(sub):

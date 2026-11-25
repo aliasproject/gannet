@@ -1065,7 +1065,9 @@ impl App {
         // A running job that hasn't shown yet needs one wake-up, when it's due to.
         let job = self.jobs.iter().map(|j| j.started + JOB_SHOW_AFTER).filter(|&t| t > Instant::now()).min();
         let band = if let Some(FileDrag::Band(b)) = &self.file_drag { b.scroll_at } else { None };
-        [self.reload_at, self.hold_paint, job, self.preview_deadline(), band, self.side_scroll_at].into_iter().flatten().min()
+        // A clash's buttons can be used once it has been up a moment, and a screen reader is told.
+        let guard = self.dialog_guard.map(|t| t + DIALOG_GUARD).filter(|&t| t > Instant::now() && self.dialog.is_some());
+        [self.reload_at, self.hold_paint, job, self.preview_deadline(), band, self.side_scroll_at, guard].into_iter().flatten().min()
     }
 
     fn on_loaded(&mut self, l: Loaded) {
@@ -1508,14 +1510,16 @@ impl App {
     /// since left is dropped: the screen reader is about to hear of the new one.
     fn a11y_act(&mut self, act: crate::a11y::Act) {
         use crate::a11y::{Act, BACK, CHOOSER_SAVE_NAME, COLUMN_MODIFIED, COLUMN_NAME, COLUMN_SIZE, FILTER, NAME_FIELD, PATH_FIELD, STOP0};
-        // As with the pointer: nothing behind a dialog can be used, and anything outside a menu
-        // only closes it, so the menu never acts on a selection changed under it.
-        if self.dialog.is_some() || matches!(act, Act::Wake) {
+        if matches!(act, Act::Wake) {
             return;
         }
+        // As with the pointer and the keyboard, only a dialog or menu that's open can be used.
+        // The screen reader was told the rest can't, and a request about it is dropped.
+        if self.dialog.is_some() {
+            return self.a11y_dialog_act(act);
+        }
         if self.menu.is_some() {
-            self.close_menu();
-            return;
+            return self.a11y_menu_act(act);
         }
         if self.a11y_chooser_act(&act) {
             return;
@@ -1591,7 +1595,7 @@ impl App {
                     self.invalidate(self.layout().notices);
                 }
             }
-            Act::Press(_) | Act::Wake => {}
+            Act::Press(_) | Act::Choose(..) | Act::Wake => {}
             Act::OpenCrumb(dir, i) => {
                 if *dir == self.dir
                     && let Some((_, path)) = self.crumb_parts().into_iter().nth(i)
@@ -1631,6 +1635,67 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// What a screen reader asked of the dialog that's open: a button pressed, which waits out a
+    /// new clash as a key does, the box ticked, or the keyboard moved to a part.
+    fn a11y_dialog_act(&mut self, act: crate::a11y::Act) {
+        use crate::a11y::{Act, DIALOG_BUTTON0, DIALOG_CHECK, RENAME_FIND, RENAME_REPLACE};
+        let guarded = self.dialog_guarded();
+        let edit_gen = self.edit_gen;
+        let Some(d) = self.dialog.as_mut() else { return };
+        let button = |id: u64| id.checked_sub(DIALOG_BUTTON0).map(|i| i as usize);
+        match act {
+            Act::Choose(id, name) if !guarded => {
+                let Some(i) = button(id).filter(|&i| Self::dialog_buttons(d).get(i).is_some_and(|b| b.label == name)) else { return };
+                self.press_dialog_button(i);
+            }
+            Act::Press(DIALOG_CHECK) if !guarded => {
+                if let Dialog::Conflict { apply_to_all, .. } = d {
+                    *apply_to_all = !*apply_to_all;
+                }
+            }
+            // A change to Find or Replace gives it the keyboard first, as clicking it does, then
+            // is made as typing it would be. One about a field since closed is dropped.
+            Act::EditText(id @ (RENAME_FIND | RENAME_REPLACE), asked, op) if asked == edit_gen => {
+                let Dialog::RenameMany(rm) = d else { return };
+                rm.focus = if id == RENAME_FIND { Focus::Find } else { Focus::Replace };
+                return self.a11y_edit(op);
+            }
+            Act::Focus(id) => {
+                let n = Self::dialog_buttons(d).len();
+                match (d, id) {
+                    (Dialog::RenameMany(rm), RENAME_FIND) => rm.focus = Focus::Find,
+                    (Dialog::RenameMany(rm), RENAME_REPLACE) => rm.focus = Focus::Replace,
+                    (Dialog::RenameMany(rm), id) if button(id).is_some_and(|i| i < n) => rm.focus = Focus::Button(button(id).unwrap_or(0)),
+                    (Dialog::Conflict { at, .. } | Dialog::ConfirmDelete { at, .. } | Dialog::ConfirmQuit { at } | Dialog::Unlock { at, .. } | Dialog::ConfirmReplace { at, .. }, id) if button(id).is_some_and(|i| i < n) => *at = button(id).unwrap_or(0),
+                    _ => return,
+                }
+            }
+            _ => return,
+        }
+        self.invalidate_all();
+    }
+
+    /// What a screen reader asked of the menu that's open: an item chosen, as clicking it does,
+    /// or picked, as the pointer over it does.
+    fn a11y_menu_act(&mut self, act: crate::a11y::Act) {
+        use crate::a11y::{Act, DIALOG_BUTTON0, MENU_ITEM0};
+        let Some(m) = self.menu.as_mut() else { return };
+        let item = |id: u64| (MENU_ITEM0..DIALOG_BUTTON0).contains(&id).then(|| (id - MENU_ITEM0) as usize).filter(|&i| m.items.get(i).is_some_and(|i| i.enabled));
+        match act {
+            Act::Choose(id, name) => {
+                let Some(a) = item(id).map(|i| &m.items[i]).filter(|i| i.label == name).map(|i| i.action) else { return };
+                self.close_menu();
+                self.action(a);
+            }
+            Act::Focus(id) => {
+                let Some(i) = item(id) else { return };
+                m.at = i;
+                self.invalidate_all();
+            }
+            _ => {}
         }
     }
 
@@ -2494,6 +2559,64 @@ impl App {
         }
     }
 
+    /// What a dialog asks, and the line under it, as it's drawn and as a screen reader says it.
+    pub fn dialog_text(&self, d: &Dialog) -> (String, String) {
+        let name = |p: &Path| p.file_name().map_or_else(|| p.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+        match d {
+            Dialog::Conflict { conflict, .. } => {
+                let t = if conflict.both_folders { format!("A folder named “{}” is already here", name(&conflict.target)) } else { format!("“{}” is already here", name(&conflict.target)) };
+                let body = if conflict.both_folders {
+                    "Merge puts the contents together and asks about any clashes."
+                } else if conflict.can_replace {
+                    "Replace trashes the old one. Keep both renames the new one."
+                } else {
+                    "One's a file and the other's a folder, so it can't be replaced."
+                };
+                (t, body.to_string())
+            }
+            Dialog::ConfirmDelete { paths, empty: true, .. } => {
+                let t = match paths.len() {
+                    1 => "Delete the one item in the Trash for good?".to_string(),
+                    n => format!("Delete all {n} items in the Trash for good?"),
+                };
+                // A disk that didn't answer keeps its items, and the question shouldn't hide that.
+                let more = if self.load_error.is_some() { " A disk that couldn't be read keeps its items." } else { "" };
+                (t, format!("This can't be undone.{more}"))
+            }
+            Dialog::ConfirmDelete { paths, .. } => {
+                let t = match paths.as_slice() {
+                    [one] => format!("Delete “{}” for good?", name(one)),
+                    many => format!("Delete {} for good?", crate::format::count(many.len(), "item", "items")),
+                };
+                (t, "This can't be undone.".to_string())
+            }
+            Dialog::ConfirmReplace { paths, existing, .. } => {
+                let t = match existing.as_slice() {
+                    [one] => format!("Replace “{}”?", crate::chooser::shown_name(one)),
+                    many => format!("Replace {} of the {} files?", many.len(), paths.len()),
+                };
+                let folder = existing.first().and_then(|p| p.parent()).map_or_else(String::new, |d| self.crumb_label(d));
+                let body = if existing.len() == 1 { format!("It's already in “{folder}”. Replacing it overwrites what's there.") } else { format!("They're already in “{folder}”. Replacing them overwrites what's there.") };
+                (t, body)
+            }
+            Dialog::ConfirmQuit { .. } => ("Operations are still running".to_string(), "Closing stops them. Whatever's finished stays finished.".to_string()),
+            Dialog::Unlock { volume, error, waiting, .. } => {
+                let line = if *waiting { "Unlocking…".to_string() } else { error.clone().unwrap_or_else(|| "It's encrypted. Type its passphrase to open it.".to_string()) };
+                (format!("Unlock “{}”", Self::drive_name(volume)), line)
+            }
+            Dialog::RenameMany(d) => (d.title(), d.summary().0),
+        }
+    }
+
+    /// The button Enter presses: the one picked, or in the rename dialog, Rename while a field
+    /// has the keyboard.
+    pub fn dialog_default(d: &Dialog) -> usize {
+        match d {
+            Dialog::Conflict { at, .. } | Dialog::ConfirmDelete { at, .. } | Dialog::ConfirmQuit { at } | Dialog::Unlock { at, .. } | Dialog::ConfirmReplace { at, .. } => *at,
+            Dialog::RenameMany(d) => if let Focus::Button(i) = d.focus { i } else { 0 },
+        }
+    }
+
     /// Conflicts appear on their own, so Enter means Skip and nothing is answered in the
     /// moment after one pops up.
     fn show_conflict(&mut self, conflict: Conflict) {
@@ -2502,8 +2625,13 @@ impl App {
         self.dialog_guard = Some(Instant::now());
     }
 
-    fn dialog_guarded(&self) -> bool {
+    pub(crate) fn dialog_guarded(&self) -> bool {
         self.dialog_guard.is_some_and(|t| t.elapsed() < DIALOG_GUARD)
+    }
+
+    /// When the last clash was asked.
+    pub(crate) fn dialog_asked(&self) -> Option<Instant> {
+        self.dialog_guard
     }
 
     fn press_dialog_button(&mut self, i: usize) {
@@ -10163,6 +10291,161 @@ mod tests {
         assert!(r.app.a11y_name_has_keyboard(), "a request about another folder took the keyboard");
         r.app.on_msg(Msg::A11y(Act::Press(CHOOSER_CANCEL)));
         assert!(r.app.cmds.iter().any(|c| matches!(c, Cmd::Quit)) && r.app.chooser.as_ref().unwrap().picked.is_none(), "cancelled");
+    }
+
+    // ---- Menus and dialogs for screen readers ----
+
+    fn snapshot(r: &mut Rig) -> crate::a11y::Snapshot {
+        crate::a11y::Link::new().build(&mut r.app)
+    }
+
+    #[test]
+    fn a_screen_reader_answers_a_dialog_and_cant_act_behind_it() {
+        use crate::a11y::{Act, BACK, DIALOG, DIALOG_BUTTON0, FRAME, Focus as Has, LIST, PLACE0, Role};
+        let mut r = Rig::new("a11y-dialog");
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        r.open(r.work());
+        r.select("a.txt");
+        r.app.key(k::KEY_Delete, "", Mods { shift: true, ..Mods::default() });
+        let s = snapshot(&mut r);
+        let d = s.get(DIALOG).expect("the dialog");
+        assert_eq!((d.role, d.name.as_str(), d.description.as_str()), (Role::Alert, "Delete “a.txt” for good?", "This can't be undone."));
+        assert_eq!(s.get(FRAME).unwrap().children.last(), Some(&DIALOG), "over the rest");
+        let buttons: Vec<&str> = d.children.iter().map(|&c| s.get(c).unwrap().name.as_str()).collect();
+        assert_eq!(buttons, ["Delete", "Cancel"]);
+        // The keyboard is on the safe choice, which Enter presses.
+        assert_eq!(s.focus, Has::Node(DIALOG_BUTTON0 + 1));
+        assert_eq!(s.modal.and_then(|m| m.default), Some(DIALOG_BUTTON0 + 1));
+        assert!(s.behind(LIST) && s.behind(BACK) && s.rows_behind(), "what's behind can't be used");
+        use crate::a11y::{COLUMN_NAME, CRUMB0, NOTICES, PATH};
+        assert!(s.behind(PATH) && s.behind(CRUMB0) && s.behind(COLUMN_NAME) && s.behind(NOTICES), "the path bar, the headings and the notices too");
+        assert!(!s.behind(FRAME) && !s.behind(DIALOG) && !s.behind(DIALOG_BUTTON0), "the dialog can, in its window");
+        // Behind it, nothing happens.
+        r.app.on_msg(Msg::A11y(Act::OpenPlace(0)));
+        r.app.on_msg(Msg::A11y(Act::Press(BACK)));
+        r.app.on_msg(Msg::A11y(Act::Focus(PLACE0)));
+        assert!(r.app.dialog.is_some() && r.app.dir == r.work());
+        // A button is pressed only if it's still the one the screen reader saw.
+        r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0, "Cancel".into())));
+        assert!(r.app.dialog.is_some(), "not pressed under another's name");
+        r.app.on_msg(Msg::A11y(Act::Focus(DIALOG_BUTTON0)));
+        assert_eq!(snapshot(&mut r).focus, Has::Node(DIALOG_BUTTON0), "moving to a button picks it");
+        r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0 + 1, "Cancel".into())));
+        assert!(r.app.dialog.is_none(), "cancelled");
+        let s = snapshot(&mut r);
+        assert!(s.modal.is_none() && s.get(DIALOG).is_none() && !s.behind(LIST));
+        assert!(matches!(s.focus, Has::Row(_)), "the keyboard is back on the row");
+        assert!(r.work().join("a.txt").exists());
+    }
+
+    #[test]
+    fn a_screen_reader_reads_a_menu_and_chooses_from_it() {
+        use crate::a11y::{Act, MENU, MENU_ITEM0, Focus as Has, Role};
+        let mut r = Rig::new("a11y-menu");
+        fs::write(r.work().join("a.txt"), "a").unwrap();
+        r.open(r.work());
+        r.select("a.txt");
+        r.app.open_menu(100, 100);
+        let s = snapshot(&mut r);
+        let m = s.get(MENU).expect("the menu");
+        assert_eq!(m.role, Role::Menu);
+        assert_eq!(s.focus, Has::Node(MENU), "nothing picked yet, as when the pointer opens it");
+        let items: Vec<&crate::a11y::Node> = m.children.iter().map(|&c| s.get(c).unwrap()).collect();
+        let copy = items.iter().find(|n| n.name == "Copy").unwrap();
+        assert_eq!((copy.role, copy.description.as_str(), copy.enabled), (Role::MenuItem, "Ctrl+C", true), "the shortcut is said after it");
+        assert!(!items.iter().find(|n| n.name == "Undo").unwrap().enabled, "nothing to undo");
+        let hidden = items.iter().position(|n| n.name == "Show hidden files").unwrap() as u64;
+        // Moving to an item picks it, and a row behind the menu can't be moved to.
+        r.app.on_msg(Msg::A11y(Act::Focus(MENU_ITEM0 + hidden)));
+        assert_eq!(snapshot(&mut r).focus, Has::Node(MENU_ITEM0 + hidden));
+        let dir = Arc::new(r.work());
+        r.app.on_msg(Msg::A11y(Act::SelectRow(dir, b"a.txt".to_vec(), false)));
+        assert!(r.app.menu.is_some() && r.app.sel_count == 1, "the menu stays, and the selection with it");
+        r.app.on_msg(Msg::A11y(Act::Choose(MENU_ITEM0 + hidden, "Copy".into())));
+        assert!(r.app.menu.is_some() && !r.app.show_hidden, "not chosen under another's name");
+        r.app.on_msg(Msg::A11y(Act::Choose(MENU_ITEM0 + hidden, "Show hidden files".into())));
+        assert!(r.app.menu.is_none() && r.app.show_hidden, "chosen, as clicking it does");
+    }
+
+    #[test]
+    fn the_rename_dialog_has_its_fields_and_names_for_a_screen_reader() {
+        use crate::a11y::{Act, DIALOG, DIALOG_BUTTON0, Focus as Has, RENAME_FIND, RENAME_NAME0, RENAME_NAMES, RENAME_REPLACE, Role};
+        let mut r = Rig::new("a11y-rename-many");
+        for n in ["a.jpg", "b.jpg", "keep.txt"] {
+            fs::write(r.work().join(n), n).unwrap();
+        }
+        r.open(r.work());
+        r.ctrl(k::KEY_a);
+        r.key(k::KEY_F2, "");
+        let s = snapshot(&mut r);
+        let d = s.get(DIALOG).unwrap();
+        assert_eq!((d.role, d.name.as_str()), (Role::Dialog, "Rename 3 items"));
+        assert_eq!(s.focus, Has::Node(RENAME_FIND));
+        assert!(!s.get(DIALOG_BUTTON0).unwrap().enabled, "nothing to rename yet");
+        type_in(&mut r, ".jpg");
+        // Typing into Replace through AT-SPI gives it the keyboard first, as clicking it does.
+        let edit_gen = snapshot(&mut r).edit_gen;
+        r.app.on_msg(Msg::A11y(Act::EditText(RENAME_REPLACE, edit_gen, crate::a11y::TextEdit::Replace(0, 0, ".jpeg".into()))));
+        let s = snapshot(&mut r);
+        assert_eq!(s.focus, Has::Node(RENAME_REPLACE));
+        let field = |id| s.get(id).and_then(|n| n.field.as_ref()).map(|f| f.text.as_str());
+        assert_eq!((field(RENAME_FIND), field(RENAME_REPLACE)), (Some(".jpg"), Some(".jpeg")), "each field carries its text");
+        assert_eq!(s.get(DIALOG).unwrap().description, "2 items will be renamed, 1 unchanged");
+        let names: Vec<(&str, &str)> = s.get(RENAME_NAMES).unwrap().children.iter().map(|&c| s.get(c).unwrap()).map(|n| (n.name.as_str(), n.description.as_str())).collect();
+        assert_eq!(names, [("a.jpg", "becomes “a.jpeg”"), ("b.jpg", "becomes “b.jpeg”"), ("keep.txt", "unchanged")]);
+        assert!(s.get(RENAME_NAME0).unwrap().showing);
+        assert!(s.get(DIALOG_BUTTON0).unwrap().enabled);
+        r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0, "Rename".into())));
+        r.idle();
+        assert!(r.app.dialog.is_none() && r.work().join("a.jpeg").exists());
+    }
+
+    #[test]
+    fn a_clash_just_asked_cant_be_answered_by_a_screen_reader_either() {
+        use crate::a11y::{Act, DIALOG_BUTTON0, DIALOG_CHECK};
+        let mut r = Rig::new("a11y-clash");
+        let (reply, answers) = std::sync::mpsc::sync_channel(2);
+        let clash = |reply| gannet_core::ops::Conflict { job: 1, source: "/a/b.txt".into(), target: "/w/b.txt".into(), both_folders: false, can_replace: true, reply };
+        r.app.show_conflict(clash(reply.clone()));
+        let s = snapshot(&mut r);
+        let asked = s.modal.and_then(|m| m.asked);
+        assert!(asked.is_some(), "a clash says when it was asked");
+        assert!(!s.get(DIALOG_BUTTON0 + 1).unwrap().enabled && !s.get(DIALOG_CHECK).unwrap().enabled, "Skip and the box wait a moment, as with the keyboard");
+        assert!(r.app.next_deadline().is_some(), "and the window wakes when they can be used");
+        r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0 + 1, "Skip".into())));
+        assert!(answers.try_recv().is_err() && r.app.dialog.is_some());
+        r.app.dialog_guard = Some(Instant::now() - DIALOG_GUARD);
+        let s = snapshot(&mut r);
+        assert!(s.get(DIALOG_BUTTON0 + 1).unwrap().enabled && s.get(DIALOG_CHECK).unwrap().enabled);
+        // The next clash about the same name is still a new question.
+        r.app.pending_conflicts.push(clash(reply));
+        r.app.on_msg(Msg::A11y(Act::Choose(DIALOG_BUTTON0 + 1, "Skip".into())));
+        assert!(matches!(answers.try_recv(), Ok(Answer { choice: Choice::Skip, .. })));
+        let s = snapshot(&mut r);
+        assert!(s.modal.and_then(|m| m.asked).is_some_and(|t| Some(t) != asked), "asked again");
+    }
+
+    #[test]
+    fn the_passphrase_is_never_given_to_a_screen_reader() {
+        use crate::a11y::{DIALOG, Focus as Has, PASSPHRASE, Role};
+        let mut r = drive_rig("a11y-unlock");
+        let v = stick(&r, Some("SECRET"), None, true);
+        let mut field = Field::new("pa");
+        field.insert("ß");
+        field.left(false, false);
+        r.app.dialog = Some(Dialog::Unlock { volume: v, field, at: 0, error: None, waiting: false });
+        let s = snapshot(&mut r);
+        assert_eq!(s.get(DIALOG).map(|d| (d.role, d.name.as_str())), Some((Role::Dialog, "Unlock “SECRET”")));
+        let p = s.get(PASSPHRASE).unwrap();
+        let f = p.field.as_ref().unwrap();
+        assert_eq!((p.role, f.text.as_str()), (Role::PasswordText, "•••"), "a dot for each character");
+        assert_eq!(f.caret, "••".len(), "the caret among the dots where it is in the passphrase");
+        assert_eq!(s.focus, Has::Node(PASSPHRASE), "typing goes to it");
+        if let Some(Dialog::Unlock { waiting, .. }) = r.app.dialog.as_mut() {
+            *waiting = true;
+        }
+        let s = snapshot(&mut r);
+        assert!(!s.get(PASSPHRASE).unwrap().enabled && s.get(DIALOG).unwrap().description == "Unlocking…", "left alone while it's tried");
     }
 
     #[test]

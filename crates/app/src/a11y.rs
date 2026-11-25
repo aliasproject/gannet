@@ -74,6 +74,20 @@ pub const NOTICE0: u64 = 1 << 14;
 pub const DISMISS0: u64 = 1 << 15;
 pub const JOB0: u64 = 1 << 32;
 pub const STOP0: u64 = 1 << 33;
+// A menu or dialog open over the window, and the dialog's parts. A menu's items and a dialog's
+// buttons are by their place in it, and the rename dialog's names by theirs.
+pub const MENU: u64 = 30;
+pub const DIALOG: u64 = 31;
+/// The clash dialog's "Do the same for the rest".
+pub const DIALOG_CHECK: u64 = 32;
+/// The drive-unlock prompt's passphrase.
+pub const PASSPHRASE: u64 = 33;
+pub const RENAME_FIND: u64 = 34;
+pub const RENAME_REPLACE: u64 = 35;
+pub const RENAME_NAMES: u64 = 36;
+pub const MENU_ITEM0: u64 = 1 << 17;
+pub const DIALOG_BUTTON0: u64 = 1 << 18;
+pub const RENAME_NAME0: u64 = 1 << 19;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
@@ -97,6 +111,12 @@ pub enum Role {
     /// A job under way. Its value is in `News::jobs`.
     ProgressBar,
     Panel,
+    /// A dialog that asks before going on, like whether to delete for good.
+    Alert,
+    /// A passphrase being typed. Its `field` has a dot for each character, never the text.
+    PasswordText,
+    Menu,
+    MenuItem,
 }
 
 /// The one thing a part does when a screen reader asks: its name and description, as AT-SPI
@@ -452,6 +472,21 @@ pub struct Snapshot {
     /// is dropped.
     pub edit_gen: u64,
     pub news: News,
+    /// The menu or dialog open over the window, if one is.
+    pub modal: Option<Modal>,
+}
+
+/// A menu or dialog open over the window. While one is, only it can be used, as with the
+/// pointer and the keyboard: everything else is neither enabled nor sensitive, and asking it
+/// to do anything does nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Modal {
+    pub id: u64,
+    /// The button Enter presses.
+    pub default: Option<u64>,
+    /// When a paste's clash was asked: the next clash can ask the same, and is still a new
+    /// question.
+    pub asked: Option<std::time::Instant>,
 }
 
 /// What the window has to tell, besides its parts: its notices and the jobs under way. A
@@ -505,6 +540,24 @@ impl Snapshot {
         out.extend(is.notices[is.notices.len() - fresh..].iter().map(|t| (t.clone(), true)));
         out
     }
+    /// Whether a part is behind the menu or dialog that's open, so it can't be used. What's in
+    /// the menu or dialog isn't, nor is the window around it.
+    pub fn behind(&self, id: u64) -> bool {
+        self.behind_in(id, |at| self.get(at))
+    }
+
+    /// The same, finding parts through `get`, which can be quicker than `Snapshot::get`.
+    pub fn behind_in<'a>(&'a self, id: u64, get: impl Fn(u64) -> Option<&'a Node>) -> bool {
+        let Some(m) = self.modal else { return false };
+        let up = |from: u64| std::iter::successors(Some(from), |&at| get(at).map(|n| n.parent).filter(|&p| p != 0));
+        !(up(id).any(|at| at == m.id) || up(m.id).any(|at| at == id))
+    }
+
+    /// Whether the file list's rows are behind a menu or dialog.
+    pub fn rows_behind(&self) -> bool {
+        self.modal.is_some()
+    }
+
     pub fn geometry(&self, id: u64) -> Option<&TextGeometry> {
         self.text_geometry.iter().find(|(i, _)| *i == id).map(|(_, g)| &**g)
     }
@@ -535,6 +588,10 @@ pub enum Act {
     /// Give a part the keyboard: an entry, or an item of a list other than the file list, which
     /// picks it, as moving to it does with the keyboard.
     Focus(u64),
+    /// Press a menu's item or a dialog's button, by its id, if it's still called that: the menu
+    /// or dialog can have closed, and another opened in its place. One with the same buttons,
+    /// like the next clash, takes no answer for a moment after it's asked, as with a key.
+    Choose(u64, String),
     /// Open a place in the sidebar.
     OpenPlace(usize),
     /// Scroll the sidebar to show a place.
@@ -793,6 +850,15 @@ impl Link {
             }
             fixed.extend(parts);
         }
+        // What's open over the window, drawn last: a menu, then a dialog, which has the keyboard
+        // if both are open.
+        let mut modal = None;
+        for (parts, m, has) in [menu(app), dialog(app)].into_iter().flatten() {
+            fixed[0].children.push(m.id);
+            fixed.extend(parts);
+            focus = Focus::Node(has);
+            modal = Some(m);
+        }
         // Where every field's characters are, the Save dialog's name among them. Each is drawn by
         // `paint_field` in its node's box.
         let mut text_geometry = Vec::new();
@@ -803,7 +869,7 @@ impl Link {
             let line = app.field_line(n.rect);
             text_geometry.push((n.id, Arc::new(TextGeometry::measure(&mut app.text, f, x0, line, prev))));
         }
-        Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry, edit_gen: app.edit_gen(), news }
+        Snapshot { fixed, rows, focus, window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry, edit_gen: app.edit_gen(), news, modal }
     }
 
     /// The text fields of the file manager's own window showing.
@@ -861,7 +927,7 @@ impl Link {
             Node::new(PREVIEW_NEXT, Role::PushButton, "Next file", Rect::default(), FRAME).enabled(s.can_step.1).doing(click("Show the next file in the folder", "Right")),
             Node::new(PREVIEW_CLOSE, Role::PushButton, "Close", Rect::default(), FRAME).doing(click("Close the preview", "Escape")),
         ];
-        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry: Vec::new(), edit_gen: 0, news: News::default() }
+        Snapshot { fixed, rows: self.no_rows(), focus: Focus::Node(PREVIEW), window_focused: app.has_keyboard, dir: self.dir.clone(), text_geometry: Vec::new(), edit_gen: 0, news: News::default(), modal: None }
     }
 }
 
@@ -877,6 +943,94 @@ pub struct PreviewText {
     pub foot: Rect,
     /// Whether there's a file before it and after it.
     pub can_step: (bool, bool),
+}
+
+/// The menu open, if one is: its parts, the menu first, and the part with the keyboard. That's
+/// the item picked, or the menu while none is, as when the pointer opened it.
+fn menu(app: &App) -> Option<(Vec<Node>, Modal, u64)> {
+    let m = app.menu.as_ref()?;
+    let r = app.menu_rect(m);
+    let (row, top) = (app.px(28.0), r.y + app.px(4.0));
+    let items: Vec<Node> = m.items.iter().enumerate().map(|(i, item)| {
+            let rect = Rect::new(r.x + app.px(4.0), top + i as i32 * row, r.w - app.px(8.0), row);
+            // The shortcut is said after the name, as it's drawn after it.
+            Node::new(MENU_ITEM0 + i as u64, Role::MenuItem, item.label, rect, MENU).described(item.keys).enabled(item.enabled).selected(i == m.at && item.enabled).doing(click("Choose it", ""))
+        })
+        .collect();
+    let picked = m.items.get(m.at).filter(|i| i.enabled).map_or(MENU, |_| MENU_ITEM0 + m.at as u64);
+    let mut parts = vec![Node::new(MENU, Role::Menu, "", r, FRAME).with_children(items.iter().map(|n| n.id).collect())];
+    parts.extend(items);
+    Some((parts, Modal { id: MENU, default: None, asked: None }, picked))
+}
+
+/// The dialog open, if one is: its parts, the dialog first, and the part with the keyboard.
+/// It's named for its question and described by what it says under it, and one that asks
+/// before going on is an alert.
+fn dialog(app: &mut App) -> Option<(Vec<Node>, Modal, u64)> {
+    use crate::app::Dialog;
+    use crate::rename_many::Focus as RenameFocus;
+    let d = app.dialog.take()?;
+    let r = app.dialog_rect_for(&d);
+    let (title, message) = app.dialog_text(&d);
+    let rects = app.dialog_button_rects(&d);
+    let default = DIALOG_BUTTON0 + App::dialog_default(&d) as u64;
+    // A clash just asked takes no answer for a moment, as with the keyboard and the pointer.
+    let guarded = app.dialog_guarded();
+    let mut parts = Vec::new();
+    let mut has = default;
+    match &d {
+        Dialog::Conflict { apply_to_all, .. } => {
+            let mut check = Node::new(DIALOG_CHECK, Role::CheckBox, "Do the same for the rest", app.dialog_check_rect(), DIALOG).enabled(!guarded).doing(Action::new("toggle", "Answer the rest the same way", "a"));
+            check.checked = Some(*apply_to_all);
+            parts.push(check);
+        }
+        Dialog::Unlock { field, waiting, .. } => {
+            // A dot for each character, as it's drawn, with the caret where it is among them.
+            let dot = |b: usize| field.text[..b].chars().count() * '•'.len_utf8();
+            let mut f = crate::field::Field::new(&"•".repeat(field.text.chars().count()));
+            (f.caret, f.anchor) = (dot(field.caret), dot(field.anchor));
+            let mut n = Node::new(PASSPHRASE, Role::PasswordText, "Passphrase", app.dialog_check_rect(), DIALOG).enabled(!*waiting);
+            n.field = Some(f);
+            parts.push(n);
+            // Typing goes to it, whichever button Enter presses.
+            has = PASSPHRASE;
+        }
+        Dialog::RenameMany(rm) => {
+            let l = app.rename_layout(rm.names.len());
+            let mut find = Node::new(RENAME_FIND, Role::Entry, "Find", l.find, DIALOG);
+            find.field = Some(rm.find.clone());
+            let mut replace = Node::new(RENAME_REPLACE, Role::Entry, "Replace with", l.replace, DIALOG);
+            replace.field = Some(rm.replace.clone());
+            // Each old name, described by what it becomes. Those scrolled out of the list aren't
+            // showing.
+            let shown = rm.scroll..rm.scroll + (l.list.h / l.row_h).max(1) as usize;
+            let names: Vec<Node> = rm.names.iter().enumerate().map(|(i, old)| {
+                    let rect = Rect::new(l.list.x, l.list.y + (i as i32 - rm.scroll as i32) * l.row_h, l.list.w, l.row_h);
+                    Node::new(RENAME_NAME0 + i as u64, Role::ListItem, String::from_utf8_lossy(old), rect, RENAME_NAMES).described(rm.outcome(i)).showing(shown.contains(&i))
+                })
+                .collect();
+            parts.extend([find, replace, Node::new(RENAME_NAMES, Role::List, "Names", l.list, DIALOG).with_children(names.iter().map(|n| n.id).collect())]);
+            parts.extend(names);
+            has = match rm.focus {
+                RenameFocus::Find => RENAME_FIND,
+                RenameFocus::Replace => RENAME_REPLACE,
+                RenameFocus::Button(i) => DIALOG_BUTTON0 + i as u64,
+            };
+        }
+        _ => {}
+    }
+    for (i, (b, rect)) in App::dialog_buttons(&d).iter().zip(rects).enumerate() {
+        // The rename dialog's Rename waits until something changes and nothing clashes.
+        let can = !guarded && !matches!(&d, Dialog::RenameMany(rm) if i == 0 && !rm.can_rename());
+        let keys = if b.key == "Esc" { "Escape" } else { b.key };
+        parts.push(Node::new(DIALOG_BUTTON0 + i as u64, Role::PushButton, b.label, rect, DIALOG).enabled(can).doing(click("Press it", keys)));
+    }
+    let role = if matches!(d, Dialog::Unlock { .. } | Dialog::RenameMany(_)) { Role::Dialog } else { Role::Alert };
+    let kids = parts.iter().filter(|n| n.parent == DIALOG).map(|n| n.id).collect();
+    parts.insert(0, Node::new(DIALOG, role, title, r, FRAME).described(message).with_children(kids));
+    let asked = matches!(d, Dialog::Conflict { .. }).then(|| app.dialog_asked()).flatten();
+    app.dialog = Some(d);
+    Some((parts, Modal { id: DIALOG, default: Some(default), asked }, has))
 }
 
 /// The list's columns, placed as `paint_header` draws them. Recent, the Trash and search
@@ -1033,6 +1187,18 @@ mod tests {
         assert!(!r.showing(0), "scrolled out of view above");
         assert!(r.showing(1), "partly in view");
         assert!(r.showing(11) && !r.showing(12), "the list is 200 high");
+    }
+
+    #[test]
+    fn only_whats_open_over_the_window_can_be_used() {
+        let n = |id, parent| Node::new(id, Role::PushButton, "", Rect::default(), parent);
+        let fixed = vec![n(FRAME, 0).with_children(vec![BACK, DIALOG]), n(BACK, FRAME), n(DIALOG, FRAME).with_children(vec![DIALOG_BUTTON0]), n(DIALOG_BUTTON0, DIALOG)];
+        let mut s = Snapshot { fixed, rows: rows(3, 0.0), focus: Focus::Node(BACK), window_focused: true, dir: Arc::default(), text_geometry: Vec::new(), edit_gen: 0, news: News::default(), modal: None };
+        assert!(!s.behind(BACK) && !s.rows_behind(), "nothing's open");
+        s.modal = Some(Modal { id: DIALOG, default: Some(DIALOG_BUTTON0), asked: None });
+        assert!(s.behind(BACK) && s.rows_behind());
+        assert!(!s.behind(DIALOG) && !s.behind(DIALOG_BUTTON0), "the dialog and what's in it");
+        assert!(!s.behind(FRAME), "nor the window around it");
     }
 
     #[test]

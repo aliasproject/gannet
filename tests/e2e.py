@@ -1541,25 +1541,27 @@ def a_screen_reader_can_read_and_drive_the_window(h):
         assert not any(x["type"] == "object:state-changed:focused" for x in heard), f"the row with focus was announced again: {heard}"
         assert sr.ask("kept") == {"role": "table row", "name": "b.txt"}
 
-        # While a dialog is open, a screen reader can't act behind it, as the pointer can't.
+        # While a dialog is open, what's behind it can't be used, as with the pointer: a request
+        # about it answers false and does nothing.
         places = sr.ask("tree")["places"]
         a.key("a", mods=("ctrl",))
         a.key("F2")
         a.wait(lambda s: s["dialog"].startswith("rename-many"), "the dialog")
-        assert sr.ask(f"select_place {places.index('Home')}") is True, "select_place"
-        assert sr.ask("deselect_row 0") is True, "deselect_row"
+        assert sr.ask(f"select_place {places.index('Home')}") is False, "select_place"
+        assert sr.ask("deselect_row 0") is False, "deselect_row"
         time.sleep(0.5)
         s = a.state()
         assert s["dir"] == str(fs / "docs") and s["dialog"].startswith("rename-many") and len(s["selected"]) == 5, s
         a.key("Escape")
         a.wait(lambda s: s["dialog"] == "", "the dialog closed")
-        # Outside a menu, a request only closes it, as a click does: the menu never acts on a
-        # selection changed under it.
+        # Nor behind a menu, which stays open: it never acts on a selection changed under it.
         a.click(ROW_X, row_y(1), 0x111)
         a.wait(lambda s: s["menu"], "the menu")
-        assert sr.ask("deselect_row 0") is True, "deselect_row"
+        assert sr.ask("deselect_row 0") is False, "deselect_row"
+        time.sleep(0.3)
+        assert a.state()["menu"] and len(a.state()["selected"]) == 5, a.state()
+        a.key("Escape")
         a.wait(lambda s: not s["menu"], "the menu closed")
-        assert len(a.state()["selected"]) == 5, a.state()
 
         # A place opens when it's selected.
         assert sr.ask(f"select_place {places.index('Home')}") is True
@@ -2043,6 +2045,25 @@ def a_screen_reader_can_use_the_open_and_save_dialogs(h):
         assert sr.ask("grab [\"Save the report\", \"Name@entry\"]") is True
         a.wait(lambda s: s["chooser"]["name_focused"], "the keyboard back in the name")
         sr.until("dump [\"Save the report\"]", lambda w: a11y_focus(w) == ["Name"], "focus back on the name")
+        # Saving onto a file that's there asks first, in an alert the screen reader hears, and
+        # the Save dialog behind it can't be used.
+        a.key("a", mods=("ctrl",))
+        a.type("a.txt")
+        sr.ask("events")
+        assert sr.ask("do [\"Save the report\", \"Save\"]") is True
+        a.wait(lambda s: s["dialog"] == "replace", "asked about replacing")
+        ask = "Replace “a.txt”?"
+        w = sr.until("dump [\"Save the report\"]", lambda w: a11y_find(w, ask, "alert"), "the alert")
+        alert = a11y_find(w, ask, "alert")
+        assert alert["description"] == "It's already in “docs”. Replacing it overwrites what's there." and [c["name"] for c in alert["children"]] == ["Replace", "Cancel"], alert
+        assert "enabled" not in a11y_find(w, "File type", "list")["states"], "the bar is behind the alert"
+        heard = sr.until("events", lambda e: announced(e), "the alert announced")
+        assert announced(heard) == [f"{ask} {alert['description']}"], heard
+        assert sr.ask("select [\"Save the report\", \"File type\", 0]") is False, "behind the alert"
+        assert sr.ask(f"do {json.dumps(['Save the report', ask, 'Cancel'])}") is True
+        a.wait(lambda s: s["dialog"] == "" and s["chooser"], "kept the dialog open")
+        a.key("a", mods=("ctrl",))
+        a.type("report.txt")
         # The name reads and edits as the main window's fields do: typing through AT-SPI
         # changes it, and the change is heard.
         f = sr.ask("fields")
@@ -2137,6 +2158,170 @@ def a_screen_reader_can_pick_an_app_in_open_with(h):
         assert said(a) == "open writer.desktop\nalways\n"
     finally:
         sr.stop()
+
+
+def find(o, role, name=None):
+    """The first part in a dump of that role, and name if given."""
+    if o["role"] == role and (name is None or o["name"] == name):
+        return o
+    for c in o.get("children", []):
+        if (f := find(c, role, name)) is not None:
+            return f
+    return None
+
+
+def announced(heard):
+    return [x["said"] for x in heard if x["type"] == "object:announcement"]
+
+
+@check
+def a_screen_reader_can_use_menus_and_dialogs(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"docs/a.txt": "a", "docs/b.txt": "old", "other/b.txt": "new"})
+    media = SCRATCH / "media"
+    shutil.rmtree(media, ignore_errors=True)
+    tree(media, {"SECRETS/diary.txt": "dear diary"})
+    disks = StandIn(media)
+    sr = ScreenReader()
+    try:
+        disks.say("drive Stick Kingston-1234", "luks sdb2 Stick hunter2 SECRETS")
+        a = App(h, fs / "docs", extra_env={"DBUS_SESSION_BUS_ADDRESS": sr.session.address, "DBUS_SYSTEM_BUS_ADDRESS": disks.bus.address})
+        a.wait(lambda s: s["names"] == ["a.txt", "b.txt"], "listed")
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered")
+        w = " - Gannet"
+
+        # The menu: its items, with their shortcuts, and the one the keyboard is on. What's
+        # behind it can't be used.
+        a.key("Down")
+        a.wait(lambda s: s["cursor_shown"], "the cursor on a.txt")
+        sr.ask("events")
+        a.key("Menu")
+        a.wait(lambda s: s["menu"], "the menu")
+        d = sr.until(f'dump ["{w}"]', lambda d: find(d, "menu") is not None, "the menu")
+        menu = find(d, "menu")
+        items = {i["name"]: i for i in menu["children"]}
+        assert items["Copy"]["role"] == "menu item" and items["Copy"]["description"] == "Ctrl+C" and items["Copy"]["action"] == "click", items["Copy"]
+        assert "enabled" not in items["Undo"]["states"], "nothing to undo"
+        assert "focused" in items["Open"]["states"], "the keyboard is on the first item"
+        files = find(d, "table", "Files")
+        assert "enabled" not in files["states"] and all("enabled" not in r["states"] for r in files["children"]), "the list is behind the menu"
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "focus moves into the menu")
+        assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Open"], heard
+        assert sr.ask("focus_row 1") is False, "a row behind the menu"
+        assert "enabled" not in find(d, "column header", "Name")["states"] and all("enabled" not in c["states"] for c in find(d, "list", "Path")["children"]), "the headings and path bar are behind it too"
+        assert sr.ask("heading 0") is False and sr.ask("crumb 0") is False, "nor can they be used"
+        # Moving to an item picks it, and its action chooses it.
+        assert sr.ask(f'grab ["{w}", "", "Show hidden files"]') is True
+        sr.until(f'dump ["{w}"]', lambda d: "focused" in find(d, "menu item", "Show hidden files")["states"], "picked")
+        assert sr.ask(f'do ["{w}", "", "Show hidden files"]') is True
+        a.wait(lambda s: s["hidden"] and not s["menu"], "chosen, and the menu closed")
+        t = sr.until("tree", lambda t: t["focus"] == ["a.txt"], "the keyboard back on the row")
+        a.shot("a11y-menu-chosen")
+
+        # A confirmation is an alert: what it asks, what it says under that, its buttons and the
+        # one Enter presses, which has the keyboard. It's announced as it opens.
+        sr.ask("events")
+        a.key("Delete", mods=("shift",))
+        a.wait(lambda s: s["dialog"] == "delete", "asks")
+        ask = "Delete “a.txt” for good?"
+        d = sr.until(f'dump ["{w}"]', lambda d: find(d, "alert") is not None, "the alert")
+        alert = find(d, "alert")
+        assert alert["name"] == ask and alert["description"] == "This can't be undone." and "modal" in alert["states"], alert
+        buttons = {b["name"]: b for b in alert["children"]}
+        assert list(buttons) == ["Delete", "Cancel"], buttons
+        assert {"focused", "default", "enabled"} <= set(buttons["Cancel"]["states"]) and "default" not in buttons["Delete"]["states"], buttons
+        heard = sr.until("events", lambda e: announced(e), "the alert announced")
+        assert announced(heard) == [f"{ask} This can't be undone."], announced(heard)
+        assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Cancel"], heard
+        assert any(x["type"] == "object:state-changed:sensitive" and x["detail1"] == 0 and x["source"] == "Files" for x in heard), f"the list was said to be unavailable: {heard}"
+        a.shot("a11y-delete-alert")
+        assert sr.ask("focus_row 1") is False and sr.ask("select_row 1") is False, "behind the alert"
+        assert sr.ask(f'do ["{w}", "{ask}", "Cancel"]') is True
+        a.wait(lambda s: s["dialog"] == "", "cancelled")
+        t = sr.until("tree", lambda t: t["focus"] == ["a.txt"], "the keyboard back on the row")
+        assert (fs / "docs/a.txt").exists()
+        a.key("Delete", mods=("shift",))
+        a.wait(lambda s: s["dialog"] == "delete", "asks again")
+        sr.until(f'dump ["{w}"]', lambda d: find(d, "alert") is not None, "the alert")
+        assert sr.ask(f'do ["{w}", "{ask}", "Delete"]') is True
+        a.wait(lambda s: s["dialog"] == "" and s["names"] == ["b.txt"], "deleted")
+
+        # The clash a paste meets asks whether to replace, with a box to answer the rest the
+        # same way.
+        a.key("l", mods=("ctrl",))
+        a.type(str(fs / "other"))
+        a.key("Return")
+        a.wait(lambda s: s["names"] == ["b.txt"] and s["dir"] == str(fs / "other"), "the other folder")
+        a.key("Down")
+        a.key("c", mods=("ctrl",))
+        time.sleep(0.1)
+        a.key("Left", mods=("alt",))
+        a.wait(lambda s: s["dir"] == str(fs / "docs"), "back")
+        sr.ask("events")
+        a.key("v", mods=("ctrl",))
+        a.wait(lambda s: s["dialog"] == "conflict", "the clash")
+        ask = "“b.txt” is already here"
+        d = sr.until(f'dump ["{w}"]', lambda d: find(d, "alert", ask) is not None, "the clash's alert")
+        alert = find(d, "alert", ask)
+        assert [c["name"] for c in alert["children"]] == ["Do the same for the rest", "Replace", "Skip", "Keep both", "Cancel"], alert
+        assert alert["description"] == "Replace trashes the old one. Keep both renames the new one.", alert
+        check_box = find(alert, "check box")
+        assert "checked" not in check_box["states"] and check_box["action"] == "toggle", check_box
+        assert announced(sr.until("events", lambda e: announced(e), "the clash announced")) == [f"{ask}. Replace trashes the old one. Keep both renames the new one."]
+        a.shot("a11y-clash")
+        time.sleep(0.45)  # A new clash takes no answer for a moment.
+        assert sr.ask(f'do ["{w}", "{ask}", "Do the same for the rest"]') is True
+        sr.until(f'dump ["{w}"]', lambda d: "checked" in find(d, "check box")["states"], "ticked")
+        assert sr.ask(f'do ["{w}", "{ask}", "Replace"]') is True
+        a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0, "replaced")
+        assert (fs / "docs/b.txt").read_text() == "new"
+
+        # The rename dialog's fields are entries, and its names say what they become.
+        (fs / "docs/c.txt").write_text("c")
+        a.wait(lambda s: "c.txt" in s["names"], "c.txt")
+        a.key("a", mods=("ctrl",))
+        a.key("F2")
+        a.wait(lambda s: s["dialog"].startswith("rename-many"), "the rename dialog")
+        a.type(".txt")
+        # Replace, through EditableText, which gives it the keyboard as clicking it does.
+        assert sr.ask("set_text Replace .md") is True
+        d = sr.until(f'dump ["{w}"]', lambda d: find(d, "dialog", "Rename 2 items") is not None and "focused" in find(d, "entry", "Replace with")["states"], "the rename dialog")
+        dialog = find(d, "dialog", "Rename 2 items")
+        assert [(c["role"], c["name"]) for c in dialog["children"]] == [("entry", "Find"), ("entry", "Replace with"), ("list", "Names"), ("button", "Rename"), ("button", "Cancel")], dialog
+        assert [(n["name"], n["description"]) for n in find(dialog, "list", "Names")["children"]] == [("b.txt", "becomes “b.md”"), ("c.txt", "becomes “c.md”")]
+        assert dialog["description"] == "2 items will be renamed", dialog
+        a.shot("a11y-rename-many")
+        assert sr.ask(f'do ["{w}", "Rename 2 items", "Rename"]') is True
+        a.wait(lambda s: s["dialog"] == "" and s["jobs"] == 0 and s["names"] == ["b.md", "c.md"], "renamed")
+
+        # The drive-unlock prompt: the passphrase, which is never read out, has the keyboard,
+        # and a wrong one is announced.
+        s = a.wait(lambda s: place_flags(s, "8.0 GB Volume") == {"locked", "eject"}, "the locked drive")
+        click_place(a, s, "8.0 GB Volume")
+        a.wait(lambda s: s["dialog"] == "unlock", "asked for the passphrase")
+        ask = "Unlock “8.0 GB Volume”"
+        d = sr.until(f'dump ["{w}"]', lambda d: find(d, "dialog", ask) is not None, "the prompt")
+        dialog = find(d, "dialog", ask)
+        assert dialog["description"] == "It's encrypted. Type its passphrase to open it.", dialog
+        phrase = find(dialog, "password text")
+        assert phrase["name"] == "Passphrase" and {"focused", "editable"} <= set(phrase["states"]), phrase
+        assert sr.ask("set_text Passphrase hunter2") is False, "a passphrase is only typed"
+        sr.ask("events")
+        a.type("nope")
+        a.key("Return")
+        a.wait(lambda s: s["dialog"] == "unlock-again", "told it's wrong", timeout=10)
+        heard = sr.until("events", lambda e: "That passphrase isn't right. Try again." in announced(e), "the wrong passphrase announced")
+        assert not any("nope" in t for t in announced(heard)), heard
+        a.shot("a11y-unlock-wrong")
+        a.type("hunter2")
+        assert sr.ask(f'do ["{w}", "{ask}", "Unlock"]') is True
+        a.wait(lambda s: s["dialog"] == "" and s["dir"] == str(media / "SECRETS"), "unlocked and opened", timeout=10)
+        a.close()
+    finally:
+        sr.stop()
+        disks.stop()
 
 
 PORTAL = ["org.freedesktop.impl.portal.desktop.gannet", "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser"]
