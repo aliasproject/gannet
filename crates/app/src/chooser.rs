@@ -640,6 +640,7 @@ impl App {
             a11y::Act::Focus(a11y::CHOOSER_SAVE_NAME) => {
                 if let Some(c) = self.chooser.as_mut().filter(|c| c.spec.mode == Mode::Save) {
                     c.name_focused = true;
+                    self.leave_sidebar();
                     self.invalidate_all();
                 }
             }

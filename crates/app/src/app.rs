@@ -558,6 +558,10 @@ pub struct App {
 
     pub cursor: usize,
     pub cursor_shown: bool,
+    /// The place the keyboard is on while the sidebar has it, which F6 gives it: its index then,
+    /// and what it is (`place_identity`). Read through `side_focus`, as places can come and go
+    /// while it's there.
+    side_cursor: Option<(usize, String)>,
     anchor: usize,
     selected: Vec<u64>,
     pub sel_count: usize,
@@ -745,6 +749,7 @@ impl App {
             last_load_cost: Duration::ZERO,
             cursor: 0,
             cursor_shown: false,
+            side_cursor: None,
             anchor: 0,
             selected: Vec::new(),
             sel_count: 0,
@@ -1532,17 +1537,22 @@ impl App {
         // Pressing something, or moving to a row, ends an edit as clicking there would. A request
         // about a row of a folder the window has left is dropped, and leaves the edit alone.
         let clicks = match &act {
-            Act::Press(_) | Act::OpenPlace(_) | Act::OpenCrumb(..) | Act::Eject(..) | Act::Dismiss(..) => true,
+            Act::Press(_) | Act::OpenPlace(_) | Act::PlaceMenu(..) | Act::OpenCrumb(..) | Act::Eject(..) | Act::Dismiss(..) => true,
             Act::FocusRow(dir, key) | Act::SelectRow(dir, key, _) => row(self, dir, key).is_some(),
             _ => false,
         };
         if clicks {
             self.leave_field();
+            // A place's menu goes back to the sidebar, if that's where it was opened from.
+            if !matches!(act, Act::PlaceMenu(..)) {
+                self.leave_sidebar();
+            }
         }
         match act {
             Act::Focus(FILTER) => {
                 if !matches!(self.edit, Edit::Filter(_)) && self.filter_rect().is_some() {
                     self.leave_field();
+                    self.leave_sidebar();
                     self.start_filter("");
                 }
             }
@@ -1568,6 +1578,7 @@ impl App {
                 } else if !ours {
                     return;
                 }
+                self.leave_sidebar();
                 self.a11y_edit(op);
             }
             Act::Press(BACK) if !self.viewer => self.go_back(),
@@ -1613,6 +1624,12 @@ impl App {
             Act::OpenPlace(i) => {
                 self.reveal_place(i);
                 self.open_place(i);
+            }
+            // The place is checked by name, as the sidebar may have changed since.
+            Act::PlaceMenu(i, name) => {
+                if self.places.get(i).is_some_and(|p| p.label == name) {
+                    self.keyboard_place_menu(i);
+                }
             }
             Act::ShowPlace(i) => self.reveal_place(i),
             Act::FocusRow(dir, key) => {
@@ -3837,9 +3854,130 @@ impl App {
             self.preview_key(sym, m);
         } else if !matches!(self.edit, Edit::None) {
             self.field_key(sym, utf8, m);
-        } else if !(self.chooser.is_some() && self.chooser_key(sym, utf8, m)) {
-            // A chooser's bar has first go at a key, and leaves the rest to the list.
+        } else if self.side_focus().is_some() {
+            self.side_key(sym, utf8, m);
+        } else {
+            self.list_or_chooser_key(sym, utf8, m);
+        }
+    }
+
+    fn list_or_chooser_key(&mut self, sym: u32, utf8: &str, m: Mods) {
+        // A chooser's bar has first go at a key, and leaves the rest to the list.
+        if !(self.chooser.is_some() && self.chooser_key(sym, utf8, m)) {
             self.list_key(sym, utf8, m);
+        }
+    }
+
+    /// The place the keyboard is on, while the sidebar has it. It follows its place when the
+    /// places above it change, and when its place has gone it's on the one that took its index.
+    pub fn side_focus(&self) -> Option<usize> {
+        let last = self.places.len().checked_sub(1)?;
+        let (i, id) = self.side_cursor.as_ref()?;
+        if self.places.get(*i).is_some_and(|p| Self::place_identity(p) == *id) {
+            return Some(*i);
+        }
+        Some(self.places.iter().position(|p| Self::place_identity(p) == *id).unwrap_or((*i).min(last)))
+    }
+
+    /// What a place is, to find it again among the places: a drive by its block device, as one
+    /// that isn't mounted has no folder, and the rest by their kind and folder, as a pin and a
+    /// mount can be the same folder.
+    fn place_identity(p: &Place) -> String {
+        match &p.volume {
+            Some(v) => format!("drive:{}", v.block),
+            None => format!("{:?}:{}", p.kind, p.path.display()),
+        }
+    }
+
+    fn set_side_cursor(&mut self, i: usize) {
+        self.side_cursor = self.places.get(i).map(|p| (i, Self::place_identity(p)));
+    }
+
+    /// Gives the sidebar the keyboard, on the place showing or else the first.
+    fn focus_sidebar(&mut self) {
+        if self.places.is_empty() {
+            return;
+        }
+        let i = self.places.iter().position(|p| p.path == self.dir).unwrap_or(0);
+        self.set_side_cursor(i);
+        self.reveal_place(i);
+        self.invalidate_all();
+    }
+
+    /// Gives the keyboard back to the list.
+    pub(crate) fn leave_sidebar(&mut self) {
+        if self.side_cursor.take().is_some() {
+            self.invalidate_all();
+        }
+    }
+
+    /// A key while the sidebar has the keyboard. Up and Down move between places, Enter opens
+    /// one, the Menu key or Shift+F10 opens its menu, and Escape or F6 goes back to the list.
+    /// A shortcut with Ctrl or Alt, or F5, goes back to the list and does what it does there.
+    /// Other keys do nothing here, so one meant for the list, like Delete, can't reach files
+    /// that aren't in view.
+    fn side_key(&mut self, sym: u32, utf8: &str, m: Mods) {
+        let Some(i) = self.side_focus() else { return };
+        if m.ctrl || m.alt || m.logo || sym == k::KEY_F5 {
+            self.leave_sidebar();
+            return self.list_or_chooser_key(sym, utf8, m);
+        }
+        let last = self.places.len() - 1;
+        let to = match sym {
+            k::KEY_Up => i.saturating_sub(1),
+            k::KEY_Down => (i + 1).min(last),
+            k::KEY_Home => 0,
+            k::KEY_End => last,
+            k::KEY_Return | k::KEY_KP_Enter => {
+                self.reveal_place(i);
+                return self.open_place(i);
+            }
+            k::KEY_Menu | k::KEY_F10 => return self.keyboard_place_menu(i),
+            // Holding Escape to close a menu doesn't go on to leave the sidebar.
+            k::KEY_Escape | k::KEY_F6 if self.key_is_repeat => return,
+            k::KEY_Escape | k::KEY_F6 => return self.leave_sidebar(),
+            // Tab goes on to do what it does in the list, as the Save dialog's name field is
+            // reached with it.
+            k::KEY_Tab | k::KEY_ISO_Left_Tab => {
+                self.leave_sidebar();
+                return self.list_or_chooser_key(sym, utf8, m);
+            }
+            _ => return,
+        };
+        if to != i {
+            self.set_side_cursor(to);
+            self.reveal_place(to);
+            self.invalidate(self.layout().sidebar);
+        }
+    }
+
+    /// Whether a place has a menu: a pin, or a drive udisks2 knows.
+    pub fn place_has_menu(&self, i: usize) -> bool {
+        self.places.get(i).is_some_and(|p| p.volume.is_some() || p.kind == PlaceKind::Pinned)
+    }
+
+    /// Opens a place's menu at a point, if it has one.
+    fn open_place_menu(&mut self, i: usize, x: i32, y: i32) {
+        let Some(p) = self.places.get(i) else { return };
+        if let Some(v) = p.volume.clone() {
+            self.open_drive_menu(v, x, y);
+        } else if p.kind == PlaceKind::Pinned {
+            self.open_pin_menu(p.path.clone(), x, y);
+        }
+    }
+
+    /// Opens a place's menu under it, with its first item picked, as the list's keyboard menu
+    /// opens.
+    fn keyboard_place_menu(&mut self, i: usize) {
+        if !self.place_has_menu(i) {
+            return;
+        }
+        self.reveal_place(i);
+        let side = self.layout().sidebar;
+        let y = (self.place_top(i) + self.px(30.0)).min(side.bottom()).max(side.y);
+        self.open_place_menu(i, side.x + self.px(40.0), y);
+        if let Some(m) = self.menu.as_mut() {
+            m.at = next_enabled(&m.items, usize::MAX, 1);
         }
     }
 
@@ -4056,6 +4194,7 @@ impl App {
             (k::KEY_period, true, _) => self.stop_newest_job(),
             (k::KEY_F5, _, _) | (k::KEY_r, true, _) => self.action(Action::Reload),
             (k::KEY_F10, _, _) | (k::KEY_Menu, _, _) => self.keyboard_menu(),
+            (k::KEY_F6, _, _) => self.focus_sidebar(),
             (k::KEY_h, true, _) => self.action(Action::ToggleHidden),
             (k::KEY_l, true, _) => self.start_path_edit(),
             (k::KEY_f, true, _) if !m.shift => self.start_search(),
@@ -4509,6 +4648,11 @@ impl App {
         if self.preview.is_some() {
             return self.preview_button(button, hit);
         }
+        // A click gives the keyboard back to the list, though not one on an item of a menu the
+        // sidebar opened, which goes back to it.
+        if !matches!(hit, Hit::MenuItem(_)) {
+            self.leave_sidebar();
+        }
         match button {
             BTN_SIDE => return self.go_back(),
             BTN_EXTRA => return self.go_forward(),
@@ -4531,14 +4675,8 @@ impl App {
                 self.clear_selection();
                 self.invalidate_list();
                 self.open_menu(x, y);
-            } else if let Hit::Place(i) | Hit::Eject(i) = self.hit(x, y)
-                && let Some(v) = self.places.get(i).and_then(|p| p.volume.clone())
-            {
-                self.open_drive_menu(v, x, y);
-            } else if let Hit::Place(i) = self.hit(x, y)
-                && let Some(p) = self.places.get(i).filter(|p| p.kind == PlaceKind::Pinned)
-            {
-                self.open_pin_menu(p.path.clone(), x, y);
+            } else if let Hit::Place(i) | Hit::Eject(i) = self.hit(x, y) {
+                self.open_place_menu(i, x, y);
             }
             return;
         }
@@ -9659,6 +9797,132 @@ mod tests {
         assert!(r.bookmarks().contains("sftp://server/srv Server"), "a line Gannet doesn't show is kept: {}", r.bookmarks());
         assert!(r.root.join("pins/Projects").is_dir());
         assert_eq!(r.labels(), ["Home", "Notes"]);
+    }
+
+    #[test]
+    fn f6_gives_the_sidebar_the_keyboard_and_the_menu_key_opens_a_pins_menu_there() {
+        let mut r = pin_rig("pins-keys", &["Projects", "Notes"]);
+        r.key(k::KEY_Down, "");
+        assert!(r.app.cursor_shown);
+        // The folder showing isn't a place, so the keyboard starts on the first.
+        r.key(k::KEY_F6, "");
+        assert_eq!(r.app.side_focus(), Some(0));
+        // Home has no menu, and the list's isn't opened in its place.
+        r.key(k::KEY_Menu, "");
+        assert!(r.app.menu.is_none());
+        r.key(k::KEY_Down, "");
+        assert_eq!(r.app.side_focus(), Some(1));
+        // Keys meant for the list don't reach it while the sidebar has the keyboard.
+        r.key(k::KEY_Delete, "");
+        assert!(r.app.jobs.is_empty() && r.work().join("d").exists());
+        r.app.key(k::KEY_F10, "", Mods { shift: true, ..Mods::default() });
+        let m = r.app.menu.as_ref().expect("the pin's menu");
+        assert_eq!(m.items.iter().map(|i| i.label).collect::<Vec<_>>(), ["Open", "Unpin"]);
+        assert_eq!(m.at, 0, "its first item picked, as the list's keyboard menu has");
+        let side = r.app.layout().sidebar;
+        assert!(side.contains(m.x, m.y) && m.y >= r.app.place_top(1), "under the pin: {}, {}", m.x, m.y);
+        r.key(k::KEY_Down, "");
+        r.key(k::KEY_Return, "");
+        assert!(r.app.menu.is_none());
+        assert_eq!(r.pinned(), ["Notes"]);
+        // The keyboard stays in the sidebar, on the place that took the pin's.
+        assert_eq!(r.app.side_focus(), Some(1));
+        r.key(k::KEY_Return, "");
+        assert_eq!(r.app.dir, r.root.join("pins/Notes"), "Enter opens it");
+        assert_eq!(r.app.side_focus(), Some(1), "and the sidebar keeps the keyboard");
+        // A menu closed with Escape leaves the keyboard where it was, and Escape again gives it
+        // back to the list.
+        r.key(k::KEY_Menu, "");
+        assert!(r.app.menu.is_some());
+        r.key(k::KEY_Escape, "");
+        assert!(r.app.menu.is_none() && r.app.side_focus() == Some(1));
+        // Escape held down doesn't go on to leave the sidebar.
+        r.app.key_is_repeat = true;
+        r.key(k::KEY_Escape, "");
+        r.app.key_is_repeat = false;
+        assert_eq!(r.app.side_focus(), Some(1));
+        r.key(k::KEY_Escape, "");
+        assert_eq!(r.app.side_focus(), None);
+        // Tab leaves it too, for what it does in the list.
+        r.key(k::KEY_F6, "");
+        r.key(k::KEY_Tab, "");
+        assert_eq!(r.app.side_focus(), None);
+        // F6 starts on the place showing, and a click anywhere gives the keyboard back.
+        r.key(k::KEY_F6, "");
+        assert_eq!(r.app.side_focus(), Some(1));
+        let (x, y) = (r.sidebar_x(), r.place_y(0));
+        r.app.input(Input::Move { x, y });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
+        assert_eq!(r.app.side_focus(), None);
+        // So does a click that closes a menu the sidebar opened, away from its items.
+        r.key(k::KEY_F6, "");
+        r.key(k::KEY_Down, "");
+        r.key(k::KEY_Menu, "");
+        assert!(r.app.menu.is_some());
+        r.app.input(Input::Move { x: 900.0, y: 600.0 });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        assert!(r.app.menu.is_none());
+        assert_eq!(r.app.side_focus(), None);
+        // A shortcut with Ctrl or Alt goes back to the list and does what it does there.
+        r.key(k::KEY_F6, "");
+        r.app.key(k::KEY_Up, "", Mods { alt: true, ..Mods::default() });
+        assert_eq!(r.app.side_focus(), None);
+        assert_eq!(r.app.dir, r.root, "Alt+Up went up from Home");
+    }
+
+    #[test]
+    fn the_menu_key_opens_a_drives_menu_in_the_sidebar() {
+        let mut r = drive_rig("drive-keys");
+        let mount = r.root.join("media/PHOTOS");
+        fs::create_dir_all(&mount).unwrap();
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        r.key(k::KEY_F6, "");
+        r.key(k::KEY_Down, "");
+        assert_eq!(r.app.side_focus(), Some(1));
+        assert_eq!(r.app.places[1].label, "PHOTOS");
+        r.key(k::KEY_Menu, "");
+        let m = r.app.menu.as_ref().expect("the drive's menu");
+        assert_eq!(m.items.iter().map(|i| i.label).collect::<Vec<_>>(), ["Open", "Unmount", "Eject"]);
+        // Its items do what they do from a right-click.
+        r.key(k::KEY_Down, "");
+        r.key(k::KEY_Down, "");
+        r.key(k::KEY_Return, "");
+        assert!(r.app.notices.iter().any(|n| n.starts_with("Couldn't eject “PHOTOS”")), "the drive was asked to eject: {:?}", r.app.notices);
+        // The keyboard stays on its drive when one above it comes and goes.
+        let other = r.root.join("media/OTHER");
+        fs::create_dir_all(&other).unwrap();
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("AAA"), Some(&other), false), stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        let at = |r: &Rig| r.app.side_focus().map(|i| r.app.places[i].label.clone());
+        assert_eq!(r.app.places[1].label, "AAA");
+        assert_eq!(at(&r).as_deref(), Some("PHOTOS"));
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        assert_eq!(at(&r).as_deref(), Some("PHOTOS"));
+    }
+
+    #[test]
+    fn a_screen_reader_opens_a_places_menu_and_hears_the_sidebars_keyboard() {
+        use crate::a11y::{Act, Focus as Has, MENU_ITEM0, PLACE0, SHOW_MENU};
+        let mut r = pin_rig("pins-a11y-menu", &["Projects", "Notes"]);
+        let s = snapshot(&mut r);
+        assert_eq!(s.get(PLACE0).unwrap().more, None, "Home has no menu");
+        assert_eq!(s.get(PLACE0 + 1).unwrap().more, Some(SHOW_MENU));
+        // A place that took the place of the one asked about doesn't open its menu.
+        r.app.on_msg(Msg::A11y(Act::PlaceMenu(1, "Notes".into())));
+        assert!(r.app.menu.is_none());
+        r.app.on_msg(Msg::A11y(Act::PlaceMenu(0, "Home".into())));
+        assert!(r.app.menu.is_none(), "nor does a place without one");
+        r.app.on_msg(Msg::A11y(Act::PlaceMenu(1, "Projects".into())));
+        assert_eq!(r.app.menu.as_ref().map(|m| m.at), Some(0));
+        assert_eq!(snapshot(&mut r).focus, Has::Node(MENU_ITEM0), "read as it opens, from its first item");
+        r.app.on_msg(Msg::A11y(Act::Choose(MENU_ITEM0 + 1, "Unpin".into())));
+        assert_eq!(r.pinned(), ["Notes"]);
+        // The sidebar's keyboard is the place it's on.
+        r.key(k::KEY_F6, "");
+        r.key(k::KEY_Down, "");
+        assert_eq!(snapshot(&mut r).focus, Has::Node(PLACE0 + 1));
+        r.key(k::KEY_F6, "");
+        assert_ne!(snapshot(&mut r).focus, Has::Node(PLACE0 + 1), "back to the list");
     }
 
     #[test]

@@ -665,11 +665,11 @@ impl Ctx {
         n.parent == a11y::SIDEBAR && n.role == Role::ListItem
     }
 
-    /// The single action an object has.
-    fn action_of(&self, target: &Target<'_>) -> Option<a11y::Action> {
+    /// The actions an object has: one, or two for a place with a menu.
+    fn actions_of(&self, target: &Target<'_>) -> Vec<a11y::Action> {
         match target {
-            Target::Fixed(n) => n.action,
-            _ => None,
+            Target::Fixed(n) => n.action.into_iter().chain(n.more).collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -690,7 +690,7 @@ impl Ctx {
                 ("AtspiVersion", Variant::from("2.1".to_string())),
                 ("Id", Variant::from(*self.id.lock().unwrap())),
             ],
-            (ACTION, _) if self.action_of(target).is_some() => vec![("NActions", Variant::from(1i32))],
+            (ACTION, _) if !self.actions_of(target).is_empty() => vec![("NActions", Variant::from(self.actions_of(target).len() as i32))],
             (SELECTION, Target::Fixed(n)) if Self::selects(n) => vec![("NSelectedChildren", Variant::from(self.selected_children(n, snap).len() as i32))],
             (TABLE, Target::Fixed(n)) if n.id == a11y::LIST => vec![
                 ("NRows", Variant::from(snap.rows.len() as i32)),
@@ -744,7 +744,7 @@ impl Ctx {
                     Target::Root => v.push(APPLICATION),
                     _ => v.push(COMPONENT),
                 }
-                if self.action_of(target).is_some() {
+                if !self.actions_of(target).is_empty() {
                     v.push(ACTION);
                 }
                 match target {
@@ -850,21 +850,34 @@ impl Ctx {
     }
 
     fn action(&self, h: &Header<'_>, m: &str, body: &Body, target: &Target<'_>, snap: &Snapshot) {
-        let Some(a) = self.action_of(target) else { return self.error(h, UNKNOWN_METHOD, m) };
+        let all = self.actions_of(target);
         let Target::Fixed(n) = target else { return self.error(h, UNKNOWN_METHOD, m) };
+        if all.is_empty() {
+            return self.error(h, UNKNOWN_METHOD, m);
+        }
+        if m == "GetActions" {
+            return self.reply(h, &(all.iter().map(|a| (a.name, a.description, a.keys)).collect::<Vec<_>>(),));
+        }
+        // The rest are about one action, by its place among them. One that isn't there has
+        // empty strings, as libatspi gives for an object without it.
+        let i: i32 = body.deserialize().unwrap_or(-1);
+        let a = usize::try_from(i).ok().and_then(|i| all.get(i).copied()).unwrap_or(a11y::Action::new("", "", ""));
         match m {
-            "GetActions" => self.reply(h, &(vec![(a.name, a.description, a.keys)],)),
-            "GetName" | "GetLocalizedName" => self.reply(h, &(a.name,)),
+            "GetName" => self.reply(h, &(a.name,)),
+            // What it does, said in words, where there are some: Orca lists actions by it.
+            "GetLocalizedName" => self.reply(h, &(if a.description.is_empty() { a.name } else { a.description },)),
             "GetDescription" => self.reply(h, &(a.description,)),
             "GetKeyBinding" => self.reply(h, &(a.keys,)),
             "DoAction" => {
-                let i: i32 = body.deserialize().unwrap_or(-1);
                 // A clash just asked takes no answer for a moment (`App::dialog_guarded`). Its
                 // buttons aren't shown as unavailable meanwhile, but a press is refused.
                 let guarded = n.parent == a11y::DIALOG && snap.modal.and_then(|m| m.asked).is_some_and(|t| t.elapsed() < crate::app::DIALOG_GUARD);
-                let ok = i == 0 && n.enabled && !guarded;
+                let ok = (i == 0 || (i == 1 && n.more.is_some())) && n.enabled && !guarded;
                 if ok {
-                    let act = if Self::is_place(n) {
+                    let act = if i == 1 {
+                        // Named for the place, so it can't open the menu of another in its place.
+                        Act::PlaceMenu(Self::place_index(n, snap).unwrap_or(usize::MAX), n.name.clone())
+                    } else if Self::is_place(n) {
                         Act::OpenPlace(Self::place_index(n, snap).unwrap_or(usize::MAX))
                     } else if matches!(n.role, Role::MenuItem) || (n.parent == a11y::DIALOG && n.role == Role::PushButton) {
                         // Named, so it can't press another menu's or dialog's in its place.

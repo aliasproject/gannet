@@ -119,8 +119,8 @@ pub enum Role {
     MenuItem,
 }
 
-/// The one thing a part does when a screen reader asks: its name and description, as AT-SPI
-/// has them, and the key that does it too.
+/// A thing a part does when a screen reader asks: its name and description, as AT-SPI has
+/// them, and the key that does it too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Action {
     pub name: &'static str,
@@ -152,6 +152,8 @@ pub struct Node {
     /// Whether any of it is in view: a place can be scrolled out of the sidebar.
     pub showing: bool,
     pub action: Option<Action>,
+    /// A second thing it does, after `action`: a place's menu.
+    pub more: Option<Action>,
     /// A check box's state.
     pub checked: Option<bool>,
     /// An entry's text, caret and selection.
@@ -161,7 +163,7 @@ pub struct Node {
 impl Node {
     /// A part with nothing selected, checked or typed in, enabled and showing.
     pub fn new(id: u64, role: Role, name: impl Into<String>, rect: Rect, parent: u64) -> Self {
-        Node { id, role, name: name.into(), description: String::new(), rect, children: Vec::new(), parent, selected: false, enabled: true, showing: true, action: None, checked: None, field: None }
+        Node { id, role, name: name.into(), description: String::new(), rect, children: Vec::new(), parent, selected: false, enabled: true, showing: true, action: None, more: None, checked: None, field: None }
     }
 
     pub fn described(mut self, d: impl Into<String>) -> Self {
@@ -176,6 +178,12 @@ impl Node {
 
     pub fn doing(mut self, a: Action) -> Self {
         self.action = Some(a);
+        self
+    }
+
+    /// Adds a second action, when there's one.
+    pub fn also(mut self, a: Option<Action>) -> Self {
+        self.more = a;
         self
     }
 
@@ -194,6 +202,9 @@ impl Node {
         self
     }
 }
+
+/// A place's second action, which opens the menu the Menu key opens on it.
+pub const SHOW_MENU: Action = Action::new("menu", "Show menu", "Shift+F10");
 
 /// A push button's action.
 pub const fn click(description: &'static str, keys: &'static str) -> Action {
@@ -597,6 +608,9 @@ pub enum Act {
     Choose(u64, String),
     /// Open a place in the sidebar.
     OpenPlace(usize),
+    /// Open the menu of the place at that place in the sidebar, if it's still the one of that
+    /// name.
+    PlaceMenu(usize, String),
     /// Scroll the sidebar to show a place.
     ShowPlace(usize),
     /// Go to a part of the path, by its place in it, if the window is still in that folder.
@@ -796,7 +810,7 @@ impl Link {
                 // Placed as drawn, with the sidebar scrolled.
                 let rect = Rect::new(l.sidebar.x, app.place_top(i), l.sidebar.w, place_h);
                 let showing = rect.y + rect.h > l.sidebar.y && rect.y < l.sidebar.y + l.sidebar.h;
-                Node::new(PLACE0 + i as u64, Role::ListItem, p.label.clone(), rect, SIDEBAR).selected(p.path == app.dir).showing(showing).doing(Action::new("activate", "Open", ""))
+                Node::new(PLACE0 + i as u64, Role::ListItem, p.label.clone(), rect, SIDEBAR).selected(p.path == app.dir).showing(showing).doing(Action::new("activate", "Open", "")).also(app.place_has_menu(i).then_some(SHOW_MENU))
             })
             .collect();
         let b = app.px(36.0);
@@ -836,10 +850,11 @@ impl Link {
         // The filter box can show what it filters by without being typed in.
         let typing = fields.iter().map(|n| n.id).find(|&id| id != FILTER || matches!(app.edit, Edit::Filter(_)));
         fixed.extend(fields);
-        let mut focus = match (typing, rows.entry(app.cursor)) {
+        let mut focus = match (typing, app.side_focus(), rows.entry(app.cursor)) {
             // A field being typed in has the keyboard.
-            (Some(id), _) => Focus::Node(id),
-            (None, Some(e)) if app.cursor_shown => Focus::Row(e),
+            (Some(id), ..) => Focus::Node(id),
+            (None, Some(i), _) => Focus::Node(PLACE0 + i as u64),
+            (None, None, Some(e)) if app.cursor_shown => Focus::Row(e),
             _ => Focus::Node(LIST),
         };
         if let Some(c) = app.chooser.as_ref() {

@@ -821,7 +821,7 @@ mod bench {
             Edit::NewFolder(f) => format!("newfolder:{}", f.text),
         };
         format!(
-            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"side_scroll\":{},\"side_max\":{},\"chooser\":{},\"searching\":{},\"found\":{},\"locations\":{},\"status\":{},\"thumbs\":{}}}\n",
+            "{{\"dir\":{},\"loading\":{},\"count\":{},\"names\":{},\"cursor\":{},\"cursor_shown\":{},\"selected\":{},\"filter\":{},\"edit\":{},\"hidden\":{},\"sort\":{},\"desc\":{},\"scroll\":{},\"notices\":{},\"menu\":{},\"menu_items\":{},\"error\":{},\"base\":{},\"can_back\":{},\"can_forward\":{},\"jobs\":{},\"visible_jobs\":{},\"dialog\":{},\"undo\":{},\"redo\":{},\"panel\":{},\"preview\":{},\"previewing\":{},\"drag\":{},\"places\":{},\"headings\":{},\"side_scroll\":{},\"side_max\":{},\"chooser\":{},\"searching\":{},\"found\":{},\"locations\":{},\"status\":{},\"thumbs\":{},\"side_focus\":{}}}\n",
             esc(&a.dir.to_string_lossy()),
             a.loading,
             a.rows.len(),
@@ -873,6 +873,7 @@ mod bench {
             list(a.rows.iter().take(300).map(|&i| a.listing.as_ref().filter(|l| l.search().is_some()).and_then(|l| l.location(i).map(|f| a.search_location(f))).unwrap_or_default())),
             esc(&a.status_text()),
             thumbs(a),
+            a.side_focus().map_or(-1, |i| i as i64),
         )
     }
 

@@ -298,6 +298,7 @@ impl App {
         // A drag that can't go to the Trash shows it dimmed, like a button that can't be pressed.
         let trash_off = self.trash_unavailable();
         let carried = self.carried_pin().map(std::path::Path::to_path_buf);
+        let keyboard = self.side_focus();
         let places = std::mem::take(&mut self.places);
         for (i, p) in places.iter().enumerate() {
             let y = tops[i];
@@ -309,6 +310,10 @@ impl App {
                 c.rrect(r, self.px(5.0), co.selection);
             } else if self.hover == Hit::Place(i) {
                 c.rrect(r, self.px(5.0), co.hover);
+            }
+            // The place the keyboard is on is marked as the list's cursor is.
+            if keyboard == Some(i) {
+                c.fill(Rect::new(r.x, r.y + self.px(5.0), self.px(3.0), r.h - self.px(10.0)), co.accent);
             }
             let ic = match p.kind {
                 PlaceKind::Disk if p.volume.as_ref().is_some_and(|v| v.locked) => Icon::Lock,
@@ -419,6 +424,8 @@ impl App {
         let icon = self.px(16.0);
         let now = time::now();
         let hover_row = if let Hit::Row(r) = self.hover { Some(r) } else { None };
+        // While the sidebar has the keyboard, its place shows that instead of the list's cursor.
+        let cursor_shown = self.cursor_shown && self.side_focus().is_none();
         let thumb_room = if self.scrollbar_visible(Pane::List) { self.px(12.0) } else { 0 };
         Self::with_clip(c, area, |c| {
             let visible = (area.h + offset) / row_h.max(1) + 1;
@@ -438,7 +445,7 @@ impl App {
                 } else if hover_row == Some(row) {
                     c.fill(r, co.hover);
                 }
-                if self.cursor_shown && row == self.cursor {
+                if cursor_shown && row == self.cursor {
                     c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.accent);
                 }
                 let fg = if selected { co.on_selection } else { co.foreground };
