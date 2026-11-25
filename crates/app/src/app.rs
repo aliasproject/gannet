@@ -3880,11 +3880,12 @@ impl App {
     }
 
     /// What a place is, to find it again among the places: a drive by its block device, as one
-    /// that isn't mounted has no folder, and the rest by their folder.
+    /// that isn't mounted has no folder, and the rest by their kind and folder, as a pin and a
+    /// mount can be the same folder.
     fn place_identity(p: &Place) -> String {
         match &p.volume {
             Some(v) => format!("drive:{}", v.block),
-            None => format!("folder:{}", p.path.display()),
+            None => format!("{:?}:{}", p.kind, p.path.display()),
         }
     }
 
@@ -3932,7 +3933,15 @@ impl App {
                 return self.open_place(i);
             }
             k::KEY_Menu | k::KEY_F10 => return self.keyboard_place_menu(i),
+            // Holding Escape to close a menu doesn't go on to leave the sidebar.
+            k::KEY_Escape | k::KEY_F6 if self.key_is_repeat => return,
             k::KEY_Escape | k::KEY_F6 => return self.leave_sidebar(),
+            // Tab goes on to do what it does in the list, as the Save dialog's name field is
+            // reached with it.
+            k::KEY_Tab | k::KEY_ISO_Left_Tab => {
+                self.leave_sidebar();
+                return self.list_or_chooser_key(sym, utf8, m);
+            }
             _ => return,
         };
         if to != i {
@@ -9827,7 +9836,16 @@ mod tests {
         assert!(r.app.menu.is_some());
         r.key(k::KEY_Escape, "");
         assert!(r.app.menu.is_none() && r.app.side_focus() == Some(1));
+        // Escape held down doesn't go on to leave the sidebar.
+        r.app.key_is_repeat = true;
         r.key(k::KEY_Escape, "");
+        r.app.key_is_repeat = false;
+        assert_eq!(r.app.side_focus(), Some(1));
+        r.key(k::KEY_Escape, "");
+        assert_eq!(r.app.side_focus(), None);
+        // Tab leaves it too, for what it does in the list.
+        r.key(k::KEY_F6, "");
+        r.key(k::KEY_Tab, "");
         assert_eq!(r.app.side_focus(), None);
         // F6 starts on the place showing, and a click anywhere gives the keyboard back.
         r.key(k::KEY_F6, "");

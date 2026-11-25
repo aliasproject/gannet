@@ -424,6 +424,8 @@ impl App {
         let icon = self.px(16.0);
         let now = time::now();
         let hover_row = if let Hit::Row(r) = self.hover { Some(r) } else { None };
+        // While the sidebar has the keyboard, its place shows that instead of the list's cursor.
+        let cursor_shown = self.cursor_shown && self.side_focus().is_none();
         let thumb_room = if self.scrollbar_visible(Pane::List) { self.px(12.0) } else { 0 };
         Self::with_clip(c, area, |c| {
             let visible = (area.h + offset) / row_h.max(1) + 1;
@@ -443,8 +445,7 @@ impl App {
                 } else if hover_row == Some(row) {
                     c.fill(r, co.hover);
                 }
-                // While the sidebar has the keyboard, its place shows that instead.
-                if self.cursor_shown && row == self.cursor && self.side_focus().is_none() {
+                if cursor_shown && row == self.cursor {
                     c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.accent);
                 }
                 let fg = if selected { co.on_selection } else { co.foreground };
