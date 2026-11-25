@@ -558,9 +558,10 @@ pub struct App {
 
     pub cursor: usize,
     pub cursor_shown: bool,
-    /// The place the keyboard is on while the sidebar has it, which F6 gives it. Read through
-    /// `side_focus`, as places can go while it's there.
-    side_cursor: Option<usize>,
+    /// The place the keyboard is on while the sidebar has it, which F6 gives it: its index then,
+    /// and what it is (`place_identity`). Read through `side_focus`, as places can come and go
+    /// while it's there.
+    side_cursor: Option<(usize, String)>,
     anchor: usize,
     selected: Vec<u64>,
     pub sel_count: usize,
@@ -3867,10 +3868,28 @@ impl App {
         }
     }
 
-    /// The place the keyboard is on, while the sidebar has it.
+    /// The place the keyboard is on, while the sidebar has it. It follows its place when the
+    /// places above it change, and when its place has gone it's on the one that took its index.
     pub fn side_focus(&self) -> Option<usize> {
         let last = self.places.len().checked_sub(1)?;
-        self.side_cursor.map(|i| i.min(last))
+        let (i, id) = self.side_cursor.as_ref()?;
+        if self.places.get(*i).is_some_and(|p| Self::place_identity(p) == *id) {
+            return Some(*i);
+        }
+        Some(self.places.iter().position(|p| Self::place_identity(p) == *id).unwrap_or((*i).min(last)))
+    }
+
+    /// What a place is, to find it again among the places: a drive by its block device, as one
+    /// that isn't mounted has no folder, and the rest by their folder.
+    fn place_identity(p: &Place) -> String {
+        match &p.volume {
+            Some(v) => format!("drive:{}", v.block),
+            None => format!("folder:{}", p.path.display()),
+        }
+    }
+
+    fn set_side_cursor(&mut self, i: usize) {
+        self.side_cursor = self.places.get(i).map(|p| (i, Self::place_identity(p)));
     }
 
     /// Gives the sidebar the keyboard, on the place showing or else the first.
@@ -3879,7 +3898,7 @@ impl App {
             return;
         }
         let i = self.places.iter().position(|p| p.path == self.dir).unwrap_or(0);
-        self.side_cursor = Some(i);
+        self.set_side_cursor(i);
         self.reveal_place(i);
         self.invalidate_all();
     }
@@ -3893,10 +3912,15 @@ impl App {
 
     /// A key while the sidebar has the keyboard. Up and Down move between places, Enter opens
     /// one, the Menu key or Shift+F10 opens its menu, and Escape or F6 goes back to the list.
-    /// Shortcuts with Ctrl or Alt do what they do in the list; other keys do nothing here, so
-    /// one meant for the list, like Delete, can't reach files that aren't in view.
+    /// A shortcut with Ctrl or Alt, or F5, goes back to the list and does what it does there.
+    /// Other keys do nothing here, so one meant for the list, like Delete, can't reach files
+    /// that aren't in view.
     fn side_key(&mut self, sym: u32, utf8: &str, m: Mods) {
         let Some(i) = self.side_focus() else { return };
+        if m.ctrl || m.alt || m.logo || sym == k::KEY_F5 {
+            self.leave_sidebar();
+            return self.list_or_chooser_key(sym, utf8, m);
+        }
         let last = self.places.len() - 1;
         let to = match sym {
             k::KEY_Up => i.saturating_sub(1),
@@ -3909,18 +3933,10 @@ impl App {
             }
             k::KEY_Menu | k::KEY_F10 => return self.keyboard_place_menu(i),
             k::KEY_Escape | k::KEY_F6 => return self.leave_sidebar(),
-            _ if m.ctrl || m.alt || m.logo || sym == k::KEY_F5 => {
-                self.list_or_chooser_key(sym, utf8, m);
-                // One that opened a field gives it the keyboard.
-                if !matches!(self.edit, Edit::None) {
-                    self.leave_sidebar();
-                }
-                return;
-            }
             _ => return,
         };
         if to != i {
-            self.side_cursor = Some(to);
+            self.set_side_cursor(to);
             self.reveal_place(to);
             self.invalidate(self.layout().sidebar);
         }
@@ -4623,9 +4639,9 @@ impl App {
         if self.preview.is_some() {
             return self.preview_button(button, hit);
         }
-        // A click gives the keyboard back to the list, though not one in a menu the sidebar
-        // opened, which goes back to it.
-        if self.menu.is_none() {
+        // A click gives the keyboard back to the list, though not one on an item of a menu the
+        // sidebar opened, which goes back to it.
+        if !matches!(hit, Hit::MenuItem(_)) {
             self.leave_sidebar();
         }
         match button {
@@ -9819,7 +9835,22 @@ mod tests {
         let (x, y) = (r.sidebar_x(), r.place_y(0));
         r.app.input(Input::Move { x, y });
         r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: false });
         assert_eq!(r.app.side_focus(), None);
+        // So does a click that closes a menu the sidebar opened, away from its items.
+        r.key(k::KEY_F6, "");
+        r.key(k::KEY_Down, "");
+        r.key(k::KEY_Menu, "");
+        assert!(r.app.menu.is_some());
+        r.app.input(Input::Move { x: 900.0, y: 600.0 });
+        r.app.input(Input::Button { button: BTN_LEFT, pressed: true });
+        assert!(r.app.menu.is_none());
+        assert_eq!(r.app.side_focus(), None);
+        // A shortcut with Ctrl or Alt goes back to the list and does what it does there.
+        r.key(k::KEY_F6, "");
+        r.app.key(k::KEY_Up, "", Mods { alt: true, ..Mods::default() });
+        assert_eq!(r.app.side_focus(), None);
+        assert_eq!(r.app.dir, r.root, "Alt+Up went up from Home");
     }
 
     #[test]
@@ -9840,6 +9871,15 @@ mod tests {
         r.key(k::KEY_Down, "");
         r.key(k::KEY_Return, "");
         assert!(r.app.notices.iter().any(|n| n.starts_with("Couldn't eject “PHOTOS”")), "the drive was asked to eject: {:?}", r.app.notices);
+        // The keyboard stays on its drive when one above it comes and goes.
+        let other = r.root.join("media/OTHER");
+        fs::create_dir_all(&other).unwrap();
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("AAA"), Some(&other), false), stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        let at = |r: &Rig| r.app.side_focus().map(|i| r.app.places[i].label.clone());
+        assert_eq!(r.app.places[1].label, "AAA");
+        assert_eq!(at(&r).as_deref(), Some("PHOTOS"));
+        r.app.on_msg(Msg::Volumes(vec![stick(&r, Some("PHOTOS"), Some(&mount), false)]));
+        assert_eq!(at(&r).as_deref(), Some("PHOTOS"));
     }
 
     #[test]
