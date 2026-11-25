@@ -2361,6 +2361,106 @@ def a_screen_reader_can_use_menus_and_dialogs(h):
         disks.stop()
 
 
+@check
+def pin_and_drive_menus_open_from_the_keyboard_and_a_screen_reader(h):
+    assert REGISTRYD.exists(), "needs at-spi2-core"
+    fs = fresh_fs()
+    tree(fs, {"docs/a.txt": "a", "pins/Projects/p": "p", "pins/Notes/n": "n"})
+    media = SCRATCH / "media"
+    shutil.rmtree(media, ignore_errors=True)
+    tree(media, {"PHOTOS/beach.png": png_bytes(10, 10)})
+    disks = StandIn(media)
+    sr = ScreenReader()
+    try:
+        disks.say("drive Stick Kingston-1234", "fs sdb1 Stick PHOTOS")
+        env = {"DBUS_SESSION_BUS_ADDRESS": sr.session.address, "DBUS_SYSTEM_BUS_ADDRESS": disks.bus.address}
+        conf = bookmarks_file(App(h, fs / "docs", launch=False, extra_env=env))
+        conf.parent.mkdir(parents=True, exist_ok=True)
+        conf.write_text("".join((fs / "pins" / n).as_uri() + "\n" for n in ["Projects", "Notes"]))
+        a = App(h, fs / "docs", extra_env=env)
+        s = a.wait(lambda s: s["names"] == ["a.txt"] and "Notes" in s["places"] and place_flags(s, "PHOTOS") == {"eject"}, "listed, with the pins and the drive")
+        assert s["side_focus"] == -1
+
+        # F6 gives the sidebar the keyboard, on the first place, as the folder showing isn't
+        # one. Up and Down move along it, and Shift+F10 opens a pin's menu under it.
+        a.key("Down")
+        a.wait(lambda s: s["cursor_shown"], "the cursor on a.txt")
+        a.key("F6")
+        a.wait(lambda s: s["side_focus"] == 0, "the sidebar has the keyboard")
+        # Home has no menu.
+        a.key("Menu")
+        time.sleep(0.2)
+        assert not a.state()["menu"], "Home has no menu"
+        projects = place_index(s, "Projects")
+        a.key(*["Down"] * projects)
+        a.wait(lambda s: s["side_focus"] == projects, "on the pin")
+        a.shot("sidebar-keyboard")
+        a.key("F10", mods=("shift",))
+        assert a.wait(lambda s: s["menu"], "the pin's menu")["menu_items"] == ["Open", "Unpin"]
+        a.shot("pin-menu-from-the-keyboard")
+        a.key("Down", "Return")
+        s = a.wait(lambda s: "Projects" not in s["places"] and not s["menu"], "unpinned")
+        assert "Projects" not in conf.read_text() and (fs / "pins/Projects/p").exists()
+        assert s["side_focus"] == projects, "the keyboard stays in the sidebar"
+        # A drive's menu, by the Menu key: Open mounts it.
+        photos = place_index(s, "PHOTOS")
+        a.key("End")
+        a.wait(lambda s: s["side_focus"] == len(s["places"]) - 1, "the last place")
+        a.key(*["Up"] * (len(s["places"]) - 1 - photos))
+        a.wait(lambda s: s["side_focus"] == photos, "on the drive")
+        a.key("Menu")
+        assert a.wait(lambda s: s["menu"], "the drive's menu")["menu_items"] == ["Open", "Unmount", "Eject"]
+        a.shot("drive-menu-from-the-keyboard")
+        a.key("Return")
+        a.wait(lambda s: "mounted" in place_flags(s, "PHOTOS") and s["dir"] == str(media / "PHOTOS"), "mounted and opened", timeout=10)
+        # Escape gives the keyboard back to the list.
+        a.key("Escape")
+        a.wait(lambda s: s["side_focus"] == -1, "back to the list")
+
+        # A screen reader hears the place the keyboard is on.
+        sr.screen_reader(True)
+        sr.until("apps", lambda x: x == ["Gannet"], "registered")
+        sr.until("tree", lambda t: "PHOTOS" in t["places"], "the places")
+        sr.ask("events")
+        a.key("F6")
+        t = sr.until("tree", lambda t: t["place_focus"] == ["PHOTOS"], "the keyboard on the drive showing")
+        assert t["focus"] == [], t
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "the focus heard")
+        assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["PHOTOS"], heard
+        a.key("Escape")
+        sr.until("tree", lambda t: t["place_focus"] == [], "back to the list")
+
+        # A place with a menu has a second action that opens it, and one without has only Open.
+        t = sr.ask("tree")
+        home, notes, photos = (t["places"].index(n) for n in ["Home", "Notes", "PHOTOS"])
+        assert sr.ask(f"place_actions {home}") == [["activate", "Open", "Open", ""]]
+        assert sr.ask(f"place_actions {notes}") == [["activate", "Open", "Open", ""], ["menu", "Show menu", "Show menu", "Shift+F10"]]
+        assert len(sr.ask(f"place_actions {photos}")) == 2
+        assert sr.ask(f"place_do {home} 1") is False
+        sr.ask("events")
+        assert sr.ask(f"place_do {notes} 1") is True
+        assert a.wait(lambda s: s["menu"], "the pin's menu")["menu_items"] == ["Open", "Unpin"]
+        # Read as it opens, from its first item, as the list's menu is.
+        heard = sr.until("events", lambda e: any(x["type"] == "object:state-changed:focused" and x["detail1"] == 1 for x in e), "focus moves into the menu")
+        assert [x["source"] for x in heard if x["type"] == "object:state-changed:focused" and x["detail1"] == 1] == ["Open"], heard
+        a.shot("a11y-pin-menu")
+        w = " - Gannet"
+        assert sr.ask(f'do ["{w}", "", "Unpin"]') is True
+        a.wait(lambda s: "Notes" not in s["places"] and not s["menu"], "unpinned")
+        assert conf.read_text().strip() == ""
+        # And a drive's: Unmount.
+        t = sr.until("tree", lambda t: "Notes" not in t["places"], "the pin gone")
+        photos = t["places"].index("PHOTOS")
+        assert sr.ask(f"place_do {photos} 1") is True
+        assert a.wait(lambda s: s["menu"], "the drive's menu")["menu_items"] == ["Open", "Unmount", "Eject"]
+        assert sr.ask(f'do ["{w}", "", "Unmount"]') is True
+        a.wait(lambda s: place_flags(s, "PHOTOS") == {"eject"}, "unmounted", timeout=10)
+        a.close()
+    finally:
+        sr.stop()
+        disks.stop()
+
+
 PORTAL = ["org.freedesktop.impl.portal.desktop.gannet", "/org/freedesktop/portal/desktop", "org.freedesktop.impl.portal.FileChooser"]
 
 

@@ -128,6 +128,7 @@ def tree():
         "selected_at": [i for i, r in enumerate(rows) if r.get_state_set().contains(Atspi.StateType.SELECTED)],
         "focus_at": [i for i, r in enumerate(rows) if focused(r)],
         "focus": focus,
+        "place_focus": [p.get_name() for p in children(places) if p.get_role_name() == "list item" and focused(p)],
         "descriptions": [r.get_description() for r in rows],
         "files_description": files.get_description(),
         "manages_descendants": files.get_state_set().contains(Atspi.StateType.MANAGES_DESCENDANTS),
@@ -290,6 +291,12 @@ def run(cmd, arg):
         return parts()[3].deselect_child(int(arg))
     if cmd == "focus_place":
         return place_items()[int(arg)].grab_focus()
+    if cmd == "place_actions":
+        p = place_items()[int(arg)]
+        return [[p.get_action_name(i), Atspi.Action.get_localized_name(p, i), p.get_action_description(i), p.get_key_binding(i)] for i in range(p.get_n_actions())]
+    if cmd == "place_do":
+        i, n = (int(x) for x in arg.split())
+        return place_items()[i].do_action(n)
     if cmd == "focus_row":
         return parts()[3].get_child_at_index(int(arg)).grab_focus()
     if cmd == "select_place":
