@@ -20,10 +20,11 @@ sockets() { stat -c '%n %i %Y %Z' "$runtime/bus" "$runtime/at-spi" "$runtime"/at
 before=$(sockets)
 code=0
 # Not exec'd, so the sockets can be checked after it. Ctrl-C still reaches cargo and the tests,
-# which are in the foreground; this script only waits for them to stop, then checks.
-trap : INT TERM HUP
+# which are in the foreground; this script only waits for them to stop, then checks. TERM and
+# HUP aren't held back, so a runner that signals only this script still stops it at once.
+trap : INT
 cargo test "$@" || code=$?
-trap - INT TERM HUP
+trap - INT
 after=$(sockets)
 if [ "$before" != "$after" ]; then
   bar=$(printf '!%.0s' {1..78})

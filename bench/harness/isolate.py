@@ -1,7 +1,7 @@
 """Keeps a test run away from the desktop's own buses.
 
-Every harness that starts a bus or a screen reader (tests/e2e.py, tests/orca_tour.py,
-bench/run.py) calls `isolate()` first. Outside the sandbox, it records the real session's
+Every harness that starts a bus, a screen reader or a toolkit app (tests/e2e.py,
+tests/orca_tour.py, bench/run.py, bench/bakeoff/run.py) calls `isolate()` first. Outside the sandbox, it records the real session's
 bus sockets and runs the script again inside bubblewrap, where:
 
 - /run/user/$UID is an empty tmpfs, and XDG_RUNTIME_DIR points at it, so anything that
@@ -17,7 +17,7 @@ replaced, removed or added, even when every check passed.
 
   python3 -B bench/harness/isolate.py --self-test
 """
-import os, shutil, socket, subprocess, sys, tempfile
+import os, shutil, signal, socket, subprocess, sys, tempfile
 from pathlib import Path
 
 MARK = "GANNET_ISOLATED"
@@ -98,20 +98,60 @@ def sandbox_command(argv):
             "--unsetenv", "DBUS_STARTER_ADDRESS", "--unsetenv", "DBUS_STARTER_BUS_TYPE", *argv]
 
 
+def _sandboxed_processes(bwrap_pid):
+    """The processes running inside the sandbox: bwrap's descendants that aren't bwrap."""
+    out, todo = [], [bwrap_pid]
+    while todo:
+        pid = todo.pop()
+        try:
+            for task in os.listdir(f"/proc/{pid}/task"):
+                with open(f"/proc/{pid}/task/{task}/children") as f:
+                    todo += [int(c) for c in f.read().split()]
+            if pid != bwrap_pid:
+                with open(f"/proc/{pid}/comm") as f:
+                    if f.read().strip() != "bwrap":
+                        out.append(pid)
+        except OSError:
+            pass
+    return out
+
+
 def run_guarded(argv, runtime=None):
     """Runs argv in the sandbox, then fails if the real sockets changed. Returns the exit code.
     The sandbox only keeps argv off the desktop's buses and display: files, the real home
     among them, are as writable as they are outside it."""
     runtime = runtime or real_runtime()
     before = fingerprint(runtime)
-    # Ctrl-C reaches the run too. Wait for it to clean up and stop, so the check comes after.
-    proc = subprocess.Popen(sandbox_command(argv))
-    while True:
-        try:
-            code = proc.wait()
-            break
-        except KeyboardInterrupt:
-            pass
+    # bwrap has its own session, so the terminal's Ctrl-C doesn't reach it: bwrap would die at
+    # once and take the sandbox with it, cutting off the harness's cleanup. The signal is passed
+    # to what runs inside instead, and the check comes after the run has stopped. A second
+    # Ctrl-C kills the whole run.
+    proc = subprocess.Popen(sandbox_command(argv), start_new_session=True)
+
+    def forward(signum, _frame):
+        for pid in _sandboxed_processes(proc.pid):
+            try:
+                if os.getpgid(pid) == proc.pid:
+                    os.kill(pid, signum)
+            except OSError:
+                pass
+
+    old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGHUP)}
+    interrupted = False
+    try:
+        while True:
+            try:
+                code = proc.wait()
+                break
+            except KeyboardInterrupt:
+                if interrupted:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    forward(signal.SIGINT, None)
+                interrupted = True
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
     if code < 0:
         # Killed by a signal: report it as a shell would, never as a pass.
         code = 128 - code
@@ -144,7 +184,8 @@ def isolate():
 def self_test():
     """Shows that the guard notices a replaced socket and that the sandbox hides the real ones.
     Writes nothing outside a scratch folder and the sandbox's own tmpfs."""
-    scratch = Path(tempfile.mkdtemp(prefix="gnisolate-"))
+    # In /tmp, not TMPDIR: a socket path must fit in 108 bytes.
+    scratch = Path(tempfile.mkdtemp(prefix="gnisolate-", dir="/tmp"))
     try:
         rt = scratch / "runtime"
         (rt / "at-spi").mkdir(parents=True)
