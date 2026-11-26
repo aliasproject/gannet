@@ -762,7 +762,7 @@ impl Window {
         for (r, label, primary, hit) in [(l.cancel, "Cancel", false, Hit::Cancel), (l.open, "Open", true, Hit::Open)] {
             let hovered = self.hover == hit;
             let (bg, fg) = match (primary, can) {
-                (true, true) => (if hovered { theme::blend(co.accent, co.foreground, 0.12) } else { co.accent }, co.on_accent),
+                (true, true) => (if hovered { co.accent_hover } else { co.accent }, co.on_accent),
                 (true, false) => (co.hover, co.border),
                 (false, _) => (if hovered { theme::blend(co.hover, co.foreground, 0.08) } else { co.hover }, co.foreground),
             };

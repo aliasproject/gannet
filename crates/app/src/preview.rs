@@ -1781,7 +1781,7 @@ impl App {
         let Some(layout) = &p.doc_layout else { return };
         p.scroll = p.scroll.clamp(0.0, (layout.height - area.h).max(0) as f64);
         let co = self.colors;
-        let ink = docview::Ink { text: co.foreground, muted: co.muted, link: co.accent, code: co.surface, rule: co.border };
+        let ink = docview::Ink { text: co.foreground, muted: co.muted, link: co.link, code: co.surface, rule: co.border };
         App::with_clip(c, area, |c| docview::paint(c, area, p.scroll as i32, layout, fonts, ink));
     }
 

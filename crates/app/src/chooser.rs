@@ -830,7 +830,7 @@ impl App {
         }
         if let (Some(r), Some(label)) = (b.filter, filter_label) {
             c.rrect(r, self.px(5.0), if self.hover == Hit::ChooserFilter { co.hover } else { co.base });
-            c.frame(r, 1, co.border);
+            c.frame(r, 1, co.control_border);
             let by = self.baseline(r.y, r.h);
             let arrow = self.px(12.0);
             self.text.draw_fitted(c, label, (r.x + self.px(10.0)) as f32, by, (r.w - self.px(30.0) - arrow) as f32, co.foreground);
@@ -840,7 +840,7 @@ impl App {
         for (r, label, primary, hit) in [(b.cancel, "Cancel".to_string(), false, Hit::ChooserCancel), (b.accept, accept_label, true, Hit::ChooserAccept)] {
             let hovered = self.hover == hit;
             let (bg, fg) = match (primary, can) {
-                (true, true) => (if hovered { gannet_core::theme::blend(co.accent, co.foreground, 0.12) } else { co.accent }, co.on_accent),
+                (true, true) => (if hovered { co.accent_hover } else { co.accent }, co.on_accent),
                 (true, false) => (co.hover, co.border),
                 (false, _) => (if hovered { gannet_core::theme::blend(co.hover, co.foreground, 0.08) } else { co.hover }, co.foreground),
             };

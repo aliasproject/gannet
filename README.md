@@ -533,6 +533,11 @@ Elsewhere, it uses the light or dark preference from your GTK settings or `gsett
 built-in palette, and asks `gsettings` again whenever its window regains focus. With no
 preference set, it's light.
 
+Text and controls stay readable in any theme: Gannet keeps the theme's colors where they meet
+WCAG 2.2 AA contrast (4.5:1 for text, 3:1 for field outlines and icons), and moves the colors
+it works out from them, such as quieter text, red text and field outlines, only as far towards
+the text color as they need to go to meet it.
+
 Text is in your monospace font at 13 px, the one `aliasos-font-set` picks on aliasOS, so
 Gannet matches the terminal and the bar. Pick another and Gannet uses it from its next start.
 The chevrons, drive and lock icons are [Lucide](https://lucide.dev)'s (ISC, see
@@ -548,7 +553,8 @@ folder, its size and when it changed, and in Recent, the Trash and search result
 is. The sidebar with its headings, the path bar, the column headings (which sort), the path,
 filter, search and rename fields, menus, questions such as "Delete for good?", the rename
 dialog, notices and the progress of copies are read too, and changes are announced as they
-happen. The drive-unlock prompt reads its passphrase as dots and never gives it out. The
+happen. The drive-unlock prompt reads its passphrase as dots and never gives it out; a
+passphrase can be pasted into it with Ctrl+V. The
 preview, the Open and Save dialogs and Open With are windows of their own and read the same
 way.
 

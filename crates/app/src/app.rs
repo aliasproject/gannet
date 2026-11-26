@@ -1425,6 +1425,11 @@ impl App {
                 Some(Dialog::RenameMany(d)) => d.field_mut(),
                 _ => None,
             },
+            // The passphrase, while it isn't being tried.
+            Edit::None if matches!(self.dialog, Some(Dialog::Unlock { waiting: false, .. })) => match &mut self.dialog {
+                Some(Dialog::Unlock { field, .. }) => Some(field),
+                _ => None,
+            },
             // A chooser's name field, when it has the keyboard.
             Edit::None => self.chooser.as_mut().filter(|c| c.name_focused).map(|c| &mut c.name),
         }
@@ -2810,6 +2815,11 @@ impl App {
                     true
                 }
                 k::KEY_Return | k::KEY_KP_Enter | k::KEY_Escape | k::KEY_Tab => false,
+                // A passphrase from a password manager is pasted, not retyped.
+                k::KEY_v if m.ctrl => {
+                    self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: self.edit_gen }));
+                    false
+                }
                 _ if !utf8.is_empty() && !utf8.chars().any(char::is_control) => {
                     field.insert(utf8);
                     true
@@ -8925,6 +8935,28 @@ mod tests {
             Some(Dialog::Unlock { waiting, error, field, .. }) => assert!(*waiting && error.is_none() && field.text == "x", "still waiting on the first: {error:?}"),
             _ => panic!("no dialog"),
         }
+    }
+
+    #[test]
+    fn a_passphrase_can_be_pasted() {
+        let mut r = drive_rig("drives-paste-passphrase");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.app.open_place(1);
+        r.key(0, "a");
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        // Only the first line: a passphrase copied with its line break mustn't press Unlock.
+        r.app.on_msg(Msg::Clipboard(Some(b"hunter2\nmore".to_vec()), clipboard::TEXT.to_string(), asked));
+        match &r.app.dialog {
+            Some(Dialog::Unlock { field, waiting, .. }) => assert!(field.text == "ahunter2" && !*waiting, "pasted after what was typed: {:?}", field.text),
+            _ => panic!("no dialog"),
+        }
+        // Not while it's being tried.
+        r.key(k::KEY_Return, "");
+        r.ctrl(k::KEY_v);
+        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadClipboard(_))), "no paste while waiting");
     }
 
     #[test]

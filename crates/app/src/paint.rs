@@ -2,7 +2,6 @@
 
 use gannet_core::listing::{Kind, SortKey, Stat};
 use gannet_core::places::PlaceKind;
-use gannet_core::theme::blend;
 use gannet_core::time;
 
 use std::path::PathBuf;
@@ -76,7 +75,7 @@ impl App {
         let inset = self.px(1.0);
         c.rrect(Rect::new(row.x + inset, row.y + inset, row.w - inset * 2, row.h - inset * 2), radius, co.selection);
         let icon = self.px(16.0);
-        let tint = if g.kind.is_dirlike() { co.on_selection } else { blend(co.on_selection, co.selection, 0.25) };
+        let tint = if g.kind.is_dirlike() { co.on_selection } else { co.on_selection_muted };
         self.icons.draw(c, icon_for(g.kind, &g.name), row.x + self.px(10.0), row.y + (row.h - icon) / 2, icon, tint);
         let badge = g.count.to_string();
         let badge_w = if g.count > 1 { self.text.measure(&badge).ceil() as i32 + self.px(12.0) } else { 0 };
@@ -172,7 +171,7 @@ impl App {
             if on && self.hover == Hit::EmptyTrash {
                 c.rrect(r, self.px(5.0), co.hover);
             }
-            c.frame(r, 1, co.border);
+            c.frame(r, 1, co.control_border);
             let w = self.text.measure("Empty Trash");
             let by = self.baseline(r.y, r.h);
             self.text.draw_str(c, "Empty Trash", r.x as f32 + (r.w as f32 - w) / 2.0, by, if on { co.danger } else { co.muted });
@@ -196,7 +195,7 @@ impl App {
     pub(crate) fn paint_field(&mut self, c: &mut Canvas, r: Rect, f: &Field, focused: bool) {
         let co = self.colors;
         c.rrect(r, self.px(5.0), co.base);
-        c.frame(r, 1, if focused { co.accent } else { co.border });
+        c.frame(r, 1, if focused { co.accent } else { co.control_border });
         let inner = Rect::new(r.x + self.px(8.0), r.y, r.w - self.px(16.0), r.h);
         let y = self.baseline(r.y, r.h);
         let caret_x = self.text.measure(&f.text[..f.caret]);
@@ -305,7 +304,7 @@ impl App {
             let r = Rect::new(l.sidebar.x + self.px(6.0), y, l.sidebar.w - self.px(13.0) - room, row);
             let here = p.path == self.dir;
             if self.is_drop_target(Hit::Place(i)) {
-                c.rrect(r, self.px(5.0), blend(co.accent, co.surface, 0.45));
+                c.rrect(r, self.px(5.0), co.drop_target);
             } else if here {
                 c.rrect(r, self.px(5.0), co.selection);
             } else if self.hover == Hit::Place(i) {
@@ -439,7 +438,7 @@ impl App {
                 }
                 let selected = self.is_selected(id);
                 if self.is_drop_target(Hit::Row(row)) {
-                    c.fill(r, blend(co.accent, co.base, 0.45));
+                    c.fill(r, co.drop_target);
                 } else if selected {
                     c.fill(r, co.selection);
                 } else if hover_row == Some(row) {
@@ -449,7 +448,7 @@ impl App {
                     c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.accent);
                 }
                 let fg = if selected { co.on_selection } else { co.foreground };
-                let dim = if selected { blend(co.on_selection, co.selection, 0.25) } else { co.muted };
+                let dim = if selected { co.on_selection_muted } else { co.muted };
                 let name = listing.name(id);
                 let kind = listing.kind(id);
                 let tint = if kind.is_dirlike() { if selected { co.on_selection } else { co.accent } } else { dim };
@@ -567,7 +566,7 @@ impl App {
         for (i, msg) in shown.iter().enumerate() {
             let y = l.notices.y + (job_rows + i) as i32 * row;
             let r = Rect::new(l.notices.x, y, l.notices.w, row);
-            c.fill(r, blend(co.base, co.danger, 0.18));
+            c.fill(r, co.danger_tint);
             c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.danger);
             let by = self.baseline(y, row);
             let more = self.notices.len() - count;
@@ -644,7 +643,7 @@ impl App {
             let focused = i == at && !off;
             let bg = if focused { if b.danger { co.danger } else { co.accent } } else { co.hover };
             c.rrect(*br, self.px(5.0), bg);
-            let fg = if off { co.muted } else if focused { co.on_accent } else if b.danger { co.danger } else { co.foreground };
+            let fg = if off { co.muted } else if focused { if b.danger { co.on_danger } else { co.on_accent } } else if b.danger { co.danger } else { co.foreground };
             let w = self.text.measure(b.label);
             let by = self.baseline(br.y, br.h);
             self.text.draw_str(c, b.label, br.x as f32 + (br.w as f32 - w) / 2.0, by, fg);
@@ -680,7 +679,7 @@ impl App {
             let by = self.baseline(top, l.row_h);
             let (problem, same) = (d.problems[i].is_some(), d.names[i] == d.new[i]);
             if problem {
-                c.fill(Rect::new(l.list.x, top, l.list.w, l.row_h), blend(co.surface, co.danger, 0.14));
+                c.fill(Rect::new(l.list.x, top, l.list.w, l.row_h), co.danger_tint);
             }
             self.text.draw_fitted(c, &String::from_utf8_lossy(&d.names[i]), l.list.x as f32, by, col_w, if same { co.muted } else { co.foreground });
             self.text.draw_str(c, "→", arrow_x, by, co.muted);
@@ -779,7 +778,8 @@ impl App {
             let by = self.baseline(y, row);
             self.text.draw_str(c, item.label, (r.x + self.px(12.0)) as f32, by, fg);
             let w = self.text.measure(item.keys);
-            self.text.draw_str(c, item.keys, (r.right() - self.px(12.0)) as f32 - w, by, if item.enabled { co.muted } else { co.border });
+            let keys = if !item.enabled { co.border } else if i == m.at { co.on_selection_muted } else { co.muted };
+            self.text.draw_str(c, item.keys, (r.right() - self.px(12.0)) as f32 - w, by, keys);
         }
         self.menu = Some(m);
     }
