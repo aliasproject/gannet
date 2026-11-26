@@ -5,3 +5,4 @@
 bench/bakeoff/rawshm/Cargo.lock
 /bench/harness/vptr/Cargo.lock
 /.ci
+__pycache__/
