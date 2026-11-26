@@ -130,6 +130,8 @@ class Tour:
 
 
 def main():
+    # Off the desktop's session and accessibility buses, or not at all.
+    e2e.isolate()
     out = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / ".bench/orca-tour.txt"
     assert e2e.BIN.exists(), "run: CARGO_TARGET_DIR=target/bench cargo build --release -p gannet --features bench"
     assert e2e.STANDIN.exists(), "run: CARGO_TARGET_DIR=target/bench cargo build --release -p gannet-core --example udisks-standin"

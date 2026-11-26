@@ -14,4 +14,5 @@ bwrap --die-with-parent --unshare-pid --unshare-net --ro-bind / / --dev /dev --p
   --setenv XDG_DATA_HOME "$SCRATCH/home/.local/share" --setenv XDG_CONFIG_HOME "$SCRATCH/home/.config" \
   --setenv XDG_STATE_HOME "$SCRATCH/home/.local/state" --setenv XDG_CACHE_HOME "$SCRATCH/home/.cache" \
   --unsetenv XDG_RUNTIME_DIR --unsetenv WAYLAND_DISPLAY --unsetenv DBUS_SESSION_BUS_ADDRESS \
+  --unsetenv DISPLAY --unsetenv AT_SPI_BUS_ADDRESS \
   "$BIN" "$@"

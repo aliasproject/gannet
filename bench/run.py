@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bench/harness"))
 from hl import Headless, cpu_seconds, median, pss_kib, tree
+from isolate import isolate
 
 PLAIN = ROOT / "target/release/gannet"
 BENCH = ROOT / "target/bench/release/gannet"
@@ -528,6 +529,8 @@ def gannet_same_way(h, runs):
 
 
 def main():
+    # Nautilus's dbus-run-session would start an accessibility bus; keep it off the desktop's.
+    isolate()
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", type=int, default=7)
     ap.add_argument("--no-nautilus", action="store_true")
