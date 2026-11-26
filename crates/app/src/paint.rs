@@ -42,9 +42,9 @@ impl App {
         if let Some(FileDrag::Band(b)) = &self.file_drag
             && !b.rect.is_empty()
         {
-            let accent = self.colors.accent;
-            c.tint(b.rect, accent, 48);
-            c.frame(b.rect, 1, accent);
+            let co = self.colors;
+            c.tint(b.rect, co.accent, 48);
+            c.frame(b.rect, 1, co.accent_mark);
         }
         if self.menu.is_some() {
             self.paint_menu(c);
@@ -356,7 +356,7 @@ impl App {
         // Where a pin or a dragged folder would land among the pins.
         if let Some(y) = self.pin_bar() {
             let h = self.px(2.0).max(2);
-            c.rrect(Rect::new(l.sidebar.x + self.px(8.0), y - h / 2, l.sidebar.w - self.px(17.0) - room, h), h / 2, co.accent);
+            c.rrect(Rect::new(l.sidebar.x + self.px(8.0), y - h / 2, l.sidebar.w - self.px(17.0) - room, h), h / 2, co.accent_mark);
         }
     }
 
@@ -561,7 +561,7 @@ impl App {
             self.text.draw_fitted(c, &detail, (r.x + self.px(14.0)) as f32, by, text_max, co.foreground);
             c.rrect(bar, bar.h / 2, co.hover);
             let fill = ((bar.w as f32 * fraction.clamp(0.0, 1.0)) as i32).max(if scanning { 0 } else { bar.h });
-            c.rrect(Rect::new(bar.x, bar.y, fill, bar.h), bar.h / 2, co.accent);
+            c.rrect(Rect::new(bar.x, bar.y, fill, bar.h), bar.h / 2, co.accent_mark);
             let s = self.px(12.0);
             let color = if self.hover == Hit::JobCancel(i) { co.foreground } else { co.muted };
             self.icons.draw(c, Icon::Close, r.right() - self.px(22.0), y + (row - s) / 2, s, color);
@@ -627,9 +627,9 @@ impl App {
             let s = self.px(14.0);
             let bx = Rect::new(cr.x, cr.y + (cr.h - s) / 2, s, s);
             if *apply_to_all {
-                c.rrect(bx, self.px(3.0), co.accent);
+                c.rrect(bx, self.px(3.0), co.accent_mark);
             }
-            c.frame(bx, 1, if *apply_to_all { co.accent } else { co.muted });
+            c.frame(bx, 1, if *apply_to_all { co.accent_mark } else { co.muted });
             let by = self.baseline(cr.y, cr.h);
             self.text.draw_str(c, "Do the same for the rest (A)", (cr.x + s + self.px(8.0)) as f32, by, co.foreground);
         }

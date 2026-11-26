@@ -535,8 +535,8 @@ preference set, it's light.
 
 Text and controls stay readable in any theme: Gannet keeps the theme's colors where they meet
 WCAG 2.2 AA contrast (4.5:1 for text, 3:1 for field outlines and icons), and moves the colors
-it works out from them, such as quieter text, red text and field outlines, only as far towards
-the text color as they need to go to meet it.
+it works out from them, such as quieter text, red text, field outlines and the accent where
+it marks focus or a check box, only as far towards the text color as they need to go to meet it.
 
 Text is in your monospace font at 13 px, the one `aliasos-font-set` picks on aliasOS, so
 Gannet matches the terminal and the bar. Pick another and Gannet uses it from its next start.

@@ -750,9 +750,9 @@ impl Window {
             let bx = Rect::new(r.x, r.y + (r.h - s) / 2, s, s);
             let on = self.picker.always;
             if on {
-                c.rrect(bx, self.px(3.0), co.accent);
+                c.rrect(bx, self.px(3.0), co.accent_mark);
             }
-            c.frame(bx, 1, if on || self.hover == Hit::Always { co.accent } else { co.muted });
+            c.frame(bx, 1, if on || self.hover == Hit::Always { co.accent_mark } else { co.muted });
             let label = self.picker.always_label();
             let by = self.baseline(r.y, r.h);
             let x = r.x + s + self.px(8.0);

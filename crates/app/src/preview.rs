@@ -1084,9 +1084,9 @@ impl App {
         let y = track.y + (track.h - h) / 2;
         c.rrect(Rect::new(track.x, y, track.w, h), h / 2, co.hover);
         let done = (track.w as f64 * along.clamp(0.0, 1.0)) as i32;
-        c.rrect(Rect::new(track.x, y, done, h), h / 2, co.accent);
+        c.rrect(Rect::new(track.x, y, done, h), h / 2, co.accent_mark);
         let knob = self.px(10.0);
-        c.rrect(Rect::new(track.x + done - knob / 2, track.y + (track.h - knob) / 2, knob, knob), knob / 2, co.accent);
+        c.rrect(Rect::new(track.x + done - knob / 2, track.y + (track.h - knob) / 2, knob, knob), knob / 2, co.accent_mark);
     }
 
     // ---- Opening, moving and closing ----

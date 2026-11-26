@@ -3030,6 +3030,10 @@ impl App {
 
     /// Closes the dialog, and shows the next question a job is waiting on, if there is one.
     fn close_dialog(&mut self) {
+        // A paste asked for in a passphrase prompt mustn't land in a field after it.
+        if matches!(self.dialog, Some(Dialog::Unlock { .. })) {
+            self.edit_gen += 1;
+        }
         self.dialog = None;
         if !self.pending_conflicts.is_empty() {
             let c = self.pending_conflicts.remove(0);
@@ -8980,6 +8984,29 @@ mod tests {
             Some(Dialog::Unlock { field, .. }) => assert_eq!(field.text, "", "the first prompt's paste went into the second"),
             _ => panic!("no dialog"),
         }
+    }
+
+    /// Whatever closes a passphrase prompt, a paste asked for in it is dropped, so it can't land
+    /// in a field that has the keyboard afterwards, such as a Save dialog's name.
+    #[test]
+    fn every_way_a_prompt_closes_drops_its_paste() {
+        let mut r = drive_rig("drives-paste-closed");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        let stale = |r: &Rig, asked: &Paste| matches!(asked, Paste::IntoField { edit } if *edit != r.app.edit_gen);
+        // Cancel.
+        r.app.open_place(1);
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        r.key(k::KEY_Escape, "");
+        assert!(r.app.dialog.is_none() && stale(&r, &asked), "cancelled");
+        // udisks2 or polkit closing it.
+        r.app.open_place(1);
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        r.app.on_msg(Msg::DiskDone { volume: secret, doing: Doing::Unlock(String::new()), result: Err(DiskError::Cancelled) });
+        assert!(r.app.dialog.is_none() && stale(&r, &asked), "closed by udisks2");
     }
 
     #[test]
