@@ -6,6 +6,9 @@ import subprocess, sys, time
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "harness"))
 from hl import *
+from isolate import isolate
+# GTK and Qt look for an accessibility bus; keep them off the desktop's.
+isolate()
 ROOT = Path(__file__).resolve().parent.parent.parent
 B = ROOT / ".bench/bakeoff"
 PROBES = [("raw wl_shm+swash", [B / "rawshm"], {}),

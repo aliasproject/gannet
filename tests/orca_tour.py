@@ -20,6 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import e2e  # noqa: E402
+from isolate import isolate  # noqa: E402
 from e2e import (ROOT, ROW_X, SCRATCH, App, Headless, ScreenReader, StandIn, bookmarks_file, click_place, fresh_fs, go_to,  # noqa: E402
                  holding, place_flags, png_bytes, row_y, sandboxed, stand_in_apps, tree)
 
@@ -130,6 +131,8 @@ class Tour:
 
 
 def main():
+    # Off the desktop's session and accessibility buses, or not at all.
+    isolate()
     out = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else ROOT / ".bench/orca-tour.txt"
     assert e2e.BIN.exists(), "run: CARGO_TARGET_DIR=target/bench cargo build --release -p gannet --features bench"
     assert e2e.STANDIN.exists(), "run: CARGO_TARGET_DIR=target/bench cargo build --release -p gannet-core --example udisks-standin"

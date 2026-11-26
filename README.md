@@ -603,6 +603,45 @@ speech-dispatcher and its settings in memory, so nothing is spoken aloud and you
 settings aren't touched. It fails if the passphrase typed at the unlock prompt appears
 anywhere in Orca's log.
 
+### Keeping tests off the desktop's buses
+
+A test must never reach your session's D-Bus or its accessibility bus. Starting
+`at-spi-bus-launcher` anywhere with your real `XDG_RUNTIME_DIR` is enough to break it: the
+launcher unlinks `$XDG_RUNTIME_DIR/at-spi/bus_0` and binds its own socket there. When it
+exits, the desktop's accessibility bus keeps running on a socket nobody can find, and Orca
+fails to start with "Couldn't connect to accessibility bus". `dbus-run-session` doesn't
+prevent this. It gives you a private session bus, but that bus starts the system's
+`org.a11y.Bus` service, and the launcher it starts still uses the real runtime folder. A GTK
+or Qt app on a private bus is enough to trigger it.
+
+So `tests/e2e.py`, `tests/orca_tour.py`, `bench/run.py` and `bench/bakeoff/run.py` run themselves again inside
+bubblewrap (`bench/harness/isolate.py`), with:
+
+- an empty tmpfs over `/run/user/$UID`, which is also `XDG_RUNTIME_DIR`;
+- an empty `/tmp/.X11-unix`, no `DISPLAY` or `WAYLAND_DISPLAY`, and no network, so nothing
+  can reach Xwayland;
+- `DBUS_SESSION_BUS_ADDRESS` pointing nowhere and `AT_SPI_BUS_ADDRESS` unset.
+
+Inside the sandbox, each one checks that the real sockets can't be seen, and refuses to run
+if they can. Outside it, the inode and times of `$XDG_RUNTIME_DIR/bus` and everything in
+`$XDG_RUNTIME_DIR/at-spi` are recorded before the run and checked after it. The run fails
+loudly, with exit code 3 if nothing else failed, when one was replaced, removed or added.
+`scripts/test.sh` does the same check around `cargo test`. Its test binaries already run
+with `/run` covered, but doc-tests and build scripts don't, so for those the check is the
+only guard. To check the guard itself:
+
+    python3 -B bench/harness/isolate.py --self-test
+
+Run a one-off probe or prototype the same way, inside the guard, never on its own or only in
+`dbus-run-session`. The guard keeps it off the desktop's buses and display, not off your
+files, so a probe still needs its own scratch folders:
+
+    python3 -I -c 'import sys; sys.path.insert(0, "bench/harness"); import isolate; sys.exit(isolate.run_guarded(sys.argv[1:]))' ./probe.sh
+
+If a run did break the bus, `ss -xlpe` shows `dbus-broker` listening on `at-spi/bus_0` with
+an `ino:` that differs from the file's inode in `stat`. Restart the launcher with
+`pkill -f at-spi-bus-launcher`, and D-Bus starts it again the next time something asks.
+
 ## License
 
 [MIT](LICENSE)

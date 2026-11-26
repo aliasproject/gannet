@@ -28,4 +28,7 @@ spawn to sway reporting the mapped window, which happens on the first committed 
 Reads only: the fixture lives in `.bench/`, the app runs with HOME and XDG folders in a
 scratch root, and Nautilus runs in bubblewrap with the real home hidden. The one thing it
 writes outside `.bench/` is a temporary folder for the copy test on `/tmp`. The Trash test
-uses a Trash folder inside `.bench/`, not the real one.
+uses a Trash folder inside `.bench/`, not the real one. The whole run is inside
+bubblewrap with the desktop's runtime folder covered, so Nautilus's `dbus-run-session` can't
+start an accessibility bus over the desktop's (see "Keeping tests off the desktop's buses"
+in the main README).

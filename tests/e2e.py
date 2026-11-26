@@ -12,6 +12,7 @@ from urllib.parse import quote
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "bench/harness"))
 from hl import Headless, Ipc, tree as hl_tree
+from isolate import isolate
 
 BIN = ROOT / "target/bench/release/gannet"
 PREVIEW_APP_ID = "com.aliasproject.Gannet.Preview"
@@ -5213,6 +5214,8 @@ def a_long_sidebar_scrolls_and_drags_near_its_edges_scroll_it(h):
 
 
 def main():
+    # Off the desktop's session and accessibility buses, or not at all.
+    isolate()
     want = sys.argv[1] if len(sys.argv) > 1 else ""
     assert BIN.exists(), "run: CARGO_TARGET_DIR=target/bench cargo build --release -p gannet --features bench"
     SCRATCH.mkdir(exist_ok=True)
