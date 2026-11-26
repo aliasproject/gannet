@@ -17,7 +17,7 @@ replaced, removed or added, even when every check passed.
 
   python3 -B bench/harness/isolate.py --self-test
 """
-import os, shutil, signal, socket, subprocess, sys, tempfile
+import os, shutil, signal, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 
 MARK = "GANNET_ISOLATED"
@@ -33,8 +33,10 @@ def fingerprint(runtime):
     """Each bus socket in `runtime` with its inode and times. A replaced socket has a new inode."""
     out = {}
     paths = [runtime / "bus", runtime / "at-spi"]
-    if (runtime / "at-spi").is_dir():
+    try:
         paths += sorted((runtime / "at-spi").iterdir())
+    except OSError:
+        pass  # Not there, or gone while being listed.
     for p in paths:
         try:
             st = os.lstat(p)
@@ -125,30 +127,48 @@ def run_guarded(argv, runtime=None):
     # bwrap has its own session, so the terminal's Ctrl-C doesn't reach it: bwrap would die at
     # once and take the sandbox with it, cutting off the harness's cleanup. The signal is passed
     # to what runs inside instead, and the check comes after the run has stopped. A second
-    # Ctrl-C kills the whole run.
+    # Ctrl-C, or TERM or HUP not obeyed within 10 s, kills the whole run.
     proc = subprocess.Popen(sandbox_command(argv), start_new_session=True)
+    deadline = None
+
+    def kill_all():
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
 
     def forward(signum, _frame):
+        nonlocal deadline
         for pid in _sandboxed_processes(proc.pid):
             try:
                 if os.getpgid(pid) == proc.pid:
                     os.kill(pid, signum)
             except OSError:
                 pass
+        if signum != signal.SIGINT and deadline is None:
+            deadline = time.monotonic() + 10
 
     old = {s: signal.signal(s, forward) for s in (signal.SIGTERM, signal.SIGHUP)}
     interrupted = False
     try:
         while True:
             try:
-                code = proc.wait()
-                break
+                try:
+                    code = proc.wait(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    if deadline is not None and time.monotonic() > deadline:
+                        kill_all()
             except KeyboardInterrupt:
-                if interrupted:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                else:
-                    forward(signal.SIGINT, None)
-                interrupted = True
+                try:
+                    if interrupted:
+                        kill_all()
+                    else:
+                        interrupted = True
+                        forward(signal.SIGINT, None)
+                except KeyboardInterrupt:
+                    # Pressed again while the first was being passed on.
+                    kill_all()
     finally:
         for s, h in old.items():
             signal.signal(s, h)
