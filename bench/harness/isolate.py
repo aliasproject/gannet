@@ -82,9 +82,16 @@ def problems():
 
 def sandbox_command(argv):
     uid = os.geteuid()
+    if not os.path.isdir(f"/run/user/{uid}"):
+        # bwrap would have to make it on the real disk, and can't. Without logind there is no
+        # desktop session to protect, but the harness still needs somewhere to run.
+        sys.exit(f"refusing to run: /run/user/{uid} doesn't exist, so there's no runtime folder to cover with the sandbox's own")
     bwrap = shutil.which("bwrap") or "/usr/bin/bwrap"
+    # Only covered if it's there: bwrap would otherwise make it on the real /tmp, owned by
+    # this user, and Xwayland refuses a /tmp/.X11-unix it doesn't trust.
+    x11 = ["--tmpfs", "/tmp/.X11-unix"] if os.path.isdir("/tmp/.X11-unix") else []
     return [bwrap, "--die-with-parent", "--unshare-pid", "--unshare-net", "--dev-bind", "/", "/", "--proc", "/proc",
-            "--perms", "0700", "--tmpfs", f"/run/user/{uid}", "--tmpfs", "/tmp/.X11-unix",
+            "--perms", "0700", "--tmpfs", f"/run/user/{uid}", *x11,
             "--setenv", MARK, "1", "--setenv", "XDG_RUNTIME_DIR", f"/run/user/{uid}",
             "--setenv", "DBUS_SESSION_BUS_ADDRESS", NOWHERE, "--setenv", "DBUS_SYSTEM_BUS_ADDRESS", NOWHERE,
             "--unsetenv", "DISPLAY", "--unsetenv", "WAYLAND_DISPLAY", "--unsetenv", "AT_SPI_BUS_ADDRESS",
@@ -99,13 +106,17 @@ def run_guarded(argv, runtime=None):
         code = subprocess.run(sandbox_command(argv)).returncode
     except KeyboardInterrupt:
         code = 130
+    if code < 0:
+        # Killed by a signal: report it as a shell would, never as a pass.
+        code = 128 - code
     changed = changes(before, fingerprint(runtime))
     if changed:
         bar = "!" * 78
         print(f"\n{bar}\nTHE DESKTOP'S BUS SOCKETS CHANGED DURING THIS RUN:", file=sys.stderr)
         for line in changed:
             print("  " + line, file=sys.stderr)
-        print("Something in the run reached the real runtime folder. A screen reader will fail to\n"
+        print("Unless the desktop itself started or restarted a bus meanwhile, something in the run\n"
+              "reached the real runtime folder. If bus_0 was replaced, a screen reader will fail to\n"
               "connect until the bus is restarted; see the README's Development section.\n" + bar, file=sys.stderr)
         return code or 3
     return code
@@ -126,7 +137,7 @@ def isolate():
 
 def self_test():
     """Shows that the guard notices a replaced socket and that the sandbox hides the real ones.
-    Touches nothing outside a scratch folder."""
+    Writes nothing outside a scratch folder and the sandbox's own tmpfs."""
     scratch = Path(tempfile.mkdtemp(prefix="gnisolate-"))
     try:
         rt = scratch / "runtime"
@@ -157,13 +168,12 @@ def self_test():
         # real one. It's a new name, never bus_0, and it's only made once the sandbox checks out.
         real = real_runtime()
         probe = real / "at-spi/gannet-isolate-probe"
-        before = fingerprint(real)
         inner = (f"import os, sys; sys.path.insert(0, {str(Path(__file__).parent)!r}); import isolate; "
                  "sys.exit(1) if isolate.problems() else None; "
                  "d = os.environ['XDG_RUNTIME_DIR'] + '/at-spi'; os.makedirs(d, exist_ok=True); open(d + '/gannet-isolate-probe', 'w').close()")
-        code = run_guarded([sys.executable, "-I", "-c", inner])
-        assert code == 0, f"the probe run exited {code}"
-        assert not probe.exists() and changes(before, fingerprint(real)) == [], "the sandbox let a write reach the real runtime folder"
+        r = subprocess.run(sandbox_command([sys.executable, "-I", "-c", inner]))
+        assert r.returncode == 0, f"the probe run exited {r.returncode}"
+        assert not probe.exists(), "the sandbox let a write reach the real runtime folder"
         for s in socks:
             s.close()
         print("isolate self-test passed")

@@ -626,8 +626,9 @@ Inside the sandbox, each one checks that the real sockets can't be seen, and ref
 if they can. Outside it, the inode and times of `$XDG_RUNTIME_DIR/bus` and everything in
 `$XDG_RUNTIME_DIR/at-spi` are recorded before the run and checked after it. The run fails
 loudly, with exit code 3 if nothing else failed, when one was replaced, removed or added.
-`scripts/test.sh` does the same check around `cargo test`, whose test binaries already run
-with `/run` covered. To check the guard itself:
+`scripts/test.sh` does the same check around `cargo test`. Its test binaries already run
+with `/run` covered, but doc-tests and build scripts don't, so for those the check is the
+only guard. To check the guard itself:
 
     python3 -B bench/harness/isolate.py --self-test
 
