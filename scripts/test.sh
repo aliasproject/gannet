@@ -19,16 +19,10 @@ runtime=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 sockets() { stat -c '%n %i %Y %Z' "$runtime/bus" "$runtime/at-spi" "$runtime"/at-spi/* 2>/dev/null || true; }
 before=$(sockets)
 code=0
-# Not exec'd, so the sockets can be checked after it. A signal to this script is passed on to
-# cargo and waited for, so the check runs after cargo has really stopped.
-cargo test "$@" &
-pid=$!
-trap 'kill -TERM "$pid" 2>/dev/null || true' INT TERM HUP
-while :; do
-  wait "$pid" && break
-  code=$?
-  kill -0 "$pid" 2>/dev/null || break
-done
+# Not exec'd, so the sockets can be checked after it. Ctrl-C still reaches cargo and the tests,
+# which are in the foreground; this script only waits for them to stop, then checks.
+trap : INT TERM HUP
+cargo test "$@" || code=$?
 trap - INT TERM HUP
 after=$(sockets)
 if [ "$before" != "$after" ]; then

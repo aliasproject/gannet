@@ -83,8 +83,8 @@ def problems():
 def sandbox_command(argv):
     uid = os.geteuid()
     if not os.path.isdir(f"/run/user/{uid}"):
-        # bwrap would have to make it on the real disk, and can't. Without logind there is no
-        # desktop session to protect, but the harness still needs somewhere to run.
+        # bwrap would have to make it on the real disk, and can't. That's a machine with no
+        # logind session (ssh, a container), where the harnesses' headless sway can't run either.
         sys.exit(f"refusing to run: /run/user/{uid} doesn't exist, so there's no runtime folder to cover with the sandbox's own")
     bwrap = shutil.which("bwrap") or "/usr/bin/bwrap"
     # Only covered if it's there: bwrap would otherwise make it on the real /tmp, owned by
@@ -99,13 +99,19 @@ def sandbox_command(argv):
 
 
 def run_guarded(argv, runtime=None):
-    """Runs argv in the sandbox, then fails if the real sockets changed. Returns the exit code."""
+    """Runs argv in the sandbox, then fails if the real sockets changed. Returns the exit code.
+    The sandbox only keeps argv off the desktop's buses and display: files, the real home
+    among them, are as writable as they are outside it."""
     runtime = runtime or real_runtime()
     before = fingerprint(runtime)
-    try:
-        code = subprocess.run(sandbox_command(argv)).returncode
-    except KeyboardInterrupt:
-        code = 130
+    # Ctrl-C reaches the run too. Wait for it to clean up and stop, so the check comes after.
+    proc = subprocess.Popen(sandbox_command(argv))
+    while True:
+        try:
+            code = proc.wait()
+            break
+        except KeyboardInterrupt:
+            pass
     if code < 0:
         # Killed by a signal: report it as a shell would, never as a pass.
         code = 128 - code
@@ -171,9 +177,13 @@ def self_test():
         inner = (f"import os, sys; sys.path.insert(0, {str(Path(__file__).parent)!r}); import isolate; "
                  "sys.exit(1) if isolate.problems() else None; "
                  "d = os.environ['XDG_RUNTIME_DIR'] + '/at-spi'; os.makedirs(d, exist_ok=True); open(d + '/gannet-isolate-probe', 'w').close()")
-        r = subprocess.run(sandbox_command([sys.executable, "-I", "-B", "-c", inner]))
-        assert r.returncode == 0, f"the probe run exited {r.returncode}"
-        assert not probe.exists(), "the sandbox let a write reach the real runtime folder"
+        try:
+            r = subprocess.run(sandbox_command([sys.executable, "-I", "-B", "-c", inner]))
+            assert r.returncode == 0, f"the probe run exited {r.returncode}"
+            assert not probe.exists(), "the sandbox let a write reach the real runtime folder"
+        finally:
+            # Only if the sandbox failed; never left behind to trip the next guarded run.
+            probe.unlink(missing_ok=True)
         for s in socks:
             s.close()
         print("isolate self-test passed")

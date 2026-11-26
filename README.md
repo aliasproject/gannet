@@ -633,7 +633,8 @@ only guard. To check the guard itself:
     python3 -B bench/harness/isolate.py --self-test
 
 Run a one-off probe or prototype the same way, inside the guard, never on its own or only in
-`dbus-run-session`:
+`dbus-run-session`. The guard keeps it off the desktop's buses and display, not off your
+files, so a probe still needs its own scratch folders:
 
     python3 -I -c 'import sys; sys.path.insert(0, "bench/harness"); import isolate; sys.exit(isolate.run_guarded(sys.argv[1:]))' ./probe.sh
 
