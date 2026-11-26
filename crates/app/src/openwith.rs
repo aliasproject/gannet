@@ -663,7 +663,7 @@ impl Window {
     fn paint_search(&mut self, c: &mut Canvas, r: Rect) {
         let co = self.colors;
         c.rrect(r, self.px(5.0), co.surface);
-        c.frame(r, 1, co.accent);
+        c.frame(r, 1, co.accent_mark);
         let inner = Rect::new(r.x + self.px(8.0), r.y, r.w - self.px(16.0), r.h);
         let y = self.baseline(r.y, r.h);
         let f = self.picker.search.clone();

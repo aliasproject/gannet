@@ -195,7 +195,7 @@ impl App {
     pub(crate) fn paint_field(&mut self, c: &mut Canvas, r: Rect, f: &Field, focused: bool) {
         let co = self.colors;
         c.rrect(r, self.px(5.0), co.base);
-        c.frame(r, 1, if focused { co.accent } else { co.control_border });
+        c.frame(r, 1, if focused { co.accent_mark } else { co.control_border });
         let inner = Rect::new(r.x + self.px(8.0), r.y, r.w - self.px(16.0), r.h);
         let y = self.baseline(r.y, r.h);
         let caret_x = self.text.measure(&f.text[..f.caret]);
@@ -263,7 +263,7 @@ impl App {
         let (ty, th) = self.scrollbar_thumb(pane);
         let w = self.px(5.0);
         let co = self.colors;
-        let color = if self.hover == Hit::Scrollbar(pane) { co.muted } else { co.border };
+        let color = if self.hover == Hit::Scrollbar(pane) { co.muted } else { co.control_border };
         c.rrect(Rect::new(right - w - self.px(3.0), area.y + ty, w, th), w / 2, color);
     }
 
@@ -312,7 +312,7 @@ impl App {
             }
             // The place the keyboard is on is marked as the list's cursor is.
             if keyboard == Some(i) {
-                c.fill(Rect::new(r.x, r.y + self.px(5.0), self.px(3.0), r.h - self.px(10.0)), co.accent);
+                c.fill(Rect::new(r.x, r.y + self.px(5.0), self.px(3.0), r.h - self.px(10.0)), co.accent_mark);
             }
             let ic = match p.kind {
                 PlaceKind::Disk if p.volume.as_ref().is_some_and(|v| v.locked) => Icon::Lock,
@@ -344,7 +344,12 @@ impl App {
                     c.rrect(Rect::new(e.x + self.px(2.0), e.y + self.px(3.0), e.w - self.px(4.0), e.h - self.px(6.0)), self.px(4.0), if here { co.accent } else { co.border });
                 }
                 let s = self.px(16.0);
-                self.icons.draw(c, Icon::Eject, e.x + (e.w - s) / 2, e.y + (e.h - s) / 2, s, if here { co.on_selection } else { co.muted });
+                let ink = match (here, self.hover == Hit::Eject(i)) {
+                    (true, true) => co.on_accent,
+                    (true, false) => co.on_selection,
+                    _ => co.muted,
+                };
+                self.icons.draw(c, Icon::Eject, e.x + (e.w - s) / 2, e.y + (e.h - s) / 2, s, ink);
             }
         }
         self.places = places;
@@ -445,13 +450,13 @@ impl App {
                     c.fill(r, co.hover);
                 }
                 if cursor_shown && row == self.cursor {
-                    c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.accent);
+                    c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.accent_mark);
                 }
                 let fg = if selected { co.on_selection } else { co.foreground };
                 let dim = if selected { co.on_selection_muted } else { co.muted };
                 let name = listing.name(id);
                 let kind = listing.kind(id);
-                let tint = if kind.is_dirlike() { if selected { co.on_selection } else { co.accent } } else { dim };
+                let tint = if kind.is_dirlike() { if selected { co.on_selection } else { co.accent_mark } } else { dim };
                 // A thumbnail in the icon's place, centred where the icon would be.
                 if let Some(pic) = self.thumbnail(&listing, id) {
                     let (cx, cy) = (area.x + self.px(14.0) + icon / 2, y + row_h / 2);
@@ -502,7 +507,7 @@ impl App {
                 let f = f.clone();
                 let r = Rect::new(area.x, area.y, area.w, row_h);
                 c.fill(r, co.hover);
-                self.icons.draw(c, crate::icons::Icon::Folder, area.x + self.px(14.0), area.y + (row_h - icon) / 2, icon, co.accent);
+                self.icons.draw(c, crate::icons::Icon::Folder, area.x + self.px(14.0), area.y + (row_h - icon) / 2, icon, co.accent_mark);
                 self.paint_field(c, Rect::new(name_x - self.px(4.0), area.y + 1, name_max as i32 + self.px(8.0), row_h - self.px(2.0)), &f, true);
             }
             if thumb_room > 0 {
@@ -607,7 +612,7 @@ impl App {
             // The passphrase shows as a dot for each character, never as itself.
             let fr = self.dialog_check_rect();
             c.rrect(fr, self.px(5.0), co.base);
-            c.frame(fr, 1, co.accent);
+            c.frame(fr, 1, co.accent_mark);
             let n = field.text.chars().count();
             let before = field.text[..field.caret].chars().count();
             let dot = self.text.measure("•");

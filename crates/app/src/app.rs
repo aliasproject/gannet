@@ -2699,6 +2699,8 @@ impl App {
                 }
                 // Cancelled: if it was already being tried, the window stays where it is.
                 self.opening = None;
+                // Nor in a field that has the keyboard after it.
+                self.edit_gen += 1;
             }
             Dialog::ConfirmReplace { paths, .. } => {
                 if label == "Replace" {
@@ -2969,6 +2971,8 @@ impl App {
         if v.locked {
             // Another question, like a copy's, comes first.
             if self.dialog.is_none() {
+                // A paste asked for in an earlier prompt mustn't land in this one.
+                self.edit_gen += 1;
                 self.dialog = Some(Dialog::Unlock { volume: v, field: Field::new(""), at: 0, error: None, waiting: false });
                 self.invalidate_all();
             }
@@ -8957,6 +8961,25 @@ mod tests {
         r.key(k::KEY_Return, "");
         r.ctrl(k::KEY_v);
         assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadClipboard(_))), "no paste while waiting");
+    }
+
+    #[test]
+    fn a_paste_asked_for_in_a_closed_prompt_doesnt_land_in_the_next() {
+        let mut r = drive_rig("drives-paste-stale");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.app.open_place(1);
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        r.key(k::KEY_Escape, "");
+        assert!(r.app.dialog.is_none());
+        r.app.open_place(1);
+        r.app.on_msg(Msg::Clipboard(Some(b"old".to_vec()), clipboard::TEXT.to_string(), asked));
+        match &r.app.dialog {
+            Some(Dialog::Unlock { field, .. }) => assert_eq!(field.text, "", "the first prompt's paste went into the second"),
+            _ => panic!("no dialog"),
+        }
     }
 
     #[test]

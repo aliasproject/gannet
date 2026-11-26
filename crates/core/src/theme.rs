@@ -73,6 +73,9 @@ pub struct Colors {
     pub muted: Rgb,
     pub accent: Rgb,
     pub on_accent: Rgb,
+    /// The accent as a mark on the window or the bars: a focused field's outline, the
+    /// keyboard's place, folders' icons. `accent` unless that's under 3:1 there.
+    pub accent_mark: Rgb,
     /// An accent-filled button under the pointer, still readable with `on_accent` on it.
     pub accent_hover: Rgb,
     /// Links in text, which is `accent` unless that's too faint to read as text.
@@ -114,8 +117,8 @@ pub fn parse_colors(text: &str) -> Option<Colors> {
     let fg = get("foreground")?;
     let accent = get("accent").or_else(|| get("color4")).or_else(|| get("blue")).unwrap_or_else(|| blend(fg, bg, 0.3));
     let selection = get("selection_background").or_else(|| get("selection")).unwrap_or_else(|| blend(bg, accent, 0.35));
-    let readable_or = |c: Rgb| if contrast(selection, c) >= TEXT_CONTRAST { c } else { readable_on(selection) };
-    let on_selection = readable_or(get("selection_foreground").unwrap_or(fg));
+    // The theme's own, then its text color, then black or white.
+    let on_selection = [get("selection_foreground"), Some(fg)].into_iter().flatten().find(|&c| contrast(selection, c) >= TEXT_CONTRAST).unwrap_or_else(|| readable_on(selection));
     let mode = text.lines().find_map(|l| {
         let (k, v) = l.split_once('=')?;
         (k.trim() == "mode").then(|| v.trim().trim_matches('"').to_string())
@@ -131,6 +134,7 @@ pub fn parse_colors(text: &str) -> Option<Colors> {
     let danger = get("color1").or_else(|| get("red")).unwrap_or(if luminance(bg) < 0.4 { 0xe06c75 } else { 0xc0392b });
     let danger = toward(danger, fg, |d| on_all(d, &[bg, surface, hover], TEXT_CONTRAST));
     let muted = toward(blend(fg, bg, 0.40), fg, |m| on_all(m, &[bg, surface, hover], TEXT_CONTRAST));
+    let accent_mark = toward(accent, fg, |a| on_all(a, &[bg, surface, hover], GRAPHIC_CONTRAST));
     Some(Colors {
         dark,
         base: bg,
@@ -142,13 +146,14 @@ pub fn parse_colors(text: &str) -> Option<Colors> {
         muted,
         accent,
         on_accent: readable_on(accent),
+        accent_mark,
         accent_hover: toward(blend(accent, fg, 0.12), accent, |h| contrast(h, readable_on(accent)) >= TEXT_CONTRAST),
         link: toward(accent, fg, |a| on_all(a, &[bg, surface], TEXT_CONTRAST)),
         selection,
         on_selection,
         on_selection_muted: toward(blend(on_selection, selection, 0.25), on_selection, |m| contrast(m, selection) >= TEXT_CONTRAST),
-        // A drop target's row keeps its text and quieter text readable.
-        drop_target: toward(blend(accent, surface, 0.45), surface, |t| on_all(t, &[fg, muted], TEXT_CONTRAST)),
+        // A drop target's row keeps its text, quieter text and folder icon readable.
+        drop_target: toward(blend(accent, surface, 0.45), surface, |t| on_all(t, &[fg, muted], TEXT_CONTRAST) && contrast(t, accent_mark) >= GRAPHIC_CONTRAST),
         danger,
         on_danger: readable_on(danger),
         danger_tint: toward(blend(surface, danger, 0.16), surface, |t| on_all(t, &[fg, muted, danger], TEXT_CONTRAST)),
@@ -365,12 +370,15 @@ mod tests {
             check(&format!("quieter text on the {on}"), c.muted, bg, TEXT_CONTRAST);
             check(&format!("red text on the {on}"), c.danger, bg, TEXT_CONTRAST);
             check(&format!("a field's outline on the {on}"), c.control_border, bg, GRAPHIC_CONTRAST);
+            check(&format!("a focused field's outline on the {on}"), c.accent_mark, bg, GRAPHIC_CONTRAST);
         }
         check("text on a hovered button", c.foreground, blend(c.hover, c.foreground, 0.08), TEXT_CONTRAST);
         check("selected text", c.on_selection, c.selection, TEXT_CONTRAST);
         check("quieter selected text", c.on_selection_muted, c.selection, TEXT_CONTRAST);
         check("text on a drop target", c.foreground, c.drop_target, TEXT_CONTRAST);
         check("quieter text on a drop target", c.muted, c.drop_target, TEXT_CONTRAST);
+        check("a folder's icon on a drop target", c.accent_mark, c.drop_target, GRAPHIC_CONTRAST);
+        check("a hovered eject button on the current place", c.on_accent, c.accent, GRAPHIC_CONTRAST);
         check("a default button's label", c.on_accent, c.accent, TEXT_CONTRAST);
         check("a hovered default button's label", c.on_accent, c.accent_hover, TEXT_CONTRAST);
         check("a focused Delete button's label", c.on_danger, c.danger, TEXT_CONTRAST);
@@ -380,7 +388,9 @@ mod tests {
         check("a link", c.link, c.base, TEXT_CONTRAST);
         check("a link on the bars", c.link, c.surface, TEXT_CONTRAST);
         if check_accent {
-            check("folders' icons and the keyboard's place", c.accent, c.base, GRAPHIC_CONTRAST);
+            // The theme's own accent, kept as it is: the shipped themes' meet 3:1 unchanged.
+            check("the shipped accent", c.accent, c.base, GRAPHIC_CONTRAST);
+            assert_eq!(c.accent_mark, c.accent, "{name}: the accent was moved");
         }
     }
 
@@ -462,6 +472,13 @@ mod tests {
     fn selection_stays_readable_when_the_theme_gives_no_foreground_for_it() {
         let c = parse_colors("background = \"#000000\"\nforeground = \"#eeeeee\"\nselection_background = \"#ffffff\"\n").unwrap();
         assert_eq!(c.on_selection, 0x000000);
+    }
+
+    #[test]
+    fn a_faint_selection_foreground_gives_way_to_the_theme_text_first() {
+        // #777777 on #333333 is under 4.5:1; the theme's text is well over.
+        let c = parse_colors("background = \"#000000\"\nforeground = \"#eeeeee\"\nselection_background = \"#333333\"\nselection_foreground = \"#777777\"\n").unwrap();
+        assert_eq!(c.on_selection, 0xeeeeee);
     }
 
     #[test]
