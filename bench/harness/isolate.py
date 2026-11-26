@@ -161,7 +161,7 @@ def self_test():
         code = run_guarded(["/bin/sh", "-c", f"rm -f {rt}/at-spi/bus_1 && : > {rt}/at-spi/bus_1"], runtime=rt)
         assert code == 3, f"a run that added a socket exited {code}, not 3"
         # Inside the sandbox the real sockets can't be seen, and the check agrees.
-        r = subprocess.run(sandbox_command([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(Path(__file__).parent)!r}); import isolate; print(isolate.problems())"]),
+        r = subprocess.run(sandbox_command([sys.executable, "-I", "-B", "-c", f"import sys; sys.path.insert(0, {str(Path(__file__).parent)!r}); import isolate; print(isolate.problems())"]),
                            capture_output=True, text=True)
         assert r.returncode == 0 and r.stdout.strip() == "[]", (r.returncode, r.stdout, r.stderr)
         # And a file made in the runtime folder's at-spi lands in the sandbox's tmpfs, never the
@@ -171,7 +171,7 @@ def self_test():
         inner = (f"import os, sys; sys.path.insert(0, {str(Path(__file__).parent)!r}); import isolate; "
                  "sys.exit(1) if isolate.problems() else None; "
                  "d = os.environ['XDG_RUNTIME_DIR'] + '/at-spi'; os.makedirs(d, exist_ok=True); open(d + '/gannet-isolate-probe', 'w').close()")
-        r = subprocess.run(sandbox_command([sys.executable, "-I", "-c", inner]))
+        r = subprocess.run(sandbox_command([sys.executable, "-I", "-B", "-c", inner]))
         assert r.returncode == 0, f"the probe run exited {r.returncode}"
         assert not probe.exists(), "the sandbox let a write reach the real runtime folder"
         for s in socks:
