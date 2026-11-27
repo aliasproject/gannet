@@ -1425,6 +1425,11 @@ impl App {
                 Some(Dialog::RenameMany(d)) => d.field_mut(),
                 _ => None,
             },
+            // The passphrase, while it isn't being tried.
+            Edit::None if matches!(self.dialog, Some(Dialog::Unlock { waiting: false, .. })) => match &mut self.dialog {
+                Some(Dialog::Unlock { field, .. }) => Some(field),
+                _ => None,
+            },
             // A chooser's name field, when it has the keyboard.
             Edit::None => self.chooser.as_mut().filter(|c| c.name_focused).map(|c| &mut c.name),
         }
@@ -2694,6 +2699,8 @@ impl App {
                 }
                 // Cancelled: if it was already being tried, the window stays where it is.
                 self.opening = None;
+                // Nor in a field that has the keyboard after it.
+                self.edit_gen += 1;
             }
             Dialog::ConfirmReplace { paths, .. } => {
                 if label == "Replace" {
@@ -2810,6 +2817,11 @@ impl App {
                     true
                 }
                 k::KEY_Return | k::KEY_KP_Enter | k::KEY_Escape | k::KEY_Tab => false,
+                // A passphrase from a password manager is pasted, not retyped.
+                k::KEY_v if m.ctrl => {
+                    self.cmds.push(Cmd::ReadClipboard(Paste::IntoField { edit: self.edit_gen }));
+                    false
+                }
                 _ if !utf8.is_empty() && !utf8.chars().any(char::is_control) => {
                     field.insert(utf8);
                     true
@@ -2959,6 +2971,8 @@ impl App {
         if v.locked {
             // Another question, like a copy's, comes first.
             if self.dialog.is_none() {
+                // A paste asked for in an earlier prompt mustn't land in this one.
+                self.edit_gen += 1;
                 self.dialog = Some(Dialog::Unlock { volume: v, field: Field::new(""), at: 0, error: None, waiting: false });
                 self.invalidate_all();
             }
@@ -3016,6 +3030,10 @@ impl App {
 
     /// Closes the dialog, and shows the next question a job is waiting on, if there is one.
     fn close_dialog(&mut self) {
+        // A paste asked for in a passphrase prompt mustn't land in a field after it.
+        if matches!(self.dialog, Some(Dialog::Unlock { .. })) {
+            self.edit_gen += 1;
+        }
         self.dialog = None;
         if !self.pending_conflicts.is_empty() {
             let c = self.pending_conflicts.remove(0);
@@ -8925,6 +8943,70 @@ mod tests {
             Some(Dialog::Unlock { waiting, error, field, .. }) => assert!(*waiting && error.is_none() && field.text == "x", "still waiting on the first: {error:?}"),
             _ => panic!("no dialog"),
         }
+    }
+
+    #[test]
+    fn a_passphrase_can_be_pasted() {
+        let mut r = drive_rig("drives-paste-passphrase");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.app.open_place(1);
+        r.key(0, "a");
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        // Only the first line: a passphrase copied with its line break mustn't press Unlock.
+        r.app.on_msg(Msg::Clipboard(Some(b"hunter2\nmore".to_vec()), clipboard::TEXT.to_string(), asked));
+        match &r.app.dialog {
+            Some(Dialog::Unlock { field, waiting, .. }) => assert!(field.text == "ahunter2" && !*waiting, "pasted after what was typed: {:?}", field.text),
+            _ => panic!("no dialog"),
+        }
+        // Not while it's being tried.
+        r.key(k::KEY_Return, "");
+        r.ctrl(k::KEY_v);
+        assert!(!r.app.cmds.iter().any(|c| matches!(c, Cmd::ReadClipboard(_))), "no paste while waiting");
+    }
+
+    #[test]
+    fn a_paste_asked_for_in_a_closed_prompt_doesnt_land_in_the_next() {
+        let mut r = drive_rig("drives-paste-stale");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        r.app.open_place(1);
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        r.key(k::KEY_Escape, "");
+        assert!(r.app.dialog.is_none());
+        r.app.open_place(1);
+        r.app.on_msg(Msg::Clipboard(Some(b"old".to_vec()), clipboard::TEXT.to_string(), asked));
+        match &r.app.dialog {
+            Some(Dialog::Unlock { field, .. }) => assert_eq!(field.text, "", "the first prompt's paste went into the second"),
+            _ => panic!("no dialog"),
+        }
+    }
+
+    /// Whatever closes a passphrase prompt, a paste asked for in it is dropped, so it can't land
+    /// in a field that has the keyboard afterwards, such as a Save dialog's name.
+    #[test]
+    fn every_way_a_prompt_closes_drops_its_paste() {
+        let mut r = drive_rig("drives-paste-closed");
+        let secret = stick(&r, Some("SECRETS"), None, true);
+        r.app.on_msg(Msg::Volumes(vec![secret.clone()]));
+        r.app.system_bus = Some("unix:path=/nonexistent".into());
+        let stale = |r: &Rig, asked: &Paste| matches!(asked, Paste::IntoField { edit } if *edit != r.app.edit_gen);
+        // Cancel.
+        r.app.open_place(1);
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        r.key(k::KEY_Escape, "");
+        assert!(r.app.dialog.is_none() && stale(&r, &asked), "cancelled");
+        // udisks2 or polkit closing it.
+        r.app.open_place(1);
+        r.ctrl(k::KEY_v);
+        let Some(Cmd::ReadClipboard(asked)) = r.app.cmds.pop() else { panic!("no read requested") };
+        r.app.on_msg(Msg::DiskDone { volume: secret, doing: Doing::Unlock(String::new()), result: Err(DiskError::Cancelled) });
+        assert!(r.app.dialog.is_none() && stale(&r, &asked), "closed by udisks2");
     }
 
     #[test]

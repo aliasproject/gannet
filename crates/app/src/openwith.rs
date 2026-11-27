@@ -663,7 +663,7 @@ impl Window {
     fn paint_search(&mut self, c: &mut Canvas, r: Rect) {
         let co = self.colors;
         c.rrect(r, self.px(5.0), co.surface);
-        c.frame(r, 1, co.accent);
+        c.frame(r, 1, co.accent_mark);
         let inner = Rect::new(r.x + self.px(8.0), r.y, r.w - self.px(16.0), r.h);
         let y = self.baseline(r.y, r.h);
         let f = self.picker.search.clone();
@@ -750,9 +750,9 @@ impl Window {
             let bx = Rect::new(r.x, r.y + (r.h - s) / 2, s, s);
             let on = self.picker.always;
             if on {
-                c.rrect(bx, self.px(3.0), co.accent);
+                c.rrect(bx, self.px(3.0), co.accent_mark);
             }
-            c.frame(bx, 1, if on || self.hover == Hit::Always { co.accent } else { co.muted });
+            c.frame(bx, 1, if on || self.hover == Hit::Always { co.accent_mark } else { co.muted });
             let label = self.picker.always_label();
             let by = self.baseline(r.y, r.h);
             let x = r.x + s + self.px(8.0);
@@ -762,7 +762,7 @@ impl Window {
         for (r, label, primary, hit) in [(l.cancel, "Cancel", false, Hit::Cancel), (l.open, "Open", true, Hit::Open)] {
             let hovered = self.hover == hit;
             let (bg, fg) = match (primary, can) {
-                (true, true) => (if hovered { theme::blend(co.accent, co.foreground, 0.12) } else { co.accent }, co.on_accent),
+                (true, true) => (if hovered { co.accent_hover } else { co.accent }, co.on_accent),
                 (true, false) => (co.hover, co.border),
                 (false, _) => (if hovered { theme::blend(co.hover, co.foreground, 0.08) } else { co.hover }, co.foreground),
             };

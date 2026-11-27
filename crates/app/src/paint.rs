@@ -2,7 +2,6 @@
 
 use gannet_core::listing::{Kind, SortKey, Stat};
 use gannet_core::places::PlaceKind;
-use gannet_core::theme::blend;
 use gannet_core::time;
 
 use std::path::PathBuf;
@@ -43,9 +42,9 @@ impl App {
         if let Some(FileDrag::Band(b)) = &self.file_drag
             && !b.rect.is_empty()
         {
-            let accent = self.colors.accent;
-            c.tint(b.rect, accent, 48);
-            c.frame(b.rect, 1, accent);
+            let co = self.colors;
+            c.tint(b.rect, co.accent, 48);
+            c.frame(b.rect, 1, co.accent_mark);
         }
         if self.menu.is_some() {
             self.paint_menu(c);
@@ -76,7 +75,7 @@ impl App {
         let inset = self.px(1.0);
         c.rrect(Rect::new(row.x + inset, row.y + inset, row.w - inset * 2, row.h - inset * 2), radius, co.selection);
         let icon = self.px(16.0);
-        let tint = if g.kind.is_dirlike() { co.on_selection } else { blend(co.on_selection, co.selection, 0.25) };
+        let tint = if g.kind.is_dirlike() { co.on_selection } else { co.on_selection_muted };
         self.icons.draw(c, icon_for(g.kind, &g.name), row.x + self.px(10.0), row.y + (row.h - icon) / 2, icon, tint);
         let badge = g.count.to_string();
         let badge_w = if g.count > 1 { self.text.measure(&badge).ceil() as i32 + self.px(12.0) } else { 0 };
@@ -172,7 +171,7 @@ impl App {
             if on && self.hover == Hit::EmptyTrash {
                 c.rrect(r, self.px(5.0), co.hover);
             }
-            c.frame(r, 1, co.border);
+            c.frame(r, 1, co.control_border);
             let w = self.text.measure("Empty Trash");
             let by = self.baseline(r.y, r.h);
             self.text.draw_str(c, "Empty Trash", r.x as f32 + (r.w as f32 - w) / 2.0, by, if on { co.danger } else { co.muted });
@@ -196,7 +195,7 @@ impl App {
     pub(crate) fn paint_field(&mut self, c: &mut Canvas, r: Rect, f: &Field, focused: bool) {
         let co = self.colors;
         c.rrect(r, self.px(5.0), co.base);
-        c.frame(r, 1, if focused { co.accent } else { co.border });
+        c.frame(r, 1, if focused { co.accent_mark } else { co.control_border });
         let inner = Rect::new(r.x + self.px(8.0), r.y, r.w - self.px(16.0), r.h);
         let y = self.baseline(r.y, r.h);
         let caret_x = self.text.measure(&f.text[..f.caret]);
@@ -264,7 +263,7 @@ impl App {
         let (ty, th) = self.scrollbar_thumb(pane);
         let w = self.px(5.0);
         let co = self.colors;
-        let color = if self.hover == Hit::Scrollbar(pane) { co.muted } else { co.border };
+        let color = if self.hover == Hit::Scrollbar(pane) { co.muted } else { co.control_border };
         c.rrect(Rect::new(right - w - self.px(3.0), area.y + ty, w, th), w / 2, color);
     }
 
@@ -305,7 +304,7 @@ impl App {
             let r = Rect::new(l.sidebar.x + self.px(6.0), y, l.sidebar.w - self.px(13.0) - room, row);
             let here = p.path == self.dir;
             if self.is_drop_target(Hit::Place(i)) {
-                c.rrect(r, self.px(5.0), blend(co.accent, co.surface, 0.45));
+                c.rrect(r, self.px(5.0), co.drop_target);
             } else if here {
                 c.rrect(r, self.px(5.0), co.selection);
             } else if self.hover == Hit::Place(i) {
@@ -313,7 +312,7 @@ impl App {
             }
             // The place the keyboard is on is marked as the list's cursor is.
             if keyboard == Some(i) {
-                c.fill(Rect::new(r.x, r.y + self.px(5.0), self.px(3.0), r.h - self.px(10.0)), co.accent);
+                c.fill(Rect::new(r.x, r.y + self.px(5.0), self.px(3.0), r.h - self.px(10.0)), co.accent_mark);
             }
             let ic = match p.kind {
                 PlaceKind::Disk if p.volume.as_ref().is_some_and(|v| v.locked) => Icon::Lock,
@@ -345,14 +344,19 @@ impl App {
                     c.rrect(Rect::new(e.x + self.px(2.0), e.y + self.px(3.0), e.w - self.px(4.0), e.h - self.px(6.0)), self.px(4.0), if here { co.accent } else { co.border });
                 }
                 let s = self.px(16.0);
-                self.icons.draw(c, Icon::Eject, e.x + (e.w - s) / 2, e.y + (e.h - s) / 2, s, if here { co.on_selection } else { co.muted });
+                let ink = match (here, self.hover == Hit::Eject(i)) {
+                    (true, true) => co.on_accent,
+                    (true, false) => co.on_selection,
+                    _ => co.muted,
+                };
+                self.icons.draw(c, Icon::Eject, e.x + (e.w - s) / 2, e.y + (e.h - s) / 2, s, ink);
             }
         }
         self.places = places;
         // Where a pin or a dragged folder would land among the pins.
         if let Some(y) = self.pin_bar() {
             let h = self.px(2.0).max(2);
-            c.rrect(Rect::new(l.sidebar.x + self.px(8.0), y - h / 2, l.sidebar.w - self.px(17.0) - room, h), h / 2, co.accent);
+            c.rrect(Rect::new(l.sidebar.x + self.px(8.0), y - h / 2, l.sidebar.w - self.px(17.0) - room, h), h / 2, co.accent_mark);
         }
     }
 
@@ -439,20 +443,20 @@ impl App {
                 }
                 let selected = self.is_selected(id);
                 if self.is_drop_target(Hit::Row(row)) {
-                    c.fill(r, blend(co.accent, co.base, 0.45));
+                    c.fill(r, co.drop_target);
                 } else if selected {
                     c.fill(r, co.selection);
                 } else if hover_row == Some(row) {
                     c.fill(r, co.hover);
                 }
                 if cursor_shown && row == self.cursor {
-                    c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.accent);
+                    c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.accent_mark);
                 }
                 let fg = if selected { co.on_selection } else { co.foreground };
-                let dim = if selected { blend(co.on_selection, co.selection, 0.25) } else { co.muted };
+                let dim = if selected { co.on_selection_muted } else { co.muted };
                 let name = listing.name(id);
                 let kind = listing.kind(id);
-                let tint = if kind.is_dirlike() { if selected { co.on_selection } else { co.accent } } else { dim };
+                let tint = if kind.is_dirlike() { if selected { co.on_selection } else { co.accent_mark } } else { dim };
                 // A thumbnail in the icon's place, centred where the icon would be.
                 if let Some(pic) = self.thumbnail(&listing, id) {
                     let (cx, cy) = (area.x + self.px(14.0) + icon / 2, y + row_h / 2);
@@ -503,7 +507,7 @@ impl App {
                 let f = f.clone();
                 let r = Rect::new(area.x, area.y, area.w, row_h);
                 c.fill(r, co.hover);
-                self.icons.draw(c, crate::icons::Icon::Folder, area.x + self.px(14.0), area.y + (row_h - icon) / 2, icon, co.accent);
+                self.icons.draw(c, crate::icons::Icon::Folder, area.x + self.px(14.0), area.y + (row_h - icon) / 2, icon, co.accent_mark);
                 self.paint_field(c, Rect::new(name_x - self.px(4.0), area.y + 1, name_max as i32 + self.px(8.0), row_h - self.px(2.0)), &f, true);
             }
             if thumb_room > 0 {
@@ -557,7 +561,7 @@ impl App {
             self.text.draw_fitted(c, &detail, (r.x + self.px(14.0)) as f32, by, text_max, co.foreground);
             c.rrect(bar, bar.h / 2, co.hover);
             let fill = ((bar.w as f32 * fraction.clamp(0.0, 1.0)) as i32).max(if scanning { 0 } else { bar.h });
-            c.rrect(Rect::new(bar.x, bar.y, fill, bar.h), bar.h / 2, co.accent);
+            c.rrect(Rect::new(bar.x, bar.y, fill, bar.h), bar.h / 2, co.accent_mark);
             let s = self.px(12.0);
             let color = if self.hover == Hit::JobCancel(i) { co.foreground } else { co.muted };
             self.icons.draw(c, Icon::Close, r.right() - self.px(22.0), y + (row - s) / 2, s, color);
@@ -567,7 +571,7 @@ impl App {
         for (i, msg) in shown.iter().enumerate() {
             let y = l.notices.y + (job_rows + i) as i32 * row;
             let r = Rect::new(l.notices.x, y, l.notices.w, row);
-            c.fill(r, blend(co.base, co.danger, 0.18));
+            c.fill(r, co.danger_tint);
             c.fill(Rect::new(r.x, r.y, self.px(3.0), r.h), co.danger);
             let by = self.baseline(y, row);
             let more = self.notices.len() - count;
@@ -608,7 +612,7 @@ impl App {
             // The passphrase shows as a dot for each character, never as itself.
             let fr = self.dialog_check_rect();
             c.rrect(fr, self.px(5.0), co.base);
-            c.frame(fr, 1, co.accent);
+            c.frame(fr, 1, co.accent_mark);
             let n = field.text.chars().count();
             let before = field.text[..field.caret].chars().count();
             let dot = self.text.measure("•");
@@ -623,9 +627,9 @@ impl App {
             let s = self.px(14.0);
             let bx = Rect::new(cr.x, cr.y + (cr.h - s) / 2, s, s);
             if *apply_to_all {
-                c.rrect(bx, self.px(3.0), co.accent);
+                c.rrect(bx, self.px(3.0), co.accent_mark);
             }
-            c.frame(bx, 1, if *apply_to_all { co.accent } else { co.muted });
+            c.frame(bx, 1, if *apply_to_all { co.accent_mark } else { co.muted });
             let by = self.baseline(cr.y, cr.h);
             self.text.draw_str(c, "Do the same for the rest (A)", (cr.x + s + self.px(8.0)) as f32, by, co.foreground);
         }
@@ -644,7 +648,7 @@ impl App {
             let focused = i == at && !off;
             let bg = if focused { if b.danger { co.danger } else { co.accent } } else { co.hover };
             c.rrect(*br, self.px(5.0), bg);
-            let fg = if off { co.muted } else if focused { co.on_accent } else if b.danger { co.danger } else { co.foreground };
+            let fg = if off { co.muted } else if focused { if b.danger { co.on_danger } else { co.on_accent } } else if b.danger { co.danger } else { co.foreground };
             let w = self.text.measure(b.label);
             let by = self.baseline(br.y, br.h);
             self.text.draw_str(c, b.label, br.x as f32 + (br.w as f32 - w) / 2.0, by, fg);
@@ -680,7 +684,7 @@ impl App {
             let by = self.baseline(top, l.row_h);
             let (problem, same) = (d.problems[i].is_some(), d.names[i] == d.new[i]);
             if problem {
-                c.fill(Rect::new(l.list.x, top, l.list.w, l.row_h), blend(co.surface, co.danger, 0.14));
+                c.fill(Rect::new(l.list.x, top, l.list.w, l.row_h), co.danger_tint);
             }
             self.text.draw_fitted(c, &String::from_utf8_lossy(&d.names[i]), l.list.x as f32, by, col_w, if same { co.muted } else { co.foreground });
             self.text.draw_str(c, "→", arrow_x, by, co.muted);
@@ -779,7 +783,8 @@ impl App {
             let by = self.baseline(y, row);
             self.text.draw_str(c, item.label, (r.x + self.px(12.0)) as f32, by, fg);
             let w = self.text.measure(item.keys);
-            self.text.draw_str(c, item.keys, (r.right() - self.px(12.0)) as f32 - w, by, if item.enabled { co.muted } else { co.border });
+            let keys = if !item.enabled { co.border } else if i == m.at { co.on_selection_muted } else { co.muted };
+            self.text.draw_str(c, item.keys, (r.right() - self.px(12.0)) as f32 - w, by, keys);
         }
         self.menu = Some(m);
     }

@@ -28,7 +28,8 @@ pub fn luminance(c: Rgb) -> f32 {
     0.2126 * lin(16) + 0.7152 * lin(8) + 0.0722 * lin(0)
 }
 
-fn contrast(a: Rgb, b: Rgb) -> f32 {
+/// The WCAG contrast ratio, 1 to 21.
+pub fn contrast(a: Rgb, b: Rgb) -> f32 {
     let (x, y) = (luminance(a), luminance(b));
     (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
@@ -37,22 +38,59 @@ fn readable_on(bg: Rgb) -> Rgb {
     if contrast(bg, 0xffffff) >= contrast(bg, 0x000000) { 0xffffff } else { 0x000000 }
 }
 
+/// WCAG 2.2 AA: text needs 4.5:1 against what's behind it.
+pub const TEXT_CONTRAST: f32 = 4.5;
+/// WCAG 2.2 AA: icons, control borders and focus marks need 3:1.
+pub const GRAPHIC_CONTRAST: f32 = 3.0;
+
+/// The first color on the way from `start` to `end`, in twentieths, that `ok` accepts, or
+/// `end` if none does. A theme's own colors are kept where they're readable, and moved only
+/// as far as they need to be.
+fn toward(start: Rgb, end: Rgb, ok: impl Fn(Rgb) -> bool) -> Rgb {
+    (0..=20).map(|i| blend(start, end, i as f32 / 20.0)).find(|&c| ok(c)).unwrap_or(end)
+}
+
+/// True if `c` has at least `min` contrast against each of `bgs`.
+fn on_all(c: Rgb, bgs: &[Rgb], min: f32) -> bool {
+    bgs.iter().all(|&bg| contrast(c, bg) >= min)
+}
+
 /// Every color the UI draws with, all derived from a theme's palette so any theme
-/// looks coherent with no per-theme work.
+/// looks coherent with no per-theme work. The derived ones are nudged until they meet
+/// WCAG 2.2 AA against what they're drawn on, so a theme can't make text unreadable.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Colors {
     pub dark: bool,
     pub base: Rgb,
     pub surface: Rgb,
     pub hover: Rgb,
+    /// Lines between parts of the window. Decoration only, so it can be faint.
     pub border: Rgb,
+    /// The outline of a text field or a button, which has to be seen to be found: 3:1
+    /// against the window and the bars.
+    pub control_border: Rgb,
     pub foreground: Rgb,
     pub muted: Rgb,
     pub accent: Rgb,
     pub on_accent: Rgb,
+    /// The accent as a mark on the window or the bars: a focused field's outline, the
+    /// keyboard's place, folders' icons. `accent` unless that's under 3:1 there.
+    pub accent_mark: Rgb,
+    /// An accent-filled button under the pointer, still readable with `on_accent` on it.
+    pub accent_hover: Rgb,
+    /// Links in text, which is `accent` unless that's too faint to read as text.
+    pub link: Rgb,
     pub selection: Rgb,
     pub on_selection: Rgb,
+    /// Quieter text on a selected row, such as its size and date.
+    pub on_selection_muted: Rgb,
+    /// The row or place a drag is over.
+    pub drop_target: Rgb,
     pub danger: Rgb,
+    /// Text on a `danger` fill, such as a focused Delete button.
+    pub on_danger: Rgb,
+    /// Behind an error notice or a name that can't be used, with any text readable on it.
+    pub danger_tint: Rgb,
     pub warning: Rgb,
 }
 
@@ -79,7 +117,8 @@ pub fn parse_colors(text: &str) -> Option<Colors> {
     let fg = get("foreground")?;
     let accent = get("accent").or_else(|| get("color4")).or_else(|| get("blue")).unwrap_or_else(|| blend(fg, bg, 0.3));
     let selection = get("selection_background").or_else(|| get("selection")).unwrap_or_else(|| blend(bg, accent, 0.35));
-    let on_selection = get("selection_foreground").unwrap_or_else(|| if contrast(selection, fg) >= 3.0 { fg } else { readable_on(selection) });
+    // The theme's own, then its text color, then black or white.
+    let on_selection = [get("selection_foreground"), Some(fg)].into_iter().flatten().find(|&c| contrast(selection, c) >= TEXT_CONTRAST).unwrap_or_else(|| readable_on(selection));
     let mode = text.lines().find_map(|l| {
         let (k, v) = l.split_once('=')?;
         (k.trim() == "mode").then(|| v.trim().trim_matches('"').to_string())
@@ -89,19 +128,35 @@ pub fn parse_colors(text: &str) -> Option<Colors> {
         Some("dark") => true,
         _ => luminance(bg) < 0.4,
     };
+    let (surface, hover) = (blend(bg, fg, 0.04), blend(bg, fg, 0.08));
+    let border = blend(bg, fg, 0.16);
+    // Red text sits on the bars, on buttons and on its own faint tint.
+    let danger = get("color1").or_else(|| get("red")).unwrap_or(if luminance(bg) < 0.4 { 0xe06c75 } else { 0xc0392b });
+    let danger = toward(danger, fg, |d| on_all(d, &[bg, surface, hover], TEXT_CONTRAST));
+    let muted = toward(blend(fg, bg, 0.40), fg, |m| on_all(m, &[bg, surface, hover], TEXT_CONTRAST));
+    let accent_mark = toward(accent, fg, |a| on_all(a, &[bg, surface, hover], GRAPHIC_CONTRAST));
     Some(Colors {
         dark,
         base: bg,
-        surface: blend(bg, fg, 0.04),
-        hover: blend(bg, fg, 0.08),
-        border: blend(bg, fg, 0.16),
+        surface,
+        hover,
+        border,
+        control_border: toward(border, fg, |b| on_all(b, &[bg, surface, hover], GRAPHIC_CONTRAST)),
         foreground: fg,
-        muted: blend(fg, bg, 0.40),
+        muted,
         accent,
         on_accent: readable_on(accent),
+        accent_mark,
+        accent_hover: toward(blend(accent, fg, 0.12), accent, |h| contrast(h, readable_on(accent)) >= TEXT_CONTRAST),
+        link: toward(accent, fg, |a| on_all(a, &[bg, surface], TEXT_CONTRAST)),
         selection,
         on_selection,
-        danger: get("color1").or_else(|| get("red")).unwrap_or(if luminance(bg) < 0.4 { 0xe06c75 } else { 0xc0392b }),
+        on_selection_muted: toward(blend(on_selection, selection, 0.25), on_selection, |m| contrast(m, selection) >= TEXT_CONTRAST),
+        // A drop target's row keeps its text, quieter text and folder icon readable.
+        drop_target: toward(blend(accent, surface, 0.45), surface, |t| on_all(t, &[fg, muted], TEXT_CONTRAST) && contrast(t, accent_mark) >= GRAPHIC_CONTRAST),
+        danger,
+        on_danger: readable_on(danger),
+        danger_tint: toward(blend(surface, danger, 0.16), surface, |t| on_all(t, &[fg, muted, danger], TEXT_CONTRAST)),
         warning: get("color3").or_else(|| get("yellow")).unwrap_or(if luminance(bg) < 0.4 { 0xe5c07b } else { 0xb7791f }),
     })
 }
@@ -114,7 +169,7 @@ fn parse_hex(v: &str) -> Option<Rgb> {
     u32::from_str_radix(h, 16).ok()
 }
 
-const LIGHT: &str = "background = \"#fafafa\"\nforeground = \"#1f2328\"\naccent = \"#2f6feb\"\nselection_background = \"#cfe0fc\"\nselection_foreground = \"#1f2328\"\n";
+const LIGHT: &str = "background = \"#fafafa\"\nforeground = \"#1f2328\"\naccent = \"#2865dc\"\nselection_background = \"#cfe0fc\"\nselection_foreground = \"#1f2328\"\n";
 const DARK: &str = "background = \"#1b1d21\"\nforeground = \"#d8dbe0\"\naccent = \"#5b9bf5\"\nselection_background = \"#2c466e\"\nselection_foreground = \"#eef1f5\"\n";
 
 pub fn builtin(dark: bool) -> Colors {
@@ -290,6 +345,93 @@ mod tests {
         s.file("state/aliasos/current/theme/colors.toml", text.as_bytes());
     }
 
+    /// The themes aliasOS ships in `/usr/share/aliasos/themes`, with only the keys read here.
+    const ALIASOS_THEMES: &[(&str, &str)] = &[
+        ("aliasos", "accent = \"#7F96A1\"\nforeground = \"#D8DDE0\"\nbackground = \"#131A1F\"\nselection_foreground = \"#D8DDE0\"\nselection_background = \"#1B2328\"\ncolor1 = \"#B9827B\"\ncolor4 = \"#7F96A1\""),
+        ("aliasos-amber", "accent = \"#E0B36A\"\nforeground = \"#E6DFD3\"\nbackground = \"#14100C\"\nselection_foreground = \"#E6DFD3\"\nselection_background = \"#261F17\"\ncolor1 = \"#C97B72\"\ncolor4 = \"#7FA3B8\""),
+        ("aliasos-azure", "accent = \"#5E9AC4\"\nforeground = \"#DCE2E6\"\nbackground = \"#06121A\"\nselection_foreground = \"#DCE2E6\"\nselection_background = \"#11222E\"\ncolor1 = \"#C97B72\"\ncolor4 = \"#5E9AC4\""),
+        ("aliasos-teal", "accent = \"#5EC4B6\"\nforeground = \"#DCE2E6\"\nbackground = \"#06161A\"\nselection_foreground = \"#DCE2E6\"\nselection_background = \"#11282E\"\ncolor1 = \"#C97B72\"\ncolor4 = \"#6FA8C9\""),
+        ("ayu-dark", "accent = \"#53bdfa\"\nforeground = \"#bfbdb6\"\nbackground = \"#0b0e14\"\ncolor1 = \"#ea6c73\"\ncolor4 = \"#53bdfa\""),
+        ("last-horizon", "accent = \"#b59790\"\nbackground = \"#0c0b0c\"\nforeground = \"#FAFCFB\"\nred = \"#c38b7b\"\nblue = \"#b59790\""),
+        ("matte-black", "accent = \"#e68e0d\"\nforeground = \"#bebebe\"\nbackground = \"#121212\"\nselection_foreground = \"#bebebe\"\nselection_background = \"#333333\"\ncolor1 = \"#D35F5F\"\ncolor4 = \"#e68e0d\""),
+        ("osaka-jade", "accent = \"#509475\"\nforeground = \"#C1C497\"\nbackground = \"#111c18\"\nselection_foreground = \"#111C18\"\nselection_background = \"#C1C497\"\ncolor1 = \"#FF5345\"\ncolor4 = \"#509475\""),
+        ("retro-82", "accent = \"#faa968\"\nbackground = \"#05182e\"\nforeground = \"#f6dcac\"\nred = \"#f85525\"\nblue = \"#3f8f8a\""),
+    ];
+
+    /// Every pair of colors the window draws text or a control's outline with, against
+    /// WCAG 2.2 AA. `accent` is the theme's own, so it's only checked where `check_accent`.
+    fn assert_aa(name: &str, c: &Colors, check_accent: bool) {
+        let check = |what: &str, a: Rgb, b: Rgb, min: f32| {
+            let r = contrast(a, b);
+            assert!(r >= min, "{name}: {what} is {r:.2}:1, under {min}:1 ({a:06x} on {b:06x})");
+        };
+        for (on, bg) in [("window", c.base), ("bars", c.surface), ("hover", c.hover)] {
+            check(&format!("text on the {on}"), c.foreground, bg, TEXT_CONTRAST);
+            check(&format!("quieter text on the {on}"), c.muted, bg, TEXT_CONTRAST);
+            check(&format!("red text on the {on}"), c.danger, bg, TEXT_CONTRAST);
+            check(&format!("a field's outline on the {on}"), c.control_border, bg, GRAPHIC_CONTRAST);
+            check(&format!("a focused field's outline on the {on}"), c.accent_mark, bg, GRAPHIC_CONTRAST);
+        }
+        check("text on a hovered button", c.foreground, blend(c.hover, c.foreground, 0.08), TEXT_CONTRAST);
+        check("selected text", c.on_selection, c.selection, TEXT_CONTRAST);
+        check("quieter selected text", c.on_selection_muted, c.selection, TEXT_CONTRAST);
+        check("text on a drop target", c.foreground, c.drop_target, TEXT_CONTRAST);
+        check("quieter text on a drop target", c.muted, c.drop_target, TEXT_CONTRAST);
+        check("a folder's icon on a drop target", c.accent_mark, c.drop_target, GRAPHIC_CONTRAST);
+        check("a hovered eject button on the current place", c.on_accent, c.accent, GRAPHIC_CONTRAST);
+        check("a default button's label", c.on_accent, c.accent, TEXT_CONTRAST);
+        check("a hovered default button's label", c.on_accent, c.accent_hover, TEXT_CONTRAST);
+        check("a focused Delete button's label", c.on_danger, c.danger, TEXT_CONTRAST);
+        check("an error notice", c.foreground, c.danger_tint, TEXT_CONTRAST);
+        check("a rename's problem", c.danger, c.danger_tint, TEXT_CONTRAST);
+        check("quieter text beside a rename's problem", c.muted, c.danger_tint, TEXT_CONTRAST);
+        check("a link", c.link, c.base, TEXT_CONTRAST);
+        check("a link on the bars", c.link, c.surface, TEXT_CONTRAST);
+        if check_accent {
+            // The theme's own accent, kept as it is: the shipped themes' meet 3:1 unchanged.
+            check("the shipped accent", c.accent, c.base, GRAPHIC_CONTRAST);
+            assert_eq!(c.accent_mark, c.accent, "{name}: the accent was moved");
+        }
+    }
+
+    #[test]
+    fn every_aliasos_theme_and_the_built_in_ones_meet_wcag_aa() {
+        for (name, text) in ALIASOS_THEMES {
+            assert_aa(name, &parse_colors(text).unwrap(), true);
+        }
+        assert_aa("built-in light", &builtin(false), true);
+        assert_aa("built-in dark", &builtin(true), true);
+    }
+
+    /// Any theme with readable text gets readable everything else, whatever its other colors.
+    #[test]
+    fn any_readable_theme_meets_wcag_aa() {
+        let greys = [0x000000, 0x101010, 0x1b1d21, 0x2a2a2a, 0x8a8a8a, 0xb0b0b0, 0xe0e0e0, 0xfafafa, 0xffffff];
+        let hues = [0xff0000, 0xc0392b, 0xe5c07b, 0x2f6feb, 0x5ec4b6, 0x7f96a1, 0x333333, 0xcccccc, 0x000000, 0xffffff];
+        let mut checked = 0;
+        for &bg in &greys {
+            for &fg in &greys {
+                // Text that isn't readable on its own background can't be fixed from here.
+                if contrast(fg, bg) < 7.0 {
+                    continue;
+                }
+                for &accent in &hues {
+                    for &red in &hues {
+                        for sel in [None, Some(blend(bg, accent, 0.2)), Some(accent)] {
+                            let mut t = format!("background = \"#{bg:06x}\"\nforeground = \"#{fg:06x}\"\naccent = \"#{accent:06x}\"\ncolor1 = \"#{red:06x}\"\n");
+                            if let Some(s) = sel {
+                                t += &format!("selection_background = \"#{s:06x}\"\nselection_foreground = \"#{fg:06x}\"\n");
+                            }
+                            assert_aa(&t, &parse_colors(&t).unwrap(), false);
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "{checked}");
+    }
+
     #[test]
     fn parses_an_aliasos_theme() {
         let c = parse_colors(SAMPLE).unwrap();
@@ -298,7 +440,8 @@ mod tests {
         assert_eq!(c.accent, 0x5E92C6);
         assert_eq!(c.selection, 0x1E3047);
         assert_eq!(c.on_selection, 0xE3EAF0);
-        assert_eq!(c.danger, 0xC25F54);
+        // The theme's red is too dark to read on the bars, so it's lightened towards the text.
+        assert_eq!(c.danger, blend(0xC25F54, 0xC5CED6, 0.15));
         assert!(c.dark);
     }
 
@@ -329,6 +472,13 @@ mod tests {
     fn selection_stays_readable_when_the_theme_gives_no_foreground_for_it() {
         let c = parse_colors("background = \"#000000\"\nforeground = \"#eeeeee\"\nselection_background = \"#ffffff\"\n").unwrap();
         assert_eq!(c.on_selection, 0x000000);
+    }
+
+    #[test]
+    fn a_faint_selection_foreground_gives_way_to_the_theme_text_first() {
+        // #777777 on #333333 is under 4.5:1; the theme's text is well over.
+        let c = parse_colors("background = \"#000000\"\nforeground = \"#eeeeee\"\nselection_background = \"#333333\"\nselection_foreground = \"#777777\"\n").unwrap();
+        assert_eq!(c.on_selection, 0xeeeeee);
     }
 
     #[test]
