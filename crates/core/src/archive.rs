@@ -172,7 +172,8 @@ pub fn unpack(tool: &OsStr, archive: &File, into: &Path, mut on_entry: impl FnMu
     Err(match Failed::from_messages(&problems) {
         // A zip's old ZipCrypto lock checks a password against one byte, so about one archive
         // in 256 takes the made-up passphrase above, then fails to decompress, which reads as
-        // damage. The zip itself says whether it's locked (ALI-2187).
+        // damage. The zip itself says whether it's locked (ALI-2187). A locked zip that's also
+        // damaged reads as locked too: the two can't be told apart, and it can't be opened either way.
         Failed::Unreadable if zip_is_locked(archive) => Failed::Password,
         failed => failed,
     })
