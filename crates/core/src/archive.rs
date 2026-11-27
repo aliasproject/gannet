@@ -13,7 +13,7 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Seek};
 use std::path::{Component, Path, PathBuf};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -166,7 +166,55 @@ pub fn unpack(tool: &OsStr, archive: &File, into: &Path, mut on_entry: impl FnMu
     while let Ok(line) = rx.try_recv() {
         sort(line, &mut problems);
     }
-    if status.success() { Ok(()) } else { Err(Failed::from_messages(&problems)) }
+    if status.success() {
+        return Ok(());
+    }
+    Err(match Failed::from_messages(&problems) {
+        // A zip's old ZipCrypto lock checks a password against one byte, so about one archive
+        // in 256 takes the made-up passphrase above, then fails to decompress, which reads as
+        // damage. The zip itself says whether it's locked (ALI-2187). A locked zip that's also
+        // damaged reads as locked too: the two can't be told apart, and it can't be opened either way.
+        Failed::Unreadable if zip_is_locked(archive) => Failed::Password,
+        failed => failed,
+    })
+}
+
+/// Whether `archive` is a zip that says any of its entries is encrypted: bit 0 of an entry's
+/// flags, set for ZipCrypto and for WinZip's AES alike. Reads the central directory at the end
+/// of the file; a zip cut short has none, so then the first entry's own header decides.
+fn zip_is_locked(archive: &File) -> bool {
+    const LIMIT: u64 = 64 << 20;
+    let Ok(len) = archive.metadata().map(|m| m.len()) else { return false };
+    let read = |at: u64, n: u64| -> Option<Vec<u8>> {
+        let mut buf = vec![0; usize::try_from(n).ok()?];
+        archive.read_exact_at(&mut buf, at).ok().map(|()| buf)
+    };
+    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+
+    // The end record is the last 22 bytes, or up to 64 KiB earlier with a comment after it.
+    let directory_says_locked = || -> Option<bool> {
+        let tail_len = len.min(22 + 0xffff);
+        let tail = read(len - tail_len, tail_len)?;
+        let end = tail.windows(4).rposition(|w| w == b"PK\x05\x06").filter(|&i| i + 22 <= tail.len())?;
+        let (size, offset) = (u64::from(u32_at(&tail, end + 12)), u64::from(u32_at(&tail, end + 16)));
+        if size > LIMIT || offset.checked_add(size).is_none_or(|e| e > len) {
+            return None;
+        }
+        let dir = read(offset, size)?;
+        let mut at = 0;
+        while at + 46 <= dir.len() && &dir[at..at + 4] == b"PK\x01\x02" {
+            if u16_at(&dir, at + 8) & 1 == 1 {
+                return Some(true);
+            }
+            at += 46 + usize::from(u16_at(&dir, at + 28)) + usize::from(u16_at(&dir, at + 30)) + usize::from(u16_at(&dir, at + 32));
+        }
+        Some(false)
+    };
+    if directory_says_locked() == Some(true) {
+        return true;
+    }
+    read(0, 30.min(len)).is_some_and(|head| head.len() == 30 && &head[..4] == b"PK\x03\x04" && u16_at(&head, 6) & 1 == 1)
 }
 
 /// The folders `check_links` had to open up, each with the mode it had, from the top down.
@@ -353,6 +401,46 @@ mod tests {
             assert!(matches!(found, Err(Failed::Unsafe)), "{name}, link first {link_first}: {found:?}");
             assert_eq!(mode, 0o000, "d gets its mode back");
         }
+    }
+
+    /// A ZipCrypto zip whose one check byte happens to take the passphrase `unpack` tries, so
+    /// bsdtar gets as far as decompressing and says only that that failed (ALI-2187). About one
+    /// newly made locked zip in 256 is like this, which made a test flaky. Its password is
+    /// "secret".
+    const LOCKED_BUT_CHECK_BYTE_PASSES: &[u8] = include_bytes!("../tests/data/locked-check-byte-passes.zip");
+
+    fn unpack_bytes(bytes: &[u8]) -> Result<(), Failed> {
+        let s = crate::testutil::Scratch::new();
+        let archive = File::open(s.file("a.zip", bytes)).unwrap();
+        unpack(OsStr::new("bsdtar"), &archive, &s.dir("out"), |_| {}, |_| true)
+    }
+
+    #[test]
+    fn a_locked_zip_says_password_even_when_its_check_byte_takes_the_wrong_one() {
+        let got = unpack_bytes(LOCKED_BUT_CHECK_BYTE_PASSES);
+        assert!(matches!(got, Err(Failed::Password)), "{got:?}");
+    }
+
+    #[test]
+    fn a_zip_tells_whether_it_is_locked() {
+        let s = crate::testutil::Scratch::new();
+        let locked = |bytes: &[u8]| zip_is_locked(&File::open(s.file("z.zip", bytes)).unwrap());
+        assert!(locked(LOCKED_BUT_CHECK_BYTE_PASSES));
+        // Cut short, so there's no central directory: the first entry's header says so.
+        assert!(locked(&LOCKED_BUT_CHECK_BYTE_PASSES[..LOCKED_BUT_CHECK_BYTE_PASSES.len() / 2]));
+        s.file("src/a.txt", b"plain");
+        let plain = s.path().join("plain.zip");
+        let made = Command::new("bsdtar").args(["--format", "zip", "-cf"]).arg(&plain).arg("-C").arg(s.path().join("src")).arg("a.txt").status().unwrap();
+        assert!(made.success());
+        assert!(!locked(&std::fs::read(&plain).unwrap()));
+        assert!(!locked(b"this was never a zip file"));
+        assert!(!locked(b""));
+    }
+
+    #[test]
+    fn a_damaged_zip_that_isnt_locked_still_says_damaged() {
+        let got = unpack_bytes(b"PK\x03\x04 not really a zip");
+        assert!(matches!(got, Err(Failed::Unreadable)), "{got:?}");
     }
 
     #[test]
